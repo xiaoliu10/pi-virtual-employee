@@ -1,0 +1,88 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+	color-scheme: light;
+}
+
+html,
+body,
+#root {
+	height: 100%;
+	margin: 0;
+}
+
+body {
+	font-family: ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI",
+		sans-serif;
+	background: #f5f4f0;
+	color: #1b2738;
+	-webkit-font-smoothing: antialiased;
+}
+
+/* macOS hiddenInset title bar drag region */
+.titlebar-drag {
+	-webkit-app-region: drag;
+}
+.titlebar-nodrag {
+	-webkit-app-region: no-drag;
+}
+
+/* thin scrollbars */
+*::-webkit-scrollbar {
+	width: 8px;
+	height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+	background: rgba(120, 130, 150, 0.35);
+	border-radius: 8px;
+}
+*::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+@keyframes caret-blink {
+	0%,
+	100% {
+		opacity: 1;
+	}
+	50% {
+		opacity: 0;
+	}
+}
+.streaming-caret::after {
+	content: "▍";
+	animation: caret-blink 1s steps(1) infinite;
+	color: #e0a458;
+	margin-left: 1px;
+}
+
+@keyframes fade-in {
+	from {
+		opacity: 0;
+		transform: translateY(4px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+
+@keyframes settings-in {
+	from {
+		opacity: 0;
+		transform: translateY(12px) scale(0.985);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0) scale(1);
+	}
+}
+
+.animate-settings-in {
+	animation: settings-in 0.2s ease-out;
+}
+.animate-fade-in {
+	animation: fade-in 0.25s ease-out;
+}

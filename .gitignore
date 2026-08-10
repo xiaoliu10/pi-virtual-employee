@@ -1,0 +1,14 @@
+node_modules/
+dist/
+dist-electron/
+release/
+build/native-win/
+.claude/
+.idea/
+*.log
+.env
+.DS_Store
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
