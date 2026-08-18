@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 
-import type { AppConfig, ExternalDoc, ExternalProviderConfig, KbGap, KnowledgeDoc, KnowledgeEntry, ModelConfig, ResourceInput, ResourceRow, ScheduledTaskRow, SearchHit, SkillInfo, Supplier, VectorStatus } from "./lib/types";
+import type { AppConfig, ExternalDoc, ExternalProviderConfig, KbGap, KnowledgeDoc, KnowledgeEntry, ModelConfig, ResourceInput, ResourceRow, ScheduledTaskRow, SearchHit, SkillInfo, Supplier, UpdateState, VectorStatus } from "./lib/types";
 import type { ConversationRow, MessageRow } from "./lib/types";
 
 /** Whitelisted API bridged by electron/preload.ts. Kept in sync manually. */
@@ -88,6 +88,11 @@ testOss(): Promise<{ ok: boolean; detail: string }>;
 	importSkills(): Promise<{ imported: number; errors: string[] }>;
 	deleteSkill(filePath: string): Promise<boolean>;
 	setEnabledSkill(name: string, enabled: boolean): Promise<boolean>;
+	getUpdateState(): Promise<UpdateState>;
+	checkForUpdates(): Promise<UpdateState>;
+	downloadUpdate(): Promise<UpdateState>;
+	installUpdate(): Promise<boolean>;
+	onUpdateEvent(cb: (state: UpdateState) => void): () => void;
 }
 
 declare global {

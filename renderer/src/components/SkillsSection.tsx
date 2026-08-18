@@ -67,7 +67,7 @@ export function SkillsSection(): ReactNode {
 				<div>
 					<h3 className="text-[15px] font-semibold text-slate-800">技能管理</h3>
 					<p className="mt-1 text-xs text-slate-400">
-						共 {skills.length} 个，启用 {enabledCount} 个。技能以声明式 Markdown 注入系统提示词，本阶段不支持可执行插件。
+						共 {skills.length} 个，启用 {enabledCount} 个。技能以声明式 Markdown 注入系统提示词。可导入单个 SKILL.md、含 SKILL.md 的目录，或 .zip（zip 顶层放 SKILL.md + 任意附属脚本/模板/子目录，员工可用 read_skill_asset 读取附属文件）。
 					</p>
 				</div>
 				<div className="flex gap-2">
@@ -94,7 +94,7 @@ export function SkillsSection(): ReactNode {
 			{msg && <div className="mb-3 rounded-lg bg-blue-50 px-3 py-2 text-xs text-blue-700">{msg}</div>}
 
 			{skills.length === 0 ? (
-				<p className="py-6 text-center text-sm text-slate-400">还没有技能。点「导入 Skill…」添加 SKILL.md 文件或目录。</p>
+				<p className="py-6 text-center text-sm text-slate-400">还没有技能。点「导入 Skill…」添加 SKILL.md 文件、含 SKILL.md 的目录，或 zip 压缩包（内含 SKILL.md + 附属文件）。</p>
 			) : (
 				<ul className="divide-y divide-slate-100">
 					{skills.map((skill) => (

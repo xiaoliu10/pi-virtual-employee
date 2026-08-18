@@ -342,3 +342,18 @@ export interface ArtifactAttachment {
 	checksum: string | null;
 	createdAt: number;
 }
+
+/**
+ * Auto-updater state pushed/pulled from the main process. `phase` is the
+ * machine position: idle → checking → available → downloading → ready (or
+ * none / error). Only the packaged Windows build actually runs the updater —
+ * everywhere else it sits at "idle" so the UI shows the version, not buttons.
+ */
+export type UpdateState =
+	| { phase: "idle"; currentVersion: string }
+	| { phase: "checking"; currentVersion: string }
+	| { phase: "available"; currentVersion: string; version: string; releaseNotes?: string; manualUrl: string }
+	| { phase: "none"; currentVersion: string }
+	| { phase: "downloading"; currentVersion: string; version: string; percent: number }
+	| { phase: "ready"; currentVersion: string; version: string }
+	| { phase: "error"; currentVersion: string; message: string };

@@ -11,7 +11,11 @@
     "build": "vite build && node scripts/build-electron.mjs",
     "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
     "prepare:native:win": "node scripts/prepare-win-native.mjs",
+    "prepare:native:linux": "node scripts/prepare-linux-native.mjs",
     "package:win": "npm run typecheck && npm run build && npm run prepare:native:win && electron-builder --win nsis --x64",
+    "package:linux": "npm run typecheck && npm run build && npm run prepare:native:linux && electron-builder --linux AppImage --x64",
+    "release": "node scripts/publish.mjs",
+    "release:dry": "node scripts/publish.mjs --dry-run",
     "postinstall": "electron-rebuild -f -w better-sqlite3"
   },
   "dependencies": {
@@ -23,6 +27,7 @@
     "better-sqlite3": "^11.7.0",
     "cron-parser": "^5.7.0",
     "dingtalk-stream": "^2.1.6-beta.1",
+    "electron-updater": "^6.8.9",
     "mammoth": "^1.12.0",
     "playwright": "^1.62.1",
     "react": "^18.3.1",
@@ -62,20 +67,17 @@
     "directories": {
       "output": "release"
     },
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://gitee.com/xiaoliu10/pi-virtual-employee/releases/download/latest"
+      }
+    ],
     "files": [
       "dist-electron/**/*",
       "renderer/dist/**/*",
       "node_modules/**/*",
       "package.json"
-    ],
-    "extraResources": [
-      {
-        "from": "build/native-win",
-        "to": "native",
-        "filter": [
-          "**/*"
-        ]
-      }
     ],
     "asarUnpack": [
       "node_modules/better-sqlite3/**/*"
@@ -83,6 +85,15 @@
     "npmRebuild": false,
     "nodeGypRebuild": false,
     "win": {
+      "extraResources": [
+        {
+          "from": "build/native-win",
+          "to": "native",
+          "filter": [
+            "**/*"
+          ]
+        }
+      ],
       "target": [
         {
           "target": "nsis",
@@ -90,7 +101,8 @@
             "x64"
           ]
         }
-      ]
+      ],
+      "artifactName": "Pi-Virtual-Employee-Setup-${version}-${arch}.${ext}"
     },
     "nsis": {
       "oneClick": false,
@@ -98,6 +110,28 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Pi Virtual Employee"
+    },
+    "linux": {
+      "extraResources": [
+        {
+          "from": "build/native-linux",
+          "to": "native",
+          "filter": [
+            "**/*"
+          ]
+        }
+      ],
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "category": "Office",
+      "artifactName": "Pi-Virtual-Employee-${version}-${arch}.${ext}",
+      "maintainer": "Pi Virtual Employee"
     }
   }
 }

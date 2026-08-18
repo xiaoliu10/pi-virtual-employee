@@ -33,6 +33,13 @@ export interface PromptParts {
 	language?: Language;
 	/** Optional override for the core behavioral rules (replaces the built-in 工作准则). */
 	rules?: string;
+	/**
+	 * True when the session serves an unattended scheduled run (conversation id
+	 * starts with "sched:"). Injects a built-in unattended-context section at the
+	 * end of the prompt — complements the capability rules but is independent of
+	 * them and of any user-editable block.
+	 */
+	isScheduledRun?: boolean;
 	extra?: string;
 }
 
@@ -51,6 +58,11 @@ export function buildSystemPrompt(parts: PromptParts): string {
 	if (parts.skillsBlock?.trim()) sections.push(parts.skillsBlock.trim());
 	if (parts.extra?.trim()) {
 		sections.push(`## 管理者追加指令\n以下补充要求同样必须遵守：\n\n${parts.extra.trim()}`);
+	}
+	if (parts.isScheduledRun) {
+		sections.push(
+			"## 定时任务运行（内置，勿删）\n本次对话由定时任务自动触发、无人值守。涉及后台系统时：先检测登录态，已登录则直接执行任务、不要重复登录或索取验证码；未登录则停止浏览器操作并回复「后台登录态已过期，请在对话中重新登录」。",
+		);
 	}
 	return sections.join("\n\n");
 }
@@ -148,10 +160,6 @@ function capabilityRules(c: RulesCtx): string {
 	if (c.filesystemEnabled)
 		lines.push(
 			"- 需要查看/整理本地文件（如清理下载目录）时，先用 list_directory 在允许的目录内查看文件（名称/大小/最近修改与访问时间），据此判断哪些长期未用、可清理。**删除任何文件前必须**：先把拟删清单明确展示给用户、征得其明确同意，之后才用 delete_files(confirmed=true) 执行；**未经用户明确授权，绝不删除或修改任何文件**。仅能删除白名单内的文件、不能删目录；越界路径会被拒绝。",
-		);
-	if (c.reportsEnabled)
-		lines.push(
-			'- 当对方需要"把内容保存下来并给一个可访问链接/文件地址"、"生成一份报告并发布"、"给我一个能随时打开的地址"时，调用 save_report 工具：把要保存的内容（用 Markdown 写完整、自包含）作为 content、简明标题作为 title 传入。工具会把它保存到「产物中心」并发布，返回一个可分享的访问链接（url）——把该链接原样告诉对方即可。任何类型的可成文内容（总结、分析、诗作、文档、日报等）都能这样保存分享，不限主题。',
 		);
 	if (c.reportsEnabled)
 		lines.push(

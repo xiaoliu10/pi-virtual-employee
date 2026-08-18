@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/ipc";
-import type { AppConfig, ImChannelConfig, IMChannel, ScheduledTaskRow } from "../lib/types";
+import type { AppConfig, ImChannelConfig, IMChannel, ScheduledTaskRow, UpdateState } from "../lib/types";
 import { ModelServiceSection } from "../components/ModelServiceSection";
 import { KnowledgeSection } from "../components/KnowledgeSection";
 import { MigrationSection } from "../components/MigrationSection";
@@ -11,6 +11,13 @@ import { SkillsSection } from "../components/SkillsSection";
 interface SettingsPageProps {
 	config: AppConfig | null;
 	onChange: (patch: Partial<AppConfig>) => Promise<void>;
+	/** Updater state (single subscription owned by App; the sidebar badge shares it). */
+	updater: {
+		state: UpdateState | null;
+		check: () => void;
+		download: () => void;
+		install: () => void;
+	};
 	onClose: () => void;
 }
 
@@ -126,7 +133,7 @@ function Field({ label, children, hint }: { label: string; children: JSX.Element
 
 const inputCls = "h-11 w-full rounded-xl border border-slate-200 bg-[#f7f8fa] px-3.5 text-sm text-slate-800 outline-none transition focus:border-blue-400 focus:bg-white focus:ring-2 focus:ring-blue-100";
 
-export function SettingsPage({ config, onChange, onClose }: SettingsPageProps) {
+export function SettingsPage({ config, onChange, updater, onClose }: SettingsPageProps) {
 	const [tab, setTab] = useState<Tab>("model");
 	const [contentTab, setContentTab] = useState<ContentTab>("resources");
 	const [draft, setDraft] = useState<AppConfig | null>(config);
@@ -541,6 +548,70 @@ export function SettingsPage({ config, onChange, onClose }: SettingsPageProps) {
 													</Field>
 												</div>
 											</div>
+
+											{(() => {
+												const u = updater.state;
+												const busy = u?.phase === "checking" || u?.phase === "downloading";
+												return (
+													<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
+														<div className="flex items-center justify-between gap-3">
+															<div className="min-w-0">
+																<div className="flex items-center gap-2 text-sm font-medium text-slate-800">
+																	软件更新
+																	{u && (
+																		<span className="rounded-md bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-500">
+																			v{u.currentVersion}
+																		</span>
+																	)}
+																</div>
+																<div className="mt-1 text-xs text-slate-400">
+																	{u?.phase === "checking" && "正在检查更新…"}
+																	{u?.phase === "idle" && "当前版本为最新版本。"}
+																	{u?.phase === "none" && "已是最新版本。"}
+																	{u?.phase === "available" && (
+																		<>
+																			发现新版本 <span className="font-medium text-slate-600">v{u.version}</span>
+																		</>
+																	)}
+																	{u?.phase === "available" && u.releaseNotes && (
+																		<span className="mt-0.5 block whitespace-pre-wrap text-slate-500">{u.releaseNotes}</span>
+																	)}
+																	{u?.phase === "downloading" && `正在下载 v${u.version}… ${u.percent}%`}
+																	{u?.phase === "ready" && `v${u.version} 已下载完成，点击右侧按钮安装。`}
+																	{u?.phase === "error" && <span className="text-rose-500">更新失败：{u.message}</span>}
+																</div>
+															</div>
+															<div className="flex shrink-0 items-center gap-2">
+																{u?.phase === "available" && (
+																	<>
+																		<a href={u.manualUrl} target="_blank" rel="noreferrer" className="rounded-xl border border-slate-200 px-4 py-2 text-xs text-slate-500 transition hover:bg-slate-50" title="自动下载失败时的手动下载链接">
+																			手动下载
+																		</a>
+																		<button type="button" onClick={() => updater.download()} className="rounded-xl bg-blue-500 px-5 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-blue-600">
+																			下载更新
+																		</button>
+																	</>
+																)}
+																{u?.phase === "downloading" && (
+																	<button type="button" disabled className="rounded-xl bg-blue-500/60 px-5 py-2 text-sm font-medium text-white shadow-sm">
+																		下载中 {u.percent}%
+																	</button>
+																)}
+																{u?.phase === "ready" && (
+																	<button type="button" onClick={() => updater.install()} className="rounded-xl bg-emerald-500 px-5 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-emerald-600">
+																		重启并安装
+																	</button>
+																)}
+																{u && u.phase !== "ready" && u.phase !== "downloading" && u.phase !== "available" && (
+																	<button type="button" onClick={() => updater.check()} disabled={busy} className="rounded-xl border border-slate-200 px-4 py-2 text-sm text-slate-600 transition hover:bg-slate-50 disabled:opacity-50">
+																		{u.phase === "checking" ? "检查中…" : "检查更新"}
+																	</button>
+																)}
+															</div>
+														</div>
+													</div>
+												);
+											})()}
 										</>
 									)}
 								</div>

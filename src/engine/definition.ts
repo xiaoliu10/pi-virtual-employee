@@ -19,6 +19,7 @@ import { createKnowledgeTool } from "./tools/knowledge.js";
 import { createSaveToKnowledgeTool } from "./tools/save-knowledge.js";
 import { createManageKnowledgeTool } from "./tools/manage-knowledge.js";
 import { createSaveToSkillTool } from "./tools/save-skill.js";
+import { createReadSkillAssetTool } from "./tools/read-skill-asset.js";
 import { createResearchWebTool } from "./tools/research-web.js";
 import { createBrowserTools } from "./tools/browser.js";
 import { createSchedulerTools } from "./tools/scheduler.js";
@@ -54,6 +55,9 @@ export interface ToolSetOptions {
 	/** Writes declarative SKILL.md packages to the user skills dir (always wired —
 	 * skill authoring is a built-in channel, not gated by a config flag). */
 	skillWriter: SkillWriter;
+	/** User skills dir root — lets read_skill_asset resolve a skill's bundled
+	 * assets (scripts/templates) by relative path. Always wired (skills are on). */
+	userSkillsDir: string;
 	/** Persistent config store used by guarded admin/identity tools. */
 	config: ConfigStore;
 	/** Resolve the verified IM actor + raw inbound text for the turn in flight. */
@@ -114,6 +118,9 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 	// Skill authoring is an always-on channel: explicit 技能/Skill intent writes
 	// here; everything else defaults to the knowledge base (see prompt routing rules).
 	tools.push(createSaveToSkillTool(options.skillWriter, options.onSkillsChanged));
+	// Read-only access to a skill's bundled assets (scripts/templates that shipped
+	// alongside SKILL.md in a zip or directory import). Always-on with skills.
+	tools.push(createReadSkillAssetTool(options.userSkillsDir));
 	// Inline image delivery — degrades to a text notice when the channel can't send
 	// images, so it's safe to always register.
 	tools.push(createSendImageTool(options.resolveImageSender, options.conversationId));

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./lib/ipc";
 import type { AppConfig, ConversationRow } from "./lib/types";
+import { useUpdater } from "./lib/useUpdater";
 import { Sidebar } from "./components/Sidebar";
 import { ChatPage } from "./pages/ChatPage";
 import { SettingsPage } from "./pages/SettingsPage";
@@ -17,6 +18,8 @@ export default function App() {
 	// ChatPage watches this to reload the currently-open conversation live.
 	const [imTick, setImTick] = useState(0);
 	const [imChangedId, setImChangedId] = useState<string | null>(null);
+	// Single updater subscription for the whole app (sidebar badge + settings page).
+	const updater = useUpdater();
 
 	const refreshTasks = useCallback(async () => {
 		setConversations(await api.listTasks());
@@ -50,6 +53,7 @@ export default function App() {
 				view={view}
 				conversations={conversations}
 				activeId={activeId}
+				update={updater}
 				modelLabel={(() => {
 					const m = config?.model;
 					if (!m) return "—";
@@ -99,6 +103,7 @@ export default function App() {
 				<SettingsPage
 					config={config}
 					onChange={handleConfigChange}
+					updater={updater}
 					onClose={() => setView("chat")}
 				/>
 			)}

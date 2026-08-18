@@ -3,6 +3,7 @@ dist/
 dist-electron/
 release/
 build/native-win/
+build/native-linux/
 .claude/
 .idea/
 *.log

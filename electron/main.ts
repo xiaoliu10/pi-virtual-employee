@@ -26,6 +26,7 @@ import { DownloadService } from "../src/downloads/download-service.js";
 import { EmployeeEngine } from "../src/engine/engine.js";
 import { buildSystemPrompt, defaultCoreRules } from "../src/engine/prompt.js";
 import { startHttpTransport } from "../src/transport/http.js";
+import { setupAutoUpdater, getUpdateState, checkNow, downloadNow, quitAndInstall, stopUpdater } from "./updater.js";
 import { IMAdapterManager, availableChannels } from "../src/im/manager.js";
 import {
 	buildEmployeePackage,
@@ -34,6 +35,8 @@ import {
 	pendingImportPath,
 	type ExportOptions,
 } from "../src/io/employee-package.js";
+import AdmZip from "adm-zip";
+import { parseSkillFile, SKILL_NAME_PATTERN } from "../src/engine/skills/skill-parser.js";
 
 // __dirname is provided at runtime by the esbuild ESM shim banner (scripts/).
 const isDev = !!process.env.VITE_DEV_SERVER_URL;
@@ -162,6 +165,109 @@ async function copyTree(src: string, dest: string): Promise<void> {
 	}
 }
 
+/**
+ * Import a skill from a .zip whose root IS the skill directory: top-level
+ * SKILL.md plus any number of bundled scripts/templates/subdirectories.
+ *
+ * Safety (zip-slip): every entry's relative path is normalized and rejected if
+ * it escapes the skill dir (`..`, absolute, drive letters). `entryName` is never
+ * joined raw — we split on `/` and let `path.join` re-normalize, then assert
+ * the resolved dest stays under the skill dir.
+ *
+ * Top-level wrapper directory: zips often wrap content in `<name>/SKILL.md`.
+ * If all entries share a single top-level segment we strip it so the skill
+ * lands at `userSkillsDir/<skillName>/SKILL.md` (the form the loader expects).
+ * Returns `{ok:false}` for any malformed structure so the caller reports it.
+ */
+async function importSkillZip(
+	zipPath: string,
+	userSkillsDir: string,
+): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
+	let zip: AdmZip;
+	try {
+		zip = new AdmZip(zipPath);
+	} catch (err) {
+		return { ok: false, error: `无法读取 zip：${(err as Error).message}` };
+	}
+	const entries = zip.getEntries().filter((e) => !e.isDirectory && !e.entryName.endsWith("/"));
+	if (entries.length === 0) return { ok: false, error: "zip 内无可读文件" };
+
+	// Normalize entry names to forward-slash relative paths; reject anything
+	// that looks like an absolute or escaping path outright.
+	const rels: string[] = [];
+	for (const e of entries) {
+		let rel = e.entryName.replace(/\\/g, "/").replace(/^\.\//, "");
+		// Drop any leading "/" — an entryName that starts with "/" is absolute in zip terms.
+		rel = rel.replace(/^\/+/, "");
+		if (!rel || rel.includes("..") || /^[a-zA-Z]:/.test(rel)) {
+			return { ok: false, error: `zip 内含非法路径，已拒绝：${e.entryName}` };
+		}
+		rels.push(rel);
+	}
+
+	// Detect & strip a shared top-level wrapper directory (e.g. my-skill/SKILL.md).
+	const prefix = sharedTopLevelSegment(rels);
+	const stripped = prefix ? rels.map((r) => r.slice(prefix.length)) : rels;
+
+	// There must be a top-level SKILL.md for this to be a valid skill package.
+	const hasSkillMd = stripped.some((r) => r === "SKILL.md");
+	if (!hasSkillMd) {
+		return { ok: false, error: "zip 顶层缺少 SKILL.md（若外层有包裹目录，应直接以 SKILL.md 为顶层）" };
+	}
+
+	// Skill name: prefer the SKILL.md frontmatter `name`; fall back to the zip
+	// file name (minus extension). Both must satisfy the loader's name rule so
+	// the imported directory is one the loader will actually load.
+	const skillMdEntry = entries.find((e) =>
+		e.entryName.replace(/\\/g, "/").replace(/^\.\//, "").replace(/^\/+/, "").slice(prefix?.length ?? 0) === "SKILL.md",
+	)!;
+	let name = "";
+	try {
+		const raw = skillMdEntry.getData().toString("utf8");
+		const parsed = parseSkillFile("SKILL.md", raw);
+		name = parsed.skill?.name ?? "";
+	} catch {
+		/* fall back to filename */
+	}
+	if (!name) {
+		name = path.basename(zipPath, ".zip");
+	}
+	if (!SKILL_NAME_PATTERN.test(name)) {
+		return { ok: false, error: `技能名「${name}」不合法：仅允许中文、小写字母、数字、连字符` };
+	}
+
+	const dest = path.join(userSkillsDir, name);
+	// Same-name overwrite mirrors the existing directory-import behavior. Clean
+	// the target first so stale files from a prior version don't linger.
+	await rm(dest, { recursive: true, force: true }).catch(() => {});
+	await mkdir(dest, { recursive: true });
+
+	for (let i = 0; i < entries.length; i++) {
+		const entry = entries[i];
+		const rel = stripped[i];
+		// Final safety net: the resolved destination must stay under the skill dir.
+		const target = path.resolve(dest, ...rel.split("/"));
+		const base = path.resolve(dest);
+		if (target !== base && !target.startsWith(base + path.sep)) {
+			return { ok: false, error: `解压路径越界，已拒绝：${entry.entryName}` };
+		}
+		await mkdir(path.dirname(target), { recursive: true });
+		await writeFile(target, entry.getData());
+	}
+	return { ok: true, name };
+}
+
+/** If every relative path shares the same first segment followed by `/`, return
+ * that segment (with trailing `/`) so callers can strip the wrapper dir. */
+function sharedTopLevelSegment(rels: string[]): string | null {
+	const tops = rels.map((r) => (r.includes("/") ? r.slice(0, r.indexOf("/") + 1) : null));
+	if (tops.length === 0) return null;
+	const first = tops[0];
+	if (!first) return null; // a path with no `/` means files live at zip root → no wrapper
+	if (!tops.every((t) => t === first)) return null;
+	return first;
+}
+
 /** Directory for a named (non-default) profile. */
 function profileDir(name: string): string {
 	return path.join(app.getPath("appData"), "pi-virtual-employee", "profiles", name);
@@ -286,12 +392,21 @@ async function main(): Promise<void> {
 				trigger: "cron",
 				inputRef: task.prompt,
 			});
-			const { reply, error } = await engine.send(agent, task.prompt, {
-				onPersist: () => {
-					pushActivity(execConvId);
-					if (task.conversation_id) pushActivity(task.conversation_id);
-				},
-			});
+			let sendResult: Awaited<ReturnType<typeof engine.send>>;
+			try {
+				sendResult = await engine.send(agent, task.prompt, {
+					onPersist: () => {
+						pushActivity(execConvId);
+						if (task.conversation_id) pushActivity(task.conversation_id);
+					},
+				});
+			} finally {
+				// Scheduled runs are fire-and-forget: each run uses a unique
+				// conversation id, so its browser page can never be reused. Close it
+				// to avoid leaking a Page (and its tab) per fire.
+				await browser.releasePage(execConvId);
+			}
+			const { reply, error } = sendResult;
 			pushActivity(execConvId);
 			if (task.conversation_id) pushActivity(task.conversation_id);
 			reportService.completeRun(reportRun.runId, {
@@ -361,6 +476,16 @@ async function main(): Promise<void> {
 		applyAutostart(enabled);
 		config.update({ general: { autostart: enabled } });
 		return app.getLoginItemSettings().openAtLogin;
+	});
+
+	// Auto-update: renderer pulls state on mount + receives live "update:event"
+	// pushes; check/download/install are user-initiated (see updater.ts gate).
+	ipcMain.handle("update:getState", () => getUpdateState());
+	ipcMain.handle("update:check", async () => checkNow());
+	ipcMain.handle("update:download", async () => downloadNow());
+	ipcMain.handle("update:install", () => {
+		quitAndInstall();
+		return true;
 	});
 
 	ipcMain.handle("im:simulate", async (_e, conversationId: string, text: string) =>
@@ -719,14 +844,22 @@ async function main(): Promise<void> {
 	ipcMain.handle("skills:import", async () => {
 		const open = mainWindow
 			? await dialog.showOpenDialog(mainWindow, {
-					title: "导入 Skill（SKILL.md 或目录）",
+					title: "导入 Skill（SKILL.md / 目录 / zip）",
 					properties: ["openFile", "openDirectory", "multiSelections"],
-					filters: [{ name: "Markdown", extensions: ["md"] }],
+					filters: [
+						{ name: "Skill", extensions: ["md", "zip"] },
+						{ name: "Markdown", extensions: ["md"] },
+						{ name: "Zip", extensions: ["zip"] },
+					],
 				})
 			: await dialog.showOpenDialog({
-					title: "导入 Skill（SKILL.md 或目录）",
+					title: "导入 Skill（SKILL.md / 目录 / zip）",
 					properties: ["openFile", "openDirectory", "multiSelections"],
-					filters: [{ name: "Markdown", extensions: ["md"] }],
+					filters: [
+						{ name: "Skill", extensions: ["md", "zip"] },
+						{ name: "Markdown", extensions: ["md"] },
+						{ name: "Zip", extensions: ["zip"] },
+					],
 				});
 		if (open.canceled || !open.filePaths.length) return { imported: 0, errors: [] as string[] };
 		const errors: string[] = [];
@@ -749,12 +882,16 @@ async function main(): Promise<void> {
 					await mkdir(dest, { recursive: true });
 					await copyTree(selected, dest);
 					imported++;
+				} else if (selected.toLowerCase().endsWith(".zip")) {
+					const result = await importSkillZip(selected, userSkillsDir);
+					if (result.ok) imported++;
+					else errors.push(`${path.basename(selected)}: ${result.error}`);
 				} else if (selected.toLowerCase().endsWith(".md")) {
 					const name = path.basename(selected);
 					await copyFile(selected, path.join(userSkillsDir, name));
 					imported++;
 				} else {
-					errors.push(`${path.basename(selected)}: 仅支持 .md 文件或含 SKILL.md 的目录`);
+					errors.push(`${path.basename(selected)}: 仅支持 .md 文件、含 SKILL.md 的目录或 zip`);
 				}
 			} catch (err) {
 				errors.push(`${path.basename(selected)}: ${err instanceof Error ? err.message : String(err)}`);
@@ -814,10 +951,15 @@ async function main(): Promise<void> {
 	app.on("will-quit", () => {
 		if (consolidateTimer) clearInterval(consolidateTimer);
 		scheduler.stop();
+		stopUpdater();
 		void browser.close();
 	});
 
 	createWindow();
+	// Auto-updater hooks the main window so state changes can be pushed to the
+	// renderer. No-op in dev / macOS (packaged Windows-only); setState still
+	// pushes an "idle" so the UI shows the current version without update buttons.
+	if (mainWindow) setupAutoUpdater(mainWindow);
 	// Push IM activity to the renderer so the task list refreshes live (the
 	// renderer otherwise never learns about asynchronously-stored IM messages).
 	im.setOnActivity((conversationId: string) => {

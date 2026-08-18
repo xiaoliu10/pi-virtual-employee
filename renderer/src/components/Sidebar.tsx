@@ -1,9 +1,16 @@
-import type { ConversationRow } from "../lib/types";
+import type { ConversationRow, UpdateState } from "../lib/types";
 
 interface SidebarProps {
 	view: "chat" | "settings";
 	conversations: ConversationRow[];
 	activeId: string | null;
+	/** Updater state (single subscription owned by App). Only surfaces a badge when there's news. */
+	update: {
+		state: UpdateState | null;
+		check: () => void;
+		download: () => void;
+		install: () => void;
+	};
 	modelLabel: string;
 	onNavigate: (view: "chat" | "settings") => void;
 	onSelect: (id: string) => void;
@@ -35,8 +42,15 @@ function GearIcon({ className }: { className?: string }) {
 }
 
 export function Sidebar(props: SidebarProps) {
-	const { view, conversations, activeId, modelLabel } = props;
+	const { view, conversations, activeId, modelLabel, update } = props;
 	const settingsActive = view === "settings";
+	// Badge only when there's actionable news; everything else (idle/none/
+	// checking…) stays quiet to avoid nagging on every 6h recheck.
+	const updateVersion = update.state?.phase === "available" || update.state?.phase === "downloading"
+		? update.state.version
+		: update.state?.phase === "ready"
+			? update.state.version
+			: undefined;
 
 	return (
 		<aside className="titlebar-drag flex w-72 shrink-0 flex-col bg-ink-900 text-slate-200">
@@ -115,6 +129,22 @@ export function Sidebar(props: SidebarProps) {
 					<span className="h-2 w-2 rounded-full bg-emerald-400" />
 					<span className="truncate font-mono" title={modelLabel}>{modelLabel}</span>
 				</div>
+				{updateVersion && (
+					<button
+						onClick={() => props.onNavigate("settings")}
+						className="mb-2 flex w-full items-center gap-2 rounded-lg bg-ink-800 px-2 py-1.5 text-xs transition-colors hover:bg-ink-700"
+						title="前往设置页处理更新"
+					>
+						<span
+							className={`h-2 w-2 shrink-0 rounded-full ${
+								update.state?.phase === "ready" ? "bg-emerald-400" : "bg-amber-400"
+							} animate-pulse`}
+						/>
+						<span className={update.state?.phase === "ready" ? "text-emerald-300" : "text-amber-300"}>
+							{update.state?.phase === "ready" ? `新版本 v${updateVersion} 待安装` : `发现新版本 v${updateVersion}`}
+						</span>
+					</button>
+				)}
 				<button
 					onClick={() => props.onNavigate(settingsActive ? "chat" : "settings")}
 					className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm transition-colors ${

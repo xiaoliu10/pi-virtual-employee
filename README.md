@@ -57,6 +57,60 @@ npm run build
 
 > 国内网络已在 `.npmrc` 配置 `ELECTRON_MIRROR`。对话需在 **设置 → 模型配置** 填入 API key(或依赖环境变量 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`)。
 
+## 发布
+
+每次发版同时产出 **Windows(NSIS)** 与 **Linux(AppImage)** 两套安装包,发布到 Gitee 的 `latest` tag release;已安装的 Windows 客户端会通过 `electron-updater` 自动检查并提示更新(仅打包后的 Windows 生效,dev / macOS 为 no-op)。
+
+### 一次性准备
+
+在项目根的 `.env`(已被 `.gitignore` 忽略)填入 Gitee 个人访问令牌:
+
+```bash
+cp .env.example .env
+# 编辑 .env,设置 GITEE_TOKEN=<你的令牌>
+```
+
+令牌在 https://gitee.com/profile/personal_access_tokens 生成,勾选 **projects** 权限(release 资产读写)。
+
+### 发版流程
+
+```bash
+# 1) 升版本号(会改 package.json 并打 git tag)
+npm version patch        # 或 minor / major
+
+# 2) 打包两套安装包(各自完成 typecheck + build + 拉取平台原生二进制 + electron-builder)
+npm run package:win
+npm run package:linux
+
+# 3) 预览将要上传的产物(不碰 Gitee)
+npm run release:dry
+
+# 4) 实发:删旧 latest release+tag → 新建 → 上传全部产物 → 校验每个链接可达
+npm run release
+```
+
+token 的取值优先级:命令行 `GITEE_TOKEN=xxx npm run release` > `.env` 文件 > 报错。
+
+### 产物与命名
+
+| 平台 | 产物文件名 | 自动更新元数据 |
+|---|---|---|
+| Windows (x64) | `Pi-Virtual-Employee-Setup-<ver>-x64.exe` + `.blockmap` | `latest.yml` |
+| Linux (x64) | `Pi-Virtual-Employee-<ver>-x86_64.AppImage` | `latest-linux.yml` |
+
+注意 AppImage 的 `${arch}` 产物为 `x86_64`(非 NSIS 的 `x64`),其 blockmap **内嵌**在镜像中(无独立 `.blockmap` 文件)。自动更新元数据 `latest*.yml` 由 electron-builder 自动生成,文件名须与 `electron/updater.ts` 的 `manualUrl()` 保持一致。
+
+### 原生模块(`better-sqlite3` + `sqlite-vec`)
+
+两套安装包都内嵌目标平台的预编译原生二进制(放在 `resources/native/`,运行时由 `electron/main.ts` 跨平台解析):
+
+- **Windows**:`prepare-win-native.mjs` → `better_sqlite3.node` + `vec0.dll`(PE)
+- **Linux**:`prepare-linux-native.mjs` → `better_sqlite3.node` + `vec0.so`(ELF)
+
+平台头 ABI 由 `node-abi` 的 `getAbi(electronVersion, "electron")` 解析;脚本内置魔数校验(PE `MZ` / ELF `\x7fELF`)防止下错平台。`npmRebuild: false` —— 打包机**不需要**安装各平台编译工具链。
+
+> 在 macOS 上即可同时打出 Win + Linux 包(electron-builder 会拉取目标平台的 electron + 打包工具),无需 Linux 宿主。
+
 ## 扩展点(内部抽象,非"造 agent"产品功能)
 
 | 抽象 | 位置 | 用途 |
@@ -75,7 +129,7 @@ src/engine      engine.ts + definition.ts + prompt.ts + tools/
 src/transport   http.ts(SSE)
 src/im          types / manager + adapters/echo
 renderer/src    React GUI(pages / components / lib)
-scripts/        dev.mjs(vite+esbuild+electron 编排) / build-electron.mjs
+scripts/        dev.mjs / build-electron.mjs / prepare-{win,linux}-native.mjs / publish.mjs
 ```
 
 ## 已知限制

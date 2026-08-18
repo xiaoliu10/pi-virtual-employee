@@ -150,6 +150,12 @@ export class BrowserService {
 		};
 		for (const p of this.context.pages()) attach(p);
 		this.context.on("page", attach);
+		// Close the blank initial page launchPersistentContext opens — otherwise an
+		// empty tab lingers for the whole app lifetime. Pages opened later (via
+		// getPage or popups) still get the attach listener above.
+		for (const p of this.context.pages()) {
+			if (p.url() === "about:blank") void p.close().catch(() => {});
+		}
 	}
 
 	/**
@@ -269,7 +275,7 @@ export class BrowserService {
 	/** 主要输入框的简要状态（不含明文），帮助模型判断登录态/表单是否已填。 */
 	async readInputs(ownerId: string): Promise<InputFieldSummary[]> {
 		const page = await this.getPage(ownerId);
-		return page.evaluate(
+		return page.evaluate<InputFieldSummary[]>(
 			`(() => {
 				const els = Array.from(document.querySelectorAll('input:not([type=hidden]):not([type=checkbox]):not([type=radio]), textarea'));
 				return els.slice(0, 10).map((el) => ({

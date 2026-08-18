@@ -97,6 +97,18 @@ const api = {
 	importSkills: () => ipcRenderer.invoke("skills:import"),
 	deleteSkill: (filePath: string) => ipcRenderer.invoke("skills:delete", filePath),
 	setEnabledSkill: (name: string, enabled: boolean) => ipcRenderer.invoke("skills:setEnabled", name, enabled),
+
+	// Auto-update (packaged Windows only; other builds get a stable idle state)
+	getUpdateState: (): Promise<unknown> => ipcRenderer.invoke("update:getState"),
+	checkForUpdates: (): Promise<unknown> => ipcRenderer.invoke("update:check"),
+	downloadUpdate: (): Promise<unknown> => ipcRenderer.invoke("update:download"),
+	installUpdate: (): Promise<boolean> => ipcRenderer.invoke("update:install"),
+	/** Subscribe to updater state pushes (main → renderer). Returns an unsubscribe. */
+	onUpdateEvent: (cb: (state: unknown) => void): (() => void) => {
+		const listener = (_e: unknown, state: unknown) => cb(state);
+		ipcRenderer.on("update:event", listener);
+		return () => ipcRenderer.removeListener("update:event", listener);
+	},
 };
 
 contextBridge.exposeInMainWorld("api", api);
