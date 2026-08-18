@@ -64,17 +64,16 @@ if (!token && !dryRun) {
 /** The artifacts a complete release needs: build outputs + their yml + blockmap. */
 async function collectArtifacts() {
 	const version = JSON.parse(await readFile(join(root, "package.json"), "utf8")).version;
-	// NSIS produces a separate .blockmap (electron-updater fetches it for delta
-	// downloads); AppImage embeds its blockmap inside the image, so no sidecar.
+	// Windows only: Gitee caps a single release asset at 100 MB, and the Linux
+	// AppImage (~135 MB) / tar.gz (~111 MB) both exceed it. Linux distribution
+	// will move to GitHub Releases (no such cap) — for now this release carries
+	// the Windows installer + its auto-update feed only.
 	const expect = {
 		win: [
 			`Pi-Virtual-Employee-Setup-${version}-x64.exe`,
 			`Pi-Virtual-Employee-Setup-${version}-x64.exe.blockmap`,
+			`latest.yml`,
 		],
-		linux: [
-			`Pi-Virtual-Employee-${version}-x86_64.AppImage`,
-		],
-		yml: ["latest.yml", "latest-linux.yml"],
 	};
 	const out = [];
 	for (const group of Object.values(expect)) {
@@ -92,7 +91,11 @@ async function collectArtifacts() {
 	return out;
 }
 
-/** Resolve the existing `latest` release id (or null). */
+/** Resolve the existing `latest` release id (or null).
+ *
+ * Gitee quirk: a release that doesn't exist for the tag returns HTTP 200 with
+ * a literal `null` body (NOT 404). So we must treat `j == null` as "not found"
+ * after a 200, not just a 404 status. */
 async function findLatestRelease() {
 	if (dryRun) { console.log(`[publish] (dry-run) would look up existing ${TAG} release`); return null; }
 	const url = `${API}/repos/${OWNER}/${REPO}/releases/tags/${TAG}?access_token=${encodeURIComponent(token)}`;
@@ -100,6 +103,7 @@ async function findLatestRelease() {
 	if (r.status === 404) return null;
 	if (!r.ok) throw new Error(`findLatestRelease: ${r.status} ${await r.text()}`);
 	const j = await r.json();
+	if (!j || typeof j.id !== "number") return null; // 200 + null body = no release for this tag
 	return j.id;
 }
 
