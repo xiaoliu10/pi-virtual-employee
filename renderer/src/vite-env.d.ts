@@ -13,6 +13,16 @@ export interface RendererApi {
 	listScheduledTasks(): Promise<ScheduledTaskRow[]>;
 	deleteScheduledTask(id: string): Promise<boolean>;
 	toggleScheduledTask(id: string, enabled: boolean): Promise<boolean>;
+	testReportTarget(): Promise<{ ok: boolean; detail: string }>;
+testGitee(): Promise<{ ok: boolean; detail: string }>;
+testOss(): Promise<{ ok: boolean; detail: string }>;
+	listReports(): Promise<import("./lib/types").Artifact[]>;
+	getReport(id: string): Promise<import("./lib/types").Artifact | null>;
+	reportRuns(artifactId: string): Promise<import("./lib/types").ArtifactRun[]>;
+	reportBody(runId: string): Promise<import("./lib/types").ArtifactAttachment | null>;
+	reportUrl(runId: string): Promise<string | null>;
+	republishReport(runId: string): Promise<{ url: string; path: string } | null>;
+	deleteReport(id: string): Promise<boolean>;
 	listTasks(): Promise<ConversationRow[]>;
 	getMessages(id: string): Promise<MessageRow[]>;
 	deleteTask(id: string): Promise<boolean>;
@@ -77,6 +87,7 @@ export interface RendererApi {
 	refreshSkills(): Promise<boolean>;
 	importSkills(): Promise<{ imported: number; errors: string[] }>;
 	deleteSkill(filePath: string): Promise<boolean>;
+	setEnabledSkill(name: string, enabled: boolean): Promise<boolean>;
 }
 
 declare global {

@@ -199,6 +199,14 @@ export interface AppConfig {
 		 * this, a brief in-progress note is pushed to the channel. 0 = disabled.
 		 */
 		longTaskProgressMin: number;
+		/**
+		 * Per-turn tool-loop cap. Each "step" is one assistant response that fired
+		 * tool calls and received their results. After this many steps the agent
+		 * loop is stopped gracefully and the model is asked to produce a final
+		 * answer from what it has gathered. 0 = unlimited (preserves prior behavior;
+		 * use a positive number as a safety net against an infinite tool-call loop).
+		 */
+		maxToolSteps: number;
 	};
 	/**
 	 * Computer-use / browser automation. When enabled the employee gets Playwright
@@ -234,18 +242,134 @@ export interface AppConfig {
 	 * authorization (two-step confirmed gate in the tool).
 	 */
 	filesystem: { enabled: boolean; allowedDirs: string[] };
+	/**
+	 * Report / artifact center. Generated reports (scheduled-task outputs, etc.)
+	 * are persisted locally (with run history) and pushed to a configurable Gitee
+	 * repo; the IM push carries a shareable link. EVERY field is instance-specific
+	 * — owner/repo/branch/tokens are all user-configured, nothing is hard-coded.
+	 */
+	reports: {
+		enabled: boolean;
+		/** Which publisher pushes reports: "gitee" (repo commit + raw link) or "oss" (Aliyun OSS + presigned URL). */
+		target: "gitee" | "oss";
+		publish: {
+			/**
+			 * How the Gitee share link is built from the pushed file path.
+			 * - raw_with_token: `{webUrl}/{owner}/{repo}/raw/{branch}/{path}?access_token={readToken}` — tries to let readers open without login. Gitee may still require a collaborator login for private repos; if so switch mode.
+			 * - web_blob: `{webUrl}/{owner}/{repo}/blob/{branch}/{path}` — Gitee's online view page; collaborators log in to view.
+			 * - public: raw URL without token — use only with a public report repo.
+			 */
+			linkMode: "raw_with_token" | "web_blob" | "public";
+		};
+		gitee: {
+			/** Gitee OpenAPI base, e.g. https://gitee.com/api/v5 */
+			apiUrl: string;
+			/** Gitee web base for building raw/blob links, e.g. https://gitee.com */
+			webUrl: string;
+			/** Repo owner (user/org name). */
+			owner: string;
+			/** Repo name. */
+			repo: string;
+			/** Target branch (created if missing on first push). Default "main". */
+			branch: string;
+			/** Subpath inside the repo, e.g. "reports/". Empty = repo root. */
+			basePath: string;
+			/** Personal access token with push scope — used to commit files. */
+			writeToken: string;
+			/** Token appended to raw links for read access (may equal writeToken). */
+			readToken: string;
+			/** Optional commit author name. */
+			commitAuthor: string;
+			/** Optional commit author email. */
+			commitEmail: string;
+		};
+		/**
+		 * Aliyun OSS publisher: putObject the report body into a private bucket and
+		 * return a presigned GET URL (anyone with the link can read until expiry,
+		 * no login required). region/bucket/credentials/endpoint all configurable.
+		 */
+		oss: {
+			region: string;
+			accessKeyId: string;
+			accessKeySecret: string;
+			bucket: string;
+			/** Custom endpoint, e.g. https://oss-cn-hangzhou.aliyuncs.com or an internal/CDN domain. */
+			endpoint: string;
+			/** Prefix (virtual "folder") inside the bucket, e.g. "reports/". */
+			basePath: string;
+			/** Presigned URL validity in seconds (default 30 days). */
+			urlTtlSec: number;
+		};
+	};
+	/**
+	 * Browser downloads: files the automated browser saves are captured into a
+	 * managed workspace so the employee can list/read/analyze them. `dir` empty →
+	 * default under userData/downloads. maxSizeMb rejects oversized files;
+	 * retainDays is reserved for future cleanup. Per-instance, nothing hard-coded.
+	 */
+	downloads: {
+		enabled: boolean;
+		dir: string;
+		maxSizeMb: number;
+		retainDays: number;
+	};
+	/** Skills: declarative SKILL.md packages injected into the system prompt. */
+	skills: {
+		/** Disabled skill names (built-in or user); everything else is active. */
+		disabled: string[];
+	};
+	/**
+	 * Security: conversation-side admin gate. `adminStaffIds` is the whitelist of
+	 * IM sender ids (e.g. DingTalk senderStaffId) allowed to manage this
+	 * employee's identity/admin list from a 1:1 chat. EMPTY = unclaimed: the
+	 * first sender to claim in a 1:1 chat becomes the (only) admin; once
+	 * non-empty, only listed ids may operate. The whitelist itself can also be
+	 * edited from the desktop settings UI as a recovery path.
+	 */
+	security: {
+		adminStaffIds: string[];
+	};
 }
 
 const DEFAULTS: AppConfig = {
 	model: { suppliers: [], defaultSupplierId: "", defaultModelId: "" },
 	identity: { name: "客服小派", role: "虚拟客服", duty: "在线为客户提供专业、礼貌、高效的服务", serviceHours: "7×24h" },
 	im: { enabled: false, channels: [], ack: { enabled: true, text: "👍 收到，正在处理…" } },
-	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 30 },
+	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 30, maxToolSteps: 20 },
 	browser: { enabled: false, headless: true, allowedDomains: [] },
 	scheduler: { enabled: true },
 	prompt: { extra: "", rules: "" },
 	documents: { enabled: false, dir: "" },
 	filesystem: { enabled: false, allowedDirs: ["~/Downloads"] },
+	reports: {
+		enabled: false,
+		target: "gitee",
+		publish: { linkMode: "raw_with_token" },
+		gitee: {
+			apiUrl: "https://gitee.com/api/v5",
+			webUrl: "https://gitee.com",
+			owner: "",
+			repo: "",
+			branch: "main",
+			basePath: "reports/",
+			writeToken: "",
+			readToken: "",
+			commitAuthor: "",
+			commitEmail: "",
+		},
+		oss: {
+			region: "oss-cn-hangzhou",
+			accessKeyId: "",
+			accessKeySecret: "",
+			bucket: "",
+			endpoint: "https://oss-cn-hangzhou.aliyuncs.com",
+			basePath: "reports/",
+			urlTtlSec: 30 * 24 * 3600,
+		},
+	},
+	downloads: { enabled: true, dir: "", maxSizeMb: 200, retainDays: 30 },
+	skills: { disabled: [] },
+	security: { adminStaffIds: [] },
 	kb: {
 		enabled: true,
 		mode: "local",
@@ -277,6 +401,20 @@ function normalizedModels(value: unknown): string[] {
 		.filter((model): model is string => typeof model === "string")
 		.map((model) => model.trim())
 		.filter(Boolean))];
+}
+
+/** Coerce an untrusted admin whitelist into clean, unique, non-empty ids. */
+function normalizedAdminIds(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	return [...new Set(value
+		.filter((id): id is string => typeof id === "string")
+		.map((id) => id.trim())
+		.filter(Boolean))];
+}
+
+/** Normalize the security block (admin whitelist) of a merged config. */
+function normalizeSecurity(merged: AppConfig): AppConfig["security"] {
+	return { adminStaffIds: normalizedAdminIds(merged.security?.adminStaffIds) };
 }
 
 export function newSupplier(partial: Partial<Supplier> = {}): Supplier {
@@ -573,6 +711,7 @@ export class ConfigStore {
 					model: normalizeModelConfig(parsed.model ?? merged.model),
 					im: normalizeIm(merged.im),
 					kb: { ...merged.kb, external: normalizeExternalProviders(merged.kb.external) },
+					security: normalizeSecurity(merged),
 				};
 				if (JSON.stringify(normalized) !== JSON.stringify(parsed)) this.persist(normalized);
 				return normalized;
@@ -642,6 +781,7 @@ export class ConfigStore {
 			model: normalizeModelConfig(merged.model),
 			im: normalizeIm(merged.im),
 			kb: { ...merged.kb, external: normalizeExternalProviders(merged.kb.external) },
+			security: normalizeSecurity(merged),
 		};
 		this.persist(normalized);
 		return normalized;
@@ -660,6 +800,7 @@ export class ConfigStore {
 			model: normalizeModelConfig(parsed.model ?? merged.model),
 			im: normalizeIm(merged.im),
 			kb: { ...merged.kb, external: normalizeExternalProviders(merged.kb.external) },
+			security: normalizeSecurity(merged),
 		};
 		this.persist(normalized);
 		return normalized;

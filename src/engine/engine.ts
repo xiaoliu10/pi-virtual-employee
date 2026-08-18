@@ -14,23 +14,30 @@ import { Agent, convertToLlm } from "@earendil-works/pi-agent-core";
 import type { AgentEvent, AgentMessage, Skill, StreamFn } from "@earendil-works/pi-agent-core";
 import { createModels } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
-import type { Api, Model, MutableModels, TextContent } from "@earendil-works/pi-ai";
+import type { Api, ImageContent, Model, MutableModels, TextContent } from "@earendil-works/pi-ai";
 import type { ConfigStore, Supplier } from "../db/config-store.js";
 import type { HistoryStore } from "../db/history-store.js";
+import type { InboundActor } from "../im/types.js";
 import type { KnowledgeService } from "../knowledge/knowledge-service.js";
 import type { BrowserService } from "../browser/browser-service.js";
 import type { SchedulerService } from "../scheduler/scheduler-service.js";
 import type { DocumentService, FileSender } from "../documents/document-service.js";
 import type { FileSystemService } from "../filesystem/filesystem-service.js";
+import type { ReportService } from "../reports/report-service.js";
+import type { DownloadService } from "../downloads/download-service.js";
 import { buildSystemPrompt, buildTools } from "./definition.js";
 import { maybeCompact, rehydrateMessages } from "./context.js";
 import { SkillLoader, pickActiveSkills } from "./skills/skill-loader.js";
+import { SkillWriter } from "./skills/skill-writer.js";
 import { formatInlineSkills } from "./skills/skills-prompt.js";
 
 export interface SendResult {
 	reply: string;
 	error?: string;
 }
+
+/** Delivers an image into the originating IM chat as an inline image message. */
+export type ImageSender = (filePath: string) => Promise<{ ok: boolean; url?: string; error?: string }>;
 
 /**
  * Per-turn context threaded from the inbound message into `send()`. Currently
@@ -41,6 +48,12 @@ export interface SendResult {
  */
 export interface SendCtx {
 	sendFile?: FileSender;
+	/** Inline image sender for the send_image tool (IM channels that support it). */
+	sendImage?: ImageSender;
+	/** Images the user attached to this message (passed to a vision-capable model). */
+	images?: { data: string; mimeType: string }[];
+	/** Verified IM sender metadata for conversation-side admin authorization. */
+	actor?: InboundActor;
 	/** Called right after a message is persisted, so the UI can reload this conversation live. */
 	onPersist?: (conversationId: string) => void;
 }
@@ -102,10 +115,24 @@ export class EmployeeEngine implements EmployeeRuntime {
 	private readonly models: MutableModels;
 	private readonly opts: Required<Omit<EngineOptions, "streamFn">> & { streamFn?: StreamFn };
 	private readonly skillLoader: SkillLoader;
+	/** Authoring surface for declarative skills (save_to_skill). */
+	private readonly skillWriter: SkillWriter;
 	private skillsCache: Skill[] | null = null;
 	private skillsCacheKey = "";
+	/**
+	 * Bumped every time the skills on disk change (a save_to_skill write, or an
+	 * IPC import/delete). Each cached Agent records the revision it was built
+	 * against; when a new message arrives on an idle session whose revision is
+	 * stale, the session is rebuilt so the new skill enters the system prompt —
+	 * without aborting any other in-flight turn.
+	 */
+	private skillsRevision = 0;
 	/** Per-conversation file-sender for the turn in flight (set/cleared in send()). */
 	private readonly turnSendFile = new Map<string, FileSender>();
+	/** Per-conversation inline-image sender for the turn in flight (send_image tool). */
+	private readonly turnSendImage = new Map<string, ImageSender>();
+	/** Verified IM actor + raw text for the turn in flight (admin/identity tools). */
+	private readonly turnActor = new Map<string, InboundActor & { text: string }>();
 
 	constructor(
 		private readonly config: ConfigStore,
@@ -115,6 +142,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 		private readonly scheduler: SchedulerService,
 		private readonly documents: DocumentService,
 		private readonly filesystem: FileSystemService,
+		private readonly reportService: ReportService,
+		private readonly downloadService: DownloadService,
 		private readonly paths: { builtinSkillsDir: string; userSkillsDir: string },
 		options: EngineOptions = {},
 	) {
@@ -122,16 +151,38 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.models = createModels();
 		for (const provider of builtinProviders()) this.models.setProvider(provider);
 		this.skillLoader = new SkillLoader(paths.builtinSkillsDir, paths.userSkillsDir);
+		this.skillWriter = new SkillWriter(this.skillLoader, paths.userSkillsDir);
 	}
 
-	/** List loaded skills (for the management UI). */
+	/** List loaded skills (for the management UI), annotated with enabled state. */
 	async listSkills() {
-		return this.skillLoader.list();
+		const { skills, info } = await this.skillLoader.list();
+		const disabled = new Set(this.config.all().skills?.disabled ?? []);
+		return {
+			skills,
+			info: info.map((i) => ({ ...i, enabled: !disabled.has(i.name) })),
+		};
 	}
 
-	/** Drop cached skills + sessions so the next session picks up fresh config. */
-	invalidate(): void {
-		this.skillsCache = null;
+	/**
+	 * Reload skills, then drop every cached Agent session so the next inbound
+	 * message rebuilds it with fresh config (prompt + tools + skills). This is
+	 * the fix for the old "refreshSkills() then invalidate() wiped the cache"
+	 * bug, and it also makes skill/config changes take effect on existing IM &
+	 * scheduled conversations (each run calls getOrCreateSession, which rebuilds).
+	 * Conversation history is persisted in the DB and rehydrated, so no dialogue
+	 * is lost — only transient Agent state resets.
+	 */
+	async invalidate(): Promise<void> {
+		await this.refreshSkills();
+		for (const [, agent] of this.sessions) {
+			try {
+				agent.abort();
+			} catch {
+				/* session may already be gone */
+			}
+		}
+		this.sessions.clear();
 		this.skillsCacheKey = "";
 	}
 
@@ -306,12 +357,21 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** Live agent for a conversation, created on first use with its chosen model. */
 	getOrCreateSession(conversationId: string): Agent {
 		const cached = this.sessions.get(conversationId);
-		if (cached) return cached;
+		// If skills changed since this session was built AND it's idle, drop it so
+		// the rebuild below picks up the new skill in the system prompt. We never
+		// abort here: an in-flight turn (isStreaming true) is left to finish and
+		// will be rebuilt on its next inbound message.
+		if (cached) {
+			const builtAt = (cached as Agent & { __skillsRevision?: number }).__skillsRevision ?? 0;
+			if (builtAt >= this.skillsRevision || cached.state.isStreaming) return cached;
+			this.sessions.delete(conversationId);
+		}
 
 		const { supplier, modelId } = this.resolveForConversation(conversationId);
 		const cfg = this.config.all();
 		const skills = this.getCachedSkills();
-		const activeSkills = pickActiveSkills(skills, new Set());
+		const disabled = new Set(cfg.skills?.disabled ?? []);
+		const activeSkills = pickActiveSkills(skills, disabled);
 		const agent = new Agent({
 			initialState: {
 				systemPrompt: buildSystemPrompt({
@@ -327,13 +387,14 @@ export class EmployeeEngine implements EmployeeRuntime {
 					schedulerEnabled: cfg.scheduler.enabled,
 					documentsEnabled: cfg.documents.enabled,
 					filesystemEnabled: cfg.filesystem.enabled,
+					reportsEnabled: cfg.reports.enabled,
 					skillsBlock: formatInlineSkills(activeSkills),
 					rules: cfg.prompt.rules,
 					extra: cfg.prompt.extra,
 					language: cfg.general.language,
 				}),
 				model: this.buildModel(supplier, modelId),
-				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, knowledge: this.knowledge, browser: this.browser, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid) }),
+				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onConfigChanged: () => this.markConfigChanged(), conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } } }),
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
 				messages: rehydrateMessages(this.history.listMessages(conversationId)),
@@ -346,8 +407,95 @@ export class EmployeeEngine implements EmployeeRuntime {
 			getApiKey: () => supplier.apiKey || undefined,
 		});
 
+		this.applyToolStepCap(agent);
+		(agent as Agent & { __skillsRevision?: number }).__skillsRevision = this.skillsRevision;
 		this.sessions.set(conversationId, agent);
 		return agent;
+	}
+
+	/**
+	 * Reload skills from disk and mark every cached session stale. Used after a
+	 * skill is written (save_to_skill) or imported/deleted via IPC. Unlike
+	 * {@link invalidate}, this does NOT abort in-flight turns: it only bumps a
+	 * revision so each session rebuilds itself, with the new skill in its system
+	 * prompt, the next time a message arrives on it.
+	 */
+	async markSkillsChanged(): Promise<void> {
+		await this.refreshSkills();
+		this.markConfigChanged();
+	}
+
+	/** Mark cached sessions stale after a prompt/tool/config change. The current
+	 * in-flight turn is allowed to finish; its next inbound message rebuilds the
+	 * Agent from the newly-persisted config. */
+	markConfigChanged(): void {
+		this.skillsRevision += 1;
+	}
+
+	/**
+	 * Install a per-turn tool-loop safety cap on an Agent, honoring
+	 * `config.general.maxToolSteps`. The cap uses the SDK's `shouldStopAfterTurn`
+	 * loop hook: after each assistant turn's tool calls finish, increment the
+	 * counter; once it reaches `maxToolSteps`, return `true` to end the loop
+	 * gracefully and set a flag on the agent. `send()` checks that flag after
+	 * `promptWithRetry` resolves and, if set, asks the model for a final
+	 * plain-language summary (no tools) so the user gets a closing reply
+	 * instead of a mid-task truncation — same pattern as the empty-reply
+	 * fallback.
+	 *
+	 * The SDK's `Agent` doesn't expose `shouldStopAfterTurn` as a constructor
+	 * option (it lives on the internal `AgentLoopConfig`), so we wrap the
+	 * prototype `createLoopConfig()` per-instance. The counter resets on each
+	 * fresh `agent.prompt()` (new user turn) but not on `agent.continue()`
+	 * (transient-error retry, same logical turn). A `maxToolSteps` of 0 means
+	 * unlimited and preserves prior behavior.
+	 */
+	private applyToolStepCap(agent: Agent): void {
+		type ToolStepCapAgent = {
+			prompt: Agent["prompt"];
+			createLoopConfig: (opts?: unknown) => Record<string, unknown>;
+			__toolStepCapHit?: boolean;
+		};
+		// `createLoopConfig` is private in the SDK's declaration but exists on the
+		// runtime instance. Use a narrow structural view so the workaround stays
+		// isolated here rather than weakening the Agent type elsewhere.
+		const target = agent as unknown as ToolStepCapAgent;
+		const originalCreateLoopConfig = target.createLoopConfig.bind(agent);
+		let steps = 0;
+
+		// Reset the counter at the start of each new user turn. `prompt` is the
+		// new-message entry point; `continue` (transient-error retry) does NOT
+		// reset, so a retried turn still counts toward the cap. Also clear the
+		// hit flag from the previous turn.
+		const originalPrompt = agent.prompt.bind(agent);
+		target.prompt = ((...args: Parameters<typeof agent.prompt>) => {
+			steps = 0;
+			target.__toolStepCapHit = false;
+			return originalPrompt(...args);
+		}) as typeof agent.prompt;
+
+		target.createLoopConfig = (opts?: unknown) => {
+			const config = originalCreateLoopConfig(opts) as Record<string, unknown>;
+			config.shouldStopAfterTurn = (context: { toolResults?: unknown[] }) => {
+				// The SDK invokes this hook after every assistant response, including a
+				// normal text-only final answer. Only responses that actually executed
+				// tools count as tool-loop steps.
+				if (!context.toolResults?.length) return false;
+				const max = this.config.all().general.maxToolSteps ?? 0;
+				if (max <= 0) return false; // unlimited
+				steps += 1;
+				if (steps < max) return false;
+				target.__toolStepCapHit = true;
+				console.warn(`[engine] tool-loop cap reached (maxToolSteps=${max}); ending turn for final summary`);
+				return true;
+			};
+			return config;
+		};
+	}
+
+	/** True when the agent's last run ended because the tool-step cap fired. */
+	private toolStepCapHit(agent: Agent): boolean {
+		return Boolean((agent as Agent & { __toolStepCapHit?: boolean }).__toolStepCapHit);
 	}
 
 	private getCachedSkills(): Skill[] {
@@ -417,13 +565,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 		const existing = this.history.getConversation(conversationId);
 		this.history.ensureConversation(conversationId, existing?.title ?? deriveTitle(message));
-		this.history.appendMessage(conversationId, "user", message);
+		// Persist the user turn. Images ride along for THIS turn only (they go to the
+		// live model, not the text transcript), so mark them in the stored line.
+		const imageNote = ctx?.images?.length ? `\n[附带 ${ctx.images.length} 张图片]` : "";
+		this.history.appendMessage(conversationId, "user", message + imageNote);
 		ctx?.onPersist?.(conversationId); // user turn now persisted → refresh this conversation live
 
 		// Expose the channel's file-sender to the provide_document tool for this
 		// turn only (cleared in the finally below). Tools resolve it live via the
 		// closure passed into buildTools.
 		if (ctx?.sendFile) this.turnSendFile.set(conversationId, ctx.sendFile);
+		if (ctx?.sendImage) this.turnSendImage.set(conversationId, ctx.sendImage);
+		if (ctx?.actor) this.turnActor.set(conversationId, { ...ctx.actor, text: message });
 
 		let reply = "";
 		const unsubscribe = agent.subscribe((event: AgentEvent) => {
@@ -444,16 +597,28 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 		let hardError: string | undefined;
 		try {
-			await this.promptWithRetry(agent, message);
+			await this.promptWithRetry(agent, message, ctx?.images);
 		} catch (err) {
 			hardError = err instanceof Error ? err.message : String(err);
 			console.error(`[engine] prompt failed for ${conversationId}:`, err);
 		} finally {
 			unsubscribe();
 			this.turnSendFile.delete(conversationId);
+			this.turnSendImage.delete(conversationId);
+			this.turnActor.delete(conversationId);
 		}
 
 		const errorMessage = agent.state.errorMessage;
+
+		// TOOL-LOOP SAFETY CAP — if the SDK ended the turn early because maxToolSteps
+		// was reached, the model was mid-task and likely left a narration ("正在登录...")
+		// rather than an outcome. Force a no-tools final summary so the user gets a
+		// clear status (what succeeded, what's left, what they need to provide).
+		if (this.toolStepCapHit(agent) && !hardError) {
+			const capSummary = await this.finalSummary(agent);
+			const max = this.config.all().general.maxToolSteps ?? 0;
+			reply = capSummary || `⚠️ 本轮已达到工具调用上限（${max} 步），系统已停止继续调用工具。当前任务可能尚未完成，请提高上限后重试，或把任务拆成更小的步骤。`;
+		}
 
 		// GUARANTEED FINAL REPLY — a virtual employee must always answer, success or
 		// failure. The turn may end with no visible text (task failed, relay cut the
@@ -494,16 +659,21 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 */
 	private async finalSummary(agent: Agent): Promise<string> {
 		let text = "";
+		const savedTools = agent.state.tools;
 		const unsubscribe = agent.subscribe((event: AgentEvent) => {
 			if (event.type === "message_end" && (event.message as { role?: string }).role === "assistant") {
 				text += extractText(event.message);
 			}
 		});
 		try {
+			// Enforce the instruction structurally: the final-summary turn must not be
+			// able to start another tool loop after the safety cap has already fired.
+			agent.state.tools = [];
 			await agent.prompt("现在请不要调用任何工具，直接用一段简明的中文总结：你刚才为完成用户请求做了哪些尝试？最终是成功还是失败？如果没成功，具体卡在哪一步、需要用户怎么配合或提供什么？只输出这段总结。");
 		} catch (err) {
 			console.warn("[engine] final summary prompt failed:", err instanceof Error ? err.message : err);
 		} finally {
+			agent.state.tools = savedTools;
 			unsubscribe();
 		}
 		return text.trim();
@@ -550,10 +720,16 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * stopReason="error" with no content, or a thinking-only "stop" — which would
 	 * otherwise surface to the user as a blank reply with no error.
 	 */
-	private async promptWithRetry(agent: Agent, message: string): Promise<void> {
+	private async promptWithRetry(agent: Agent, message: string, images?: { data: string; mimeType: string }[]): Promise<void> {
+		// Vision input: only pass images when the session's model actually accepts
+		// them — a non-vision model would reject the image block and fail the turn.
+		const visionImages: ImageContent[] | undefined =
+			images?.length && agent.state.model.input.includes("image")
+				? images.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }))
+				: undefined;
 		let threwTransient = false;
 		try {
-			await agent.prompt(message);
+			await agent.prompt(message, visionImages);
 		} catch (err) {
 			const text = err instanceof Error ? err.message : String(err);
 			if (!TRANSIENT_STREAM_ERROR.test(text)) throw err;
@@ -577,7 +753,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		} catch (err) {
 			const text = err instanceof Error ? err.message : String(err);
 			if (!text.startsWith("Cannot continue")) throw err;
-			await agent.prompt(message);
+			await agent.prompt(message, visionImages);
 		}
 	}
 

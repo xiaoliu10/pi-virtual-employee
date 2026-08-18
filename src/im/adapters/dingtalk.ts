@@ -17,10 +17,31 @@
  * (AppKey) / ClientSecret (AppSecret) → add the Robot capability, choose Stream
  * mode, publish. Put ClientID/ClientSecret into Settings → IM.
  */
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
+import { extname } from "node:path";
 import { DWClient, TOPIC_ROBOT } from "dingtalk-stream";
 import type { DWClientDownStream, RobotMessage } from "dingtalk-stream";
-import type { IMAdapter, IMConfig, IMIO } from "../types.js";
+import type { IMAdapter, IMConfig, IMIO, InboundImage } from "../types.js";
+import type { ReportService } from "../../reports/report-service.js";
+
+/** Robot-message payload for a picture the user sent (Stream mode). The SDK's
+ *  RobotMessage type only models text, so this is a standalone shape. */
+interface RobotPictureMessage {
+	msgtype: "picture";
+	conversationId: string;
+	conversationType: string;
+	senderStaffId: string;
+	senderId: string;
+	robotCode: string;
+	msgId: string;
+	sessionWebhook: string;
+	text?: { content?: string };
+	content?: { downloadCode?: string; pictureDownloadCode?: string };
+	downloadCode?: string;
+}
+
+/** Either a text or picture inbound robot message — enough to route a reply. */
+type AnyRobotMsg = RobotMessage | RobotPictureMessage;
 
 /** "Thinking" text-emoji metadata accepted by DingTalk's emotion API. */
 const THINKING_EMOTION = {
@@ -33,6 +54,23 @@ interface EmotionTarget {
 	robotCode: string;
 	openMsgId: string;
 	openConversationId: string;
+}
+
+/** Map a file extension to an image MIME type (defaults to png). */
+function mimeFromExt(ext: string): string {
+	switch ((ext || "").toLowerCase()) {
+		case ".jpg":
+		case ".jpeg":
+			return "image/jpeg";
+		case ".gif":
+			return "image/gif";
+		case ".webp":
+			return "image/webp";
+		case ".bmp":
+			return "image/bmp";
+		default:
+			return "image/png";
+	}
 }
 
 /** Plain-text digest of a Markdown reply, for the DingTalk message-list preview. */
@@ -51,6 +89,8 @@ export class DingtalkAdapter implements IMAdapter {
 	private appId = "";
 	private appSecret = "";
 	private token: { value: string; expiresAt: number } | null = null;
+
+	constructor(private readonly reportService?: ReportService) {}
 
 	async start(io: IMIO, config: IMConfig): Promise<void> {
 		if (!config.appId || !config.appSecret) {
@@ -72,15 +112,32 @@ export class DingtalkAdapter implements IMAdapter {
 			// while the (slow) model call runs.
 			client.socketCallBackResponse(res.headers.messageId, {});
 
-			let msg: RobotMessage;
+			let msg: AnyRobotMsg;
 			try {
-				msg = JSON.parse(res.data) as RobotMessage;
+				msg = JSON.parse(res.data) as AnyRobotMsg;
 			} catch {
 				return;
 			}
 
-			const text = msg.text?.content?.trim();
-			if (!text) return;
+			const text = msg.text?.content?.trim() ?? "";
+			// Inbound images arrive as msgtype "picture" with a downloadCode; fetch
+			// the bytes so a vision model can see them. Image-only messages carry no
+			// text — supply a short prompt so the model knows a photo arrived.
+			let images: InboundImage[] | undefined;
+			if (msg.msgtype === "picture") {
+				const pic = msg as RobotPictureMessage;
+				const downloadCode = pic.content?.downloadCode ?? pic.content?.pictureDownloadCode ?? pic.downloadCode;
+				if (downloadCode) {
+					const fetched = await this.downloadInboundImage(downloadCode, pic.robotCode).catch((err) => {
+						console.warn("[im:dingtalk] inbound image download failed:", (err as Error).message);
+						return null;
+					});
+					if (fetched) images = [fetched];
+				}
+			}
+			const hasImage = !!images?.length;
+			if (!text && !hasImage) return;
+			const promptText = text || (hasImage ? "（用户发来一张图片，请查看图片内容并按需要回应）" : "");
 
 			// Session isolation: 1:1 → per sender; group → per conversation.
 			const conversationId =
@@ -100,7 +157,16 @@ export class DingtalkAdapter implements IMAdapter {
 
 			try {
 				const reply = await io.handle(
-					{ conversationId, text },
+					{
+							conversationId,
+							text: promptText,
+							images,
+							actor: {
+								senderId: msg.senderStaffId || msg.senderId || "",
+								channel: "dingtalk",
+								chatType: msg.conversationType === "1" ? "single" : "group",
+							},
+						},
 					{
 						// Push mid-turn progress (e.g. long-task heartbeat) back through the
 						// same session webhook (valid ~2h), rendered as Markdown like replies.
@@ -111,6 +177,8 @@ export class DingtalkAdapter implements IMAdapter {
 						// provide_document tool). On any failure the tool falls back to an
 						// archived-path notice, so this never breaks the reply.
 						sendFile: (filePath, fileName) => this.sendFileFor(msg, filePath, fileName),
+						// Deliver an inline image into this chat (used by the send_image tool).
+						sendImage: (filePath) => this.sendImageFor(msg, filePath),
 					},
 				);
 				if (msg.sessionWebhook && reply) await this.reply(msg.sessionWebhook, reply);
@@ -151,7 +219,7 @@ export class DingtalkAdapter implements IMAdapter {
 	 * Any step failing returns {ok:false,error} so the caller can fall back to an
 	 * archived-path notice — this must never break the reply.
 	 */
-	private async sendFileFor(msg: RobotMessage, filePath: string, fileName: string): Promise<{ ok: boolean; error?: string }> {
+	private async sendFileFor(msg: AnyRobotMsg, filePath: string, fileName: string): Promise<{ ok: boolean; error?: string }> {
 		try {
 			if (!msg.robotCode) return { ok: false, error: "缺少 robotCode" };
 			const downloadCode = await this.uploadFile(msg.robotCode, filePath, fileName);
@@ -183,8 +251,63 @@ export class DingtalkAdapter implements IMAdapter {
 		return data.downloadCode;
 	}
 
+	/**
+	 * Fetch a picture the user sent to the robot. The inbound callback carries a
+	 * temporary downloadCode; exchange it for a short-lived downloadUrl, then read
+	 * the bytes. Returns base64 + MIME for the vision model, or null on failure.
+	 */
+	private async downloadInboundImage(downloadCode: string, robotCode: string): Promise<InboundImage | null> {
+		const token = await this.accessToken();
+		const res = await fetch("https://api.dingtalk.com/v1.0/robot/messageFiles/download", {
+			method: "POST",
+			headers: { "Content-Type": "application/json", "x-acs-dingtalk-access-token": token },
+			body: JSON.stringify({ downloadCode, robotCode }),
+		});
+		if (!res.ok) {
+			const detail = await res.text().catch(() => "");
+			throw new Error(`messageFiles/download HTTP ${res.status}: ${detail.slice(0, 200)}`);
+		}
+		const { downloadUrl } = (await res.json()) as { downloadUrl?: string };
+		if (!downloadUrl) throw new Error("messageFiles/download 未返回 downloadUrl");
+		const fileRes = await fetch(downloadUrl);
+		if (!fileRes.ok) throw new Error(`下载图片失败 HTTP ${fileRes.status}`);
+		const buf = Buffer.from(await fileRes.arrayBuffer());
+		const mime = (fileRes.headers.get("content-type") || "image/jpeg").split(";")[0].trim();
+		return { data: buf.toString("base64"), mimeType: mime };
+	}
+
+	/**
+	 * Deliver a local image into the chat as an inline image message. Upload the
+	 * image to the configured report publisher to get a public URL, then send a
+	 * `sampleImageMsg` (photoURL) to the originating conversation. Returns
+	 * {ok:false} (never throws) when the publisher is unconfigured or the send
+	 * fails — the send_image tool then degrades to a text notice.
+	 */
+	private async sendImageFor(msg: AnyRobotMsg, filePath: string): Promise<{ ok: boolean; url?: string; error?: string }> {
+		try {
+			if (!this.reportService) return { ok: false, error: "未配置图片存储（报告中心）" };
+			const st = await stat(filePath);
+			if (!st.isFile()) return { ok: false, error: "不是有效文件" };
+			const buffer = await readFile(filePath);
+			const mime = mimeFromExt(extname(filePath));
+			const published = await this.reportService.publishImage(buffer, mime, `${msg.robotCode || "image"}-${Date.now()}${extname(filePath) || ".png"}`);
+			if (!published?.url) return { ok: false, error: "图片上传失败（报告中心未配置或不可用）" };
+			await this.sendProactive({
+				isSingle: msg.conversationType === "1",
+				msgKey: "sampleImageMsg",
+				msgParam: JSON.stringify({ photoURL: published.url }),
+				robotCode: msg.robotCode,
+				userIds: msg.conversationType === "1" ? [msg.senderStaffId || msg.senderId || ""] : undefined,
+				openConversationId: msg.conversationType === "1" ? undefined : msg.conversationId,
+			});
+			return { ok: true, url: published.url };
+		} catch (err) {
+			return { ok: false, error: (err as Error).message };
+		}
+	}
+
 	/** Send a sampleFile message to the conversation the inbound message came from. */
-	private async sendFileMessage(downloadCode: string, msg: RobotMessage): Promise<void> {
+	private async sendFileMessage(downloadCode: string, msg: AnyRobotMsg): Promise<void> {
 		const isSingle = msg.conversationType === "1";
 		await this.sendProactive({
 			isSingle,

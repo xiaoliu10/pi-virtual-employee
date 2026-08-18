@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { DB } from "../db/sqlite.js";
 import { chunkText } from "./chunker.js";
+import { extractText } from "./file-parser.js";
 
 export interface KnowledgeEntry {
 	id: string;
@@ -642,35 +643,4 @@ function unionTags(...parts: string[]): string {
 		.map((s) => s.trim())
 		.filter(Boolean);
 	return [...new Set(all)].join(",");
-}
-
-/** Extract plain text from a file based on extension. Optional parsers degrade cleanly when absent. */
-async function extractText(absPath: string): Promise<string> {
-	const lower = absPath.toLowerCase();
-	if (lower.endsWith(".pdf")) {
-		const { extractPdfText } = await import("../db/pdf-text.js");
-		return extractPdfText(absPath);
-	}
-	if (lower.endsWith(".docx")) {
-		const mammoth = await import("mammoth");
-		const result = await mammoth.extractRawText({ path: absPath });
-		return result.value;
-	}
-	if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) {
-		const xlsx = await import("xlsx");
-		const readFileAny = (xlsx.readFile ?? (xlsx as unknown as { default: { readFile: typeof xlsx.readFile } }).default?.readFile) as (p: string) => any;
-		const wb = readFileAny(absPath);
-		return wb.SheetNames.map((name: string) => {
-			const csv = wb.Utils?.sheet_to_csv
-				? wb.Utils.sheet_to_csv(wb.Sheets[name])
-				: "";
-			return `## ${name}\n${csv}`;
-		}).join("\n\n");
-	}
-	if (lower.endsWith(".html") || lower.endsWith(".htm")) {
-		const raw = await readFile(absPath, "utf8");
-		return raw.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
-	}
-	// txt / md / markdown — read raw.
-	return readFile(absPath, "utf8");
 }

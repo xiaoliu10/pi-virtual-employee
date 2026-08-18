@@ -10,14 +10,20 @@
  */
 import type { ConfigStore, ImChannelConfig } from "../db/config-store.js";
 import type { EmployeeEngine, ModelOption } from "../engine/engine.js";
+import type { ReportService } from "../reports/report-service.js";
 import { EchoAdapter } from "./adapters/echo.js";
 import { DingtalkAdapter } from "./adapters/dingtalk.js";
 import type { IMAdapter, IMIO } from "./types.js";
 
+/** Shared deps handed to adapter factories that need them (e.g. image hosting). */
+export interface AdapterDeps {
+	reportService?: ReportService;
+}
+
 /** channel type → factory. Add more real channels (feishu/wecom/…) here. */
-const REGISTRY = new Map<string, () => IMAdapter>([
+const REGISTRY = new Map<string, (deps: AdapterDeps) => IMAdapter>([
 	["echo", () => new EchoAdapter()],
-	["dingtalk", () => new DingtalkAdapter()],
+	["dingtalk", (deps) => new DingtalkAdapter(deps.reportService)],
 ]);
 
 export function availableChannels(): string[] {
@@ -34,6 +40,7 @@ export class IMAdapterManager {
 	constructor(
 		private readonly engine: EmployeeEngine,
 		private readonly config: ConfigStore,
+		private readonly deps: AdapterDeps = {},
 	) {}
 
 	/** Inject the UI-refresh callback (main process wires it to a webContents.send). */
@@ -77,7 +84,7 @@ export class IMAdapterManager {
 				console.log(`[im] no adapter registered for type "${ch.type}" (channel ${id})`);
 				continue;
 			}
-			const adapter = factory();
+			const adapter = factory(this.deps);
 			try {
 				await adapter.start(this.makeIO(), {
 					channel: ch.type,
@@ -173,7 +180,7 @@ export class IMAdapterManager {
 						const result = await this.engine.send(
 							agent,
 							msg.text,
-							{ sendFile: ctx?.sendFile, onPersist: (id) => this.onActivity?.(id) },
+							{ sendFile: ctx?.sendFile, sendImage: ctx?.sendImage, images: msg.images, actor: msg.actor, onPersist: (id) => this.onActivity?.(id) },
 						);
 						// Final turn complete — signal the UI to refresh the task list.
 						this.onActivity?.(msg.conversationId);

@@ -177,10 +177,91 @@ function migrate(db: DB): void {
 		CREATE INDEX IF NOT EXISTS idx_resources_updated ON resources(updated_at DESC);
 	`);
 
+	// Report / artifact center: generated reports (scheduled-task outputs, etc.)
+	// with run history + attachments + publish records (push to Gitee etc.).
+	// Distinct from `resources` (manually-curated doc catalog) — these are system-
+	// generated, versioned per run, and shared via a pushed link.
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS artifacts (
+			id             TEXT PRIMARY KEY,
+			kind           TEXT NOT NULL DEFAULT 'report',
+			source         TEXT NOT NULL DEFAULT 'scheduled_task',
+			source_ref     TEXT,
+			title          TEXT NOT NULL,
+			summary        TEXT,
+			partner        TEXT,
+			scenario       TEXT,
+			tags           TEXT,
+			retention_days INTEGER,
+			created_at     INTEGER NOT NULL,
+			updated_at     INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_artifacts_source ON artifacts(source, source_ref);
+		CREATE TABLE IF NOT EXISTS artifact_runs (
+			id           TEXT PRIMARY KEY,
+			artifact_id  TEXT NOT NULL,
+			trigger      TEXT NOT NULL DEFAULT 'cron',
+			status       TEXT NOT NULL DEFAULT 'running',
+			started_at   INTEGER NOT NULL,
+			finished_at  INTEGER,
+			duration_ms  INTEGER,
+			error        TEXT,
+			summary      TEXT,
+			metrics      TEXT,
+			input_ref    TEXT,
+			created_at   INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_artifact_runs_artifact ON artifact_runs(artifact_id, created_at DESC);
+		CREATE TABLE IF NOT EXISTS artifact_attachments (
+			id          TEXT PRIMARY KEY,
+			run_id      TEXT NOT NULL,
+			type        TEXT NOT NULL,
+			storage     TEXT NOT NULL DEFAULT 'sqlite',
+			content     TEXT,
+			file_path   TEXT,
+			file_name   TEXT,
+			mime        TEXT,
+			size_bytes  INTEGER NOT NULL DEFAULT 0,
+			checksum    TEXT,
+			created_at  INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_artifact_attachments_run ON artifact_attachments(run_id);
+		CREATE TABLE IF NOT EXISTS artifact_publishes (
+			id           TEXT PRIMARY KEY,
+			run_id       TEXT NOT NULL,
+			target       TEXT NOT NULL DEFAULT 'gitee',
+			url          TEXT,
+			path         TEXT,
+			status       TEXT NOT NULL DEFAULT 'ok',
+			error        TEXT,
+			published_at INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_artifact_publishes_run ON artifact_publishes(run_id);
+	`);
+
 	// FTS5 full-text index over knowledge chunks. Uses the `trigram` tokenizer so
 	// CJK text is matched by substring (unicode61 doesn't segment Chinese, which
 	// made space-less Chinese queries return nothing). Upgrades existing tables.
 	ensureChunksFts(db);
+
+	// Browser downloads: metadata + provenance for files the automated browser
+	// saved to the managed downloads dir. The file body lives on disk; this row
+	// is how the employee lists/finds/reads downloads without scanning the FS.
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS downloads (
+			id                 TEXT PRIMARY KEY,
+			saved_path         TEXT NOT NULL,
+			url                TEXT NOT NULL,
+			page_url           TEXT NOT NULL,
+			suggested_filename TEXT NOT NULL,
+			mime               TEXT,
+			size_bytes         INTEGER NOT NULL DEFAULT 0,
+			sha256             TEXT,
+			status             TEXT NOT NULL DEFAULT 'ok',
+			created_at         INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_downloads_created ON downloads(created_at DESC);
+	`);
 }
 
 /** Create (or upgrade) the kb_chunks FTS table. Falls back to LIKE if FTS5 is unavailable. */

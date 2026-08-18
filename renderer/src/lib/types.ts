@@ -136,13 +136,40 @@ export interface AppConfig {
 		channels: ImChannelConfig[];
 		ack: { enabled: boolean; text: string };
 	};
-	general: { autostart: boolean; language: "zh-CN" | "en-US"; requestTimeoutMin: number; longTaskProgressMin: number };
+	general: { autostart: boolean; language: "zh-CN" | "en-US"; requestTimeoutMin: number; longTaskProgressMin: number; maxToolSteps: number };
 	browser: { enabled: boolean; headless: boolean; allowedDomains: string[] };
 	scheduler: { enabled: boolean };
 	prompt: { extra: string; rules: string };
 	kb: KbConfig;
 	documents: { enabled: boolean; dir: string };
 	filesystem: { enabled: boolean; allowedDirs: string[] };
+	reports: {
+		enabled: boolean;
+		target: "gitee" | "oss";
+		publish: { linkMode: "raw_with_token" | "web_blob" | "public" };
+		gitee: {
+			apiUrl: string;
+			webUrl: string;
+			owner: string;
+			repo: string;
+			branch: string;
+			basePath: string;
+			writeToken: string;
+			readToken: string;
+			commitAuthor: string;
+			commitEmail: string;
+		};
+		oss: {
+			region: string;
+			accessKeyId: string;
+			accessKeySecret: string;
+			bucket: string;
+			endpoint: string;
+			basePath: string;
+			urlTtlSec: number;
+		};
+	};
+	security: { adminStaffIds: string[] };
 }
 
 /** A deliverable document resource (file or online link) for integration partners. */
@@ -231,6 +258,7 @@ export interface SkillInfo {
 	source: "builtin" | "user";
 	filePath: string;
 	enabled: boolean;
+	warnings?: string[];
 }
 
 export interface ConversationRow {
@@ -266,4 +294,51 @@ export interface ScheduledTaskRow {
 	last_status: string | null;
 	created_at: number;
 	updated_at: number;
+}
+
+/** A logical report/artifact in the report center (system-generated, versioned per run). */
+export interface Artifact {
+	id: string;
+	kind: string;
+	source: string;
+	sourceRef: string | null;
+	title: string;
+	summary: string | null;
+	partner: string | null;
+	scenario: string | null;
+	tags: string[];
+	retentionDays: number | null;
+	createdAt: number;
+	updatedAt: number;
+}
+
+/** One generation of an artifact (a run), with status + timing. */
+export interface ArtifactRun {
+	id: string;
+	artifactId: string;
+	trigger: string;
+	status: "running" | "ok" | "partial" | "error";
+	startedAt: number;
+	finishedAt: number | null;
+	durationMs: number | null;
+	error: string | null;
+	summary: string | null;
+	metrics: Record<string, unknown> | null;
+	inputRef: string | null;
+	createdAt: number;
+}
+
+/** The body/file of a run. */
+export interface ArtifactAttachment {
+	id: string;
+	runId: string;
+	type: string;
+	storage: "sqlite" | "fs";
+	content: string | null;
+	filePath: string | null;
+	fileName: string | null;
+	mime: string | null;
+	sizeBytes: number;
+	checksum: string | null;
+	createdAt: number;
 }

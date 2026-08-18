@@ -20,10 +20,15 @@ export interface LoadedSkillInfo {
 }
 
 export class SkillLoader {
-	constructor(
-		private readonly builtinDir: string,
-		private readonly userDir: string,
-	) {}
+	/** Built-in skills directory (read-only; the writer must reject same-name matches here). */
+	readonly builtinDir: string;
+	/** User skills directory (the only directory the writer may create/update). */
+	readonly userDir: string;
+
+	constructor(builtinDir: string, userDir: string) {
+		this.builtinDir = builtinDir;
+		this.userDir = userDir;
+	}
 
 	async list(): Promise<{ skills: Skill[]; info: LoadedSkillInfo[] }> {
 		const [builtin, user] = await Promise.all([
@@ -38,7 +43,12 @@ export class SkillLoader {
 		return { skills: [...byName.values()], info };
 	}
 
-	private async collect(
+	/**
+	 * Scan a single skills directory (builtin or user). Exposed so the skill
+	 * writer can detect same-name skills and locate an existing on-disk file to
+	 * update without duplicating the loader's parse/detect logic.
+	 */
+	async collect(
 		dir: string,
 		source: "builtin" | "user",
 	): Promise<{ skills: Skill[]; info: LoadedSkillInfo[] }> {

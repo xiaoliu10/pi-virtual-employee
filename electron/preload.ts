@@ -15,6 +15,18 @@ const api = {
 	deleteScheduledTask: (id: string) => ipcRenderer.invoke("tasks:schedDelete", id),
 	toggleScheduledTask: (id: string, enabled: boolean) =>
 		ipcRenderer.invoke("tasks:schedToggle", id, enabled),
+
+	// Report / artifact center
+	testReportTarget: () => ipcRenderer.invoke("reports:test"),
+	testGitee: () => ipcRenderer.invoke("reports:testGitee"),
+	testOss: () => ipcRenderer.invoke("reports:testOss"),
+	listReports: () => ipcRenderer.invoke("reports:list"),
+	getReport: (id: string) => ipcRenderer.invoke("reports:get", id),
+	reportRuns: (artifactId: string) => ipcRenderer.invoke("reports:runs", artifactId),
+	reportBody: (runId: string) => ipcRenderer.invoke("reports:body", runId),
+	reportUrl: (runId: string) => ipcRenderer.invoke("reports:url", runId),
+	republishReport: (runId: string) => ipcRenderer.invoke("reports:republish", runId),
+	deleteReport: (id: string) => ipcRenderer.invoke("reports:delete", id),
 	listTasks: () => ipcRenderer.invoke("tasks:list"),
 	getMessages: (id: string) => ipcRenderer.invoke("tasks:messages", id),
 	deleteTask: (id: string) => ipcRenderer.invoke("tasks:delete", id),
@@ -84,6 +96,7 @@ const api = {
 	refreshSkills: () => ipcRenderer.invoke("skills:refresh"),
 	importSkills: () => ipcRenderer.invoke("skills:import"),
 	deleteSkill: (filePath: string) => ipcRenderer.invoke("skills:delete", filePath),
+	setEnabledSkill: (name: string, enabled: boolean) => ipcRenderer.invoke("skills:setEnabled", name, enabled),
 };
 
 contextBridge.exposeInMainWorld("api", api);

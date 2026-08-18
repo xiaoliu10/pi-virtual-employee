@@ -5,6 +5,8 @@ import { ModelServiceSection } from "../components/ModelServiceSection";
 import { KnowledgeSection } from "../components/KnowledgeSection";
 import { MigrationSection } from "../components/MigrationSection";
 import { DocumentsSection } from "../components/DocumentsSection";
+import { ReportsSection } from "../components/ReportsSection";
+import { SkillsSection } from "../components/SkillsSection";
 
 interface SettingsPageProps {
 	config: AppConfig | null;
@@ -19,7 +21,9 @@ const CHANNEL_LABELS: Record<string, string> = {
 	echo: "Echo（测试通道）",
 };
 
-type Tab = "model" | "knowledge" | "documents" | "im" | "general" | "prompt" | "tasks" | "migrate";
+type Tab = "model" | "knowledge" | "content" | "skills" | "im" | "general" | "prompt" | "tasks" | "migrate";
+/** Sub-tab inside the unified 内容中心. */
+type ContentTab = "resources" | "artifacts";
 
 const TABS: { id: Tab; label: string; icon: JSX.Element }[] = [
 	{
@@ -51,12 +55,21 @@ const TABS: { id: Tab; label: string; icon: JSX.Element }[] = [
 		),
 	},
 	{
-		id: "documents",
-		label: "文档资源",
+		id: "content",
+		label: "内容中心",
 		icon: (
 			<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" className="h-[19px] w-[19px]">
-				<path strokeLinecap="round" strokeLinejoin="round" d="M7 3h7l5 5v13a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" />
-				<path strokeLinecap="round" strokeLinejoin="round" d="M14 3v5h5M9.5 13h5M9.5 17h5" />
+				<path strokeLinecap="round" strokeLinejoin="round" d="M3 7a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v13a1 1 0 0 0-1-1H4a1 1 0 0 1-1-1V7Z" />
+				<path strokeLinecap="round" strokeLinejoin="round" d="M21 7a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v13a1 1 0 0 1 1-1h6a1 1 0 0 0 1-1V7Z" />
+			</svg>
+		),
+	},
+	{
+		id: "skills",
+		label: "技能",
+		icon: (
+			<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" className="h-[19px] w-[19px]">
+				<path strokeLinecap="round" strokeLinejoin="round" d="M13 3 4 14h6l-1 7 9-11h-6l1-7Z" />
 			</svg>
 		),
 	},
@@ -115,6 +128,7 @@ const inputCls = "h-11 w-full rounded-xl border border-slate-200 bg-[#f7f8fa] px
 
 export function SettingsPage({ config, onChange, onClose }: SettingsPageProps) {
 	const [tab, setTab] = useState<Tab>("model");
+	const [contentTab, setContentTab] = useState<ContentTab>("resources");
 	const [draft, setDraft] = useState<AppConfig | null>(config);
 	const [saving, setSaving] = useState(false);
 	const [error, setError] = useState<string | null>(null);
@@ -175,8 +189,12 @@ export function SettingsPage({ config, onChange, onClose }: SettingsPageProps) {
 		setDraft((value) => value ? { ...value, browser: { ...value.browser, ...patch } } : value);
 	const setDocuments = (patch: Partial<AppConfig["documents"]>) =>
 		setDraft((value) => value ? { ...value, documents: { ...value.documents, ...patch } } : value);
+	const setReports = (patch: Partial<AppConfig["reports"]>) =>
+		setDraft((value) => value ? { ...value, reports: { ...value.reports, ...patch } } : value);
 	const setFilesystem = (patch: Partial<AppConfig["filesystem"]>) =>
 		setDraft((value) => value ? { ...value, filesystem: { ...value.filesystem, ...patch } } : value);
+	const setSecurity = (patch: Partial<AppConfig["security"]>) =>
+		setDraft((value) => value ? { ...value, security: { ...value.security, ...patch } } : value);
 
 	const cancel = () => {
 		setDraft(config);
@@ -224,8 +242,8 @@ export function SettingsPage({ config, onChange, onClose }: SettingsPageProps) {
 				<div className="flex min-w-0 flex-1 flex-col bg-white">
 					<header className="flex h-[82px] shrink-0 items-center justify-between border-b border-slate-100 px-8">
 						<div>
-							<h1 className="text-2xl font-semibold tracking-tight text-slate-950">{tab === "model" ? "自定义模型" : tab === "knowledge" ? "知识库" : tab === "documents" ? "文档资源" : tab === "im" ? "IM 机器人" : tab === "prompt" ? "提示词" : tab === "tasks" ? "定时任务" : tab === "migrate" ? "迁移与复制" : "通用"}</h1>
-							{tab !== "model" && <p className="mt-1 text-xs text-slate-400">{tab === "knowledge" ? "可配置、可插拔的知识库：内置混合检索 + 外接 RAG。" : tab === "documents" ? "管理可交付给对接方的文档资源（文件或在线链接），员工按需检索并投递。" : tab === "im" ? "连接即时通讯渠道，让虚拟员工随时响应。" : tab === "prompt" ? "自定义员工的内置行为规则与追加指令，保存后新对话生效。" : tab === "tasks" ? "在对话中创建定时任务，系统到点自动执行；此处可查看与管理。" : tab === "migrate" ? "把当前员工打包导出（.pve），或导入员工包：克隆为新员工 / 覆盖当前员工，支持跨机器迁移。" : "管理员工身份与系统行为。"}</p>}
+							<h1 className="text-2xl font-semibold tracking-tight text-slate-950">{tab === "model" ? "自定义模型" : tab === "knowledge" ? "知识库" : tab === "content" ? "内容中心" : tab === "skills" ? "技能" : tab === "im" ? "IM 机器人" : tab === "prompt" ? "提示词" : tab === "tasks" ? "定时任务" : tab === "migrate" ? "迁移与复制" : "通用"}</h1>
+							{tab !== "model" && <p className="mt-1 text-xs text-slate-400">{tab === "knowledge" ? "可配置、可插拔的知识库：内置混合检索 + 外接 RAG。" : tab === "content" ? "交付资料库（既有可复用资料）与任务产物（生成的带版本输出）统一在此管理。" : tab === "skills" ? "管理内置与导入的技能（SKILL.md），启停、导入、删除。技能以声明式指令注入提示词。" : tab === "im" ? "连接即时通讯渠道，让虚拟员工随时响应。" : tab === "prompt" ? "自定义员工的内置行为规则与追加指令，保存后新对话生效。" : tab === "tasks" ? "在对话中创建定时任务，系统到点自动执行；此处可查看与管理。" : tab === "migrate" ? "把当前员工打包导出（.pve），或导入员工包：克隆为新员工 / 覆盖当前员工，支持跨机器迁移。" : "管理员工身份与系统行为。"}</p>}
 						</div>
 						<button type="button" onClick={cancel} className="rounded-xl p-2 text-2xl leading-none text-slate-400 transition hover:bg-slate-100 hover:text-slate-700" aria-label="关闭设置">×</button>
 					</header>
@@ -239,8 +257,34 @@ export function SettingsPage({ config, onChange, onClose }: SettingsPageProps) {
 							<MigrationSection />
 						) : tab === "knowledge" ? (
 							<KnowledgeSection kb={draft.kb} suppliers={draft.model.suppliers} onUpdate={(kb) => setDraft((value) => value ? { ...value, kb } : value)} />
-						) : tab === "documents" ? (
-							<DocumentsSection documents={draft.documents} onUpdate={setDocuments} />
+						) : tab === "content" ? (
+							<div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-[#fafbfc] px-10 py-8">
+								<div className="mx-auto w-full max-w-3xl">
+									<div className="mb-4 inline-flex rounded-xl border border-slate-200 bg-white p-1">
+										<button type="button" onClick={() => setContentTab("resources")} className={`rounded-lg px-4 py-1.5 text-sm font-medium transition ${contentTab === "resources" ? "bg-blue-100/80 text-blue-600" : "text-slate-500 hover:text-slate-800"}`}>交付资料库</button>
+										<button type="button" onClick={() => setContentTab("artifacts")} className={`rounded-lg px-4 py-1.5 text-sm font-medium transition ${contentTab === "artifacts" ? "bg-blue-100/80 text-blue-600" : "text-slate-500 hover:text-slate-800"}`}>任务产物</button>
+									</div>
+									<div className="space-y-5">
+										{contentTab === "resources" ? (
+											<DocumentsSection documents={draft.documents} onUpdate={setDocuments} />
+										) : (
+											<ReportsSection
+												reports={draft.reports}
+												onUpdate={(reports) => setReports(reports)}
+												onBeforeTest={async () => {
+													if (draft) await onChange(draft);
+												}}
+											/>
+										)}
+									</div>
+								</div>
+							</div>
+						) : tab === "skills" ? (
+							<div className="min-h-0 flex-1 overflow-y-auto bg-[#fafbfc] px-10 py-8">
+								<div className="mx-auto w-full max-w-3xl">
+									<SkillsSection />
+								</div>
+							</div>
 						) : tab === "prompt" ? (
 							<div className="min-h-0 flex-1 overflow-y-auto bg-[#fafbfc] px-10 py-8">
 								<div className="mx-auto max-w-2xl space-y-5">
@@ -387,7 +431,28 @@ export function SettingsPage({ config, onChange, onClose }: SettingsPageProps) {
 										<Field label="员工类型 / 角色" hint="如「虚拟客服」「技术支持」，会写入系统提示词的身份与开场。"><input value={draft.identity.role} onChange={(event) => setIdentity({ role: event.target.value })} placeholder="虚拟客服" className={inputCls} /></Field>
 										<Field label="职责描述" hint="描述这个员工负责什么，会写入系统提示词（如：在线为客户提供专业、礼貌、高效的服务）。"><textarea value={draft.identity.duty} onChange={(event) => setIdentity({ duty: event.target.value })} rows={2} placeholder="在线为客户提供专业、礼貌、高效的服务" className={inputCls + " h-auto py-2"} /></Field>
 										<Field label="服务时间"><input value={draft.identity.serviceHours} onChange={(event) => setIdentity({ serviceHours: event.target.value })} placeholder="7×24h" className={inputCls} /></Field>
-										<div className="rounded-2xl border border-blue-100 bg-blue-50 px-5 py-3 text-xs leading-relaxed text-slate-600">身份与提示词规则可在「<b>提示词</b>」标签页自定义；修改后保存，对<b>新对话</b>生效。</div>
+										<div className="rounded-2xl border border-blue-100 bg-blue-50 px-5 py-3 text-xs leading-relaxed text-slate-600">身份与提示词规则可在「<b>提示词</b>」标签页自定义；修改后保存，对<b>新对话</b>生效。管理员（白名单内的人）也可在 IM 单聊中通过对话修改身份。</div>
+
+										<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
+											<div className="flex items-center justify-between">
+												<div>
+													<div className="text-sm font-medium text-slate-800">IM 管理员白名单</div>
+													<div className="mt-1 text-xs text-slate-400">名单内的人可在 IM 单聊中修改员工身份、增删管理员。为空 = 未认领：首位在单聊中明确确认身份修改的人自动成为首位管理员。</div>
+												</div>
+											</div>
+											<div className="mt-3 space-y-2">
+												{draft.security.adminStaffIds.length === 0 && (
+													<div className="rounded-lg border border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-700">尚未设置管理员（未认领）。可在此预先填写，或由首位确认者远程认领。</div>
+												)}
+												{draft.security.adminStaffIds.map((id, idx) => (
+													<div key={`${id}-${idx}`} className="flex items-center gap-2">
+														<input value={id} onChange={(e) => setSecurity({ adminStaffIds: draft.security.adminStaffIds.map((v, i) => (i === idx ? e.target.value : v)) })} placeholder="钉钉 staffId" className={inputCls} />
+														<button type="button" onClick={() => setSecurity({ adminStaffIds: draft.security.adminStaffIds.filter((_, i) => i !== idx) })} className="shrink-0 text-xs text-rose-400 hover:text-rose-600">删除</button>
+													</div>
+												))}
+												<button type="button" onClick={() => setSecurity({ adminStaffIds: [...draft.security.adminStaffIds, ""] })} className="text-xs text-blue-500 hover:text-blue-600">＋ 添加管理员</button>
+											</div>
+										</div>
 											<label className="flex cursor-pointer items-center justify-between rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
 												<div><div className="text-sm font-medium text-slate-800">开机自动启动</div><div className="mt-1 text-xs text-slate-400">登录系统时自动启动虚拟员工。</div></div>
 												<input type="checkbox" checked={draft.general.autostart} onChange={(event) => setGeneral({ autostart: event.target.checked })} className="h-5 w-5 accent-blue-500" />
@@ -418,6 +483,17 @@ export function SettingsPage({ config, onChange, onClose }: SettingsPageProps) {
 													value={Number.isFinite(draft.general.longTaskProgressMin) ? draft.general.longTaskProgressMin : 0}
 													onChange={(e) => setGeneral({ longTaskProgressMin: Math.max(0, Math.floor(Number(e.target.value) || 0)) })}
 													placeholder="30"
+													className={inputCls}
+												/>
+											</Field>
+
+											<Field label="单轮工具调用上限" hint="限制一轮对话中模型连续调用工具的最大步数，防止异常循环。达到上限后会停止调用工具，并根据已完成的操作生成结果总结。0 = 不限制。保存后立即生效。">
+												<input
+													type="number"
+													min={0}
+													value={Number.isFinite(draft.general.maxToolSteps) ? draft.general.maxToolSteps : 0}
+													onChange={(e) => setGeneral({ maxToolSteps: Math.max(0, Math.floor(Number(e.target.value) || 0)) })}
+													placeholder="0"
 													className={inputCls}
 												/>
 											</Field>

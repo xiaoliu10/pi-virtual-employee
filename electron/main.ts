@@ -19,6 +19,10 @@ import { ScheduledTaskStore } from "../src/db/scheduled-task-store.js";
 import { SchedulerService } from "../src/scheduler/scheduler-service.js";
 import { DocumentService } from "../src/documents/document-service.js";
 import { FileSystemService } from "../src/filesystem/filesystem-service.js";
+import { ArtifactStore } from "../src/db/artifact-store.js";
+import { ReportService } from "../src/reports/report-service.js";
+import { DownloadStore } from "../src/downloads/download-store.js";
+import { DownloadService } from "../src/downloads/download-service.js";
 import { EmployeeEngine } from "../src/engine/engine.js";
 import { buildSystemPrompt, defaultCoreRules } from "../src/engine/prompt.js";
 import { startHttpTransport } from "../src/transport/http.js";
@@ -180,6 +184,15 @@ function relaunchInto(profile: string): void {
 	app.exit(0);
 }
 
+/** First non-empty lines of a report, for the IM push when a link is available. */
+function briefSummary(markdown: string, max = 400): string {
+	const lines = markdown.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+	// Skip leading markdown headings/bullets-only so the excerpt starts on real text.
+	const body = lines.filter((l) => !/^#{1,6}\s/.test(l)).join(" ");
+	const text = body.length > max ? body.slice(0, max) + "…" : body;
+	return text || markdown.slice(0, max);
+}
+
 async function main(): Promise<void> {
 	const userData = app.getPath("userData");
 	// Cross-platform packages ship target-native binaries as extraResources. In
@@ -193,7 +206,7 @@ async function main(): Promise<void> {
 	const config = new ConfigStore(db);
 	const history = new HistoryStore(db);
 	const knowledge = new KnowledgeService(db, config, vecExtension);
-	const browser = new BrowserService(config);
+	const browser = new BrowserService(config, userData);
 	const scheduler = new SchedulerService(new ScheduledTaskStore(db));
 
 	// Document resources: uploaded files live under the configured documents dir
@@ -207,6 +220,16 @@ async function main(): Promise<void> {
 	// service just resolves the configured whitelist at call time.
 	const filesystem = new FileSystemService(config);
 
+	// Browser downloads: capture into a managed workspace so the employee can
+	// list/read/analyze downloaded files (Excel exports, etc.) without touching
+	// the user's real Downloads folder. Funnel every Playwright download event.
+	const downloadStore = new DownloadStore(db);
+	const downloadService = new DownloadService(config, userData, downloadStore);
+	await downloadService.dir();
+	browser.setDownloadHandler((dl, page) => {
+		void downloadService.handleDownload(dl, page);
+	});
+
 	// Built-in skills ship under dist-electron/resources/skills (copied by the
 	// build script). User-imported skills live under userData/skills.
 	const builtinSkillsDir = path.join(__dirname, "resources", "skills");
@@ -218,7 +241,8 @@ async function main(): Promise<void> {
 	await applyPendingImport({ db, config, knowledge, skillsDir: userSkillsDir });
 
 	const initialCfg = config.all();
-	const engine = new EmployeeEngine(config, history, knowledge, browser, scheduler, documents, filesystem, { builtinSkillsDir, userSkillsDir }, { timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000 });
+	const reportService = new ReportService(new ArtifactStore(db), config);
+	const engine = new EmployeeEngine(config, history, knowledge, browser, scheduler, documents, filesystem, reportService, downloadService, { builtinSkillsDir, userSkillsDir }, { timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000 });
 	knowledge.setLlm((system, user) => engine.complete(system, user));
 	// Self-heal: pick up chunks a previous run left pending/failed (crash, upgrade,
 	// or a transient embedding failure). Best-effort — never block startup on it.
@@ -232,7 +256,7 @@ async function main(): Promise<void> {
 	// dedicated conversation (results show in the sidebar), then refreshes the UI.
 	// If the task was created in an IM conversation, the result is proactively
 	// pushed back to that group/1:1 through the active IM adapter.
-	const im = new IMAdapterManager(engine, config);
+	const im = new IMAdapterManager(engine, config, { reportService });
 	scheduler.setRunner({
 		async runTask(task) {
 			// Execute in an isolated background conversation, NOT the originating IM
@@ -253,6 +277,15 @@ async function main(): Promise<void> {
 				const wc = mainWindow?.webContents;
 				if (wc && !wc.isDestroyed()) wc.send("im:activity", conversationId);
 			};
+			// Report center: open a run before the LLM turn so it records the real
+			// duration, then close it + publish the body to Gitee for a shareable link.
+			const reportRun = reportService.startRun({
+				source: "scheduled_task",
+				sourceRef: task.id,
+				title: task.title,
+				trigger: "cron",
+				inputRef: task.prompt,
+			});
 			const { reply, error } = await engine.send(agent, task.prompt, {
 				onPersist: () => {
 					pushActivity(execConvId);
@@ -261,12 +294,23 @@ async function main(): Promise<void> {
 			});
 			pushActivity(execConvId);
 			if (task.conversation_id) pushActivity(task.conversation_id);
-			// Push the result back to the originating IM chat (group/1:1) when the
-			// task was created there. Non-IM (console/http) tasks have no push target;
-			// their results live in the sidebar. A failed push is logged, never fatal.
+			reportService.completeRun(reportRun.runId, {
+				status: error ? "error" : "ok",
+				content: reply || "",
+				error: error ?? null,
+			});
+			let reportUrl: string | null = null;
+			if (reply) {
+				const pub = await reportService.publish(reportRun.runId, task.title, reply);
+				reportUrl = pub?.url ?? null;
+			}
+			// Push the result back to the originating IM chat. When a report link is
+			// available, send a short summary + link (the full report lives at the
+			// link); otherwise fall back to the full reply. Non-IM tasks skip push.
 			let pushError: string | undefined;
 			if (task.conversation_id && reply) {
-				const pushText = `⏰ **定时任务完成：${task.title}**\n\n${reply}`;
+				const body = reportUrl ? `${briefSummary(reply)}\n\n📎 查看报告：${reportUrl}` : reply;
+				const pushText = `⏰ **定时任务完成：${task.title}**\n\n${body}`;
 				const pushed = await im.pushToConversation(task.conversation_id, pushText);
 				if (!pushed.ok) {
 					pushError = pushed.error || "未知推送错误";
@@ -300,7 +344,7 @@ async function main(): Promise<void> {
 		applyAutostart(updated.general.autostart);
 		await im.sync().catch((err) => console.error("[im] sync failed", err));
 		engine.setRequestTimeoutMs((updated.general.requestTimeoutMin || 0) * 60_000);
-		engine.invalidate(); // prompt/skill/tool composition may have changed
+		await engine.invalidate(); // prompt/skill/tool composition may have changed
 		return updated;
 	});
 
@@ -445,6 +489,8 @@ async function main(): Promise<void> {
 			schedulerEnabled: c.scheduler.enabled,
 			documentsEnabled: c.documents.enabled,
 			filesystemEnabled: c.filesystem.enabled,
+			reportsEnabled: c.reports.enabled,
+			downloadsEnabled: c.downloads.enabled,
 			rules: c.prompt.rules,
 			extra: c.prompt.extra,
 		});
@@ -460,6 +506,8 @@ async function main(): Promise<void> {
 			schedulerEnabled: c.scheduler.enabled,
 			documentsEnabled: c.documents.enabled,
 			filesystemEnabled: c.filesystem.enabled,
+			reportsEnabled: c.reports.enabled,
+			downloadsEnabled: c.downloads.enabled,
 		});
 	});
 
@@ -471,6 +519,21 @@ async function main(): Promise<void> {
 	});
 	ipcMain.handle("tasks:schedToggle", (_e, id: string, enabled: boolean) => {
 		scheduler.setEnabled(id, enabled);
+		return true;
+	});
+
+	// --- Report / artifact center ---
+	ipcMain.handle("reports:test", async () => reportService.testTarget());
+	ipcMain.handle("reports:testGitee", async () => reportService.testGitee());
+	ipcMain.handle("reports:testOss", async () => reportService.testOss());
+	ipcMain.handle("reports:list", () => reportService.listArtifacts());
+	ipcMain.handle("reports:get", (_e, id: string) => reportService.getArtifact(id) ?? null);
+	ipcMain.handle("reports:runs", (_e, artifactId: string) => reportService.listRuns(artifactId));
+	ipcMain.handle("reports:body", (_e, runId: string) => reportService.runBody(runId) ?? null);
+	ipcMain.handle("reports:url", (_e, runId: string) => reportService.runUrl(runId));
+	ipcMain.handle("reports:republish", async (_e, runId: string) => reportService.republish(runId));
+	ipcMain.handle("reports:delete", (_e, id: string) => {
+		reportService.deleteArtifact(id);
 		return true;
 	});
 
@@ -545,25 +608,25 @@ async function main(): Promise<void> {
 				errors.push(`${path.basename(file)}: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		}
-		engine.invalidate();
+		await engine.invalidate();
 		return { imported, errors };
 	});
 
 	// --- Document resources (catalog of deliverable docs for integration partners) ---
 	ipcMain.handle("documents:list", () => documents.list());
-	ipcMain.handle("documents:add", (_e, input) => {
+	ipcMain.handle("documents:add", async (_e, input) => {
 		const r = documents.add(input);
-		engine.invalidate();
+		await engine.invalidate();
 		return r;
 	});
-	ipcMain.handle("documents:update", (_e, id: string, patch) => {
+	ipcMain.handle("documents:update", async (_e, id: string, patch) => {
 		const r = documents.update(id, patch);
-		engine.invalidate();
+		await engine.invalidate();
 		return r ?? null;
 	});
-	ipcMain.handle("documents:delete", (_e, id: string) => {
+	ipcMain.handle("documents:delete", async (_e, id: string) => {
 		documents.delete(id);
-		engine.invalidate();
+		await engine.invalidate();
 		return true;
 	});
 	ipcMain.handle("documents:dir", () => documents.dir());
@@ -609,7 +672,7 @@ async function main(): Promise<void> {
 			});
 			ids.push(r.id);
 		}
-		engine.invalidate();
+		await engine.invalidate();
 		return { created: ids.length, ids };
 	});
 
@@ -639,11 +702,18 @@ async function main(): Promise<void> {
 	// --- Skills ---
 	ipcMain.handle("skills:list", async () => {
 		const { info } = await engine.listSkills();
-		return info.map((entry) => ({ ...entry, enabled: true }));
+		return info; // already carries enabled (false ⇒ in config.skills.disabled)
 	});
 	ipcMain.handle("skills:refresh", async () => {
-		await engine.refreshSkills();
-		engine.invalidate();
+		await engine.invalidate();
+		return true;
+	});
+	ipcMain.handle("skills:setEnabled", async (_e, name: string, enabled: boolean) => {
+		const cur = new Set(config.all().skills?.disabled ?? []);
+		if (enabled) cur.delete(name);
+		else cur.add(name);
+		config.update({ skills: { disabled: [...cur] } });
+		await engine.invalidate();
 		return true;
 	});
 	ipcMain.handle("skills:import", async () => {
@@ -666,9 +736,15 @@ async function main(): Promise<void> {
 			try {
 				const stat = await import("node:fs/promises").then((fs) => fs.stat(selected));
 				if (stat.isDirectory()) {
-					// Copy the whole skill directory (must contain SKILL.md).
+					// Copy the whole skill directory, then validate it contains SKILL.md
+					// before counting as imported — otherwise it silently disappears from
+					// the skill list (the loader only finds SKILL.md / root .md).
 					const name = path.basename(selected);
 					const dest = path.join(userSkillsDir, name);
+					if (!existsSync(path.join(selected, "SKILL.md"))) {
+						errors.push(`${name}: 目录内缺少 SKILL.md，已跳过`);
+						continue;
+					}
 					await rm(dest, { recursive: true, force: true });
 					await mkdir(dest, { recursive: true });
 					await copyTree(selected, dest);
@@ -677,25 +753,29 @@ async function main(): Promise<void> {
 					const name = path.basename(selected);
 					await copyFile(selected, path.join(userSkillsDir, name));
 					imported++;
+				} else {
+					errors.push(`${path.basename(selected)}: 仅支持 .md 文件或含 SKILL.md 的目录`);
 				}
 			} catch (err) {
 				errors.push(`${path.basename(selected)}: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		}
-		await engine.refreshSkills();
-		engine.invalidate();
+		await engine.invalidate();
 		return { imported, errors };
 	});
 	ipcMain.handle("skills:delete", async (_e, filePath: string) => {
-		// Only allow deleting files inside the user skills dir.
-		if (!filePath.startsWith(userSkillsDir)) return false;
+		// Containment check via canonical paths — a string prefix check could be
+		// fooled by a sibling dir sharing the userSkillsDir prefix.
+		const resolved = path.resolve(filePath);
+		const userDir = path.resolve(userSkillsDir);
+		if (resolved !== userDir && !resolved.startsWith(userDir + path.sep)) return false;
 		await rm(filePath, { force: true }).catch(() => {});
 		const dir = path.dirname(filePath);
-		if (dir.startsWith(userSkillsDir) && dir !== userSkillsDir) {
+		const dirResolved = path.resolve(dir);
+		if (dirResolved.startsWith(userDir + path.sep) && dirResolved !== userDir) {
 			await rm(dir, { recursive: true, force: true }).catch(() => {});
 		}
-		await engine.refreshSkills();
-		engine.invalidate();
+		await engine.invalidate();
 		return true;
 	});
 

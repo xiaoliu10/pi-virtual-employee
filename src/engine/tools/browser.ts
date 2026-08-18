@@ -11,6 +11,8 @@
  */
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
+import { writeFile, mkdir } from "node:fs/promises";
+import { join } from "node:path";
 import type { BrowserService } from "../../browser/browser-service.js";
 
 function textResult(text: string, details: Record<string, unknown> = {}): AgentToolResult<Record<string, unknown>> {
@@ -24,7 +26,16 @@ function errorResult(err: unknown): AgentToolResult<Record<string, unknown>> {
 	};
 }
 
-export function createBrowserTools(browser: BrowserService, isVisionModel: () => boolean = () => true): AgentTool[] {
+export function createBrowserTools(
+	browser: BrowserService,
+	isVisionModel: () => boolean = () => true,
+	/** Optional resolver for a managed dir where screenshots are also saved to disk,
+	 *  so the employee can later send_image them. Absent → screenshots stay in-context only. */
+	screenshotDir?: () => Promise<string | undefined>,
+	/** 当前会话归属（ownerId，通常即 conversationId）。每个 owner 独享一个浏览器 Page，
+	 * 不同会话（IM/定时任务/控制台）互不覆盖表单与 URL。 */
+	resolveOwnerId: () => string = () => "default",
+): AgentTool[] {
 	const navigate: AgentTool = {
 		name: "browser_navigate",
 		label: "浏览器：打开网页",
@@ -35,7 +46,7 @@ export function createBrowserTools(browser: BrowserService, isVisionModel: () =>
 		}),
 		async execute(_id, params) {
 			try {
-				const r = await browser.navigate((params as { url: string }).url);
+				const r = await browser.navigate(resolveOwnerId(), (params as { url: string }).url);
 				return textResult(`已打开「${r.title || r.url}」（${r.url}）。可用 browser_read 读取内容或 browser_screenshot 截图查看。`, { ok: true, ...r });
 			} catch (err) {
 				return errorResult(err);
@@ -50,9 +61,23 @@ export function createBrowserTools(browser: BrowserService, isVisionModel: () =>
 		parameters: Type.Object({}),
 		async execute() {
 			try {
-				const r = await browser.getText();
+				const ownerId = resolveOwnerId();
+				const r = await browser.getText(ownerId);
 				const note = r.truncated ? "\n（内容较长，已截断）" : "";
-				return textResult(`页面：${r.title}（${r.url}）\n\n${r.text}${note}`, { ok: true, url: r.url, truncated: r.truncated });
+				// 附带主要输入框简要状态（name/placeholder/是否非空/长度，不含明文），
+				// 帮助模型判断是否在登录页、账号密码是否已填。
+				const inputs = await browser.readInputs(ownerId).catch(() => []);
+				const inputNote =
+					inputs.length > 0
+						? "\n\n输入框状态（不含明文）：" +
+							inputs.map((f) => `${f.tag}[${f.type}]${f.name ? ` name=${f.name}` : ""}${f.placeholder ? ` placeholder="${f.placeholder}"` : ""} ${f.filled ? `已填(${f.valueLength}字)` : "空"}`).join("；")
+						: "";
+				return textResult(`页面：${r.title}（${r.url}）\n\n${r.text}${note}${inputNote}`, {
+					ok: true,
+					url: r.url,
+					truncated: r.truncated,
+					inputs,
+				});
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -66,24 +91,39 @@ export function createBrowserTools(browser: BrowserService, isVisionModel: () =>
 		parameters: Type.Object({}),
 		async execute() {
 			try {
-				const url = await browser.currentUrl();
+				const ownerId = resolveOwnerId();
+				const url = await browser.currentUrl(ownerId);
 				if (!isVisionModel()) {
 					// Non-vision model: an image block would make the request fail —
 					// degrade to page text so the agent can still reason about the page.
-					const r = await browser.getText();
+					const r = await browser.getText(ownerId);
 					const note = r.truncated ? "\n（内容较长，已截断）" : "";
 					return textResult(
 						`当前模型不支持图像输入，已改为返回页面文本（${r.title} · ${url}）：\n\n${r.text}${note}`,
 						{ ok: true, url, degraded: true, truncated: r.truncated },
 					);
 				}
-				const shot = await browser.screenshot();
+				const shot = await browser.screenshot(ownerId);
+				// Best-effort: also save the JPEG to a managed dir so the employee can
+				// hand the file to send_image later. Failure never breaks the screenshot.
+				let savedPath: string | undefined;
+				try {
+					const dir = await screenshotDir?.();
+					if (dir) {
+						await mkdir(dir, { recursive: true });
+						savedPath = join(dir, `screenshot-${Date.now()}.jpg`);
+						await writeFile(savedPath, Buffer.from(shot.base64, "base64"));
+					}
+				} catch {
+					savedPath = undefined;
+				}
+				const note = savedPath ? `\n（已保存到 ${savedPath}，可用 send_image 发给对方）` : "";
 				return {
 					content: [
-						{ type: "text", text: `当前页面截图（${url}）：` },
+						{ type: "text", text: `当前页面截图（${url}）：${note}` },
 						{ type: "image", data: shot.base64, mimeType: shot.mimeType },
 					],
-					details: { ok: true, url, mimeType: shot.mimeType },
+					details: { ok: true, url, mimeType: shot.mimeType, savedPath },
 				};
 			} catch (err) {
 				return errorResult(err);
@@ -101,8 +141,14 @@ export function createBrowserTools(browser: BrowserService, isVisionModel: () =>
 		}),
 		async execute(_id, params) {
 			try {
-				const r = await browser.click((params as { selector: string }).selector);
-				return textResult(`已点击。当前页面：${r.url}`, { ok: r.ok, url: r.url });
+				const r = await browser.click(resolveOwnerId(), (params as { selector: string }).selector);
+				const changeNote = r.urlChanged ? "页面已变化。" : "页面 URL 未变化（可能是弹层/原地刷新，可再 browser_read 确认）。";
+				return textResult(`已点击。${changeNote}当前页面：${r.url}`, {
+					ok: r.ok,
+					url: r.url,
+					beforeUrl: r.beforeUrl,
+					urlChanged: r.urlChanged,
+				});
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -121,8 +167,13 @@ export function createBrowserTools(browser: BrowserService, isVisionModel: () =>
 		async execute(_id, params) {
 			try {
 				const p = params as { selector: string; text: string };
-				await browser.type(p.selector, p.text);
-				return textResult(`已向 ${p.selector} 输入文本。`, { ok: true, selector: p.selector });
+				const r = await browser.type(resolveOwnerId(), p.selector, p.text);
+				// 只回读长度不回传明文：密码等敏感字段不进上下文，同时能发现“没填进去”。
+				return textResult(`已向 ${p.selector} 输入文本（已确认填入 ${r.valueLength} 个字符）。`, {
+					ok: r.ok,
+					selector: p.selector,
+					valueLength: r.valueLength,
+				});
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -140,7 +191,7 @@ export function createBrowserTools(browser: BrowserService, isVisionModel: () =>
 		async execute(_id, params) {
 			try {
 				const key = (params as { key: string }).key;
-				await browser.pressKey(key);
+				await browser.pressKey(resolveOwnerId(), key);
 				return textResult(`已按下 ${key}。`, { ok: true, key });
 			} catch (err) {
 				return errorResult(err);
@@ -161,7 +212,7 @@ export function createBrowserTools(browser: BrowserService, isVisionModel: () =>
 		}),
 		async execute(_id, params) {
 			try {
-				const r = await browser.evaluate((params as { script: string }).script);
+				const r = await browser.evaluate(resolveOwnerId(), (params as { script: string }).script);
 				return textResult(`JS 执行结果：${r.value}`, { ok: true });
 			} catch (err) {
 				return errorResult(err);

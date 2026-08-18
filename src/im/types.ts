@@ -14,9 +14,28 @@ export interface IMConfig {
 	ack?: { enabled: boolean; text: string };
 }
 
+/** A base64 image attached to an inbound message (decoded by the adapter). */
+export interface InboundImage {
+	data: string;
+	mimeType: string;
+}
+
+export interface InboundActor {
+	/** Stable platform user id (e.g. DingTalk senderStaffId). */
+	senderId: string;
+	/** Source channel, used for audit details and future per-channel policies. */
+	channel: string;
+	/** Admin operations are allowed only in a direct 1:1 chat. */
+	chatType: "single" | "group";
+}
+
 export interface InboundMessage {
 	conversationId: string;
 	text: string;
+	/** Verified sender metadata supplied by the adapter, never parsed from text. */
+	actor?: InboundActor;
+	/** Images the user sent with this message (vision models can see them). */
+	images?: InboundImage[];
 }
 
 /** Per-message channel context: hooks the adapter exposes for a single inbound
@@ -32,6 +51,14 @@ export interface InboundCtx {
 	 * archived-path notice. Structurally matches DocumentService.FileSender.
 	 */
 	sendFile?: (filePath: string, fileName: string) => Promise<{ ok: boolean; error?: string }>;
+	/**
+	 * Deliver an image into the originating chat as an inline image message (when
+	 * the channel supports it, e.g. DingTalk sampleImageMsg). The adapter uploads
+	 * the file to a public host and sends the link. Threads through to the
+	 * send_image tool. Channels that can't send images omit this → the tool
+	 * degrades to a text notice.
+	 */
+	sendImage?: (filePath: string) => Promise<{ ok: boolean; url?: string; error?: string }>;
 }
 
 export interface IMIO {

@@ -14,6 +14,11 @@ export interface ParsedSkill {
 
 const NAME_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
+/** Shared name rule (lowercase words joined by `-`, ≤64 chars). Exported so the
+ * skill writer validates new skills with the exact same pattern the loader uses
+ * to parse them. */
+export const SKILL_NAME_PATTERN = NAME_PATTERN;
+
 export function parseSkillFile(filePath: string, raw: string): ParsedSkill {
 	const { frontmatter, body } = splitFrontmatter(raw);
 	const name = (frontmatter.name ?? deriveNameFromPath(filePath)).trim();
@@ -73,9 +78,17 @@ function parseSimpleYaml(src: string): Frontmatter {
 		if (idx < 0) continue;
 		const key = trimmed.slice(0, idx).trim();
 		let value = trimmed.slice(idx + 1).trim();
-		if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-			value = value.slice(1, -1);
-		}
+		// A quoted value can itself contain ":" — so a raw `indexOf(":")` only splits
+		// on the FIRST colon (the key/value separator). Unquote the value if both
+		// ends are wrapped in the same quote char, so descriptions like "退款: 标准步骤"
+		// round-trip correctly through save_to_skill.
+		const unquoted = (raw: string): string => {
+			if (raw.length >= 2 && ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'")))) {
+				return raw.slice(1, -1);
+			}
+			return raw;
+		};
+		value = unquoted(value);
 		if (key === "name") out.name = value;
 		else if (key === "description") out.description = value;
 		else if (key === "disable-model-invocation") out["disable-model-invocation"] = value === "true";

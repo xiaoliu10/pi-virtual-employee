@@ -19,6 +19,7 @@
     "@earendil-works/pi-ai": "^0.83.0",
     "@types/adm-zip": "^0.5.8",
     "adm-zip": "^0.6.0",
+    "ali-oss": "^6.23.0",
     "better-sqlite3": "^11.7.0",
     "cron-parser": "^5.7.0",
     "dingtalk-stream": "^2.1.6-beta.1",
@@ -33,6 +34,7 @@
   },
   "devDependencies": {
     "@electron/rebuild": "^3.7.1",
+    "@types/ali-oss": "^6.23.3",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.19.0",
     "@types/react": "^18.3.12",
