@@ -12,9 +12,9 @@ export interface ParsedSkill {
 	warning?: string;
 }
 
-const NAME_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+const NAME_PATTERN = /^[\p{Script=Han}a-z0-9]+(-[\p{Script=Han}a-z0-9]+)*$/u;
 
-/** Shared name rule (lowercase words joined by `-`, ≤64 chars). Exported so the
+/** Shared name rule (Chinese chars, lowercase letters, digits joined by `-`, ≤64 chars). Exported so the
  * skill writer validates new skills with the exact same pattern the loader uses
  * to parse them. */
 export const SKILL_NAME_PATTERN = NAME_PATTERN;
@@ -28,7 +28,7 @@ export function parseSkillFile(filePath: string, raw: string): ParsedSkill {
 	if (!name) return { skill: null, warning: "缺少 name" };
 	if (name.length > 64) return { skill: null, warning: `name 过长（${name.length} > 64）` };
 	if (!NAME_PATTERN.test(name)) {
-		return { skill: null, warning: "name 仅允许小写字母、数字、连字符（如 pi-knowledge-base）" };
+		return { skill: null, warning: "name 仅允许中文、小写字母、数字、连字符（如 pi-knowledge-base、退款处理）" };
 	}
 	if (!description) return { skill: null, warning: "缺少 description" };
 	if (description.length > 1024) {

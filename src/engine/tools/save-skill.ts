@@ -22,7 +22,7 @@ export function createSaveToSkillTool(
 			"不要因为内容看起来像流程就自行改存为技能；同一条内容默认只写一个渠道，除非对方明确要求「同时保存到知识库和做成技能」才可两边都写。",
 		parameters: Type.Object({
 			name: Type.String({
-				description: "技能名称，英文 kebab-case，小写字母/数字/连字符，如 handle-refund",
+				description: "技能名称，中文或小写英文/数字/连字符，如 退款处理、handle-refund",
 			}),
 			description: Type.String({
 				description: "一句话说明该技能何时被触发（≤1024 字），作为技能的触发依据",

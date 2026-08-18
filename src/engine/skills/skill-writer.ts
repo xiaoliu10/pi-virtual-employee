@@ -19,7 +19,7 @@ import { SKILL_NAME_PATTERN, parseSkillFile } from "./skill-parser.js";
 export type SkillWriteMode = "create" | "replace";
 
 export interface SkillUpsertInput {
-	/** Stable kebab-case skill name. */
+	/** Stable skill name (Chinese chars / lowercase letters / digits joined by `-`). */
 	name: string;
 	/** One-line trigger description (≤1024 chars). */
 	description: string;
@@ -180,7 +180,7 @@ export class SkillWriter {
 function validateName(name: string): string | null {
 	if (!name) return "name 不能为空";
 	if (name.length > 64) return `name 过长（${name.length} > 64）`;
-	if (!SKILL_NAME_PATTERN.test(name)) return "name 仅允许小写字母、数字、连字符（如 handle-refund）";
+	if (!SKILL_NAME_PATTERN.test(name)) return "name 仅允许中文、小写字母、数字、连字符（如 handle-refund、退款处理）";
 	return null;
 }
 
