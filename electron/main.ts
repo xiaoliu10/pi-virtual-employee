@@ -182,7 +182,11 @@ async function copyTree(src: string, dest: string): Promise<void> {
 async function importSkillZip(
 	zipPath: string,
 	userSkillsDir: string,
-): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
+	confirmOverwrite?: (name: string) => Promise<"overwrite" | "skip" | "cancel">,
+): Promise<
+	| { ok: true; name: string; skipped?: boolean; canceled?: boolean }
+	| { ok: false; error: string }
+> {
 	let zip: AdmZip;
 	try {
 		zip = new AdmZip(zipPath);
@@ -237,8 +241,14 @@ async function importSkillZip(
 	}
 
 	const dest = path.join(userSkillsDir, name);
-	// Same-name overwrite mirrors the existing directory-import behavior. Clean
-	// the target first so stale files from a prior version don't linger.
+	// Same-name import: ask before replacing an existing skill so the user never
+	// loses local edits silently. Clean the target first when overwriting so
+	// stale files from a prior version don't linger.
+	if (confirmOverwrite && existsSync(dest)) {
+		const choice = await confirmOverwrite(name);
+		if (choice === "cancel") return { ok: true, name, skipped: false, canceled: true };
+		if (choice === "skip") return { ok: true, name, skipped: true };
+	}
 	await rm(dest, { recursive: true, force: true }).catch(() => {});
 	await mkdir(dest, { recursive: true });
 
@@ -254,7 +264,7 @@ async function importSkillZip(
 		await mkdir(path.dirname(target), { recursive: true });
 		await writeFile(target, entry.getData());
 	}
-	return { ok: true, name };
+	return { ok: true, name, skipped: false };
 }
 
 /** If every relative path shares the same first segment followed by `/`, return
@@ -861,11 +871,34 @@ async function main(): Promise<void> {
 						{ name: "Zip", extensions: ["zip"] },
 					],
 				});
-		if (open.canceled || !open.filePaths.length) return { imported: 0, errors: [] as string[] };
+		if (open.canceled || !open.filePaths.length) return { imported: 0, skipped: 0, errors: [] as string[] };
 		const errors: string[] = [];
 		let imported = 0;
+		let skipped = 0;
+		let canceledAll = false;
+		// Ask once per conflicting skill: overwrite / skip this one / cancel the
+		// remaining imports. "取消" aborts the whole loop so no further prompts appear.
+		const confirmOverwrite = async (name: string): Promise<"overwrite" | "skip" | "cancel"> => {
+			const opts: Electron.MessageBoxOptions = {
+				type: "question",
+				title: "技能已存在",
+				message: `已存在同名技能「${name}」，是否覆盖？`,
+				detail: "覆盖将删除原有技能的全部文件。",
+				buttons: ["覆盖", "跳过", "取消剩余导入"],
+				defaultId: 0,
+				cancelId: 2,
+				noLink: true,
+			};
+			const { response } = mainWindow
+				? await dialog.showMessageBox(mainWindow, opts)
+				: await dialog.showMessageBox(opts);
+			if (response === 0) return "overwrite";
+			if (response === 1) return "skip";
+			return "cancel";
+		};
 		await mkdir(userSkillsDir, { recursive: true }).catch(() => {});
 		for (const selected of open.filePaths) {
+			if (canceledAll) break;
 			try {
 				const stat = await import("node:fs/promises").then((fs) => fs.stat(selected));
 				if (stat.isDirectory()) {
@@ -878,17 +911,43 @@ async function main(): Promise<void> {
 						errors.push(`${name}: 目录内缺少 SKILL.md，已跳过`);
 						continue;
 					}
+					if (existsSync(dest)) {
+						const choice = await confirmOverwrite(name);
+						if (choice === "cancel") {
+							canceledAll = true;
+							continue;
+						}
+						if (choice === "skip") {
+							skipped++;
+							continue;
+						}
+					}
 					await rm(dest, { recursive: true, force: true });
 					await mkdir(dest, { recursive: true });
 					await copyTree(selected, dest);
 					imported++;
 				} else if (selected.toLowerCase().endsWith(".zip")) {
-					const result = await importSkillZip(selected, userSkillsDir);
-					if (result.ok) imported++;
-					else errors.push(`${path.basename(selected)}: ${result.error}`);
+					const result = await importSkillZip(selected, userSkillsDir, confirmOverwrite);
+					if (result.ok) {
+						if (result.canceled) canceledAll = true;
+						else if (result.skipped) skipped++;
+						else imported++;
+					} else errors.push(`${path.basename(selected)}: ${result.error}`);
 				} else if (selected.toLowerCase().endsWith(".md")) {
 					const name = path.basename(selected);
-					await copyFile(selected, path.join(userSkillsDir, name));
+					const dest = path.join(userSkillsDir, name);
+					if (existsSync(dest)) {
+						const choice = await confirmOverwrite(name);
+						if (choice === "cancel") {
+							canceledAll = true;
+							continue;
+						}
+						if (choice === "skip") {
+							skipped++;
+							continue;
+						}
+					}
+					await copyFile(selected, dest);
 					imported++;
 				} else {
 					errors.push(`${path.basename(selected)}: 仅支持 .md 文件、含 SKILL.md 的目录或 zip`);
@@ -898,7 +957,7 @@ async function main(): Promise<void> {
 			}
 		}
 		await engine.invalidate();
-		return { imported, errors };
+		return { imported, skipped, errors };
 	});
 	ipcMain.handle("skills:delete", async (_e, filePath: string) => {
 		// Containment check via canonical paths — a string prefix check could be

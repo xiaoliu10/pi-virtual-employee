@@ -85,7 +85,7 @@ testOss(): Promise<{ ok: boolean; detail: string }>;
 	pickDirectory(): Promise<string | null>;
 	listSkills(): Promise<SkillInfo[]>;
 	refreshSkills(): Promise<boolean>;
-	importSkills(): Promise<{ imported: number; errors: string[] }>;
+	importSkills(): Promise<{ imported: number; skipped: number; errors: string[] }>;
 	deleteSkill(filePath: string): Promise<boolean>;
 	setEnabledSkill(name: string, enabled: boolean): Promise<boolean>;
 	getUpdateState(): Promise<UpdateState>;

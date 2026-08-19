@@ -34,7 +34,8 @@ export function SkillsSection(): ReactNode {
 			const res = await api.importSkills();
 			refresh();
 			if (res.errors.length > 0) flash(`导入 ${res.imported} 个，失败：${res.errors.join("；")}`);
-			else if (res.imported > 0) flash(`已导入 ${res.imported} 个技能`);
+			else if (res.imported > 0) flash(`已导入 ${res.imported} 个技能${res.skipped > 0 ? `，跳过同名 ${res.skipped} 个` : ""}`);
+			else if (res.skipped > 0) flash(`未导入，跳过同名技能 ${res.skipped} 个`);
 			else flash("未导入任何技能");
 		} finally {
 			setBusy(false);
