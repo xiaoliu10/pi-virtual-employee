@@ -466,7 +466,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 											</label>
 
 											<label className="flex cursor-pointer items-center justify-between rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
-												<div><div className="text-sm font-medium text-slate-800">无人值守自动更新</div><div className="mt-1 text-xs text-slate-400">适用于不常看界面的服务器：发现新版本自动下载，等待员工空闲时自动重启安装。关闭则需手动确认下载和安装。仅 Windows 生效。</div></div>
+												<div><div className="text-sm font-medium text-slate-800">无人值守自动更新</div><div className="mt-1 text-xs text-slate-400">适用于不常看界面的服务器：发现新版本自动下载，等待员工空闲时自动重启安装。默认开启，仅 Windows 打包版生效；管理员也可在对话中通过 manage_update 开关。</div></div>
 												<input type="checkbox" checked={draft.general.autoUpdate} onChange={(event) => setGeneral({ autoUpdate: event.target.checked })} className="h-5 w-5 accent-blue-500" />
 											</label>
 

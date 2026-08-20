@@ -26,6 +26,7 @@ import type { FileSystemService } from "../filesystem/filesystem-service.js";
 import type { ReportService } from "../reports/report-service.js";
 import type { DownloadService } from "../downloads/download-service.js";
 import { buildSystemPrompt, buildTools } from "./definition.js";
+import type { UpdateOperations } from "./tools/update.js";
 import { maybeCompact, rehydrateMessages } from "./context.js";
 import { SkillLoader, pickActiveSkills } from "./skills/skill-loader.js";
 import { SkillWriter } from "./skills/skill-writer.js";
@@ -127,6 +128,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * without aborting any other in-flight turn.
 	 */
 	private skillsRevision = 0;
+	/** Conversation-side updater operations; absent outside packaged Electron. */
+	private updates?: UpdateOperations;
 	/** Per-conversation file-sender for the turn in flight (set/cleared in send()). */
 	private readonly turnSendFile = new Map<string, FileSender>();
 	/** Per-conversation inline-image sender for the turn in flight (send_image tool). */
@@ -152,6 +155,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 		for (const provider of builtinProviders()) this.models.setProvider(provider);
 		this.skillLoader = new SkillLoader(paths.builtinSkillsDir, paths.userSkillsDir);
 		this.skillWriter = new SkillWriter(this.skillLoader, paths.userSkillsDir);
+	}
+
+	/** Inject the platform updater after construction; new sessions see manage_update. */
+	setUpdateOperations(updates: UpdateOperations | undefined): void {
+		this.updates = updates;
 	}
 
 	/** List loaded skills (for the management UI), annotated with enabled state. */
@@ -398,7 +406,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 					isScheduledRun: conversationId.startsWith("sched:"),
 				}),
 				model: this.buildModel(supplier, modelId),
-				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } } }),
+				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } } }),
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
 				messages: rehydrateMessages(this.history.listMessages(conversationId)),

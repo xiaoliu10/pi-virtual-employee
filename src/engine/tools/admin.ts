@@ -27,12 +27,18 @@ import type { InboundActor } from "../../im/types.js";
 /** The actor context a tool call executes under (undefined = non-IM channel). */
 export type ActorContext = (InboundActor & { text: string }) | undefined;
 
-export interface AdminToolDeps {
-	config: ConfigStore;
-	resolveActor: (conversationId: string) => ActorContext;
-	/** Called after a successful write so cached sessions rebuild on next turn. */
-	onConfigChanged: () => void;
-	conversationId: string;
+/** Authorization failure result shared by guarded conversation tools. */
+export type AdminRefusal = {
+	content: { type: "text"; text: string }[];
+	details: { refused: true; reason: string };
+};
+
+/** Refusal with a short reason the model relays verbatim. */
+export function refuse(reason: string): AdminRefusal {
+	return {
+		content: [{ type: "text" as const, text: `⛔ 已拒绝：${reason}` }],
+		details: { refused: true, reason },
+	};
 }
 
 /**
@@ -42,27 +48,17 @@ export interface AdminToolDeps {
  */
 const CONFIRM_RE = /(^|[^a-z])((请)?确认|好的|执行|yes|ok)([^a-z]|$)/i;
 
-function isExplicitConfirmation(userText: string): boolean {
+export function isExplicitConfirmation(userText: string): boolean {
 	return CONFIRM_RE.test(userText.trim());
 }
 
-/** Refusal with a short reason the model relays verbatim. */
-function refuse(reason: string) {
-	return {
-		content: [{ type: "text" as const, text: `⛔ 已拒绝：${reason}` }],
-		details: { refused: true, reason },
-	};
-}
-
 /**
- * Authorize one admin operation. Returns either a refusal or the acting
- * context. Also decides the "first admin bootstrap": when the whitelist is
- * empty, an explicit confirmation in a 1:1 chat makes the sender the admin.
+ * Platform-verified single-chat check shared by guarded tools. Group chats and
+ * non-IM conversations have no reliable operation actor and are refused here.
  */
-function authorize(
-	deps: AdminToolDeps,
-	needConfirmation: boolean,
-): ReturnType<typeof refuse> | { actor: NonNullable<ActorContext>; claimed: boolean } {
+export function requireSingleChatActor(deps: Pick<AdminToolDeps, "resolveActor" | "conversationId">):
+	| AdminRefusal
+	| { actor: NonNullable<ActorContext> } {
 	const actor = deps.resolveActor(deps.conversationId);
 	if (!actor) {
 		return refuse("当前会话不是 IM 单聊（无经过验证的发送者身份），管理操作只能在 IM 单聊中进行。");
@@ -73,7 +69,57 @@ function authorize(
 	if (!actor.senderId) {
 		return refuse("无法识别发送者身份（senderId 为空），拒绝执行。");
 	}
+	return { actor };
+}
 
+/**
+ * Whitelisted-admin gate shared by guarded tools. Unlike `authorize`, an empty
+ * whitelist NEVER claims the caller — update/restart tools are denied on an
+ * unclaimed deployment until a first admin explicitly uses manage_admin claim.
+ */
+export function requireConfirmedAdmin(
+	deps: Pick<AdminToolDeps, "config" | "resolveActor" | "conversationId">,
+	opts: { needConfirmation: boolean; confirmationHint?: string },
+): AdminRefusal | { actor: NonNullable<ActorContext> } {
+	const gate = requireSingleChatActor(deps);
+	if ("content" in gate) return gate;
+	const { actor } = gate;
+	const adminIds = deps.config.all().security.adminStaffIds;
+	if (adminIds.length === 0) {
+		return refuse("管理员尚未设置。请先在单聊中使用 manage_admin 的 claim 动作认领首位管理员。");
+	}
+	if (!adminIds.includes(actor.senderId)) {
+		return refuse("你不是本系统的管理员，无权执行此操作。如需管理员权限，请联系现有管理员在单聊中添加。");
+	}
+	if (opts.needConfirmation && !isExplicitConfirmation(actor.text)) {
+		return refuse(
+			opts.confirmationHint ??
+				"该操作会影响当前员工运行。请明确说明要执行的操作，并在当前消息中包含「确认」（或同义明确肯定语）。",
+		);
+	}
+	return { actor };
+}
+
+export interface AdminToolDeps {
+	config: ConfigStore;
+	resolveActor: (conversationId: string) => ActorContext;
+	/** Called after a successful write so cached sessions rebuild on next turn. */
+	onConfigChanged: () => void;
+	conversationId: string;
+}
+
+/**
+ * Authorize one admin operation. Returns either a refusal or the acting
+ * context. Also decides the "first admin bootstrap": when the whitelist is
+ * empty, an explicit confirmation in a 1:1 chat makes the sender the admin.
+ */
+function authorize(
+	deps: AdminToolDeps,
+	needConfirmation: boolean,
+): AdminRefusal | { actor: NonNullable<ActorContext>; claimed: boolean } {
+	const gate = requireSingleChatActor(deps);
+	if ("content" in gate) return gate;
+	const { actor } = gate;
 	const adminIds = deps.config.all().security.adminStaffIds;
 	if (adminIds.length === 0) {
 		// Unclaimed deployment: the first explicit confirmer becomes first admin.
@@ -92,7 +138,7 @@ function authorize(
 }
 
 /** Mask an id for audit logs (keep first/last chars). */
-function maskId(id: string): string {
+export function maskId(id: string): string {
 	if (id.length <= 4) return id[0] + "***";
 	return `${id.slice(0, 2)}***${id.slice(-2)}`;
 }

@@ -52,6 +52,8 @@ let checking = false;
 let downloading = false;
 let pendingVersion: string | undefined;
 let pendingReleaseNotes: string | undefined;
+/** One-shot request from an IM admin: install once the current update is downloaded. */
+let requestedInstall = false;
 
 /**
  * Unattended mode: download + install without a human at the UI. Wired by
@@ -60,11 +62,28 @@ let pendingReleaseNotes: string | undefined;
  */
 let unattendedEnabled: () => boolean = () => false;
 let isEngineIdle: () => boolean = () => true;
+/** Before installing, pause new IM turns; released on failure/timeout. */
+let beginDrain: (() => void) | null = null;
+let endDrain: (() => void) | null = null;
 
 /** main.ts hooks the engine idle check + autoUpdate config in here. */
-export function setupUnattended(opts: { enabled: () => boolean; isIdle: () => boolean }): void {
+export function setupUnattended(opts: {
+	enabled: () => boolean;
+	isIdle: () => boolean;
+	beginDrain?: () => void;
+	endDrain?: () => void;
+}): void {
 	unattendedEnabled = opts.enabled;
 	isEngineIdle = opts.isIdle;
+	beginDrain = opts.beginDrain ?? null;
+	endDrain = opts.endDrain ?? null;
+}
+
+/** Whether this build can download and restart into a Windows update. */
+export function updateCapability(): { supported: boolean; reason?: string } {
+	if (process.platform !== "win32") return { supported: false, reason: "当前系统不是 Windows，仅 Windows 打包版支持自动更新" };
+	if (!app.isPackaged) return { supported: false, reason: "开发模式不支持自动更新" };
+	return { supported: true };
 }
 
 /** Whether the updater actually runs (packaged Windows only). */
@@ -115,11 +134,12 @@ function wireEvents(): void {
 			releaseNotes: pendingReleaseNotes,
 			manualUrl: manualUrl(info.version ?? ""),
 		});
-		// Unattended servers: kick the download off without waiting for a click.
-		if (unattendedEnabled()) void downloadNow().catch(() => {});
+		// Download without a click when unattended is on, or an IM admin asked for it.
+		if (unattendedEnabled() || requestedInstall) void downloadNow().catch(() => {});
 	});
 	autoUpdater.on("update-not-available", () => {
 		checking = false;
+		requestedInstall = false;
 		setState({ phase: "none", currentVersion: app.getVersion() });
 	});
 	autoUpdater.on("download-progress", (progress: { percent?: number }) => {
@@ -133,11 +153,13 @@ function wireEvents(): void {
 	autoUpdater.on("update-downloaded", (info: { version?: string } = {}) => {
 		downloading = false;
 		setState({ phase: "ready", currentVersion: app.getVersion(), version: info.version ?? pendingVersion ?? "" });
-		if (unattendedEnabled()) scheduleIdleRestart();
+		if (unattendedEnabled() || requestedInstall) scheduleIdleRestart();
 	});
 	autoUpdater.on("error", (err: Error) => {
 		checking = false;
 		downloading = false;
+		requestedInstall = false;
+		endDrain?.();
 		setState({ phase: "error", currentVersion: app.getVersion(), message: err.message || String(err) });
 	});
 	autoUpdater.on("update-cancelled", () => {
@@ -159,11 +181,21 @@ function scheduleIdleRestart(): void {
 		if (Date.now() > deadline) {
 			clearInterval(idlePollTimer);
 			idlePollTimer = undefined;
+			requestedInstall = false;
+			endDrain?.();
 			return;
 		}
 		if (!isEngineIdle()) return;
 		clearInterval(idlePollTimer);
 		idlePollTimer = undefined;
+		// Stop new IM turns first, then re-check before restarting. The first poll
+		// fires only after this callback returns, so the current turn's reply has
+		// time to leave engine.send() and reach the IM adapter.
+		beginDrain?.();
+		if (!isEngineIdle()) {
+			scheduleIdleRestart();
+			return;
+		}
 		quitAndInstall();
 	}, IDLE_POLL_MS);
 }
@@ -212,9 +244,48 @@ export async function downloadNow(): Promise<UpdateState> {
 		await autoUpdater.downloadUpdate();
 	} catch (err) {
 		downloading = false;
+		requestedInstall = false;
 		setState({ phase: "error", currentVersion: app.getVersion(), message: (err as Error).message || String(err) });
 	}
 	return lastState;
+}
+
+export type UpdateRequest =
+	| { started: true; mode: "checking" | "downloading" | "pending" | "installing"; state: UpdateState }
+	| { started: false; reason: string; state: UpdateState };
+
+/**
+ * Conversation-triggered update: an admin has already authorized the request,
+ * so this routine owns check → download → idle install end to end. It is
+ * fire-and-forget by design — the caller replies first, and the updater only
+ * restarts after all in-flight turns have drained.
+ */
+export function requestUpdateAndInstall(): UpdateRequest {
+	const capability = updateCapability();
+	if (!capability.supported) {
+		return { started: false, reason: capability.reason ?? "当前环境不支持自动更新", state: lastState };
+	}
+	if (!enabled()) {
+		return { started: false, reason: "自动更新不可用", state: lastState };
+	}
+
+	requestedInstall = true;
+	switch (lastState.phase) {
+		case "idle":
+		case "none":
+		case "error":
+			void checkNow().catch(() => {});
+			return { started: true, mode: "checking", state: lastState };
+		case "available":
+			void downloadNow().catch(() => {});
+			return { started: true, mode: "downloading", state: lastState };
+		case "checking":
+		case "downloading":
+			return { started: true, mode: "pending", state: lastState };
+		case "ready":
+			scheduleIdleRestart();
+			return { started: true, mode: "installing", state: lastState };
+	}
 }
 
 /** Current state (renderer pulls this on mount). */

@@ -34,6 +34,8 @@ export class IMAdapterManager {
 	private readonly active = new Map<string, IMAdapter>();
 	/** Last config applied per channel id — used to detect credential changes. */
 	private readonly applied = new Map<string, ImChannelConfig>();
+	/** Update installs drain inbound work: new IM turns get a short maintenance reply. */
+	private draining = false;
 	/** Notified after an inbound message is stored, so the UI can refresh the task list. */
 	private onActivity?: (conversationId: string) => void;
 
@@ -46,6 +48,11 @@ export class IMAdapterManager {
 	/** Inject the UI-refresh callback (main process wires it to a webContents.send). */
 	setOnActivity(fn: (conversationId: string) => void): void {
 		this.onActivity = fn;
+	}
+
+	/** Pause/resume new IM turns while an app update is about to restart. */
+	setDraining(draining: boolean): void {
+		this.draining = draining;
 	}
 
 	/** Reconcile running adapters with the current config. */
@@ -157,6 +164,9 @@ export class IMAdapterManager {
 		return {
 			handle: (msg, ctx) =>
 				this.serialize(msg.conversationId, async () => {
+					if (this.draining) {
+						return "⏳ 系统正在安装应用更新，当前消息不会被执行；请稍后重新发送。";
+					}
 					// IM slash commands (OpenClaw-style): /models, /model <n|id>
 					const cmd = parseCommand(msg.text);
 					if (cmd) return this.runCommand(msg.conversationId, cmd);

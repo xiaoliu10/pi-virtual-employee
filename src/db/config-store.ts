@@ -210,7 +210,8 @@ export interface AppConfig {
 		/**
 		 * Unattended auto-update (headless servers): check → download → wait for
 		 * the engine to be idle → restart & install, all without a human at the
-		 * UI. Off = the interactive flow (announce, user clicks download/install).
+		 * UI. Default-on for new installs and configs predating this setting;
+		 * an explicitly stored `false` remains off. Off = interactive flow.
 		 */
 		autoUpdate: boolean;
 	};
@@ -341,7 +342,7 @@ const DEFAULTS: AppConfig = {
 	model: { suppliers: [], defaultSupplierId: "", defaultModelId: "" },
 	identity: { name: "客服小派", role: "虚拟客服", duty: "在线为客户提供专业、礼貌、高效的服务", serviceHours: "7×24h" },
 	im: { enabled: false, channels: [], ack: { enabled: true, text: "👍 收到，正在处理…" } },
-	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 30, maxToolSteps: 20, autoUpdate: false },
+	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 30, maxToolSteps: 20, autoUpdate: true },
 	browser: { enabled: false, headless: true, allowedDomains: [] },
 	scheduler: { enabled: true },
 	prompt: { extra: "", rules: "" },

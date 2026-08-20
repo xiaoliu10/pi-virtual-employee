@@ -26,7 +26,8 @@ import { DownloadService } from "../src/downloads/download-service.js";
 import { EmployeeEngine } from "../src/engine/engine.js";
 import { buildSystemPrompt, defaultCoreRules } from "../src/engine/prompt.js";
 import { startHttpTransport } from "../src/transport/http.js";
-import { setupAutoUpdater, getUpdateState, checkNow, downloadNow, quitAndInstall, stopUpdater, setupUnattended } from "./updater.js";
+import { setupAutoUpdater, getUpdateState, checkNow, downloadNow, quitAndInstall, stopUpdater, setupUnattended, updateCapability, requestUpdateAndInstall, type UpdateState } from "./updater.js";
+import type { UpdateToolStatus } from "../src/engine/tools/update.js";
 import { IMAdapterManager, availableChannels } from "../src/im/manager.js";
 import {
 	buildEmployeePackage,
@@ -49,6 +50,17 @@ const isDev = !!process.env.VITE_DEV_SERVER_URL;
  */
 const PROFILE_NAME_RE = /^[A-Za-z0-9_-]+$/;
 const LOCK_FILE = ".profile.lock";
+
+/** Project the Electron updater state to the platform-agnostic tool status. */
+function toUpdateToolStatus(state: UpdateState): UpdateToolStatus {
+	return {
+		currentVersion: state.currentVersion,
+		phase: state.phase,
+		targetVersion: "version" in state ? state.version : undefined,
+		percent: state.phase === "downloading" ? state.percent : undefined,
+		error: state.phase === "error" ? state.message : undefined,
+	};
+}
 
 function resolveProfile(argv: string[], env: NodeJS.ProcessEnv): string {
 	const fromArg = (() => {
@@ -359,6 +371,15 @@ async function main(): Promise<void> {
 	const initialCfg = config.all();
 	const reportService = new ReportService(new ArtifactStore(db), config);
 	const engine = new EmployeeEngine(config, history, knowledge, browser, scheduler, documents, filesystem, reportService, downloadService, { builtinSkillsDir, userSkillsDir }, { timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000 });
+	engine.setUpdateOperations({
+		isSupported: updateCapability,
+		getStatus: () => toUpdateToolStatus(getUpdateState()),
+		checkNow: async () => toUpdateToolStatus(await checkNow()),
+		requestUpdateAndInstall: () => {
+			const result = requestUpdateAndInstall();
+			return { ...result, status: toUpdateToolStatus(result.state) };
+		},
+	});
 	knowledge.setLlm((system, user) => engine.complete(system, user));
 	// Self-heal: pick up chunks a previous run left pending/failed (crash, upgrade,
 	// or a transient embedding failure). Best-effort — never block startup on it.
@@ -1024,6 +1045,8 @@ async function main(): Promise<void> {
 	setupUnattended({
 		enabled: () => config.all().general.autoUpdate,
 		isIdle: () => engine.isIdle(),
+		beginDrain: () => im.setDraining(true),
+		endDrain: () => im.setDraining(false),
 	});
 	// Push IM activity to the renderer so the task list refreshes live (the
 	// renderer otherwise never learns about asynchronously-stored IM messages).
