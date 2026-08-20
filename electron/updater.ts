@@ -9,6 +9,12 @@
  * "restart & install", or the next normal quit installs it silently
  * (autoInstallOnAppQuit).
  *
+ * Unattended mode (headless servers, config general.autoUpdate=true): after
+ * download completes, a poll waits for the engine to be idle (no in-flight
+ * agent turn) and then restarts into the installer automatically. The poll
+ * gives up after 24h — the downloaded update still installs on the next
+ * normal quit via autoInstallOnAppQuit.
+ *
  * The renderer is the display surface: every state change is pushed as
  * "update:event", and on mount the renderer pulls "update:getState" so events
  * that fired before it subscribed (the startup check fires ~15s in) aren't
@@ -24,6 +30,10 @@ const { autoUpdater } = electronUpdater;
 const UPDATE_FEED = "https://gitee.com/xiaoliu10/pi-virtual-employee/releases/download/latest";
 const FIRST_CHECK_DELAY_MS = 15_000;
 const RECHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+/** Unattended mode: how often to re-check engine idleness after a download. */
+const IDLE_POLL_MS = 60_000;
+/** Unattended mode: give up waiting for idle after this long. */
+const IDLE_WAIT_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
 export type UpdateState =
 	| { phase: "idle"; currentVersion: string }
@@ -37,10 +47,25 @@ export type UpdateState =
 let lastState: UpdateState = { phase: "idle", currentVersion: app.getVersion() };
 let window: BrowserWindow | null = null;
 let recheckTimer: NodeJS.Timeout | undefined;
+let idlePollTimer: NodeJS.Timeout | undefined;
 let checking = false;
 let downloading = false;
 let pendingVersion: string | undefined;
 let pendingReleaseNotes: string | undefined;
+
+/**
+ * Unattended mode: download + install without a human at the UI. Wired by
+ * main.ts to config (general.autoUpdate) and the engine's idle signal. Both
+ * are getters so config changes apply without re-wiring.
+ */
+let unattendedEnabled: () => boolean = () => false;
+let isEngineIdle: () => boolean = () => true;
+
+/** main.ts hooks the engine idle check + autoUpdate config in here. */
+export function setupUnattended(opts: { enabled: () => boolean; isIdle: () => boolean }): void {
+	unattendedEnabled = opts.enabled;
+	isEngineIdle = opts.isIdle;
+}
 
 /** Whether the updater actually runs (packaged Windows only). */
 function enabled(): boolean {
@@ -90,6 +115,8 @@ function wireEvents(): void {
 			releaseNotes: pendingReleaseNotes,
 			manualUrl: manualUrl(info.version ?? ""),
 		});
+		// Unattended servers: kick the download off without waiting for a click.
+		if (unattendedEnabled()) void downloadNow().catch(() => {});
 	});
 	autoUpdater.on("update-not-available", () => {
 		checking = false;
@@ -106,6 +133,7 @@ function wireEvents(): void {
 	autoUpdater.on("update-downloaded", (info: { version?: string } = {}) => {
 		downloading = false;
 		setState({ phase: "ready", currentVersion: app.getVersion(), version: info.version ?? pendingVersion ?? "" });
+		if (unattendedEnabled()) scheduleIdleRestart();
 	});
 	autoUpdater.on("error", (err: Error) => {
 		checking = false;
@@ -116,6 +144,28 @@ function wireEvents(): void {
 		downloading = false;
 		setState({ phase: "idle", currentVersion: app.getVersion() });
 	});
+}
+
+/**
+ * Unattended mode: poll the engine until it's idle (no in-flight agent turn),
+ * then restart into the installer. Stops after IDLE_WAIT_TIMEOUT_MS — the
+ * downloaded update still applies on the next normal quit, so giving up just
+ * defers the restart rather than losing it.
+ */
+function scheduleIdleRestart(): void {
+	if (idlePollTimer) clearInterval(idlePollTimer);
+	const deadline = Date.now() + IDLE_WAIT_TIMEOUT_MS;
+	idlePollTimer = setInterval(() => {
+		if (Date.now() > deadline) {
+			clearInterval(idlePollTimer);
+			idlePollTimer = undefined;
+			return;
+		}
+		if (!isEngineIdle()) return;
+		clearInterval(idlePollTimer);
+		idlePollTimer = undefined;
+		quitAndInstall();
+	}, IDLE_POLL_MS);
 }
 
 /** Schedule the periodic recheck. */
@@ -177,6 +227,10 @@ export function stopUpdater(): void {
 	if (recheckTimer) {
 		clearInterval(recheckTimer);
 		recheckTimer = undefined;
+	}
+	if (idlePollTimer) {
+		clearInterval(idlePollTimer);
+		idlePollTimer = undefined;
 	}
 }
 

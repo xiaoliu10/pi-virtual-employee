@@ -465,6 +465,11 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 												<input type="checkbox" checked={draft.general.autostart} onChange={(event) => setGeneral({ autostart: event.target.checked })} className="h-5 w-5 accent-blue-500" />
 											</label>
 
+											<label className="flex cursor-pointer items-center justify-between rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
+												<div><div className="text-sm font-medium text-slate-800">无人值守自动更新</div><div className="mt-1 text-xs text-slate-400">适用于不常看界面的服务器：发现新版本自动下载，等待员工空闲时自动重启安装。关闭则需手动确认下载和安装。仅 Windows 生效。</div></div>
+												<input type="checkbox" checked={draft.general.autoUpdate} onChange={(event) => setGeneral({ autoUpdate: event.target.checked })} className="h-5 w-5 accent-blue-500" />
+											</label>
+
 											<Field label="回复语言" hint="员工的回复语言，默认中文。仅控制回复内容，不影响界面。保存后对新对话生效。">
 												<select value={draft.general.language} onChange={(e) => setGeneral({ language: e.target.value as AppConfig["general"]["language"] })} className={inputCls + " cursor-pointer"}>
 													<option value="zh-CN">中文</option>

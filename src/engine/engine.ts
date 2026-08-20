@@ -786,6 +786,14 @@ export class EmployeeEngine implements EmployeeRuntime {
 		return this.sessions.size;
 	}
 
+	/** True when no agent is mid-turn — the updater's "safe to restart" signal. */
+	isIdle(): boolean {
+		for (const [, agent] of this.sessions) {
+			if (agent.state.isStreaming) return false;
+		}
+		return true;
+	}
+
 	isReadOnlyConversation(conversationId: string): boolean {
 		return this.history.isReadOnly(conversationId);
 	}

@@ -26,7 +26,7 @@ import { DownloadService } from "../src/downloads/download-service.js";
 import { EmployeeEngine } from "../src/engine/engine.js";
 import { buildSystemPrompt, defaultCoreRules } from "../src/engine/prompt.js";
 import { startHttpTransport } from "../src/transport/http.js";
-import { setupAutoUpdater, getUpdateState, checkNow, downloadNow, quitAndInstall, stopUpdater } from "./updater.js";
+import { setupAutoUpdater, getUpdateState, checkNow, downloadNow, quitAndInstall, stopUpdater, setupUnattended } from "./updater.js";
 import { IMAdapterManager, availableChannels } from "../src/im/manager.js";
 import {
 	buildEmployeePackage,
@@ -1019,6 +1019,12 @@ async function main(): Promise<void> {
 	// renderer. No-op in dev / macOS (packaged Windows-only); setState still
 	// pushes an "idle" so the UI shows the current version without update buttons.
 	if (mainWindow) setupAutoUpdater(mainWindow);
+	// Unattended auto-update wiring: re-read config + engine idle on each use
+	// so toggling the setting takes effect without a restart.
+	setupUnattended({
+		enabled: () => config.all().general.autoUpdate,
+		isIdle: () => engine.isIdle(),
+	});
 	// Push IM activity to the renderer so the task list refreshes live (the
 	// renderer otherwise never learns about asynchronously-stored IM messages).
 	im.setOnActivity((conversationId: string) => {
