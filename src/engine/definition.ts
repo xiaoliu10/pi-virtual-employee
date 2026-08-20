@@ -19,6 +19,7 @@ import { createKnowledgeTool } from "./tools/knowledge.js";
 import { createSaveToKnowledgeTool } from "./tools/save-knowledge.js";
 import { createManageKnowledgeTool } from "./tools/manage-knowledge.js";
 import { createSaveToSkillTool } from "./tools/save-skill.js";
+import { createRefreshSkillsTool } from "./tools/refresh-skills.js";
 import { createReadSkillAssetTool } from "./tools/read-skill-asset.js";
 import { createResearchWebTool } from "./tools/research-web.js";
 import { createBrowserTools } from "./tools/browser.js";
@@ -65,6 +66,9 @@ export interface ToolSetOptions {
 	/** Called after a skill is written/updated, so the engine can refresh its
 	 * skill cache and mark sessions stale without aborting the running turn. */
 	onSkillsChanged: () => Promise<void>;
+	/** Fresh skill listing for refresh_skills — the engine's listSkills(), used
+	 * to report what the reload actually picked up. */
+	listSkills: () => Promise<{ skills: { name: string }[]; info: { name: string; enabled: boolean }[] }>;
 	/** Mark sessions stale after a conversation-side config change, without
 	 * aborting the turn that performed it. */
 	onConfigChanged: () => void;
@@ -121,6 +125,9 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 	// Read-only access to a skill's bundled assets (scripts/templates that shipped
 	// alongside SKILL.md in a zip or directory import). Always-on with skills.
 	tools.push(createReadSkillAssetTool(options.userSkillsDir));
+	// Conversation-side skill reload — the "刷新" button's IM equivalent, so a
+	// remote employee can pick up imported/edited skills without the admin UI.
+	tools.push(createRefreshSkillsTool(options.listSkills, options.onSkillsChanged));
 	// Inline image delivery — degrades to a text notice when the channel can't send
 	// images, so it's safe to always register.
 	tools.push(createSendImageTool(options.resolveImageSender, options.conversationId));
