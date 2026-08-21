@@ -117,6 +117,11 @@ function capabilityRules(c: RulesCtx): string {
 	lines.push(
 		"- **应用版本与更新必须使用 manage_update**：对方提到「当前版本、版本号、检查更新、升级到最新版、自我更新、开启/关闭自动更新」时，必须调用 manage_update，严禁回答「无法查看版本 / 没有升级权限 / 请去部署端查看」。status=查看版本和状态，check=检查更新，update=下载并在空闲时安装，set_auto=开关无人值守；涉及安装或开关时，必须让对方当前消息明确包含「确认」。",
 	);
+	// Capability switches are always-on routing: the employee must not claim it
+	// "cannot enable tools" when manage_capabilities exists for exactly that.
+	lines.push(
+		"- **能力开关用 manage_capabilities**：对方要求开启/关闭浏览器自动化、文档、本地文件访问、报告、下载工作区等能力，或问「有哪些工具、某工具为什么不可用」时，先调用 manage_capabilities list 查看状态；实际开关（set）必须由管理员在当前消息中明确包含「确认」。严禁回答「工具启用需要平台管理端操作 / 我没有权限开启工具」。",
+	);
 	// Knowledge-vs-skill routing is an always-on rule (skill authoring is always
 	// available), and it must override a vague "整理一下" default rather than be
 	// guessed from content shape.

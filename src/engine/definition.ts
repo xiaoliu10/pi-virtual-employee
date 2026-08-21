@@ -31,6 +31,7 @@ import { createSaveReportTool } from "./tools/reports.js";
 import { createSendImageTool, type ImageSenderResolver } from "./tools/send-image.js";
 import { createManageAdminTool, createUpdateIdentityTool, type AdminToolDeps } from "./tools/admin.js";
 import { createManageUpdateTool, type UpdateOperations } from "./tools/update.js";
+import { createManageCapabilitiesTool } from "./tools/capabilities.js";
 import { orderTool } from "./tools/orders.js";
 import { escalateTool } from "./tools/escalate.js";
 
@@ -80,6 +81,9 @@ export interface ToolSetOptions {
 	/** Conversation-side app updater, injected by the main process. Undefined in
 	 * non-packaged/non-Electron contexts leaves manage_update off the tool list. */
 	updates?: UpdateOperations;
+	/** Packaged playwright cli.js path — lets manage_capabilities install the
+	 * Chromium kernel from a headless conversation. Always wired (skills are on). */
+	playwrightCliPath: () => string;
 	/**
 	 * Resolves the current turn's channel file-sender for a conversation (set by
 	 * the engine from the inbound context), or undefined when the channel can't
@@ -144,6 +148,15 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 		conversationId: options.conversationId,
 	};
 	tools.push(createManageAdminTool(adminDeps), createUpdateIdentityTool(adminDeps));
+	// Conversation-side capability switches — headless deployments have no desktop
+	// settings UI, so admins toggle browser/documents/… from a 1:1 chat.
+	tools.push(createManageCapabilitiesTool({
+		config: options.config,
+		resolveActor: options.resolveActor,
+		onConfigChanged: options.onConfigChanged,
+		conversationId: options.conversationId,
+		playwrightCliPath: options.playwrightCliPath,
+	}));
 	if (options.updates) {
 		tools.push(createManageUpdateTool({
 			config: options.config,
