@@ -162,6 +162,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.updates = updates;
 	}
 
+	/** Running application version exposed to deterministic IM commands. */
+	appVersion(): string {
+		return this.updates?.getStatus().currentVersion ?? "unknown";
+	}
+
 	/** List loaded skills (for the management UI), annotated with enabled state. */
 	async listSkills() {
 		const { skills, info } = await this.skillLoader.list();
@@ -384,6 +389,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			initialState: {
 				systemPrompt: buildSystemPrompt({
 					name: cfg.identity.name,
+					appVersion: this.updates?.getStatus().currentVersion,
 					role: cfg.identity.role,
 					duty: cfg.identity.duty,
 					serviceHours: cfg.identity.serviceHours,

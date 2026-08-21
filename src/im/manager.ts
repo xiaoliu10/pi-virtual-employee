@@ -167,7 +167,7 @@ export class IMAdapterManager {
 					if (this.draining) {
 						return "⏳ 系统正在安装应用更新，当前消息不会被执行；请稍后重新发送。";
 					}
-					// IM slash commands (OpenClaw-style): /models, /model <n|id>
+					// IM slash commands (OpenClaw-style): /version, /models, /model <n|id>
 					const cmd = parseCommand(msg.text);
 					if (cmd) return this.runCommand(msg.conversationId, cmd);
 
@@ -208,11 +208,15 @@ export class IMAdapterManager {
 			};
 	}
 
-	/** Handle /models and /model commands, returning a text reply for the channel. */
+	/** Handle deterministic slash commands, returning a text reply for the channel. */
 	private runCommand(
 		conversationId: string,
-		cmd: { name: "models" } | { name: "model"; arg: string },
+		cmd: { name: "version" } | { name: "models" } | { name: "model"; arg: string },
 	): string {
+		if (cmd.name === "version") {
+			return `当前应用版本：v${this.engine.appVersion()}。发送「检查更新」可让 实例B 调用 manage_update 检查最新版。`;
+		}
+
 		const options = this.engine.availableModels();
 		if (options.length === 0) {
 			return "尚未启用任何可用模型,请在应用「设置 → 模型服务」中启用供应商并添加模型。";
@@ -280,8 +284,9 @@ function credChanged(prev: ImChannelConfig | undefined, next: ImChannelConfig): 
 	return prev.type !== next.type || prev.appId !== next.appId || prev.appSecret !== next.appSecret;
 }
 
-function parseCommand(text: string): { name: "models" } | { name: "model"; arg: string } | null {
+function parseCommand(text: string): { name: "version" } | { name: "models" } | { name: "model"; arg: string } | null {
 	const t = text.trim();
+	if (t === "/version" || t === "/ver") return { name: "version" };
 	if (t === "/models" || t === "/model") return { name: "models" };
 	const m = /^\/model\s+(.+)$/.exec(t);
 	if (m) return { name: "model", arg: m[1] };
