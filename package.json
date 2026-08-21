@@ -2,7 +2,7 @@
   "name": "pi-virtual-employee",
   "private": true,
   "type": "module",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Desktop virtual-employee app (Electron) built on the pi agent SDK (@earendil-works/pi-agent-core).",
   "author": "Pi Virtual Employee",
   "main": "dist-electron/main.js",
@@ -105,8 +105,7 @@
       "artifactName": "Pi-Virtual-Employee-Setup-${version}-${arch}.${ext}"
     },
     "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
+      "oneClick": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Pi Virtual Employee"

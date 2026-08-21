@@ -470,7 +470,7 @@ async function main(): Promise<void> {
 
 	// Local HTTP+SSE transport — the renderer streams chat through localhost.
 	const httpPort = Number(process.env.PORT) || 0;
-	const { port } = await startHttpTransport(engine, { port: httpPort });
+	const { port, server: httpServer } = await startHttpTransport(engine, { port: httpPort });
 	console.log(`[main] employee http transport on 127.0.0.1:${port}`);
 
 	// Preload skills so the first session already has them.
@@ -1032,6 +1032,8 @@ async function main(): Promise<void> {
 		if (consolidateTimer) clearInterval(consolidateTimer);
 		scheduler.stop();
 		stopUpdater();
+		// Ordinary quits are best-effort. The update path awaits browser/IM/HTTP
+		// cleanup explicitly in prepareToInstall BEFORE electron-updater spawns NSIS.
 		void browser.close();
 	});
 
@@ -1047,6 +1049,19 @@ async function main(): Promise<void> {
 		isIdle: () => engine.isIdle(),
 		beginDrain: () => im.setDraining(true),
 		endDrain: () => im.setDraining(false),
+		prepareToInstall: async () => {
+			// electron-updater spawns NSIS before app.quit(). Release every process /
+			// listener that can keep the old app tree alive before calling it.
+			scheduler.stop();
+			await im.stopAll();
+			await browser.close();
+			await new Promise<void>((resolve) => {
+				if (!httpServer.listening) return resolve();
+				httpServer.close(() => resolve());
+				// Node ≥18: close keep-alive connections so close() cannot hang.
+				httpServer.closeAllConnections?.();
+			});
+		},
 	});
 	// Push IM activity to the renderer so the task list refreshes live (the
 	// renderer otherwise never learns about asynchronously-stored IM messages).
