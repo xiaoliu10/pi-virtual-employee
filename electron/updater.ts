@@ -40,6 +40,8 @@ const IDLE_WAIT_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const REPLY_FLUSH_DELAY_MS = 5_000;
 /** Installer watchdog: restore service if NSIS never relaunches the app. */
 const WATCHDOG_TIMEOUT_SECONDS = 10 * 60;
+/** Watchdog: how long to wait for the (force-run-free) installer to finish. */
+const INSTALLER_WAIT_SECONDS = 10 * 60;
 const WATCHDOG_DIR = "update-watchdog";
 const UPDATE_LOG_DIR = "logs";
 const UPDATE_LOG_FILE = "updater.log";
@@ -255,11 +257,17 @@ function scheduleIdleRestart(): void {
 }
 
 /**
- * Independent PowerShell watchdog: runs outside Electron and waits for NSIS.
- * If no app process is alive after 10 minutes, it retries the copied oneClick
- * installer once. This removes the outage mode where NSIS dies/hangs after the
- * application has already quit. The installer copy is outside electron-updater's
- * cache, so cache cleanup cannot race it.
+ * Independent PowerShell watchdog — the sole restarter of the app after an
+ * update. Runs outside Electron in a non-interactive-safe way:
+ *
+ * 1. Waits for the NSIS installer to finish (max INSTALLER_WAIT_SECONDS). The
+ *    installer is launched WITHOUT --force-run, so it exits when done instead of
+ *    calling ExecShellAsUser (which hangs forever on a disconnected RDP session
+ *    — the root cause of three overnight outages).
+ * 2. If it hasn't finished in time, kills stale installers (Get-Process works on
+ *    PS2; Get-CimInstance does not) and retries the copied installer once.
+ * 3. Finally launches the installed app exe DIRECTLY via Start-Process — this
+ *    needs no interactive desktop, so service is restored even headless.
  */
 function startInstallWatchdog(): void {
 	if (process.platform !== "win32" || !downloadedInstallerPath) {
@@ -282,26 +290,35 @@ function startInstallWatchdog(): void {
 			`$installer = '${escapePowerShellSingleQuoted(installerCopy)}'`,
 			`$appExe = '${escapePowerShellSingleQuoted(appExe)}'`,
 			`$marker = '${escapePowerShellSingleQuoted(markerPath)}'`,
-			`Start-Sleep -Seconds ${WATCHDOG_TIMEOUT_SECONDS}`,
-			`$running = Get-Process -Name '${escapePowerShellSingleQuoted(exeName)}' -ErrorAction SilentlyContinue`,
-			"if ($running) {",
-			"  Add-Content -Path $log -Value \"[$([DateTime]::UtcNow.ToString('o'))] [INFO] watchdog: application recovered\"",
-			"  Set-Content -Path $marker -Value 'ok'",
-			"  exit 0",
+			`$exeName = '${escapePowerShellSingleQuoted(exeName)}'`,
+			"function Log($m) { Add-Content -Path $log -Value \"[$([DateTime]::UtcNow.ToString('o'))] $m\" }",
+			"function TestApp { return [bool](Get-Process -Name $exeName -ErrorAction SilentlyContinue) }",
+			"function KillStaleInstallers {",
+			"  Get-Process | Where-Object { $_.ProcessName -like 'Pi-Virtual-Employee-Setup*' } | Stop-Process -Force",
 			"}",
-			"Add-Content -Path $log -Value \"[$([DateTime]::UtcNow.ToString('o'))] [ERROR] watchdog: app absent after timeout, terminate stale installers and retry\"",
-			"Get-CimInstance -ClassName Win32_Process | Where-Object { $_.Name -like 'Pi-Virtual-Employee-Setup-*.exe' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+			// Phase 0: wait for the already-running installer (no --force-run → it
+			// exits by itself; no interactive desktop needed).
+			`"watchdog phase0: waiting up to ${INSTALLER_WAIT_SECONDS}s for installer" | Log`,
+			`$deadline = (Get-Date).AddSeconds(${INSTALLER_WAIT_SECONDS})`,
+			"while ((Get-Date) -lt $deadline) {",
+			"  if (TestApp) { Log 'watchdog: application recovered'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
+			"  Start-Sleep -Seconds 5",
+			"}",
+			// Phase 1: kill stale installers and retry the install once.
+			"if (TestApp) { Log 'watchdog: application recovered'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
+			"Log 'watchdog: installer did not finish in time; killing stale installers and retrying'",
+			"KillStaleInstallers",
 			"Start-Sleep -Seconds 3",
-			"$retry = Start-Process -FilePath $installer -ArgumentList @('--updated','/S','--force-run') -PassThru",
+			"$retry = Start-Process -FilePath $installer -ArgumentList @('--updated','/S') -PassThru",
 			"$finished = $retry.WaitForExit(180000)",
-			"if (-not $finished) { Stop-Process -Id $retry.Id -Force; Add-Content -Path $log -Value \"[$([DateTime]::UtcNow.ToString('o'))] [ERROR] watchdog: retry installer timed out after 180s\" }",
-			"Start-Sleep -Seconds 30",
-			`$running = Get-Process -Name '${escapePowerShellSingleQuoted(exeName)}' -ErrorAction SilentlyContinue`,
-			"if ($running) { Set-Content -Path $marker -Value 'recovered'; exit 0 }",
-			"if (Test-Path $appExe) { Start-Process -FilePath $appExe; Start-Sleep -Seconds 15 }",
-			`$running = Get-Process -Name '${escapePowerShellSingleQuoted(exeName)}' -ErrorAction SilentlyContinue`,
-			"if ($running) { Add-Content -Path $log -Value \"[$([DateTime]::UtcNow.ToString('o'))] [WARN] watchdog: restored service by launching installed app\"; exit 0 }",
-			"Add-Content -Path $log -Value \"[$([DateTime]::UtcNow.ToString('o'))] [ERROR] watchdog: retry and direct app launch both failed\"",
+			"if (-not $finished) { Stop-Process -Id $retry.Id -Force; Log 'watchdog: retry installer timed out after 180s' }",
+			"Start-Sleep -Seconds 15",
+			"if (TestApp) { Log 'watchdog: application recovered after retry'; Set-Content -Path $marker -Value 'recovered'; exit 0 }",
+			// Phase 2: direct launch of the installed exe — no desktop required.
+			"Log 'watchdog: launching installed app directly'",
+			"if (Test-Path $appExe) { Start-Process -FilePath $appExe; Start-Sleep -Seconds 20 }",
+			"if (TestApp) { Log 'watchdog: restored service by direct app launch'; exit 0 }",
+			"Log 'watchdog: all recovery attempts failed'",
 			"exit 2",
 		].join("\r\n");
 		writeFileSync(scriptPath, script, "utf8");
@@ -366,8 +383,12 @@ export function quitAndInstall(): void {
 				process.exit(0);
 			}, 15_000);
 			hardExitTimer.unref();
-			log("INFO", "calling autoUpdater.quitAndInstall(silent=true, forceRunAfter=true)");
-			autoUpdater.quitAndInstall(true, true);
+			// isForceRunAfter=false is the root-cause fix: --force-run makes NSIS
+			// relaunch via ExecShellAsUser, which blocks forever on a disconnected
+			// RDP session (three overnight outages). The watchdog launches the app
+			// directly instead — no interactive desktop needed.
+			log("INFO", "calling autoUpdater.quitAndInstall(silent=true, forceRunAfter=false)");
+			autoUpdater.quitAndInstall(true, false);
 		} catch (err) {
 			installing = false;
 			endDrain?.();
