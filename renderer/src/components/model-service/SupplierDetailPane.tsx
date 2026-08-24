@@ -72,6 +72,16 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 		props.onUpdate({ modelImage: Object.keys(next).length ? next : undefined });
 	};
 
+	/** Set the per-model context-window override (tokens); empty removes the key. */
+	const setContextWindow = (modelId: string, raw: string) => {
+		const prev = supplier.modelContextWindow ?? {};
+		const next = { ...prev };
+		const n = Math.floor(Number(raw));
+		if (!raw.trim() || !Number.isFinite(n) || n <= 0) delete next[modelId];
+		else next[modelId] = n;
+		props.onUpdate({ modelContextWindow: Object.keys(next).length ? next : undefined });
+	};
+
 	return (
 		<section className="flex min-w-0 flex-1 flex-col bg-white">
 			<div className="min-h-0 flex-1 overflow-y-auto px-8 pb-8 pt-7">
@@ -162,6 +172,15 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 											explicit={supplier.modelImage?.[modelId]}
 											effective={capabilities[modelId] ?? false}
 											onChange={(val) => setImageOverride(modelId, val)}
+										/>
+										<input
+											type="number"
+											min={0}
+											value={supplier.modelContextWindow?.[modelId] ?? ""}
+											onChange={(event) => setContextWindow(modelId, event.target.value)}
+											placeholder="上下文"
+											title="真实上下文窗口（tokens）。中转/别名模型务必按网关实际值填写，否则长对话会被错误压缩甚至空回复；留空 = 继承默认。"
+											className="h-8 w-24 rounded-lg border border-slate-200 bg-[#f7f8fa] px-2 text-xs text-slate-700 outline-none focus:border-blue-400 focus:bg-white"
 										/>
 										{isDefault ? <span className="rounded-md bg-blue-100 px-2 py-1 text-[11px] font-medium text-blue-600">默认</span> : (
 											<button type="button" disabled={!supplier.enabled} onClick={() => props.onSetDefault(modelId)} className="hidden rounded-lg px-2 py-1 text-xs text-blue-500 hover:bg-blue-50 disabled:text-slate-300 group-hover:block">设为默认</button>

@@ -58,6 +58,15 @@ export interface Supplier {
 	 * matched base model.
 	 */
 	modelImage?: Record<string, boolean>;
+	/**
+	 * Per-model context window override (tokens). Key = modelId. Absent →
+	 * inherit the base registry model's contextWindow. Custom relay/alias models
+	 * (e.g. a qwen served behind an OpenAI-compatible gateway) otherwise inherit
+	 * an unrelated base model's ~128k window; once the real conversation passes
+	 * that figure, pi-ai clamps max_completion_tokens to 1 and the model returns
+	 * empty text — the "模型连续多次未返回内容" failure mode.
+	 */
+	modelContextWindow?: Record<string, number>;
 }
 
 export interface ModelConfig {
@@ -434,6 +443,7 @@ export function newSupplier(partial: Partial<Supplier> = {}): Supplier {
 		apiKey: partial.apiKey ?? "",
 		models: normalizedModels(partial.models),
 		modelImage: normalizedModelImage(partial.modelImage),
+		modelContextWindow: normalizedModelContextWindow(partial.modelContextWindow),
 	};
 }
 
@@ -443,6 +453,16 @@ function normalizedModelImage(value: unknown): Record<string, boolean> | undefin
 	const out: Record<string, boolean> = {};
 	for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
 		if (typeof v === "boolean") out[k] = v;
+	}
+	return Object.keys(out).length ? out : undefined;
+}
+
+/** Coerce an untrusted modelContextWindow map into `{ modelId: tokens }`; drop junk. */
+function normalizedModelContextWindow(value: unknown): Record<string, number> | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const out: Record<string, number> = {};
+	for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+		if (typeof v === "number" && Number.isFinite(v) && v > 0) out[k] = Math.floor(v);
 	}
 	return Object.keys(out).length ? out : undefined;
 }
@@ -462,6 +482,7 @@ export function normalizeModelConfig(value: unknown): ModelConfig {
 				apiKey: stringValue(entry.apiKey),
 				models: normalizedModels(entry.models),
 				modelImage: normalizedModelImage(entry.modelImage),
+				modelContextWindow: normalizedModelContextWindow(entry.modelContextWindow),
 			}))
 		: [];
 

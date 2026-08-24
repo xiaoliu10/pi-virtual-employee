@@ -23,6 +23,9 @@ export interface Supplier {
 	models: string[];
 	/** Per-model image-input override (absent → inherit base registry capability). */
 	modelImage?: Record<string, boolean>;
+	/** Per-model context window override in tokens (absent → inherit base). Set
+	 * this for relay/alias models whose real window differs, e.g. qwen-200k. */
+	modelContextWindow?: Record<string, number>;
 }
 
 export interface ModelOption {

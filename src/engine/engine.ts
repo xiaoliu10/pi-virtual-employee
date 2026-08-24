@@ -295,7 +295,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 		const override = supplier.modelImage?.[modelId];
 		const wantImage = override === undefined ? base.input.includes("image") : override;
 		const input: ("text" | "image")[] = wantImage ? ["text", "image"] : ["text"];
-		return { ...base, id: modelId, name: modelId, input, ...(baseUrl ? { baseUrl } : {}) };
+		// Context window: relay/alias models must not inherit the base model's
+		// window — a real 200k model behind a base 128k window gets its completion
+		// budget clamped to 1 token once the transcript passes the fake limit.
+		const ctxOverride = supplier.modelContextWindow?.[modelId];
+		const contextWindow = typeof ctxOverride === "number" && ctxOverride > 0 ? Math.floor(ctxOverride) : base.contextWindow;
+		return { ...base, id: modelId, name: modelId, input, contextWindow, ...(baseUrl ? { baseUrl } : {}) };
 	}
 
 	/** Effective image-input capability for a configured model (override else base). For the settings UI. */
