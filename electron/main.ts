@@ -370,7 +370,11 @@ async function main(): Promise<void> {
 
 	const initialCfg = config.all();
 	const reportService = new ReportService(new ArtifactStore(db), config);
-	const engine = new EmployeeEngine(config, history, knowledge, browser, scheduler, documents, filesystem, reportService, downloadService, { builtinSkillsDir, userSkillsDir }, { timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000 });
+	const engine = new EmployeeEngine(config, history, knowledge, browser, scheduler, documents, filesystem, reportService, downloadService, {
+		builtinSkillsDir,
+		userSkillsDir,
+		shellAuditLogPath: path.join(userData, "logs", "shell-audit.log"),
+	}, { timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000 });
 	// The packaged playwright package sits under app.asar/node_modules; its CLI
 	// can install the Chromium kernel into the user's ms-playwright cache.
 	engine.setPlaywrightCliPath(path.join(__dirname, "../node_modules/playwright/cli.js"));

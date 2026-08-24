@@ -25,7 +25,7 @@ let kernelInstall:
 	| null = null;
 
 /** Toggleable capabilities exposed to conversation-side admins. */
-const TOGGLEABLE = ["browser", "documents", "filesystem", "reports", "downloads"] as const;
+const TOGGLEABLE = ["browser", "documents", "filesystem", "reports", "downloads", "shell"] as const;
 type ToggleKey = (typeof TOGGLEABLE)[number];
 
 const CAPABILITY_LABELS: Record<ToggleKey, string> = {
@@ -34,6 +34,7 @@ const CAPABILITY_LABELS: Record<ToggleKey, string> = {
 	filesystem: "本地文件访问（受限目录列表与授权删除）",
 	reports: "报告中心（生成报告并发布链接）",
 	downloads: "浏览器下载工作区（下载文件列表/读取/分析）",
+	shell: "受限命令执行（进程、系统与网络诊断白名单命令）",
 };
 
 const CONFIRM_HINT =
@@ -52,9 +53,9 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 		label: "能力开关管理",
 		description:
 			"查看或变更本应用的能力开关（仅限 IM 单聊）。action=list 查看各项能力及其开关状态；" +
-			"action=set 开启或关闭某项能力（传 capability 和 enabled）；action=setup_browser 安装/检查浏览器内核（Chromium）。" +
+			"action=set 开启或关闭某项能力（传 capability 和 enabled）；设置 shell 时可同时传 allowedCommands 更新命令白名单；action=setup_browser 安装/检查浏览器内核（Chromium）。" +
 			"可管理能力：browser（浏览器自动化）、documents（文档资源）、filesystem（本地文件访问）、" +
-			"reports（报告中心）、downloads（浏览器下载工作区）。" +
+			"reports（报告中心）、downloads（浏览器下载工作区）、shell（受限命令执行）。" +
 			"安全规则：list 需单聊；set 和 setup_browser 必须由管理员在当前消息中明确包含「确认」（或同义明确肯定语），群聊一律拒绝。" +
 			"setup_browser 已装则直接报告已安装；未装则后台下载（约 150MB，需几分钟），用 status 查询进度。",
 		parameters: Type.Object({
@@ -69,17 +70,22 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 						Type.Literal("filesystem"),
 						Type.Literal("reports"),
 						Type.Literal("downloads"),
+						Type.Literal("shell"),
 					],
 					{ description: "仅 set 必填：要开关的能力名" },
 				),
 			),
 			enabled: Type.Optional(Type.Boolean({ description: "仅 set 必填：true=开启，false=关闭" })),
+			allowedCommands: Type.Optional(Type.Array(Type.String(), {
+				description: "仅 capability=shell 时可选：完整替换可执行文件白名单，如 [\"tasklist\",\"taskkill\",\"powershell\"]；空数组=全部拒绝；*=任意命令（高风险）",
+			})),
 		}),
 		async execute(_toolCallId, params) {
-			const { action, capability, enabled } = params as {
+			const { action, capability, enabled, allowedCommands } = params as {
 				action: "list" | "set" | "setup_browser" | "status";
 				capability?: ToggleKey;
 				enabled?: boolean;
+				allowedCommands?: string[];
 			};
 
 			if (action === "list") {
@@ -91,6 +97,7 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 					const on = readCapability(cfg, key);
 					return `- ${key}：${on ? "✅ 已开启" : "❌ 已关闭"}（${CAPABILITY_LABELS[key]}）`;
 				});
+				lines.push(`  shell 白名单：${cfg.capabilities.shell.allowedCommands.length ? cfg.capabilities.shell.allowedCommands.join("、") : "（空，全部拒绝）"}`);
 				lines.push(`- 浏览器内核（Chromium）：${kernelReady ? "✅ 已就绪" : "❌ 未安装（可用 setup_browser 安装）"}`);
 				return {
 					content: [{ type: "text", text: `当前能力开关：\n${lines.join("\n")}\n如需变更，请说明要开关的能力并包含「确认」。` }],
@@ -143,8 +150,18 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 			if (typeof enabled !== "boolean") {
 				return refuse("set 需要显式传入 enabled=true（开启）或 false（关闭）。");
 			}
-			console.log(`[capabilities] ${capability} → ${enabled} by ${maskId(gate.actor.senderId)}`);
-			const updated = deps.config.update({ [capability]: { enabled } });
+			if (allowedCommands !== undefined && capability !== "shell") {
+				return refuse("allowedCommands 仅在 capability=shell 时可用。");
+			}
+			const normalizedAllowed = allowedCommands === undefined
+				? undefined
+				: [...new Set(allowedCommands.filter((c): c is string => typeof c === "string" && c.trim().length > 0).map((c) => c.trim().toLowerCase()))];
+			console.log(`[capabilities] ${capability} → ${enabled} by ${maskId(gate.actor.senderId)}${normalizedAllowed ? ` allow=[${normalizedAllowed.join(",")}]` : ""}`);
+			const updated = deps.config.update(
+				capability === "shell"
+					? { capabilities: { shell: { enabled, ...(normalizedAllowed ? { allowedCommands: normalizedAllowed } : {}) } } }
+					: { [capability]: { enabled } },
+			);
 			deps.onConfigChanged();
 			return {
 				content: [{
@@ -153,6 +170,9 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 						`✅ 能力「${capability}」（${CAPABILITY_LABELS[capability]}）已${enabled ? "开启" : "关闭"}，从下一条消息起生效。` +
 						(capability === "browser" && enabled
 							? "若首次使用浏览器工具提示缺少内核，请管理员在部署机器上执行：npx playwright install chromium。"
+							: "") +
+						(capability === "shell" && enabled
+							? `当前白名单：${updated.capabilities.shell.allowedCommands.length ? updated.capabilities.shell.allowedCommands.join("、") : "（空，全部拒绝）"}。可在设置页或 manage_capabilities allowedCommands 调整；powershell/node/npx 等解释器需显式加入。`
 							: ""),
 				}],
 				details: { action, capability, enabled, capabilities: snapshotFrom(updated) },
@@ -162,7 +182,7 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 }
 
 function readCapability(cfg: ReturnType<ConfigStore["all"]>, key: ToggleKey): boolean {
-	return cfg[key].enabled;
+	return key === "shell" ? cfg.capabilities.shell.enabled : cfg[key].enabled;
 }
 
 /** True when the Chromium binary this playwright version expects is on disk. */

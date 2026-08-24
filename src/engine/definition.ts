@@ -32,6 +32,7 @@ import { createSendImageTool, type ImageSenderResolver } from "./tools/send-imag
 import { createManageAdminTool, createUpdateIdentityTool, type AdminToolDeps } from "./tools/admin.js";
 import { createManageUpdateTool, type UpdateOperations } from "./tools/update.js";
 import { createManageCapabilitiesTool } from "./tools/capabilities.js";
+import { createRunCommandTool } from "./tools/shell.js";
 import { orderTool } from "./tools/orders.js";
 import { escalateTool } from "./tools/escalate.js";
 
@@ -84,6 +85,8 @@ export interface ToolSetOptions {
 	/** Packaged playwright cli.js path — lets manage_capabilities install the
 	 * Chromium kernel from a headless conversation. Always wired (skills are on). */
 	playwrightCliPath: () => string;
+	/** Persistent append-only log for run_command authorization/execution events. */
+	shellAuditLogPath?: string;
 	/**
 	 * Resolves the current turn's channel file-sender for a conversation (set by
 	 * the engine from the inbound context), or undefined when the channel can't
@@ -156,6 +159,16 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 		onConfigChanged: options.onConfigChanged,
 		conversationId: options.conversationId,
 		playwrightCliPath: options.playwrightCliPath,
+	}));
+	// Restricted shell execution for headless-server ops (process inspect/kill,
+	// system/network checks). Registered always; the tool itself gates on
+	// capabilities.shell.enabled + allowedCommands + admin confirmation.
+	tools.push(createRunCommandTool({
+		config: options.config,
+		resolveActor: options.resolveActor,
+		onConfigChanged: options.onConfigChanged,
+		conversationId: options.conversationId,
+		auditLogPath: options.shellAuditLogPath,
 	}));
 	if (options.updates) {
 		tools.push(createManageUpdateTool({

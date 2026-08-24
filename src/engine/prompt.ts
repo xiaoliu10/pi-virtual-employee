@@ -184,8 +184,17 @@ function capabilityRules(c: RulesCtx): string {
 	lines.push(
 		"- **身份与管理员管理（仅 IM 单聊）**：对方要修改你的员工身份（角色/职责/服务时间）或管理管理员名单时，用 update_identity / manage_admin 工具。" +
 			"这两个操作都依赖平台验证过的发送者身份——群聊一律拒绝，非管理员在已认领系统上无权操作。" +
-			"涉及实际变更时，必须对方本人在当前消息里明确说「确认」/「好的，执行」等明确肯定语；不得由你代为确认，也不得把对方的疑问或犹豫当成确认。" +
+			"涉及实际变更时，必须对方本人在当前消息里明确说「确认」/「confirm」/「yes」/「ok」；不得由你代为确认，也不得把「好的」「执行一下」、疑问或犹豫当成确认。" +
 			"修改成功后，新配置从下一条消息起生效。",
+	);
+	// Restricted shell routing is always-on: the employee must surface system
+	// facts (processes, network, installed components) instead of claiming it
+	// "has no command-line access". The tool itself enforces admin+confirmation.
+	lines.push(
+		"- **系统信息与命令执行用 run_command（仅管理员、需「确认」）**：对方要求查看/结束进程（tasklist / 查 PID / taskkill）、查看本机系统/网络信息（systeminfo/whoami/hostname/netstat/ping/ipconfig）等系统级操作时，用 run_command 执行白名单命令。" +
+			"powershell/node/npx 等解释器只有管理员显式加入 shell 白名单后才可用；安装浏览器内核优先使用 manage_capabilities setup_browser，不要改走 run_command。" +
+			"执行前对方当前消息必须明确包含「确认」；非管理员无权限，先说明需要管理员授权。" +
+			"严禁回答「我这边没有直接查看系统进程信息的工具 / windows 上没有命令工具 / 我没有权限执行命令」等——除非当前会话不是 IM 单聊或对方不是管理员，才可说明权限要求并请其联系管理员。",
 	);
 	return lines.join("\n");
 }

@@ -259,6 +259,17 @@ export interface AppConfig {
 	 */
 	filesystem: { enabled: boolean; allowedDirs: string[] };
 	/**
+	 * Restricted shell/command execution for headless-server operations
+	 * (inspect processes, terminate one PID, inspect system/network state). Off by
+	 * default; every execution additionally requires an admin's explicit
+	 * confirmation in the CURRENT message. `allowedCommands` whitelists the
+	 * executable names (e.g. "tasklist", "npx"); "*" allows anything (dangerous —
+	 * a stolen admin IM account then equals full server control).
+	 */
+	capabilities: {
+		shell: { enabled: boolean; allowedCommands: string[] };
+	};
+	/**
 	 * Report / artifact center. Generated reports (scheduled-task outputs, etc.)
 	 * are persisted locally (with run history) and pushed to a configurable Gitee
 	 * repo; the IM push carries a shareable link. EVERY field is instance-specific
@@ -357,6 +368,7 @@ const DEFAULTS: AppConfig = {
 	prompt: { extra: "", rules: "" },
 	documents: { enabled: false, dir: "" },
 	filesystem: { enabled: false, allowedDirs: ["~/Downloads"] },
+	capabilities: { shell: { enabled: false, allowedCommands: ["tasklist", "taskkill", "ping", "ipconfig", "systeminfo", "whoami", "hostname", "netstat", "where"] } },
 	reports: {
 		enabled: false,
 		target: "gitee",
@@ -431,6 +443,20 @@ function normalizedAdminIds(value: unknown): string[] {
 /** Normalize the security block (admin whitelist) of a merged config. */
 function normalizeSecurity(merged: AppConfig): AppConfig["security"] {
 	return { adminStaffIds: normalizedAdminIds(merged.security?.adminStaffIds) };
+}
+
+/** Normalize the capabilities block (restricted shell command whitelist). */
+function normalizeCapabilities(merged: AppConfig): AppConfig["capabilities"] {
+	const shell = merged.capabilities?.shell;
+	const allowed = Array.isArray(shell?.allowedCommands)
+		? [...new Set(shell.allowedCommands
+			.filter((c): c is string => typeof c === "string")
+			.map((c) => c.trim().toLowerCase().replace(/\.(exe|bat|cmd|com|ps1|js)$/i, ""))
+			.filter((c) => c === "*" || /^[a-z0-9._-]+$/.test(c)))]
+		: [];
+	return {
+		shell: { enabled: shell?.enabled === true, allowedCommands: allowed },
+	};
 }
 
 export function newSupplier(partial: Partial<Supplier> = {}): Supplier {
@@ -740,6 +766,7 @@ export class ConfigStore {
 					im: normalizeIm(merged.im),
 					kb: { ...merged.kb, external: normalizeExternalProviders(merged.kb.external) },
 					security: normalizeSecurity(merged),
+					capabilities: normalizeCapabilities(merged),
 				};
 				if (JSON.stringify(normalized) !== JSON.stringify(parsed)) this.persist(normalized);
 				return normalized;
@@ -810,6 +837,7 @@ export class ConfigStore {
 			im: normalizeIm(merged.im),
 			kb: { ...merged.kb, external: normalizeExternalProviders(merged.kb.external) },
 			security: normalizeSecurity(merged),
+			capabilities: normalizeCapabilities(merged),
 		};
 		this.persist(normalized);
 		return normalized;
@@ -829,6 +857,7 @@ export class ConfigStore {
 			im: normalizeIm(merged.im),
 			kb: { ...merged.kb, external: normalizeExternalProviders(merged.kb.external) },
 			security: normalizeSecurity(merged),
+			capabilities: normalizeCapabilities(merged),
 		};
 		this.persist(normalized);
 		return normalized;

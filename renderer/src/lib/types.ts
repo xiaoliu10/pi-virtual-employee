@@ -146,6 +146,8 @@ export interface AppConfig {
 	kb: KbConfig;
 	documents: { enabled: boolean; dir: string };
 	filesystem: { enabled: boolean; allowedDirs: string[] };
+	/** Restricted shell command execution (run_command tool) for headless-server ops. */
+	capabilities: { shell: { enabled: boolean; allowedCommands: string[] } };
 	reports: {
 		enabled: boolean;
 		target: "gitee" | "oss";

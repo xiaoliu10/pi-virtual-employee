@@ -151,8 +151,10 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 	// array so the textarea can retain newlines while typing (a derived value
 	// would strip the trailing empty line and "eat" the Enter key).
 	const [domainsText, setDomainsText] = useState((config?.browser.allowedDomains ?? []).join("\n"));
+	const [shellCommandsText, setShellCommandsText] = useState((config?.capabilities.shell.allowedCommands ?? []).join("\n"));
 	useEffect(() => {
 		setDomainsText((config?.browser.allowedDomains ?? []).join("\n"));
+		setShellCommandsText((config?.capabilities.shell.allowedCommands ?? []).join("\n"));
 	}, [config]);
 
 	useEffect(() => setDraft(config), [config]);
@@ -200,6 +202,11 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 		setDraft((value) => value ? { ...value, reports: { ...value.reports, ...patch } } : value);
 	const setFilesystem = (patch: Partial<AppConfig["filesystem"]>) =>
 		setDraft((value) => value ? { ...value, filesystem: { ...value.filesystem, ...patch } } : value);
+	const setShell = (patch: Partial<AppConfig["capabilities"]["shell"]>) =>
+		setDraft((value) => value ? {
+			...value,
+			capabilities: { ...value.capabilities, shell: { ...value.capabilities.shell, ...patch } },
+		} : value);
 	const setSecurity = (patch: Partial<AppConfig["security"]>) =>
 		setDraft((value) => value ? { ...value, security: { ...value.security, ...patch } } : value);
 
@@ -550,6 +557,31 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 															))}
 															<button type="button" onClick={async () => { const picked = await api.pickDirectory(); if (picked) setFilesystem({ allowedDirs: [...draft.filesystem.allowedDirs, picked] }); }} className="rounded-xl border border-slate-200 px-4 py-2 text-sm text-slate-600 transition hover:bg-slate-50">+ 添加目录…</button>
 														</div>
+													</Field>
+												</div>
+											</div>
+
+											<div className="rounded-2xl border border-amber-200 bg-white px-5 py-4 shadow-sm">
+												<div className="mb-3">
+													<div className="text-sm font-medium text-slate-800">受限命令执行 · run_command</div>
+													<div className="mt-1 text-xs leading-relaxed text-slate-400">用于无桌面服务器的进程查看/按 PID 结束、系统与网络诊断等运维任务。默认关闭；每次执行仍须 IM 单聊中的白名单管理员在当前消息明确「确认」。</div>
+												</div>
+												<div className="space-y-3">
+													<label className="flex cursor-pointer items-center justify-between rounded-xl border border-amber-200 bg-amber-50/50 px-4 py-3">
+														<div><div className="text-sm font-medium text-slate-800">启用受限命令执行</div><div className="mt-0.5 text-xs text-amber-700/70">开启后为员工提供 run_command；命令以当前应用用户权限运行，不会自动提权。</div></div>
+														<input type="checkbox" checked={draft.capabilities.shell.enabled} onChange={(e) => setShell({ enabled: e.target.checked })} className="h-5 w-5 accent-amber-500" />
+													</label>
+													<Field label="允许执行的命令（每行一个）" hint="只匹配可执行文件名，不含参数；默认仅含进程/系统/网络诊断命令。留空 = 全部拒绝。powershell、node、npx 属任意代码执行解释器，只有明确需要时才添加；填写 * = 允许任意可执行文件，强烈不建议。">
+														<textarea
+															value={shellCommandsText}
+															onChange={(e) => {
+																setShellCommandsText(e.target.value);
+																setShell({ allowedCommands: e.target.value.split(/[\n,]/).map((s) => s.trim().toLowerCase()).filter(Boolean) });
+															}}
+															rows={4}
+															placeholder={"tasklist\ntaskkill\nsysteminfo\nipconfig"}
+															className={inputCls + " h-auto py-2 font-mono"}
+														/>
 													</Field>
 												</div>
 											</div>

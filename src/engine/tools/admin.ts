@@ -13,7 +13,7 @@
  *    group has no reliable notion of "who is allowed".
  *  - Destructive steps (claim, identity change, admin add/remove) additionally
  *    require an explicit confirmation phrase in the user's CURRENT message
- *    ("确认" or a variant), checked server-side — the model cannot grant
+ *    ("确认" or a narrow equivalent), checked server-side — the model cannot grant
  *    itself the change by merely passing a confirmed=true parameter.
  *  - The admin whitelist itself is only editable via admin tools or the
  *    desktop settings UI (the desktop remains the recovery path); the last
@@ -46,10 +46,14 @@ export function refuse(reason: string): AdminRefusal {
  * Deliberately narrow: bare "好"/"可以" are excluded because greetings like
  * "你好" and questions like "可以改吗" would falsely count as confirmation.
  */
-const CONFIRM_RE = /(^|[^a-z])((请)?确认|好的|执行|yes|ok)([^a-z]|$)/i;
+const CONFIRM_RE = /(^|[^a-z])((请)?确认|confirm|yes|ok)([^a-z]|$)/i;
 
 export function isExplicitConfirmation(userText: string): boolean {
-	return CONFIRM_RE.test(userText.trim());
+	const text = userText.trim();
+	// A confirmation word inside an explicit cancellation/negation must never
+	// authorize a destructive or system-level operation (e.g. "别执行了").
+	if (/(不要|别|取消|停止|终止|不确认|不执行|不运行|不用执行|拒绝|\b(?:no|cancel|stop|do not|don't)\b)/i.test(text)) return false;
+	return CONFIRM_RE.test(text);
 }
 
 /**
