@@ -20,6 +20,28 @@ export function openDatabase(path: string, nativeBinding?: string): DB {
 	return db;
 }
 
+/**
+ * Close a Database before the process exits during an auto-update install.
+ * better-sqlite3 holds a native SQLite handle; an open connection keeps the
+ * DB + WAL file locked AND keeps the .node addon mapped into the process.
+ * NSIS overwriting resources/ while the old process still maps the addon is
+ * the file-replace race behind spurious "NODE_MODULE_VERSION" ABI errors and
+ * half-overwritten installs. Closing here releases the handle so the silent
+ * installer can replace files cleanly before the watchdog relaunches.
+ */
+export function closeDatabase(db: DB): void {
+	try {
+		db.pragma("wal_checkpoint(TRUNCATE)");
+	} catch {
+		/* best-effort checkpoint; close still releases the handle */
+	}
+	try {
+		db.close();
+	} catch {
+		/* already closed or never opened — close is idempotent enough */
+	}
+}
+
 function migrate(db: DB): void {
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS config (

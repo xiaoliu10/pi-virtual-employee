@@ -10,7 +10,7 @@ import { app, BrowserWindow, dialog, ipcMain } from "electron";
 import { mkdir, readFile, writeFile, copyFile, readdir, rm } from "node:fs/promises";
 import { existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { openDatabase } from "../src/db/sqlite.js";
+import { openDatabase, closeDatabase } from "../src/db/sqlite.js";
 import { ConfigStore, normalizeModelConfig, type ExternalProviderConfig, type Supplier } from "../src/db/config-store.js";
 import { HistoryStore } from "../src/db/history-store.js";
 import { KnowledgeService } from "../src/knowledge/knowledge-service.js";
@@ -1068,6 +1068,12 @@ async function main(): Promise<void> {
 				// Node ≥18: close keep-alive connections so close() cannot hang.
 				httpServer.closeAllConnections?.();
 			});
+			// Close the SQLite handle LAST so the better-sqlite3 .node addon is
+			// unmapped from the process before NSIS overwrites resources/native.
+			// An open handle keeps the DB + WAL locked (stalls the installer) and
+			// keeps the addon mapped (a mid-overwrite require is the file-race that
+			// surfaces as spurious "NODE_MODULE_VERSION" ABI errors).
+			closeDatabase(db);
 		},
 	});
 	// Push IM activity to the renderer so the task list refreshes live (the

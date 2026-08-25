@@ -499,6 +499,14 @@ export function setupAutoUpdater(win: BrowserWindow): void {
 	// Never let a normal app quit bypass prepareToInstall/watchdog. All unattended
 	// installs run through our guarded quitAndInstall() path.
 	autoUpdater.autoInstallOnAppQuit = false;
+	// Gitee Releases serve assets via a 302 → foruda.gitee.com CDN that does NOT
+	// advertise Accept-Ranges. electron-updater's differential downloader probes
+	// ranges on every check, fails ("Server doesn't support Accept-Ranges"),
+	// then falls back to a full 97MB re-download. The probe itself is wasted I/O
+	// and the noisy fallback occasionally aborts. Disabling webInstaller makes
+	// the generic provider always use the simple full-download path, which is
+	// what actually worked here anyway.
+	autoUpdater.disableWebInstaller = true;
 	autoUpdater.logger = fileLogger;
 	try {
 		autoUpdater.setFeedURL({ provider: "generic", url: UPDATE_FEED });
