@@ -21,7 +21,7 @@
  * flight just returns the current state.
  */
 import { app, type BrowserWindow } from "electron";
-import { appendFileSync, copyFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { basename, join } from "node:path";
 import electronUpdater from "electron-updater";
@@ -45,6 +45,102 @@ const INSTALLER_WAIT_SECONDS = 10 * 60;
 const WATCHDOG_DIR = "update-watchdog";
 const UPDATE_LOG_DIR = "logs";
 const UPDATE_LOG_FILE = "updater.log";
+/** Circuit-breaker state: repeated failures for the same target version. */
+const FAILURE_FILE = "update-failures.json";
+/** After this many failed install attempts for one target version, stop auto-installing it. */
+const MAX_ATTEMPTS_PER_VERSION = 2;
+
+interface FailureRecord {
+	attempts: number;
+	lastError: string;
+	lastAttemptAt: string;
+}
+
+/** Persistent per-target-version failure counters (survives restarts → breaks loops). */
+function loadFailures(): Record<string, FailureRecord> {
+	try {
+		return JSON.parse(readFileSync(join(app.getPath("userData"), FAILURE_FILE), "utf8")) as Record<string, FailureRecord>;
+	} catch {
+		return {};
+	}
+}
+
+function saveFailures(map: Record<string, FailureRecord>): void {
+	try {
+		mkdirSync(join(app.getPath("userData")), { recursive: true });
+		writeFileSync(join(app.getPath("userData"), FAILURE_FILE), JSON.stringify(map, null, 2), "utf8");
+	} catch (err) {
+		log("WARN", `failed to persist failure record: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
+function recordFailure(version: string, error: string): number {
+	const map = loadFailures();
+	const prev = map[version] ?? { attempts: 0, lastError: "", lastAttemptAt: "" };
+	map[version] = { attempts: prev.attempts + 1, lastError: error.slice(0, 500), lastAttemptAt: new Date().toISOString() };
+	saveFailures(map);
+	return map[version].attempts;
+}
+
+function clearFailure(version: string): void {
+	const map = loadFailures();
+	if (map[version]) {
+		delete map[version];
+		saveFailures(map);
+	}
+}
+
+function failureAttempts(version: string): number {
+	return loadFailures()[version]?.attempts ?? 0;
+}
+
+/**
+ * A per-user NSIS install MUST have its uninstall registry entry. A missing
+ * entry (or an UninstallString pointing at a deleted exe) means the previous
+ * install was broken or manually mangled — and since every upgrade runs the
+ * OLD uninstaller first, any new auto-install attempt will fail with
+ * "Failed to uninstall old application files". Detect that at startup and
+ * block auto-update until the deployment is repaired by a manual install.
+ */
+export function inspectInstallHealth(): { healthy: boolean; reason?: string } {
+	if (!enabled()) return { healthy: true };
+	// electron-builder NSIS per-user key:
+	// HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\<appId-or-guid>
+	// Reading via PowerShell avoids pulling winreg into the main bundle.
+	try {
+		const child = spawn(
+			"reg.exe",
+			["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall", "/s", "/f", "Pi Virtual Employee", "/d"],
+			{ stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
+		);
+		let out = "";
+		child.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
+		let settled = false;
+		const done = new Promise<boolean>((resolve) => {
+			child.once("error", () => resolve(false));
+			child.once("exit", () => {
+				settled = true;
+				resolve(out.includes("Pi Virtual Employee"));
+			});
+		});
+		void done.then((found) => {
+			if (!found) {
+				log("ERROR", "install health: no HKCU uninstall registry entry found — install is broken; blocking auto-update until a manual repair install");
+				setState({ phase: "error", currentVersion: app.getVersion(), message: "检测到安装不完整（缺少卸载注册表项），自动更新已暂停。请手动运行最新版安装包修复。" });
+			}
+		});
+		// Non-blocking health probe; if reg.exe hangs, settle after 10s.
+		setTimeout(() => {
+			if (!settled) {
+				settled = true;
+				child.kill();
+			}
+		}, 10_000).unref();
+	} catch {
+		/* probe failure must never break startup */
+	}
+	return { healthy: true }; // provisional; async result flips state if broken
+}
 
 function updaterLogPath(): string {
 	return join(app.getPath("userData"), UPDATE_LOG_DIR, UPDATE_LOG_FILE);
@@ -199,9 +295,21 @@ function wireEvents(): void {
 	autoUpdater.on("update-downloaded", (info: { version?: string; downloadedFile?: string } = {}) => {
 		downloading = false;
 		downloadedInstallerPath = info.downloadedFile;
-		log("INFO", `update downloaded: version=${info.version ?? pendingVersion ?? "unknown"} file=${downloadedInstallerPath ?? "unknown"}`);
-		setState({ phase: "ready", currentVersion: app.getVersion(), version: info.version ?? pendingVersion ?? "" });
-		if (unattendedEnabled() || requestedInstall) scheduleIdleRestart();
+		const targetVersion = info.version ?? pendingVersion ?? "unknown";
+		log("INFO", `update downloaded: version=${targetVersion} file=${downloadedInstallerPath ?? "unknown"}`);
+		setState({ phase: "ready", currentVersion: app.getVersion(), version: targetVersion });
+		if (!unattendedEnabled() && !requestedInstall) return;
+		// Circuit breaker: this target already failed MAX_ATTEMPTS_PER_VERSION
+		// times on this machine. Do NOT loop again — a broken old-uninstaller
+		// makes every retry fail identically, and each failed attempt takes the
+		// service down for minutes. Leave the update ready + manual URL.
+		if (failureAttempts(targetVersion) >= MAX_ATTEMPTS_PER_VERSION) {
+			requestedInstall = false;
+			log("ERROR", `circuit breaker open: ${targetVersion} already failed ${MAX_ATTEMPTS_PER_VERSION}+ times; NOT auto-installing again. Manual install required.`);
+			setState({ phase: "error", currentVersion: app.getVersion(), message: `版本 ${targetVersion} 在本机已连续安装失败 ${MAX_ATTEMPTS_PER_VERSION} 次，已停止自动重试。请手动运行安装包修复（下载链接在设置页）。` });
+			return;
+		}
+		scheduleIdleRestart();
 	});
 	autoUpdater.on("error", (err: Error) => {
 		checking = false;
@@ -339,6 +447,17 @@ function escapePowerShellSingleQuoted(value: string): string {
 	return value.replace(/'/g, "''");
 }
 
+/** Compare dotted versions numerically ("0.2.14" vs "0.2.9"). */
+function compareVersions(a: string, b: string): number {
+	const pa = a.split(".").map((n) => Number.parseInt(n, 10) || 0);
+	const pb = b.split(".").map((n) => Number.parseInt(n, 10) || 0);
+	for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+		const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+		if (diff !== 0) return diff;
+	}
+	return 0;
+}
+
 /** Schedule the periodic recheck. */
 function scheduleRecheck(): void {
 	if (recheckTimer) clearInterval(recheckTimer);
@@ -359,7 +478,8 @@ export function quitAndInstall(): void {
 	if (!enabled() || installing) return;
 	installing = true;
 	requestedInstall = false;
-	log("INFO", `install requested: current=${app.getVersion()} target=${pendingVersion ?? "unknown"}`);
+	const targetVersion = pendingVersion ?? "unknown";
+	log("INFO", `install requested: current=${app.getVersion()} target=${targetVersion}`);
 
 	// electron-updater starts NSIS BEFORE calling app.quit(). Drain new work,
 	// allow the final response to flush, then close Chromium/IM/HTTP before NSIS
@@ -379,6 +499,11 @@ export function quitAndInstall(): void {
 			startInstallWatchdog();
 
 			const hardExitTimer = setTimeout(() => {
+				// Forced exit: the install outcome is unknowable from here, but the
+				// watchdog owns recovery. Count the attempt so a machine whose
+				// uninstaller is broken doesn't loop this forever — if the install
+				// actually succeeds before relaunch, startup clears the record.
+				recordFailure(targetVersion, "forced exit during install (outcome unknown)");
 				log("ERROR", "app.quit() 15s 未退出，强制 process.exit(0) 以放行 NSIS 安装器");
 				process.exit(0);
 			}, 15_000);
@@ -394,6 +519,7 @@ export function quitAndInstall(): void {
 			endDrain?.();
 			const message = err instanceof Error ? err.message : String(err);
 			log("ERROR", `install preparation failed: ${message}`);
+			recordFailure(targetVersion, message);
 			setState({ phase: "error", currentVersion: app.getVersion(), message: `安装失败：${message}` });
 		}
 	})();
@@ -494,6 +620,22 @@ export function setupAutoUpdater(win: BrowserWindow): void {
 		setState({ phase: "idle", currentVersion: app.getVersion() });
 		return;
 	}
+
+	// Startup reconciliation: if the running version is >= any recorded failed
+	// target, that install actually succeeded before relaunch — clear the count
+	// so future updates to NEW versions aren't blocked by stale breakers.
+	const current = app.getVersion();
+	for (const [version, record] of Object.entries(loadFailures())) {
+		if (compareVersions(current, version) >= 0) {
+			log("INFO", `startup: running ${current} >= previously failed target ${version} — clearing failure record`);
+			clearFailure(version);
+		} else if (record.attempts >= MAX_ATTEMPTS_PER_VERSION) {
+			log("WARN", `startup: ${version} remains blocked after ${record.attempts} failed attempts (last: ${record.lastError})`);
+		}
+	}
+
+	// Broken-install probe: per-user NSIS must have an HKCU uninstall entry.
+	inspectInstallHealth();
 
 	autoUpdater.autoDownload = false;
 	// Never let a normal app quit bypass prepareToInstall/watchdog. All unattended
