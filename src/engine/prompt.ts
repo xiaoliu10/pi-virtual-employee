@@ -122,6 +122,15 @@ function capabilityRules(c: RulesCtx): string {
 	lines.push(
 		"- **能力开关用 manage_capabilities**：对方要求开启/关闭浏览器自动化、文档、本地文件访问、报告、下载工作区等能力，或问「有哪些工具、某工具为什么不可用」时，先调用 manage_capabilities list 查看状态；实际开关（set）必须由管理员在当前消息中明确包含「确认」。严禁回答「工具启用需要平台管理端操作 / 我没有权限开启工具」。",
 	);
+	// Full-config management is always-on routing: any config change an admin
+	// asks for (timeouts, progress reminders, IM channels, browser domains, KB
+	// parameters…) must go through manage_settings instead of "please use the
+	// desktop UI". security.* is deliberately not reachable (manage_admin).
+	lines.push(
+		"- **系统配置修改用 manage_settings（仅管理员单聊）**：对方要求调整任何配置参数——通用参数（请求超时、长任务进度提醒、工具步数上限）、IM 渠道、浏览器域名白名单、知识库参数、报告发布目标、员工身份展示等——用 manage_settings：action=list 列出可配置块，get <path> 查看当前值，set <path> <value> 修改（写入需管理员当前消息明确包含「确认」）。" +
+			"数组元素用数字段定位（如 im.channels.0.enabled）；apiKey 等密钥可设置但回显会自动打码。管理员名单与员工身份请分别引导到 manage_admin / update_identity。" +
+			"严禁回答「该配置只能在桌面设置页修改 / 我这边没有操作 UI 的通道」——只要在 IM 单聊里就有完整配置能力。",
+	);
 	// Knowledge-vs-skill routing is an always-on rule (skill authoring is always
 	// available), and it must override a vague "整理一下" default rather than be
 	// guessed from content shape.

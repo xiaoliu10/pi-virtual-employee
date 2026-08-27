@@ -33,6 +33,7 @@ import { createManageAdminTool, createUpdateIdentityTool, type AdminToolDeps } f
 import { createManageUpdateTool, type UpdateOperations } from "./tools/update.js";
 import { createManageCapabilitiesTool } from "./tools/capabilities.js";
 import { createRunCommandTool } from "./tools/shell.js";
+import { createManageSettingsTool } from "./tools/settings.js";
 import { orderTool } from "./tools/orders.js";
 import { escalateTool } from "./tools/escalate.js";
 
@@ -169,6 +170,14 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 		onConfigChanged: options.onConfigChanged,
 		conversationId: options.conversationId,
 		auditLogPath: options.shellAuditLogPath,
+	}));
+	// Full-config read/write for headless deployments — every block the desktop
+	// settings UI exposes, editable from an admin's 1:1 chat (security excluded).
+	tools.push(createManageSettingsTool({
+		config: options.config,
+		resolveActor: options.resolveActor,
+		onConfigChanged: options.onConfigChanged,
+		conversationId: options.conversationId,
 	}));
 	if (options.updates) {
 		tools.push(createManageUpdateTool({
