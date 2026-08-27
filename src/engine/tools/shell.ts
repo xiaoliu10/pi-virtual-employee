@@ -20,7 +20,7 @@
  */
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ConfigStore } from "../../db/config-store.js";
@@ -150,17 +150,63 @@ const SYSTEM32_COMMANDS = new Set([
 ]);
 
 /**
- * Resolve the conservative built-in command set to System32. Custom opt-in
- * whitelist entries (powershell/node/npx/etc.) remain PATH-resolved so admins
- * can deliberately enable those high-trust executables.
+ * Split an argument tail into argv Windows-style: whitespace-separated tokens
+ * with double-quote grouping (e.g. tasklist /FI "PID eq 19060"). The input has
+ * already passed composition validation (no & | < > ^ ( ) % ! newlines), so
+ * only quotes, spaces and tabs need handling here.
  */
-function commandForExecution(command: string): string {
-	if (process.platform !== "win32") return command;
+function tokenizeArgs(input: string): string[] {
+	const tokens: string[] = [];
+	let current = "";
+	let started = false;
+	let inQuotes = false;
+	for (const ch of input) {
+		if (ch === '"') {
+			inQuotes = !inQuotes;
+			started = true;
+			continue;
+		}
+		if (!inQuotes && (ch === " " || ch === "\t")) {
+			if (started || current.length > 0) {
+				tokens.push(current);
+				current = "";
+				started = false;
+			}
+			continue;
+		}
+		current += ch;
+	}
+	if (started || current.length > 0) tokens.push(current);
+	return tokens;
+}
+
+/**
+ * How runCommand will execute a validated command.
+ *
+ * The built-in diagnostic set spawns the System32 binary DIRECTLY with an argv
+ * array. Rewriting them through `cmd /c "<full path>"` broke in the packaged
+ * app: Node escapes embedded quotes to \" when building the Windows command
+ * line, cmd doesn't understand backslash-quote and strips per its own rules —
+ * the executable ended up mangled ("not recognized as an internal or external
+ * command"). Direct argv spawning sidesteps cmd's quoting entirely.
+ *
+ * Opt-in interpreter entries (powershell/node/npx added by admins) still go
+ * through cmd /c unchanged — their command lines are free-form by design.
+ */
+type ExecutionPlan =
+	| { mode: "direct"; file: string; args: string[] }
+	| { mode: "shell"; command: string };
+
+function planExecution(command: string): ExecutionPlan {
+	if (process.platform !== "win32") return { mode: "shell", command };
 	const executable = executableToken(command);
-	if (!SYSTEM32_COMMANDS.has(executable.name)) return command;
-	const args = command.trim().slice(executable.tokenLength).trim();
-	const systemExe = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\${executable.name}.exe`;
-	return `"${systemExe}"${args ? ` ${args}` : ""}`;
+	if (!SYSTEM32_COMMANDS.has(executable.name)) return { mode: "shell", command };
+	const argsTail = command.trim().slice(executable.tokenLength).trim();
+	return {
+		mode: "direct",
+		file: `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\${executable.name}.exe`,
+		args: tokenizeArgs(argsTail),
+	};
 }
 
 /** Kill the whole spawned process tree; `child.kill()` only kills cmd.exe on Windows. */
@@ -186,23 +232,30 @@ function killProcessTree(pid: number | undefined): void {
 	}
 }
 
-/** Run `command` via cmd.exe; resolve stdout+stderr, truncate, enforce timeout. */
+/** Run the planned execution; resolve stdout+stderr, truncate, enforce timeout. */
 function runCommand(command: string): Promise<{ output: string; code: number | null; timedOut: boolean }> {
+	const plan = planExecution(command);
 	return new Promise((resolve) => {
-		const cmd = process.platform === "win32"
-			? `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`
-			: "/bin/sh";
-		const args = process.platform === "win32" ? ["/d", "/s", "/c"] : ["-c"];
-		const child = spawn(cmd, [...args, commandForExecution(command)], {
-			stdio: ["ignore", "pipe", "pipe"],
+		const common = {
+			stdio: ["ignore", "pipe", "pipe"] as ("ignore" | "pipe" | "ipc" | number)[],
 			windowsHide: true,
 			detached: process.platform !== "win32",
 			env: {
 				...process.env,
 				COMSPEC: `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`,
+				// Packed app: process.execPath is the GUI exe; anything we exec as a
+				// plain Node script needs this flag instead of launching a second GUI.
 				...(process.platform === "win32" ? {} : { ELECTRON_RUN_AS_NODE: "1" }),
 			},
-		});
+		};
+		let child: ChildProcess;
+		if (plan.mode === "direct") {
+			child = spawn(plan.file, plan.args, common);
+		} else if (process.platform === "win32") {
+			child = spawn(`${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`, ["/d", "/s", "/c", plan.command], common);
+		} else {
+			child = spawn("/bin/sh", ["-c", plan.command], common);
+		}
 		const kept: Buffer[] = [];
 		let keptBytes = 0;
 		let totalBytes = 0;

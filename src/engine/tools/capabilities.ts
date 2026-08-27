@@ -217,24 +217,34 @@ function startKernelInstall(cliPath: string): void {
 		const child = spawn(process.execPath, [cliPath, "install", "chromium"], {
 			stdio: ["ignore", "pipe", "pipe"],
 			windowsHide: true,
+			env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
 		});
 		let errText = "";
+		let settled = false;
+		const finish = (result: Extract<typeof kernelInstall, { status: "done" | "failed" }>): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(watchdog);
+			kernelInstall = result;
+			if (result.status === "done") console.log("[capabilities] chromium kernel installed");
+			else console.error("[capabilities] kernel install failed:", result.error);
+		};
+		// Hard stop: a wedged download must flip to failed instead of reporting
+		// "running" forever (the stuck-at-973-minutes state).
+		const watchdog = setTimeout(() => {
+			finish({ status: "failed", finishedAt: Date.now(), error: "安装超过 30 分钟未完成，已终止并标记失败，可重试 setup_browser。" });
+			try { child.kill(); } catch { /* already gone */ }
+		}, 30 * 60_000);
+		watchdog.unref();
 		child.stderr?.on("data", (d: Buffer) => { errText += d.toString(); });
 		child.once("error", (err) => {
-			kernelInstall = { status: "failed", finishedAt: Date.now(), error: err.message };
-			console.error("[capabilities] kernel install spawn failed:", err.message);
+			finish({ status: "failed", finishedAt: Date.now(), error: err.message });
 		});
 		child.once("exit", (code) => {
 			if (code === 0 && chromiumKernelReady()) {
-				kernelInstall = { status: "done", finishedAt: Date.now() };
-				console.log("[capabilities] chromium kernel installed");
-			} else {
-				kernelInstall = {
-					status: "failed",
-					finishedAt: Date.now(),
-					error: `exit=${code ?? "unknown"} ${errText.slice(0, 300)}`.trim(),
-				};
-				console.error("[capabilities] kernel install failed:", kernelInstall.error);
+				finish({ status: "done", finishedAt: Date.now() });
+			} else if (!settled) {
+				finish({ status: "failed", finishedAt: Date.now(), error: `exit=${code ?? "unknown"} ${errText.slice(0, 300)}`.trim() });
 			}
 		});
 	} catch (err) {
