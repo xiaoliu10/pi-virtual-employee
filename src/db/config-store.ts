@@ -229,7 +229,7 @@ export interface AppConfig {
 	 * browser tools (navigate / click / type / screenshot / read). `allowedDomains`
 	 * restricts which hosts it may open (empty = unrestricted — use with care).
 	 */
-	browser: { enabled: boolean; headless: boolean; allowedDomains: string[] };
+	browser: { enabled: boolean; headless: boolean; allowedDomains: string[]; downloadHost: string };
 	/** Scheduled tasks: the employee may create timed tasks in conversation; the scheduler runs them at their cron time. */
 	scheduler: { enabled: boolean };
 	prompt: {
@@ -363,7 +363,7 @@ const DEFAULTS: AppConfig = {
 	identity: { name: "客服小派", role: "虚拟客服", duty: "在线为客户提供专业、礼貌、高效的服务", serviceHours: "7×24h" },
 	im: { enabled: false, channels: [], ack: { enabled: true, text: "👍 收到，正在处理…" } },
 	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 30, maxToolSteps: 20, autoUpdate: true },
-	browser: { enabled: false, headless: true, allowedDomains: [] },
+	browser: { enabled: false, headless: true, allowedDomains: [], downloadHost: "" },
 	scheduler: { enabled: true },
 	prompt: { extra: "", rules: "" },
 	documents: { enabled: false, dir: "" },

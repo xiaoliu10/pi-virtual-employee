@@ -140,7 +140,7 @@ export interface AppConfig {
 		ack: { enabled: boolean; text: string };
 	};
 	general: { autostart: boolean; language: "zh-CN" | "en-US"; requestTimeoutMin: number; longTaskProgressMin: number; maxToolSteps: number; autoUpdate: boolean };
-	browser: { enabled: boolean; headless: boolean; allowedDomains: string[] };
+	browser: { enabled: boolean; headless: boolean; allowedDomains: string[]; downloadHost: string };
 	scheduler: { enabled: boolean };
 	prompt: { extra: string; rules: string };
 	kb: KbConfig;

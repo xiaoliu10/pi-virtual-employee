@@ -57,7 +57,7 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 			"可管理能力：browser（浏览器自动化）、documents（文档资源）、filesystem（本地文件访问）、" +
 			"reports（报告中心）、downloads（浏览器下载工作区）、shell（受限命令执行）。" +
 			"安全规则：list 需单聊；set 和 setup_browser 必须由管理员在当前消息中明确包含「确认」（或同义明确肯定语），群聊一律拒绝。" +
-			"setup_browser 已装则直接报告已安装；未装则后台下载（约 150MB，需几分钟），用 status 查询进度。",
+			"setup_browser 已装则直接报告已安装；未装则后台下载（约 150MB，需几分钟），用 status 查询进度。下载源由 browser.downloadHost 决定（留空 = 国内默认走 npmmirror 镜像；如需改用 manage_settings 设置 browser.downloadHost）。",
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("list"), Type.Literal("set"), Type.Literal("setup_browser"), Type.Literal("status")], {
 				description: "list=查看能力开关；set=开关能力；setup_browser=安装浏览器内核；status=查询浏览器内核安装状态",
@@ -134,7 +134,8 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 					};
 				}
 				console.log(`[capabilities] chromium kernel install started by ${maskId(gate.actor.senderId)}`);
-				startKernelInstall(deps.playwrightCliPath());
+				const downloadHost = (deps.config.all().browser.downloadHost ?? "").trim();
+				startKernelInstall(deps.playwrightCliPath(), downloadHost);
 				return {
 					content: [{ type: "text", text: "✅ 已开始后台安装浏览器内核（Chromium，约 150MB，预计几分钟）。安装完成后即可使用浏览器工具；期间可用 action=status 查询进度。" }],
 					details: { action, install: kernelInstall },
@@ -211,13 +212,27 @@ function kernelStatusText(): string {
 /** Spawn the packaged playwright CLI to install the Chromium kernel, detached
  * from this tool call — downloads take minutes, so the reply returns immediately
  * and progress is queryable via action=status. */
-function startKernelInstall(cliPath: string): void {
+function startKernelInstall(cliPath: string, downloadHost: string): void {
 	kernelInstall = { status: "running", startedAt: Date.now() };
+	// Playwright pulls Chromium from its own CDN by default, which is slow or
+	// unreachable from CN servers. PLAYWRIGHT_DOWNLOAD_HOST redirects the
+	// download to a mirror (npmmirror keeps a full sync). Empty = playwright's
+	// default (official CDN). Auto-defaults to the CN mirror when the field is
+	// unset so headless CN deployments just work; overridable via config.
+	// Playwright composes `${host}/${downloadPath}` where downloadPath is like
+	// "builds/chromium/1187/chromium-win64.zip", so the host must NOT include a
+	// trailing /builds (that would double it). Empty = official CDN.
+	const host = downloadHost || "https://registry.npmmirror.com/-/binary/playwright";
+	console.log(`[capabilities] chromium download host: ${host}`);
 	try {
 		const child = spawn(process.execPath, [cliPath, "install", "chromium"], {
 			stdio: ["ignore", "pipe", "pipe"],
 			windowsHide: true,
-			env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+			env: {
+				...process.env,
+				ELECTRON_RUN_AS_NODE: "1",
+				PLAYWRIGHT_DOWNLOAD_HOST: host,
+			},
 		});
 		let errText = "";
 		let settled = false;

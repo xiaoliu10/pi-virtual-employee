@@ -534,6 +534,15 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 													<Field label="允许访问的域名（每行一个，留空 = 不限制）" hint="出于安全，建议限制员工只能访问受信域名（如 order.example.com）。支持子域匹配。">
 														<textarea value={domainsText} onChange={(e) => { setDomainsText(e.target.value); setBrowser({ allowedDomains: e.target.value.split(/[\n,]/).map((s) => s.trim()).filter(Boolean) }); }} rows={3} placeholder={"order.example.com\nhelp.example.com"} className={inputCls + " h-auto py-2 font-mono"} />
 													</Field>
+													<Field label="浏览器内核下载源" hint="安装 Chromium 内核的下载源（playwright 会自动在后面拼 /builds/chromium/…/chromium-win64.zip）。留空 = 自动（国内默认走 npmmirror 镜像，海外走官方）。默认镜像：https://registry.npmmirror.com/-/binary/playwright ——如该镜像不可达可改其它，或填官方 https://playwright.azureedge.net。">
+														<input
+															type="text"
+															value={draft.browser.downloadHost}
+															onChange={(e) => setBrowser({ downloadHost: e.target.value.trim() })}
+															placeholder="留空 = 自动（国内默认镜像）"
+															className={inputCls + " font-mono"}
+														/>
+													</Field>
 												</div>
 											</div>
 
