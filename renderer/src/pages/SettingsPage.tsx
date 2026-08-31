@@ -436,6 +436,27 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 													{selectedChannel.type === "dingtalk" && <div className="rounded-2xl border border-amber-100 bg-amber-50 px-5 py-4 text-xs leading-relaxed text-slate-600">钉钉开发者后台：创建企业内部应用 → 获取 ClientID / ClientSecret → 添加机器人能力并选择 Stream 模式 → 发布。无需公网回调地址。</div>}
 												</div>
 											)}
+
+											<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
+												<div className="flex items-center justify-between">
+													<div>
+														<div className="text-sm font-medium text-slate-800">IM 管理员白名单</div>
+														<div className="mt-1 text-xs text-slate-400">名单内的人可在 IM 单聊中修改员工身份、增删管理员、开启受控能力（命令执行等）、创建可无人值守执行受控操作的定时任务。为空 = 未认领：首位在单聊中明确确认身份修改的人自动成为首位管理员。</div>
+													</div>
+												</div>
+												<div className="mt-3 space-y-2">
+													{draft.security.adminStaffIds.length === 0 && (
+														<div className="rounded-lg border border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-700">尚未设置管理员（未认领）。可在此预先填写，或由首位确认者远程认领。</div>
+													)}
+													{draft.security.adminStaffIds.map((id, idx) => (
+														<div key={`${id}-${idx}`} className="flex items-center gap-2">
+															<input value={id} onChange={(e) => setSecurity({ adminStaffIds: draft.security.adminStaffIds.map((v, i) => (i === idx ? e.target.value : v)) })} placeholder="钉钉 staffId" className={inputCls} />
+															<button type="button" onClick={() => setSecurity({ adminStaffIds: draft.security.adminStaffIds.filter((_, i) => i !== idx) })} className="shrink-0 text-xs text-rose-400 hover:text-rose-600">删除</button>
+														</div>
+													))}
+													<button type="button" onClick={() => setSecurity({ adminStaffIds: [...draft.security.adminStaffIds, ""] })} className="text-xs text-blue-500 hover:text-blue-600">＋ 添加管理员</button>
+												</div>
+											</div>
 										</>
 									)}
 
@@ -447,26 +468,6 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 										<Field label="服务时间"><input value={draft.identity.serviceHours} onChange={(event) => setIdentity({ serviceHours: event.target.value })} placeholder="7×24h" className={inputCls} /></Field>
 										<div className="rounded-2xl border border-blue-100 bg-blue-50 px-5 py-3 text-xs leading-relaxed text-slate-600">身份与提示词规则可在「<b>提示词</b>」标签页自定义；修改后保存，对<b>新对话</b>生效。管理员（白名单内的人）也可在 IM 单聊中通过对话修改身份。</div>
 
-										<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
-											<div className="flex items-center justify-between">
-												<div>
-													<div className="text-sm font-medium text-slate-800">IM 管理员白名单</div>
-													<div className="mt-1 text-xs text-slate-400">名单内的人可在 IM 单聊中修改员工身份、增删管理员。为空 = 未认领：首位在单聊中明确确认身份修改的人自动成为首位管理员。</div>
-												</div>
-											</div>
-											<div className="mt-3 space-y-2">
-												{draft.security.adminStaffIds.length === 0 && (
-													<div className="rounded-lg border border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-700">尚未设置管理员（未认领）。可在此预先填写，或由首位确认者远程认领。</div>
-												)}
-												{draft.security.adminStaffIds.map((id, idx) => (
-													<div key={`${id}-${idx}`} className="flex items-center gap-2">
-														<input value={id} onChange={(e) => setSecurity({ adminStaffIds: draft.security.adminStaffIds.map((v, i) => (i === idx ? e.target.value : v)) })} placeholder="钉钉 staffId" className={inputCls} />
-														<button type="button" onClick={() => setSecurity({ adminStaffIds: draft.security.adminStaffIds.filter((_, i) => i !== idx) })} className="shrink-0 text-xs text-rose-400 hover:text-rose-600">删除</button>
-													</div>
-												))}
-												<button type="button" onClick={() => setSecurity({ adminStaffIds: [...draft.security.adminStaffIds, ""] })} className="text-xs text-blue-500 hover:text-blue-600">＋ 添加管理员</button>
-											</div>
-										</div>
 											<label className="flex cursor-pointer items-center justify-between rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
 												<div><div className="text-sm font-medium text-slate-800">开机自动启动</div><div className="mt-1 text-xs text-slate-400">登录系统时自动启动虚拟员工。</div></div>
 												<input type="checkbox" checked={draft.general.autostart} onChange={(event) => setGeneral({ autostart: event.target.checked })} className="h-5 w-5 accent-blue-500" />
