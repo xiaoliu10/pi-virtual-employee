@@ -12,7 +12,10 @@
  * Safety posture:
  *  - Shell execution is OFF by default (`capabilities.shell.enabled=false`).
  *  - Each run_command call requires the CURRENT message to contain an explicit
- *    confirmation (the model can't self-authorize by passing a flag).
+ *    confirmation (the model can't self-authorize by passing a flag) — except
+ *    unattended scheduled-task runs, which re-attach the task creator's admin
+ *    identity (live whitelist check, no per-message confirmation because the
+ *    prompt is fixed text).
  *  - Only executables on the whitelist may be run; "*" is supported but
  *    documented as "full server control from a stolen admin IM account".
  *  - The command runs with the parent's user token (not elevated); anything
@@ -24,7 +27,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ConfigStore } from "../../db/config-store.js";
-import { maskId, refuse, requireConfirmedAdmin, type ActorContext } from "./admin.js";
+import { maskId, refuse, requireAdminForCommand, isSchedulerActor, type ActorContext } from "./admin.js";
 
 export interface ShellToolDeps {
 	config: ConfigStore;
@@ -319,11 +322,7 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 			if (!raw) return refuse("command 不能为空。");
 			if (raw.length > 512) return refuse("命令过长（>512 字符），拒绝执行。");
 
-			const gate = requireConfirmedAdmin(deps, {
-				needConfirmation: true,
-				confirmationHint:
-					"执行命令会在部署机器上即时运行，请明确说出要执行的命令，并在当前消息中包含「确认」。",
-			});
+			const gate = requireAdminForCommand(deps);
 			if ("content" in gate) return gate;
 
 			const shell = deps.config.all().capabilities?.shell;
@@ -333,10 +332,13 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 			const gateResult = checkWhitelist(raw, shell.allowedCommands);
 			if (!gateResult.ok) return refuse(gateResult.reason);
 
-			// Audit before running: masked admin id + the exact command line.
+			// Audit before running: masked admin id + the exact command line. A
+			// scheduler actor records that this ran unattended under the task
+			// creator's re-attached identity.
 			const actorId = maskId(gate.actor.senderId);
-			console.log(`[shell] run_command by ${actorId}: ${raw}`);
-			audit(deps.auditLogPath, { event: "start", actor: actorId, channel: gate.actor.channel, command: raw });
+			const via = isSchedulerActor(gate.actor) ? "scheduler" : gate.actor.channel;
+			console.log(`[shell] run_command by ${actorId} (${via}): ${raw}`);
+			audit(deps.auditLogPath, { event: "start", actor: actorId, channel: via, command: raw });
 
 			const startedAt = Date.now();
 			const { output, code, timedOut } = await runCommand(raw);

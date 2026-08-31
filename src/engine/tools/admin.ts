@@ -57,6 +57,18 @@ export function isExplicitConfirmation(userText: string): boolean {
 }
 
 /**
+ * True when the actor is the scheduler re-attaching a task creator's identity
+ * for an unattended run (`sched:` conversation). The senderId was captured at
+ * creation time in a verified 1:1 admin chat and is re-checked against the live
+ * whitelist on every use, so revoking admin access disables the task's guarded
+ * tools immediately. Only whitelisted for run_command — see
+ * requireConfirmedAdminOrScheduler.
+ */
+export function isSchedulerActor(actor: NonNullable<ActorContext>): boolean {
+	return actor.channel === "scheduler";
+}
+
+/**
  * Platform-verified single-chat check shared by guarded tools. Group chats and
  * non-IM conversations have no reliable operation actor and are refused here.
  */
@@ -69,6 +81,13 @@ export function requireSingleChatActor(deps: Pick<AdminToolDeps, "resolveActor" 
 	}
 	if (actor.chatType !== "single") {
 		return refuse("管理操作只允许在单聊中进行，群聊不开放（群内无法可靠鉴别操作者）。");
+	}
+	if (isSchedulerActor(actor)) {
+		// Unattended scheduled runs may ONLY use run_command (via
+		// requireAdminForCommand, which checks the actor before calling here).
+		// Every other admin tool stays interactive-only: a fixed task prompt
+		// must never be able to rotate the admin list or rewrite config.
+		return refuse("定时任务会话不能执行该管理操作（仅允许 run_command 受控命令）。");
 	}
 	if (!actor.senderId) {
 		return refuse("无法识别发送者身份（senderId 为空），拒绝执行。");
@@ -102,6 +121,32 @@ export function requireConfirmedAdmin(
 		);
 	}
 	return { actor };
+}
+
+/**
+ * run_command gate: identical to requireConfirmedAdmin, except a scheduler
+ * actor (unattended scheduled-task run) passes WITHOUT the per-message
+ * confirmation — the task prompt is fixed text, so requiring 「确认」 in it is
+ * meaningless. The admin whitelist check above still applies live on every
+ * fire, and the command whitelist still gates what can run. Every other admin
+ * tool keeps using requireConfirmedAdmin, which rejects scheduler actors
+ * through requireSingleChatActor's non-IM refusal.
+ */
+export function requireAdminForCommand(
+	deps: Pick<AdminToolDeps, "config" | "resolveActor" | "conversationId">,
+): AdminRefusal | { actor: NonNullable<ActorContext> } {
+	const actor = deps.resolveActor(deps.conversationId);
+	if (actor && isSchedulerActor(actor)) {
+		const adminIds = deps.config.all().security.adminStaffIds;
+		if (adminIds.length === 0) {
+			return refuse("管理员尚未设置，定时任务无法以任何管理员身份执行受控命令。");
+		}
+		if (!adminIds.includes(actor.senderId)) {
+			return refuse("创建该定时任务的管理员已被移出白名单，任务无法继续执行受控命令。");
+		}
+		return { actor };
+	}
+	return requireConfirmedAdmin(deps, { needConfirmation: true });
 }
 
 export interface AdminToolDeps {

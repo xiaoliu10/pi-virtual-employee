@@ -168,6 +168,7 @@ function migrate(db: DB): void {
 			enabled         INTEGER NOT NULL DEFAULT 1,
 			conversation_id TEXT,
 			origin          TEXT NOT NULL DEFAULT 'console',
+			created_by      TEXT,
 			last_run_at     INTEGER,
 			next_run_at     INTEGER,
 			last_status     TEXT,
@@ -176,6 +177,15 @@ function migrate(db: DB): void {
 		);
 		CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due ON scheduled_tasks(enabled, next_run_at);
 	`);
+	// created_by: platform senderId of the admin who created the task in a 1:1
+	// chat. The scheduler re-attaches this identity at fire time so guarded
+	// tools (run_command) can authorize unattended runs — re-validated against
+	// the live admin whitelist on every fire. NULL = created from the console
+	// settings UI (no verified identity) → runs without admin-gated tools.
+	const taskCols = new Set(
+		(db.prepare("PRAGMA table_info(scheduled_tasks)").all() as { name: string }[]).map((r) => r.name),
+	);
+	if (!taskCols.has("created_by")) db.exec("ALTER TABLE scheduled_tasks ADD COLUMN created_by TEXT");
 
 	// Document resources: a catalog of deliverable docs the employee can hand to
 	// integration partners. kind=file points at a copied file under documents.dir;

@@ -433,6 +433,15 @@ async function main(): Promise<void> {
 			let sendResult: Awaited<ReturnType<typeof engine.send>>;
 			try {
 				sendResult = await engine.send(agent, task.prompt, {
+					// Re-attach the task creator's identity for guarded tools
+					// (run_command). Captured at creation in a verified 1:1 admin
+					// chat; requireAdminForCommand re-checks the live whitelist on
+					// every fire, so a removed admin's tasks lose command access
+					// immediately. Only run_command honors scheduler actors — the
+					// other admin tools keep refusing non-IM conversations.
+					...(task.created_by
+						? { actor: { senderId: task.created_by, channel: "scheduler", chatType: "single" as const } }
+						: {}),
 					onPersist: () => {
 						pushActivity(execConvId);
 						if (task.conversation_id) pushActivity(task.conversation_id);

@@ -14,6 +14,8 @@ export interface ScheduledTaskRow {
 	enabled: number; // 0 | 1
 	conversation_id: string | null;
 	origin: string; // 'console' | 'im' | 'scheduled'
+	/** Admin senderId captured at creation in a 1:1 chat; NULL for console-created. */
+	created_by: string | null;
 	last_run_at: number | null;
 	next_run_at: number | null;
 	last_status: string | null; // 'ok' | 'error:…'
@@ -28,6 +30,8 @@ export interface CreateScheduledTaskInput {
 	enabled?: boolean;
 	conversationId?: string | null;
 	origin?: string;
+	/** Admin senderId (verified 1:1 creator). Stored so unattended runs can re-attach it. */
+	createdBy?: string | null;
 	nextRunAt: number | null;
 }
 
@@ -44,6 +48,7 @@ export class ScheduledTaskStore {
 			enabled: input.enabled === false ? 0 : 1,
 			conversation_id: input.conversationId ?? null,
 			origin: input.origin ?? "console",
+			created_by: input.createdBy ?? null,
 			last_run_at: null,
 			next_run_at: input.nextRunAt,
 			last_status: null,
@@ -53,8 +58,8 @@ export class ScheduledTaskStore {
 		this.db
 			.prepare(
 				`INSERT INTO scheduled_tasks
-				 (id, title, prompt, cron, enabled, conversation_id, origin, last_run_at, next_run_at, last_status, created_at, updated_at)
-				 VALUES (@id, @title, @prompt, @cron, @enabled, @conversation_id, @origin, @last_run_at, @next_run_at, @last_status, @created_at, @updated_at)`,
+				 (id, title, prompt, cron, enabled, conversation_id, origin, created_by, last_run_at, next_run_at, last_status, created_at, updated_at)
+				 VALUES (@id, @title, @prompt, @cron, @enabled, @conversation_id, @origin, @created_by, @last_run_at, @next_run_at, @last_status, @created_at, @updated_at)`,
 			)
 			.run(row);
 		return row;

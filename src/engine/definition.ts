@@ -128,7 +128,15 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 	if (options.filesystemEnabled) tools.push(...createFilesystemTools(options.filesystem));
 	if (options.schedulerEnabled) {
 		const origin = inferConversationOrigin(options.conversationId);
-		tools.push(...createSchedulerTools(options.scheduler, options.conversationId, origin));
+		tools.push(
+			...createSchedulerTools(
+				options.scheduler,
+				options.conversationId,
+				origin,
+				options.config,
+				options.resolveActor,
+			),
+		);
 	}
 	if (options.reportsEnabled) tools.push(createSaveReportTool(options.reportService, options.conversationId));
 	// Skill authoring is an always-on channel: explicit 技能/Skill intent writes

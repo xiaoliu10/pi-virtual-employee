@@ -11,6 +11,8 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { SchedulerService } from "../../scheduler/scheduler-service.js";
+import type { ConfigStore } from "../../db/config-store.js";
+import { requireConfirmedAdmin, type ActorContext } from "./admin.js";
 
 function fmtTime(ms: number | null): string {
 	return ms ? new Date(ms).toLocaleString("zh-CN", { hour12: false }) : "—";
@@ -20,12 +22,15 @@ export function createSchedulerTools(
 	scheduler: SchedulerService,
 	conversationId: string,
 	origin: string,
+	config?: ConfigStore,
+	resolveActor?: (conversationId: string) => ActorContext,
 ): AgentTool[] {
 	const create: AgentTool = {
 		name: "create_scheduled_task",
 		label: "创建定时任务",
 		description:
-			"创建一个定时任务：到点后系统会自动以你的身份执行 prompt（可用全部工具）并保存结果；如果任务是在钉钉群聊或单聊中创建，执行结果会主动推送回创建任务的原会话，无需用户手动查询。cron 为标准 5 字段（分 时 日 月 周，本地时间），如 \"0 9 * * *\"=每天9点、\"*/30 * * * *\"=每30分钟、\"0 9 * * 1\"=每周一9点。prompt 写清到点要做什么。",
+			"创建一个定时任务：到点后系统会自动以你的身份执行 prompt（可用全部工具）并保存结果；如果任务是在钉钉群聊或单聊中创建，执行结果会主动推送回创建任务的原会话，无需用户手动查询。cron 为标准 5 字段（分 时 日 月 周，本地时间），如 \"0 9 * * *\"=每天9点、\"*/30 * * * *\"=每30分钟、\"0 9 * * 1\"=每周一9点。prompt 写清到点要做什么。" +
+			"注意：定时任务无人值守执行，若其 prompt 需要执行命令（run_command）等管理员受控操作，则任务必须由管理员在 IM 单聊中明确「确认」创建——创建者身份会被记录并在每次执行时实时校验；由普通用户或群聊创建的任务，到点后无法使用这些管理员工具。来自普通用户的此类创建请求应先说明需管理员确认。",
 		parameters: Type.Object({
 			title: Type.String({ description: "任务简短标题，如「每日订单早报」" }),
 			prompt: Type.String({ description: "到点要执行的指令，如「查询昨日所有订单状态并汇总异常」" }),
@@ -41,12 +46,25 @@ export function createSchedulerTools(
 					details: { ok: false },
 				};
 			}
+			// A task that may run admin-gated tools (run_command) unattended needs
+			// a creator identity to re-attach at fire time. Only capture it from a
+			// verified 1:1 admin chat WITH explicit confirmation — anyone else can
+			// still create the task, but it runs without admin-gated tools.
+			let createdBy: string | null = null;
+			if (config && resolveActor) {
+				const gate = requireConfirmedAdmin(
+					{ config, resolveActor, conversationId },
+					{ needConfirmation: true, confirmationHint: "该定时任务将无人值守执行。请确认任务内容，并在当前消息中包含「确认」。" },
+				);
+				if ("actor" in gate) createdBy = gate.actor.senderId;
+			}
 			const task = scheduler.create({
 				title: p.title,
 				prompt: p.prompt,
 				cron: p.cron,
 				conversationId,
 				origin,
+				createdBy,
 			});
 			return {
 				content: [
@@ -57,7 +75,7 @@ export function createSchedulerTools(
 								: `已创建定时任务「${task.title}」。下次执行：${fmtTime(task.next_run_at)}。到点后我会自动执行并把结果记入对话。`,
 					},
 				],
-				details: { ok: true, id: task.id, nextRunAt: task.next_run_at },
+				details: { ok: true, id: task.id, nextRunAt: task.next_run_at, createdBy },
 			};
 		},
 	};
