@@ -146,6 +146,14 @@ export function requireAdminForCommand(
 		}
 		return { actor };
 	}
+	// A scheduled-task conversation without a re-attached actor: the task was
+	// created before creator-identity capture existed (or from the console UI).
+	// Give an actionable message instead of the generic "not an IM 1:1 chat".
+	if (!actor && deps.conversationId.startsWith("sched:")) {
+		return refuse(
+			"该定时任务创建时未记录管理员身份，无法无人值守执行受控命令。请管理员在 IM 单聊中删除并重建该任务（创建消息中明确「确认」），重建后即可在无人值守时运行 run_command。",
+		);
+	}
 	return requireConfirmedAdmin(deps, { needConfirmation: true });
 }
 

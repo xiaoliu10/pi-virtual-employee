@@ -236,13 +236,14 @@ function killProcessTree(pid: number | undefined): void {
 }
 
 /** Run the planned execution; resolve stdout+stderr, truncate, enforce timeout. */
-function runCommand(command: string): Promise<{ output: string; code: number | null; timedOut: boolean }> {
+function runCommand(command: string, workingDir?: string): Promise<{ output: string; code: number | null; timedOut: boolean }> {
 	const plan = planExecution(command);
 	return new Promise((resolve) => {
 		const common = {
 			stdio: ["ignore", "pipe", "pipe"] as ("ignore" | "pipe" | "ipc" | number)[],
 			windowsHide: true,
 			detached: process.platform !== "win32",
+			cwd: workingDir,
 			env: {
 				...process.env,
 				COMSPEC: `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`,
@@ -312,12 +313,14 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 			"默认用于运维诊断：tasklist 查看进程、taskkill 按单个 PID 结束进程、systeminfo/whoami/hostname/netstat/ping/ipconfig 查看本机状态。" +
 			"只允许执行 capabilities.shell.allowedCommands 白名单内的可执行文件（* 表示全部）；命令输出自动截断、60 秒超时；串联、管道、重定向、变量展开、脚本扩展名和可执行文件路径均拒绝。" +
 			"powershell/node/npx 等解释器需管理员显式加入白名单；安装 Chromium 请改用 manage_capabilities setup_browser。" +
-			"安全规则：默认关闭；每次执行必须由管理员在当前消息中明确包含「确认」/confirm/yes/ok；群聊一律拒绝。命令以当前应用用户权限运行，不会自动提权。",
+			"安全规则：默认关闭；每次执行必须由管理员在当前消息中明确包含「确认」/confirm/yes/ok；群聊一律拒绝。命令以当前应用用户权限运行，不会自动提权。" +
+			"可选 workingDir：命令的工作目录（绝对路径，如 C:\\Users\\me\\project），脚本用相对路径读写数据文件时需要；不影响可执行文件白名单。定时任务无人值守执行时，run_command 以任务创建者（管理员）身份放行，无需消息内含「确认」，但命令与可执行文件白名单照常校验。",
 		parameters: Type.Object({
-			command: Type.String({ description: `要执行的命令，如「tasklist /FI "PID eq 19060"」「taskkill /PID 19060 /F」「systeminfo」` }),
+			command: Type.String({ description: `要执行的命令，如「tasklist /FI "PID eq 19060"」「taskkill /PID 19060 /F」「python scripts/gen_report.py」。跑脚本直接给脚本文件路径，不要用 python -c 内联代码（括号会被拦截）。` }),
+			workingDir: Type.Optional(Type.String({ description: "可选：命令的工作目录绝对路径，如 C:\\Users\\admin\\assistant-home\\project。脚本按相对路径找数据文件时必填。" })),
 		}),
 		async execute(_toolCallId, params) {
-			const { command } = params as { command?: string };
+			const { command, workingDir } = params as { command?: string; workingDir?: string };
 			const raw = (command ?? "").trim();
 			if (!raw) return refuse("command 不能为空。");
 			if (raw.length > 512) return refuse("命令过长（>512 字符），拒绝执行。");
@@ -332,16 +335,30 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 			const gateResult = checkWhitelist(raw, shell.allowedCommands);
 			if (!gateResult.ok) return refuse(gateResult.reason);
 
+			// Validate workingDir: an absolute, composition-free path. It only
+			// sets where the process runs, not what runs — but it must not be a
+			// vector for shell metacharacters.
+			let cwd: string | undefined;
+			const dir = (workingDir ?? "").trim();
+			if (dir) {
+				if (CMD_COMPOSITION_RE.test(dir) || /["']/.test(dir)) {
+					return refuse("workingDir 含 shell 控制字符或引号，拒绝执行。");
+				}
+				const isAbs = process.platform === "win32" ? /^[a-zA-Z]:[\\/]/.test(dir) : dir.startsWith("/");
+				if (!isAbs) return refuse("workingDir 必须是绝对路径（如 C:\\Users\\me\\project）。");
+				cwd = dir;
+			}
+
 			// Audit before running: masked admin id + the exact command line. A
 			// scheduler actor records that this ran unattended under the task
 			// creator's re-attached identity.
 			const actorId = maskId(gate.actor.senderId);
 			const via = isSchedulerActor(gate.actor) ? "scheduler" : gate.actor.channel;
-			console.log(`[shell] run_command by ${actorId} (${via}): ${raw}`);
-			audit(deps.auditLogPath, { event: "start", actor: actorId, channel: via, command: raw });
+			console.log(`[shell] run_command by ${actorId} (${via})${cwd ? ` cwd=${cwd}` : ""}: ${raw}`);
+			audit(deps.auditLogPath, { event: "start", actor: actorId, channel: via, command: raw, cwd: cwd ?? null });
 
 			const startedAt = Date.now();
-			const { output, code, timedOut } = await runCommand(raw);
+			const { output, code, timedOut } = await runCommand(raw, cwd);
 			const durationMs = Date.now() - startedAt;
 			audit(deps.auditLogPath, { event: "finish", actor: actorId, command: raw, code, timedOut, durationMs });
 			const head = timedOut
