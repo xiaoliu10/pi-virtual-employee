@@ -312,13 +312,16 @@ function relaunchInto(profile: string): void {
 	app.exit(0);
 }
 
-/** First non-empty lines of a report, for the IM push when a link is available. */
-function briefSummary(markdown: string, max = 400): string {
-	const lines = markdown.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-	// Skip leading markdown headings/bullets-only so the excerpt starts on real text.
-	const body = lines.filter((l) => !/^#{1,6}\s/.test(l)).join(" ");
-	const text = body.length > max ? body.slice(0, max) + "…" : body;
-	return text || markdown.slice(0, max);
+/**
+ * First part of a report for the IM push when a link exists. Keeps markdown
+ * structure (line breaks/headings/lists all render in DingTalk); the adapter
+ * flattens any pipe tables at send time. Capped at a line boundary.
+ */
+function briefSummary(markdown: string, max = 1200): string {
+	const text = markdown.trim();
+	if (text.length <= max) return text;
+	const cut = text.lastIndexOf("\n", max);
+	return (cut > 0 ? text.slice(0, cut) : text.slice(0, max)).trimEnd() + "\n…（完整内容见报告链接）";
 }
 
 async function main(): Promise<void> {

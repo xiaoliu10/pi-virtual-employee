@@ -83,6 +83,42 @@ function digestTitle(markdown: string): string {
 	return (stripped || "回复").slice(0, 50);
 }
 
+/**
+ * DingTalk's markdown renderer does NOT support pipe tables — `| a | b |`
+ * lines render as one unreadable run. Rewrite every table block into bullet
+ * lines (`- 列名：值　列名：值`); everything else passes through untouched.
+ * Applied at both send points (session reply + proactive push).
+ */
+function flattenMarkdownTables(markdown: string): string {
+	const src = markdown.replace(/\r\n/g, "\n").split("\n");
+	const out: string[] = [];
+	for (let i = 0; i < src.length; i++) {
+		const line = src[i].trim();
+		// Table block: header row, a |---| separator row, then data rows.
+		if (/^\|.+\|\s*$/.test(line) && i + 1 < src.length && /^\|[\s:|-]+\|\s*$/.test(src[i + 1].trim())) {
+			const splitRow = (l: string): string[] =>
+				l.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+			const headers = splitRow(line);
+			i += 2; // skip header + separator
+			const rows: string[][] = [];
+			while (i < src.length && /^\|.+\|\s*$/.test(src[i].trim())) {
+				rows.push(splitRow(src[i].trim()));
+				i++;
+			}
+			i--; // loop increment moves past the block
+			out.push("");
+			for (const row of rows) {
+				const pairs = headers.map((h, idx) => (h ? `${h}：${row[idx] ?? ""}` : row[idx] ?? "")).filter(Boolean);
+				out.push(pairs.length ? `- ${pairs.join("　")}` : "");
+			}
+			out.push("");
+			continue;
+		}
+		out.push(line);
+	}
+	return out.join("\n").replace(/\n{3,}/g, "\n\n");
+}
+
 export class DingtalkAdapter implements IMAdapter {
 	readonly channel = "dingtalk";
 	private client?: DWClient;
@@ -206,7 +242,7 @@ export class DingtalkAdapter implements IMAdapter {
 		const res = await fetch(webhook, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ msgtype: "markdown", markdown: { title: digestTitle(text), text } }),
+			body: JSON.stringify({ msgtype: "markdown", markdown: { title: digestTitle(text), text: flattenMarkdownTables(text) } }),
 		});
 		if (!res.ok) console.warn(`[im:dingtalk] reply failed: HTTP ${res.status}`);
 	}
@@ -366,7 +402,7 @@ export class DingtalkAdapter implements IMAdapter {
 		try {
 			if (!this.appId) return { ok: false, error: "dingtalk 未配置 appId" };
 			if (!text.trim()) return { ok: false, error: "推送内容为空" };
-			const msgParam = JSON.stringify({ title: digestTitle(text), text });
+			const msgParam = JSON.stringify({ title: digestTitle(text), text: flattenMarkdownTables(text) });
 			if (conversationId.startsWith("dt:group:")) {
 				const openConversationId = conversationId.slice("dt:group:".length);
 				if (!openConversationId) return { ok: false, error: "缺少 openConversationId" };

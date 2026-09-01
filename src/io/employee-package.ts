@@ -64,7 +64,7 @@ interface Manifest {
 const COLUMNS: Record<string, readonly string[]> = {
 	conversations: ["id", "title", "created_at", "updated_at", "model_supplier_id", "model_model_id", "origin"],
 	messages: ["id", "conversation_id", "role", "content", "created_at"],
-	scheduled_tasks: ["id", "title", "prompt", "cron", "enabled", "conversation_id", "origin", "last_run_at", "next_run_at", "last_status", "created_at", "updated_at"],
+	scheduled_tasks: ["id", "title", "prompt", "cron", "enabled", "conversation_id", "origin", "created_by", "last_run_at", "next_run_at", "last_status", "created_at", "updated_at"],
 	kb_entries: ["id", "title", "tags", "content", "created_at", "updated_at", "origin", "archived", "version", "lineage", "confidence", "source_url", "review_status", "hit_count", "last_used_at", "superseded_by"],
 	kb_chunks: ["id", "source", "source_id", "title", "tags", "content", "created_at", "updated_at", "chunk_index", "metadata", "embed_status", "embedding_model"],
 	kb_docs: ["id", "name", "chunks", "created_at"],
