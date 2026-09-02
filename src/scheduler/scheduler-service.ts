@@ -68,6 +68,11 @@ export class SchedulerService {
 		this.store.setEnabled(id, enabled, nextRunAt);
 	}
 
+	/** Attach an admin creator identity to an existing task (see store.setCreatedBy). */
+	setCreatedBy(id: string, senderId: string): ScheduledTaskRow | undefined {
+		return this.store.setCreatedBy(id, senderId);
+	}
+
 	/** Start the periodic tick. Idempotent; fires once immediately. */
 	start(): void {
 		if (this.timer) return;

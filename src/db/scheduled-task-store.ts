@@ -90,6 +90,20 @@ export class ScheduledTaskStore {
 			.run(enabled ? 1 : 0, nextRunAt, Date.now(), id);
 	}
 
+	/**
+	 * Attach (or replace) the creator identity on an existing task, so
+	 * unattended runs can re-attach it for run_command. Used by the
+	 * authorize_scheduled_task conversation action after a verified admin
+	 * confirms — the alternative is delete + recreate, which loses history.
+	 * Returns the updated row, or undefined when the id doesn't exist.
+	 */
+	setCreatedBy(id: string, senderId: string): ScheduledTaskRow | undefined {
+		this.db
+			.prepare("UPDATE scheduled_tasks SET created_by = ?, updated_at = ? WHERE id = ?")
+			.run(senderId, Date.now(), id);
+		return this.get(id);
+	}
+
 	/** Tasks whose next run is due now (or overdue), enabled only. */
 	listDue(now: number): ScheduledTaskRow[] {
 		return this.db

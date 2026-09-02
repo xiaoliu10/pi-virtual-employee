@@ -151,7 +151,7 @@ export function requireAdminForCommand(
 	// Give an actionable message instead of the generic "not an IM 1:1 chat".
 	if (!actor && deps.conversationId.startsWith("sched:")) {
 		return refuse(
-			"该定时任务创建时未记录管理员身份，无法无人值守执行受控命令。请管理员在 IM 单聊中删除并重建该任务（创建消息中明确「确认」），重建后即可在无人值守时运行 run_command。",
+			"该定时任务创建时未记录管理员身份，无法无人值守执行受控命令。请管理员在 IM 单聊中使用 authorize_scheduled_task 给该任务授权（消息中明确「确认」），无需删除重建。",
 		);
 	}
 	return requireConfirmedAdmin(deps, { needConfirmation: true });

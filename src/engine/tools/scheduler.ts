@@ -112,6 +112,48 @@ export function createSchedulerTools(
 		},
 	};
 
+	const authorize: AgentTool = {
+		name: "authorize_scheduled_task",
+		label: "授权定时任务",
+		description:
+			"给已有定时任务补记管理员创建者身份（仅限管理员在 IM 单聊中使用，且当前消息须明确包含「确认」）。" +
+			"适用于任务创建时未记录身份（旧版本创建/控制台创建），导致无人值守无法执行 run_command 的情况——授权后无需删除重建，保留原 cron、prompt 与执行历史。" +
+			"授权后任务的无人值守执行将以你（当前管理员）的身份实时校验白名单；若你日后被移出管理员名单，任务随即失去受控命令权限。",
+		parameters: Type.Object({
+			id: Type.String({ description: "任务 id（来自 list_scheduled_tasks）" }),
+		}),
+		async execute(_id, params) {
+			const taskId = (params as { id: string }).id;
+			if (!config || !resolveActor) {
+				return { content: [{ type: "text", text: "当前会话不支持授权操作（需要在 IM 单聊中进行）。" }], details: { ok: false } };
+			}
+			// Same gate as creating an admin-backed task: verified 1:1 admin chat
+			// WITH explicit confirmation in the current message.
+			const gate = requireConfirmedAdmin(
+				{ config, resolveActor, conversationId },
+				{
+					needConfirmation: true,
+					confirmationHint:
+						"授权后该定时任务将无人值守以你的管理员身份执行受控命令。请确认要授权的任务，并在当前消息中包含「确认」。",
+				},
+			);
+			if ("content" in gate) return gate;
+			const updated = scheduler.setCreatedBy(taskId, gate.actor.senderId);
+			if (!updated) {
+				return { content: [{ type: "text", text: `未找到 id 为 ${taskId} 的定时任务，请先用 list_scheduled_tasks 确认。` }], details: { ok: false } };
+			}
+			return {
+				content: [
+					{
+						type: "text",
+						text: `✅ 已授权定时任务「${updated.title}」：无人值守执行将以你的管理员身份校验，下次执行 ${fmtTime(updated.next_run_at)} 起可正常调用 run_command。`,
+					},
+				],
+				details: { ok: true, id: updated.id, title: updated.title },
+			};
+		},
+	};
+
 	const toggle: AgentTool = {
 		name: "toggle_scheduled_task",
 		label: "启停定时任务",
@@ -130,5 +172,5 @@ export function createSchedulerTools(
 		},
 	};
 
-	return [create, list, remove, toggle];
+	return [create, list, remove, toggle, authorize];
 }
