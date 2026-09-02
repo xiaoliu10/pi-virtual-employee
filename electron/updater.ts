@@ -49,6 +49,15 @@ const UPDATE_LOG_FILE = "updater.log";
 const FAILURE_FILE = "update-failures.json";
 /** After this many failed install attempts for one target version, stop auto-installing it. */
 const MAX_ATTEMPTS_PER_VERSION = 2;
+/**
+ * MACHINE-level breaker: consecutive failed installs ACROSS different target
+ * versions. A box whose old uninstaller is broken fails identically for every
+ * new release (0.2.17, 0.2.18, 0.2.21 — three outages, one per version bump,
+ * each per-version counter reset to zero). When the consecutive count across
+ * versions reaches this, auto-INSTALL stops entirely (checks/downloads still
+ * work) until one successful manual repair install clears the streak.
+ */
+const MAX_CONSECUTIVE_INSTALL_FAILURES = 2;
 
 interface FailureRecord {
 	attempts: number;
@@ -56,16 +65,29 @@ interface FailureRecord {
 	lastAttemptAt: string;
 }
 
-/** Persistent per-target-version failure counters (survives restarts → breaks loops). */
-function loadFailures(): Record<string, FailureRecord> {
+interface FailureFileShape {
+	/** per-version counters (legacy + per-target granularity) */
+	versions?: Record<string, FailureRecord>;
+	/** consecutive install failures across versions, machine-level */
+	consecutiveFailures?: number;
+	lastConsecutiveError?: string;
+}
+
+/** Persistent failure counters (survives restarts → breaks loops). */
+function loadFailures(): FailureFileShape {
 	try {
-		return JSON.parse(readFileSync(join(app.getPath("userData"), FAILURE_FILE), "utf8")) as Record<string, FailureRecord>;
+		const raw = JSON.parse(readFileSync(join(app.getPath("userData"), FAILURE_FILE), "utf8")) as FailureFileShape | Record<string, FailureRecord>;
+		// Legacy shape (flat per-version map) → migrate.
+		if (raw && !("versions" in raw) && typeof raw === "object") {
+			return { versions: raw as Record<string, FailureRecord>, consecutiveFailures: 0 };
+		}
+		return raw ?? { versions: {}, consecutiveFailures: 0 };
 	} catch {
-		return {};
+		return { versions: {}, consecutiveFailures: 0 };
 	}
 }
 
-function saveFailures(map: Record<string, FailureRecord>): void {
+function saveFailures(map: FailureFileShape): void {
 	try {
 		mkdirSync(join(app.getPath("userData")), { recursive: true });
 		writeFileSync(join(app.getPath("userData"), FAILURE_FILE), JSON.stringify(map, null, 2), "utf8");
@@ -76,22 +98,48 @@ function saveFailures(map: Record<string, FailureRecord>): void {
 
 function recordFailure(version: string, error: string): number {
 	const map = loadFailures();
-	const prev = map[version] ?? { attempts: 0, lastError: "", lastAttemptAt: "" };
-	map[version] = { attempts: prev.attempts + 1, lastError: error.slice(0, 500), lastAttemptAt: new Date().toISOString() };
-	saveFailures(map);
-	return map[version].attempts;
+	const versions = map.versions ?? {};
+	const prev = versions[version] ?? { attempts: 0, lastError: "", lastAttemptAt: "" };
+	versions[version] = { attempts: prev.attempts + 1, lastError: error.slice(0, 500), lastAttemptAt: new Date().toISOString() };
+	const consecutive = (map.consecutiveFailures ?? 0) + 1;
+	saveFailures({ versions, consecutiveFailures: consecutive, lastConsecutiveError: error.slice(0, 500) });
+	return versions[version].attempts;
 }
 
 function clearFailure(version: string): void {
 	const map = loadFailures();
-	if (map[version]) {
-		delete map[version];
-		saveFailures(map);
+	const versions = map.versions ?? {};
+	if (map.versions?.[version] || versions[version]) {
+		delete versions[version];
+		saveFailures({ versions, consecutiveFailures: map.consecutiveFailures ?? 0, lastConsecutiveError: map.lastConsecutiveError });
 	}
 }
 
 function failureAttempts(version: string): number {
-	return loadFailures()[version]?.attempts ?? 0;
+	return loadFailures().versions?.[version]?.attempts ?? 0;
+}
+
+/** Machine-level consecutive-install-failure count (across target versions). */
+function consecutiveInstallFailures(): number {
+	return loadFailures().consecutiveFailures ?? 0;
+}
+
+/**
+ * Clear the machine-level streak: called when the RUNNING app is newer than the
+ * last failed target — proof that an install (the manual repair, typically)
+ * finally succeeded on this box.
+ */
+function clearConsecutiveFailures(): void {
+	const map = loadFailures();
+	if ((map.consecutiveFailures ?? 0) > 0) {
+		log("INFO", "clearing machine-level consecutive install-failure streak (install succeeded)");
+		saveFailures({ versions: map.versions ?? {}, consecutiveFailures: 0 });
+	}
+}
+
+/** True when auto-INSTALL must be blocked machine-wide (manual repair needed). */
+function machineBreakerOpen(): boolean {
+	return consecutiveInstallFailures() >= MAX_CONSECUTIVE_INSTALL_FAILURES;
 }
 
 /**
@@ -299,6 +347,17 @@ function wireEvents(): void {
 		log("INFO", `update downloaded: version=${targetVersion} file=${downloadedInstallerPath ?? "unknown"}`);
 		setState({ phase: "ready", currentVersion: app.getVersion(), version: targetVersion });
 		if (!unattendedEnabled() && !requestedInstall) return;
+		// Machine-level breaker: consecutive installs failed across DIFFERENT
+		// target versions (0.2.17→0.2.18→0.2.21 pattern). Each per-version
+		// counter resets on a version bump, so the per-target breaker below never
+		// caught it — the box's old uninstaller breaks every upgrade identically.
+		// Stop auto-INSTALL entirely until a manual repair install succeeds.
+		if (machineBreakerOpen()) {
+			requestedInstall = false;
+			log("ERROR", `machine breaker open: ${consecutiveInstallFailures()} consecutive install failures across versions; auto-install disabled until manual repair`);
+			setState({ phase: "error", currentVersion: app.getVersion(), message: `本机已连续 ${consecutiveInstallFailures()} 次自动安装失败（跨版本），已停止自动安装。请手动运行最新安装包修复一次，成功后自动更新自动恢复。` });
+			return;
+		}
 		// Circuit breaker: this target already failed MAX_ATTEMPTS_PER_VERSION
 		// times on this machine. Do NOT loop again — a broken old-uninstaller
 		// makes every retry fail identically, and each failed attempt takes the
@@ -398,6 +457,21 @@ function startInstallWatchdog(): void {
 			`$installer = '${escapePowerShellSingleQuoted(installerCopy)}'`,
 			`$appExe = '${escapePowerShellSingleQuoted(appExe)}'`,
 			`$marker = '${escapePowerShellSingleQuoted(markerPath)}'`,
+			// update-failures.json lives one directory up from logs/updater.log.
+			// The watchdog is an independent PowerShell process, so it bumps the
+			// machine-level consecutive-failure counter itself when the installer
+			// wedges — otherwise the most common failure path (app killed by NSIS,
+			// hard-exit timer never fires) never recorded a failure and the
+			// breaker stayed closed forever.
+			`$failuresFile = Join-Path (Split-Path (Split-Path $log -Parent) -Parent) '${FAILURE_FILE}'`,
+			"function BumpFailureCount {",
+			"  try {",
+			"    $obj = [ordered]@{ versions = [ordered]@{}; consecutiveFailures = 1; lastConsecutiveError = 'watchdog: installer wedged, service restored to previous version (or failed to restore)' }",
+			"    if (Test-Path $failuresFile) { $raw = Get-Content -Raw -Path $failuresFile | ConvertFrom-Json; if ($raw.versions) { $obj.versions = $raw.versions }; if ($raw.consecutiveFailures) { $obj.consecutiveFailures = [int]$raw.consecutiveFailures + 1 } }",
+			"    $obj | ConvertTo-Json -Depth 5 | Set-Content -Path $failuresFile -Encoding UTF8",
+			"    Log ('watchdog: bumped machine-level failure count to ' + $obj.consecutiveFailures)",
+			"  } catch { Log ('watchdog: failed to write failure record: ' + $_.Exception.Message) }",
+			"}",
 			`$exeName = '${escapePowerShellSingleQuoted(exeName)}'`,
 			"function Log($m) { Add-Content -Path $log -Value \"[$([DateTime]::UtcNow.ToString('o'))] $m\" }",
 			"function TestApp { return [bool](Get-Process -Name $exeName -ErrorAction SilentlyContinue) }",
@@ -412,21 +486,22 @@ function startInstallWatchdog(): void {
 			"  if (TestApp) { Log 'watchdog: application recovered'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
 			"  Start-Sleep -Seconds 5",
 			"}",
-			// Phase 1: kill stale installers and retry the install once.
+			// Phase 1: the installer wedged (typically stuck in "uninstall old
+			// app" against a broken/unremovable old tree). Do NOT retry the
+			// install — a retry runs the same broken old-uninstaller and hangs
+			// the same way (three outages proved this). Kill the wedged
+			// installer so it stops holding the install lock, then try to bring
+			// the CURRENT exe back up (a wedged uninstall usually left it
+			// intact). Service first; the update waits for a manual repair.
 			"if (TestApp) { Log 'watchdog: application recovered'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
-			"Log 'watchdog: installer did not finish in time; killing stale installers and retrying'",
+			"Log 'watchdog: installer did not finish in time; killing wedged installers (no retry) and restoring current app'",
+			"BumpFailureCount",
 			"KillStaleInstallers",
-			"Start-Sleep -Seconds 3",
-			"$retry = Start-Process -FilePath $installer -ArgumentList @('--updated','/S') -PassThru",
-			"$finished = $retry.WaitForExit(180000)",
-			"if (-not $finished) { Stop-Process -Id $retry.Id -Force; Log 'watchdog: retry installer timed out after 180s' }",
-			"Start-Sleep -Seconds 15",
-			"if (TestApp) { Log 'watchdog: application recovered after retry'; Set-Content -Path $marker -Value 'recovered'; exit 0 }",
-			// Phase 2: direct launch of the installed exe — no desktop required.
-			"Log 'watchdog: launching installed app directly'",
-			"if (Test-Path $appExe) { Start-Process -FilePath $appExe; Start-Sleep -Seconds 20 }",
-			"if (TestApp) { Log 'watchdog: restored service by direct app launch'; exit 0 }",
-			"Log 'watchdog: all recovery attempts failed'",
+			"Start-Sleep -Seconds 5",
+			// Direct launch of the installed exe — no desktop required.
+			"if (Test-Path $appExe) { Start-Process -FilePath $appExe; Start-Sleep -Seconds 30 }",
+			"if (TestApp) { Log 'watchdog: restored service by direct app launch (update left for manual repair)'; exit 0 }",
+			"Log 'watchdog: direct app launch failed — exe missing or damaged; manual repair install required'",
 			"exit 2",
 		].join("\r\n");
 		writeFileSync(scriptPath, script, "utf8");
@@ -445,6 +520,30 @@ function startInstallWatchdog(): void {
 
 function escapePowerShellSingleQuoted(value: string): string {
 	return value.replace(/'/g, "''");
+}
+
+/**
+ * Kill this process's own tree BEFORE the hard exit. process.exit(0) only ends
+ * the Electron main/renderer processes — detached children (Playwright's
+ * Chromium, node helpers spawned with detached:true) survive, keep handles on
+ * files inside the app directory, and the NSIS old-uninstaller then hangs
+ * forever in "Failed to uninstall old application files" waiting to delete
+ * them (the 1h+ wedged-installer state behind three outages). taskkill /T
+ * takes the whole tree by PID; fire-and-forget, best effort.
+ */
+function killOwnProcessTree(): void {
+	if (process.platform !== "win32") return;
+	try {
+		const killer = spawn(
+			`${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`,
+			["/pid", String(process.pid), "/t", "/f"],
+			{ stdio: "ignore", windowsHide: true, detached: true },
+		);
+		killer.unref();
+		log("INFO", `killOwnProcessTree: taskkill /pid ${process.pid} /t /f dispatched`);
+	} catch (err) {
+		log("WARN", `killOwnProcessTree failed: ${err instanceof Error ? err.message : String(err)}`);
+	}
 }
 
 /** Compare dotted versions numerically ("0.2.14" vs "0.2.9"). */
@@ -476,6 +575,18 @@ function scheduleRecheck(): void {
  */
 export function quitAndInstall(): void {
 	if (!enabled() || installing) return;
+	// Machine-level breaker: repeated cross-version install failures (usually a
+	// broken old uninstaller) — refuse to take the app down again; a manual
+	// repair install is the documented exit.
+	if (machineBreakerOpen()) {
+		log("ERROR", "quitAndInstall blocked: machine breaker open (consecutive install failures)");
+		setState({
+			phase: "error",
+			currentVersion: app.getVersion(),
+			message: `本机已连续 ${consecutiveInstallFailures()} 次自动安装失败，已禁用自动安装。请手动下载最新安装包修复一次，成功后自动恢复。`,
+		});
+		return;
+	}
 	installing = true;
 	requestedInstall = false;
 	const targetVersion = pendingVersion ?? "unknown";
@@ -505,6 +616,7 @@ export function quitAndInstall(): void {
 				// actually succeeds before relaunch, startup clears the record.
 				recordFailure(targetVersion, "forced exit during install (outcome unknown)");
 				log("ERROR", "app.quit() 15s 未退出，强制 process.exit(0) 以放行 NSIS 安装器");
+				killOwnProcessTree();
 				process.exit(0);
 			}, 15_000);
 			hardExitTimer.unref();
@@ -625,13 +737,19 @@ export function setupAutoUpdater(win: BrowserWindow): void {
 	// target, that install actually succeeded before relaunch — clear the count
 	// so future updates to NEW versions aren't blocked by stale breakers.
 	const current = app.getVersion();
-	for (const [version, record] of Object.entries(loadFailures())) {
+	for (const [version, record] of Object.entries(loadFailures().versions ?? {})) {
 		if (compareVersions(current, version) >= 0) {
 			log("INFO", `startup: running ${current} >= previously failed target ${version} — clearing failure record`);
 			clearFailure(version);
+			// An install DID succeed on this box → the machine-level streak is
+			// over; re-enable auto-install.
+			clearConsecutiveFailures();
 		} else if (record.attempts >= MAX_ATTEMPTS_PER_VERSION) {
 			log("WARN", `startup: ${version} remains blocked after ${record.attempts} failed attempts (last: ${record.lastError})`);
 		}
+	}
+	if (machineBreakerOpen()) {
+		log("WARN", `startup: machine breaker open (${consecutiveInstallFailures()} consecutive cross-version install failures) — auto-install stays off until a manual repair install succeeds`);
 	}
 
 	// Broken-install probe: per-user NSIS must have an HKCU uninstall entry.
