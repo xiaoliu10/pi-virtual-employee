@@ -22,7 +22,7 @@
  */
 import { app, type BrowserWindow } from "electron";
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { basename, join } from "node:path";
 import electronUpdater from "electron-updater";
 
@@ -71,6 +71,14 @@ interface FailureFileShape {
 	/** consecutive install failures across versions, machine-level */
 	consecutiveFailures?: number;
 	lastConsecutiveError?: string;
+	/**
+	 * An install attempt in flight: written BEFORE the app quits for NSIS,
+	 * reconciled at next startup. This makes failure accounting independent of
+	 * the watchdog (which may be blocked by endpoint security — observed:
+	 * "watchdog armed" with zero script output on every outage) and of the
+	 * hard-exit timer (the natural-quit path never recorded anything).
+	 */
+	pending?: { target: string; fromVersion: string; startedAt: string };
 }
 
 /** Persistent failure counters (survives restarts → breaks loops). */
@@ -140,6 +148,46 @@ function clearConsecutiveFailures(): void {
 /** True when auto-INSTALL must be blocked machine-wide (manual repair needed). */
 function machineBreakerOpen(): boolean {
 	return consecutiveInstallFailures() >= MAX_CONSECUTIVE_INSTALL_FAILURES;
+}
+
+/**
+ * Record an install attempt in flight, BEFORE the app quits for NSIS. Reconciled
+ * at next startup by reconcilePendingInstall(): if the running version never
+ * reached the target, the install failed (the app only came back via the
+ * watchdog/manual restart on the OLD version) — count it. This closes the gap
+ * where the natural-quit path (NSIS kills the app, quit completes, the 15s
+ * hard-exit timer never fires) recorded NOTHING, so the breaker could never
+ * trip no matter how many outages happened.
+ */
+function markPendingInstall(target: string): void {
+	const map = loadFailures();
+	saveFailures({ ...map, pending: { target, fromVersion: app.getVersion(), startedAt: new Date().toISOString() } });
+	log("INFO", `pending install recorded: ${app.getVersion()} -> ${target}`);
+}
+
+/**
+ * Startup reconciliation of markPendingInstall. MUST run once per app start.
+ * Success (running >= target) also clears the machine streak — this is the
+ * only place a successful SILENT install (no hard-exit, no watchdog action)
+ * gets recognized, so the breaker resets the moment an update actually works.
+ */
+function reconcilePendingInstall(): void {
+	const map = loadFailures();
+	const pending = map.pending;
+	if (!pending) return;
+	const current = app.getVersion();
+	if (compareVersions(current, pending.target) >= 0) {
+		log("INFO", `startup: pending install ${pending.fromVersion} -> ${pending.target} SUCCEEDED (running ${current})`);
+		const { pending: _drop, ...rest } = map;
+		saveFailures(rest);
+		clearFailure(pending.target);
+		clearConsecutiveFailures();
+	} else {
+		log("ERROR", `startup: pending install ${pending.fromVersion} -> ${pending.target} FAILED (still running ${current}) — counting failure`);
+		const { pending: _drop, ...rest } = map;
+		saveFailures(rest);
+		recordFailure(pending.target, `startup reconciliation: still on ${current} after attempting ${pending.target}`);
+	}
 }
 
 /**
@@ -423,18 +471,67 @@ function scheduleIdleRestart(): void {
 	}, IDLE_POLL_MS);
 }
 
+/** Scheduled-task name used to launch the watchdog parent-independently. */
+const WATCHDOG_TASK_NAME = "PiVE-Update-Watchdog";
+
+/** The --profile args this instance was launched with (empty for default). */
+function profileArgs(): string[] {
+	const i = process.argv.indexOf("--profile");
+	if (i >= 0 && process.argv[i + 1]) return ["--profile", process.argv[i + 1]];
+	const eq = process.argv.find((a) => a.startsWith("--profile="));
+	return eq ? [eq] : [];
+}
+
+/**
+ * Profiles of every RUNNING instance of this app on the box (NSIS kills by
+ * image name, so all of them go down together — the watchdog must bring back
+ * exactly the set that was alive, no more). Snapshotted via wmic just before
+ * the quit; empty-string entry = the default profile. On wmic failure we fall
+ * back to this instance's own args only.
+ */
+function snapshotRunningProfiles(): string[] {
+	if (process.platform !== "win32") return [];
+	try {
+		const out = spawnSync(
+			"wmic.exe",
+			["process", "where", "name='Pi Virtual Employee.exe'", "get", "commandline", "/value"],
+			{ encoding: "utf8", windowsHide: true, timeout: 10_000 },
+		);
+		const text = out.stdout ?? "";
+		const profiles = new Set<string>();
+		for (const line of text.split(/\r?\n/)) {
+			const m = /CommandLine=(.*)/.exec(line);
+			if (!m || !m[1].includes("Pi Virtual Employee.exe")) continue;
+			const cl = m[1];
+			const p = /--profile[= ]([\w-]+)/.exec(cl);
+			profiles.add(p ? p[1] : "");
+		}
+		// Always include self so a wmc miss can't strand the updating instance.
+		profiles.add(profileArgs()[1] ?? "");
+		return [...profiles];
+	} catch {
+		return [profileArgs()[1] ?? ""];
+	}
+}
+
 /**
  * Independent PowerShell watchdog — the sole restarter of the app after an
- * update. Runs outside Electron in a non-interactive-safe way:
+ * update. Runs outside Electron, launched via the Task Scheduler (a detached
+ * child_process spawn proved unreliable: on the 0.2.23 outage the watchdog was
+ * "armed" yet produced zero script output — the detached powershell likely died
+ * with the parent's job/endpoint-security kill; schtasks children have no such
+ * parent linkage). A detached spawn is kept only as fallback.
  *
- * 1. Waits for the NSIS installer to finish (max INSTALLER_WAIT_SECONDS). The
- *    installer is launched WITHOUT --force-run, so it exits when done instead of
- *    calling ExecShellAsUser (which hangs forever on a disconnected RDP session
- *    — the root cause of three overnight outages).
- * 2. If it hasn't finished in time, kills stale installers (Get-Process works on
- *    PS2; Get-CimInstance does not) and retries the copied installer once.
- * 3. Finally launches the installed app exe DIRECTLY via Start-Process — this
- *    needs no interactive desktop, so service is restored even headless.
+ * 1. Waits for the NSIS installer process to exit (max INSTALLER_WAIT_SECONDS)
+ *    — or for the app to come back on its own — then relaunches the installed
+ *    app exe DIRECTLY via Start-Process (with the same --profile, so a
+ *    multi-profile box gets every instance restored). Direct launch needs no
+ *    interactive desktop, which --force-run's ExecShellAsUser did.
+ * 2. If the installer is still running past the deadline (wedged on the
+ *    uninstall-old step), kills it so it stops holding the install lock, bumps
+ *    the machine-level failure counter, and relaunches the current exe. No
+ *    install retry — a retry runs the same broken old-uninstaller (proven by
+ *    three outages). Service first; the update waits for a manual repair.
  */
 function startInstallWatchdog(): void {
 	if (process.platform !== "win32" || !downloadedInstallerPath) {
@@ -446,24 +543,50 @@ function startInstallWatchdog(): void {
 		mkdirSync(dir, { recursive: true });
 		const installerCopy = join(dir, basename(downloadedInstallerPath));
 		const scriptPath = join(dir, "watch-update.ps1");
+		const wrapperPath = join(dir, "watch-update.cmd");
 		const markerPath = join(dir, "completed.txt");
 		rmSync(markerPath, { force: true });
 		copyFileSync(downloadedInstallerPath, installerCopy);
 		const exeName = "Pi Virtual Employee";
 		const appExe = process.execPath;
+		// Snapshot the RUNNING instances now — after the quit it's too late
+		// (NSIS kills them all). Empty-string entry = default profile.
+		const runningProfiles = snapshotRunningProfiles();
+		const relaunch = runningProfiles.map((p) => `'${escapePowerShellSingleQuoted(p)}'`).join(", ");
 		const script = [
 			"$ErrorActionPreference = 'SilentlyContinue'",
 			`$log = '${escapePowerShellSingleQuoted(updaterLogPath())}'`,
-			`$installer = '${escapePowerShellSingleQuoted(installerCopy)}'`,
 			`$appExe = '${escapePowerShellSingleQuoted(appExe)}'`,
 			`$marker = '${escapePowerShellSingleQuoted(markerPath)}'`,
+			`$profileLaunch = @(${relaunch})`,
+			`$exeName = '${escapePowerShellSingleQuoted(exeName)}'`,
+			// Remove the scheduled task that launched us — the app also sweeps a
+			// stale task at startup, this covers the normal exit paths.
+			`& schtasks.exe /Delete /TN '${escapePowerShellSingleQuoted(WATCHDOG_TASK_NAME)}' /F | Out-Null`,
+			"Log ('watchdog: started pid=' + $PID + ' profiles=[' + ($profileLaunch -join ',') + ']')",
 			// update-failures.json lives one directory up from logs/updater.log.
 			// The watchdog is an independent PowerShell process, so it bumps the
 			// machine-level consecutive-failure counter itself when the installer
-			// wedges — otherwise the most common failure path (app killed by NSIS,
-			// hard-exit timer never fires) never recorded a failure and the
-			// breaker stayed closed forever.
+			// wedges — belt-and-braces alongside the app-side pending marker.
 			`$failuresFile = Join-Path (Split-Path (Split-Path $log -Parent) -Parent) '${FAILURE_FILE}'`,
+			"function Log($m) { Add-Content -Path $log -Value \"[$([DateTime]::UtcNow.ToString('o'))] $m\" }",
+			"function TestApp { return [bool](Get-Process -Name $exeName -ErrorAction SilentlyContinue) }",
+			"function TestInstaller { return [bool](Get-Process | Where-Object { $_.ProcessName -like 'Pi-Virtual-Employee-Setup*' }) }",
+			"function KillStaleInstallers {",
+			"  Get-Process | Where-Object { $_.ProcessName -like 'Pi-Virtual-Employee-Setup*' } | Stop-Process -Force",
+			"}",
+			"function LaunchApp {",
+			"  if (-not (Test-Path $appExe)) { return $false }",
+			"  # NSIS kills by image name, so ALL instances go down together (a",
+			"  # sibling --profile 小派 on the same install has no watchdog of its",
+			"  # own). Bring back exactly the set snapshotted before the quit.",
+			"  foreach ($p in $profileLaunch) {",
+			"    if ($p) { Start-Process -FilePath $appExe -ArgumentList @('--profile', $p) }",
+			"    else { Start-Process -FilePath $appExe }",
+			"  }",
+			"  Start-Sleep -Seconds 30",
+			"  return (TestApp)",
+			"}",
 			"function BumpFailureCount {",
 			"  try {",
 			"    $obj = [ordered]@{ versions = [ordered]@{}; consecutiveFailures = 1; lastConsecutiveError = 'watchdog: installer wedged, service restored to previous version (or failed to restore)' }",
@@ -472,18 +595,26 @@ function startInstallWatchdog(): void {
 			"    Log ('watchdog: bumped machine-level failure count to ' + $obj.consecutiveFailures)",
 			"  } catch { Log ('watchdog: failed to write failure record: ' + $_.Exception.Message) }",
 			"}",
-			`$exeName = '${escapePowerShellSingleQuoted(exeName)}'`,
-			"function Log($m) { Add-Content -Path $log -Value \"[$([DateTime]::UtcNow.ToString('o'))] $m\" }",
-			"function TestApp { return [bool](Get-Process -Name $exeName -ErrorAction SilentlyContinue) }",
-			"function KillStaleInstallers {",
-			"  Get-Process | Where-Object { $_.ProcessName -like 'Pi-Virtual-Employee-Setup*' } | Stop-Process -Force",
-			"}",
-			// Phase 0: wait for the already-running installer (no --force-run → it
-			// exits by itself; no interactive desktop needed).
-			`"watchdog phase0: waiting up to ${INSTALLER_WAIT_SECONDS}s for installer" | Log`,
+			// Phase 0a: this watchdog may come up BEFORE the app has quit (schtasks
+			// round-trip vs. the 5s reply-flush + quit). TestApp being TRUE right
+			// now means nothing yet — wait for the app to actually exit first
+			// (hard-exit timer bounds it at 15s; 120s is generous). If it never
+			// exits the install was abandoned and we can stand down.
+			"Log 'watchdog phase0a: waiting for app to exit (max 120s)'",
+			"$grace = (Get-Date).AddSeconds(120)",
+			"while ((Get-Date) -lt $grace -and (TestApp)) { Start-Sleep -Seconds 5 }",
+			"if (TestApp) { Log 'watchdog: app never exited — install abandoned, standing down'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
+			// Phase 0b: wait for the already-running installer (no --force-run →
+			// it exits by itself; no interactive desktop needed). The moment it is
+			// gone the new version is in place — relaunch immediately instead of
+			// sitting out the full timeout (0.2.22's script only acted on the
+			// 10-minute deadline, so even successful installs stayed down 10 min).
+			`Log ("watchdog phase0b: waiting up to ${INSTALLER_WAIT_SECONDS}s for installer to finish")`,
 			`$deadline = (Get-Date).AddSeconds(${INSTALLER_WAIT_SECONDS})`,
+			"$installerFinished = $false",
 			"while ((Get-Date) -lt $deadline) {",
 			"  if (TestApp) { Log 'watchdog: application recovered'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
+			"  if (-not (TestInstaller)) { $installerFinished = $true; break }",
 			"  Start-Sleep -Seconds 5",
 			"}",
 			// Phase 1: the installer wedged (typically stuck in "uninstall old
@@ -493,28 +624,85 @@ function startInstallWatchdog(): void {
 			// installer so it stops holding the install lock, then try to bring
 			// the CURRENT exe back up (a wedged uninstall usually left it
 			// intact). Service first; the update waits for a manual repair.
-			"if (TestApp) { Log 'watchdog: application recovered'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
-			"Log 'watchdog: installer did not finish in time; killing wedged installers (no retry) and restoring current app'",
-			"BumpFailureCount",
-			"KillStaleInstallers",
-			"Start-Sleep -Seconds 5",
+			"if (-not $installerFinished) {",
+			"  Log 'watchdog: installer did not finish in time; killing wedged installers (no retry) and restoring current app'",
+			"  BumpFailureCount",
+			"  KillStaleInstallers",
+			"  Start-Sleep -Seconds 5",
+			"} else {",
+			"  Log 'watchdog: installer finished; launching updated app'",
+			"}",
 			// Direct launch of the installed exe — no desktop required.
-			"if (Test-Path $appExe) { Start-Process -FilePath $appExe; Start-Sleep -Seconds 30 }",
-			"if (TestApp) { Log 'watchdog: restored service by direct app launch (update left for manual repair)'; exit 0 }",
+			"if (LaunchApp) { Log 'watchdog: restored service by direct app launch'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
 			"Log 'watchdog: direct app launch failed — exe missing or damaged; manual repair install required'",
 			"exit 2",
 		].join("\r\n");
 		writeFileSync(scriptPath, script, "utf8");
-		const child = spawn(
-			"powershell.exe",
-			["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
-			{ detached: true, stdio: "ignore", windowsHide: true },
+		// Task Scheduler's /TR is length- and quote-limited; a tiny .cmd wrapper
+		// keeps it to a single quoted path.
+		writeFileSync(wrapperPath, `@echo off\r\npowershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"\r\n`, "utf8");
+
+		// Primary launch: one-time scheduled task, triggered immediately. Unlike
+		// a detached spawn, the Task Scheduler service owns the process — it
+		// survives the app (and any job object) dying, which is the whole point.
+		// /ST must be in the future for /SC ONCE; we /Run manually anyway.
+		const startAt = new Date(Date.now() + 2 * 60_000);
+		const hhmm = `${String(startAt.getHours()).padStart(2, "0")}:${String(startAt.getMinutes()).padStart(2, "0")}`;
+		const task = spawn(
+			"schtasks.exe",
+			["/Create", "/F", "/TN", WATCHDOG_TASK_NAME, "/SC", "ONCE", "/ST", hhmm, "/TR", `"${wrapperPath}"`],
+			{ stdio: "ignore", windowsHide: true },
 		);
-		child.once("error", (err) => log("ERROR", `watchdog process failed: ${err.message}`));
-		child.unref();
-		log("INFO", `watchdog armed: pid=${child.pid ?? "unknown"} installer=${installerCopy}`);
+		task.once("error", (err) => {
+			log("ERROR", `watchdog schtasks create failed: ${err.message} — falling back to detached spawn`);
+			spawnWatchdogDirect(scriptPath, installerCopy);
+		});
+		task.once("exit", (code) => {
+			if (code !== 0) {
+				log("WARN", `watchdog schtasks create exit=${code} — falling back to detached spawn`);
+				spawnWatchdogDirect(scriptPath, installerCopy);
+				return;
+			}
+			const run = spawn("schtasks.exe", ["/Run", "/TN", WATCHDOG_TASK_NAME], { stdio: "ignore", windowsHide: true });
+			run.once("error", (err) => {
+				log("ERROR", `watchdog schtasks run failed: ${err.message} — falling back to detached spawn`);
+				spawnWatchdogDirect(scriptPath, installerCopy);
+			});
+			run.once("exit", (runCode) => {
+				if (runCode !== 0) {
+					log("WARN", `watchdog schtasks run exit=${runCode} — falling back to detached spawn`);
+					spawnWatchdogDirect(scriptPath, installerCopy);
+					return;
+				}
+				log("INFO", `watchdog armed via schtasks: installer=${installerCopy} relaunchArgs=[${profileArgs().join(" ")}]`);
+			});
+		});
 	} catch (err) {
 		log("ERROR", `watchdog setup failed: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
+/** Fallback watchdog launch (previous, less reliable mechanism). */
+function spawnWatchdogDirect(scriptPath: string, installerCopy: string): void {
+	const child = spawn(
+		"powershell.exe",
+		["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
+		{ detached: true, stdio: "ignore", windowsHide: true },
+	);
+	child.once("error", (err) => log("ERROR", `watchdog process failed: ${err.message}`));
+	child.unref();
+	log("INFO", `watchdog armed via detached spawn: pid=${child.pid ?? "unknown"} installer=${installerCopy}`);
+}
+
+/** Sweep a watchdog scheduled task left over from a previous run (startup). */
+function cleanupWatchdogTask(): void {
+	if (process.platform !== "win32") return;
+	try {
+		const child = spawn("schtasks.exe", ["/Delete", "/TN", WATCHDOG_TASK_NAME, "/F"], { stdio: "ignore", windowsHide: true });
+		child.once("error", () => {});
+		child.unref();
+	} catch {
+		/* best effort */
 	}
 }
 
@@ -591,6 +779,10 @@ export function quitAndInstall(): void {
 	requestedInstall = false;
 	const targetVersion = pendingVersion ?? "unknown";
 	log("INFO", `install requested: current=${app.getVersion()} target=${targetVersion}`);
+	// Persist the attempt BEFORE quitting: if the app comes back still on the
+	// old version, startup reconciliation counts the failure (the breaker then
+	// trips in-process — no dependence on the watchdog being alive).
+	markPendingInstall(targetVersion);
 
 	// electron-updater starts NSIS BEFORE calling app.quit(). Drain new work,
 	// allow the final response to flush, then close Chromium/IM/HTTP before NSIS
@@ -610,11 +802,10 @@ export function quitAndInstall(): void {
 			startInstallWatchdog();
 
 			const hardExitTimer = setTimeout(() => {
-				// Forced exit: the install outcome is unknowable from here, but the
-				// watchdog owns recovery. Count the attempt so a machine whose
-				// uninstaller is broken doesn't loop this forever — if the install
-				// actually succeeds before relaunch, startup clears the record.
-				recordFailure(targetVersion, "forced exit during install (outcome unknown)");
+				// Forced exit: outcome is unknowable from here, and the watchdog
+				// owns recovery. Failure accounting is the startup reconciliation's
+				// job now (pending marker written above) — double-counting here
+				// made a single failed install trip the breaker twice as fast.
 				log("ERROR", "app.quit() 15s 未退出，强制 process.exit(0) 以放行 NSIS 安装器");
 				killOwnProcessTree();
 				process.exit(0);
@@ -736,6 +927,7 @@ export function setupAutoUpdater(win: BrowserWindow): void {
 	// Startup reconciliation: if the running version is >= any recorded failed
 	// target, that install actually succeeded before relaunch — clear the count
 	// so future updates to NEW versions aren't blocked by stale breakers.
+	reconcilePendingInstall();
 	const current = app.getVersion();
 	for (const [version, record] of Object.entries(loadFailures().versions ?? {})) {
 		if (compareVersions(current, version) >= 0) {
@@ -754,6 +946,9 @@ export function setupAutoUpdater(win: BrowserWindow): void {
 
 	// Broken-install probe: per-user NSIS must have an HKCU uninstall entry.
 	inspectInstallHealth();
+	// Sweep a watchdog scheduled task the previous run may have left behind
+	// (the script deletes its own task, this covers crash paths).
+	cleanupWatchdogTask();
 
 	autoUpdater.autoDownload = false;
 	// Never let a normal app quit bypass prepareToInstall/watchdog. All unattended
