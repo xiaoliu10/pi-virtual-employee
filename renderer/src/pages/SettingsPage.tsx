@@ -448,11 +448,12 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 															</div>
 															<div className="rounded-2xl border border-blue-100 bg-blue-50 px-5 py-4 text-xs leading-relaxed text-slate-600">
 																<div className="font-medium text-slate-700">表格/富文本渲染（互动卡片）一次性配置：</div>
-																<div className="mt-1">普通 Markdown 消息不支持表格语法。要让日报里的表格正常渲染，需到
-																	<a href="https://open-dev.dingtalk.com/" target="_blank" rel="noreferrer" className="text-blue-600 underline">钉钉开放平台 → 卡片平台（互动卡片高级版搭建工具）</a>
-																	新建模板：放一个「Markdown 组件」，内容绑定变量 <code className="rounded bg-white px-1 font-mono">${"{content}"}</code>，
+																<div className="mt-1">普通 Markdown 消息不支持表格语法。要让日报里的表格正常渲染，需在
+																	<a href="https://open-dev.dingtalk.com/" target="_blank" rel="noreferrer" className="text-blue-600 underline">钉钉开放平台</a>完成两步：
+																	① 应用「权限管理」勾选互动卡片相关权限（机器人发送互动卡片 / 互动卡片实例写权限）并发布；
+																	② 进入「卡片平台」用互动卡片高级版搭建工具新建模板：放一个「Markdown 组件」，内容绑定变量 <code className="rounded bg-white px-1 font-mono">${"{content}"}</code>，
 																	另建纯文本变量 <code className="rounded bg-white px-1 font-mono">title</code>；发布后把模板 ID 填入上方输入框。
-																	模板创建后所有回复/推送自动走卡片通道；卡片发送失败会自动降级为普通 Markdown，不影响消息送达。
+																	配置后所有回复/推送自动走卡片通道；卡片发送失败会自动降级为普通 Markdown，不影响消息送达（失败原因见日志）。
 																</div>
 															</div>
 														</>

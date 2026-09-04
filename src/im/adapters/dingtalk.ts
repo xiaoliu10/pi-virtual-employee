@@ -224,10 +224,10 @@ export class DingtalkAdapter implements IMAdapter {
 						},
 					{
 						// Push mid-turn progress (e.g. long-task heartbeat) back through the
-						// same session webhook (valid ~2h), rendered like replies (card when
-						// a template is configured, else Markdown).
+						// same session webhook as a lightweight markdown message — never as a
+						// card, so a long turn doesn't flood the chat with stacked cards.
 						onProgress: async (progressText) => {
-							if (msg.sessionWebhook) await this.deliverReply(progressText, this.routeFromMsg(msg));
+							if (msg.sessionWebhook) await this.reply(msg.sessionWebhook, progressText);
 						},
 						// Deliver a file into this chat as a robot file message (used by the
 						// provide_document tool). On any failure the tool falls back to an
