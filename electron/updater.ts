@@ -949,6 +949,9 @@ export function setupAutoUpdater(win: BrowserWindow): void {
 	// Sweep a watchdog scheduled task the previous run may have left behind
 	// (the script deletes its own task, this covers crash paths).
 	cleanupWatchdogTask();
+	// Sweep a watchdog scheduled task the previous run may have left behind
+	// (the script deletes its own task, this covers crash paths).
+	cleanupWatchdogTask();
 
 	autoUpdater.autoDownload = false;
 	// Never let a normal app quit bypass prepareToInstall/watchdog. All unattended

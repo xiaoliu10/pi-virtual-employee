@@ -131,15 +131,47 @@ interface ReplyRoute {
 	openConversationId?: string;
 }
 
+/**
+ * Official DingTalk AI-card streaming template (the same hardcoded default the
+ * 现场/OpenClaw dingtalk connector ships — card templates are bound to an
+ * app at creation time, but this one works as a system shared template for any
+ * app with the card permissions enabled). It has a streaming markdown component
+ * bound to the `content` variable, rendered with the FULL GFM engine (tables /
+ * alignment render natively — unlike the castrated native-markdown renderer).
+ */
+const AI_CARD_TEMPLATE_ID = "02fcf2f4-5e02-4a85-b672-46d1f715543e.schema";
+
+/**
+ * DingTalk's AI-card markdown renderer refuses to render a table whose first
+ * row directly follows a text line (same pitfall 现场 patches). Ensure a
+ * blank line precedes every table block — a pure text transform, safe to run
+ * on any reply.
+ */
+export function ensureMarkdownTableBlankLines(text: string): string {
+	const lines = text.split("\n");
+	const out: string[] = [];
+	for (let i = 0; i < lines.length; i += 1) {
+		const line = lines[i];
+		const isTableRow = /^\s*\|.*\|\s*$/.test(line);
+		const prev = out[out.length - 1] ?? "";
+		if (isTableRow && prev.trim() !== "" && !/^\s*\|.*\|\s*$/.test(prev)) {
+			out.push("");
+		}
+		out.push(line);
+	}
+	return out.join("\n");
+}
+
 export class DingtalkAdapter implements IMAdapter {
 	readonly channel = "dingtalk";
 	private client?: DWClient;
 	private appId = "";
 	private appSecret = "";
 	/**
-	 * Optional 高级版互动卡片 template id. When set, replies and pushes go out as
-	 * interactive cards (full GFM renderer — tables render natively). Empty →
-	 * native markdown messages with tables flattened to lists.
+	 * Optional custom interactive-card template id. When empty, the official AI
+	 * card template (AI_CARD_TEMPLATE_ID) is used — card-first is the default.
+	 * Cards render full GFM (tables natively); native markdown messages with
+	 * tables flattened to lists are the fallback path.
 	 */
 	private cardTemplateId = "";
 	private token: { value: string; expiresAt: number } | null = null;
@@ -152,7 +184,7 @@ export class DingtalkAdapter implements IMAdapter {
 		}
 		this.appId = config.appId;
 		this.appSecret = config.appSecret;
-		this.cardTemplateId = (config.cardTemplateId ?? "").trim();
+		this.cardTemplateId = (config.cardTemplateId ?? "").trim() || AI_CARD_TEMPLATE_ID;
 
 		const client = new DWClient({
 			clientId: config.appId,
@@ -303,22 +335,33 @@ export class DingtalkAdapter implements IMAdapter {
 	}
 
 	/**
-	 * Send one interactive card (高级版) via /v1.0/im/interactiveCards/send.
-	 * The template must expose two variables: `title` (plain text) and `content`
-	 * (markdown component, bound to ${content}). Returns true on success; throws
-	 * on HTTP failure so callers can fall back.
+	 * Send one AI card (现场-style streaming chain), defaulting to the
+	 * official AI-card template (no manual template setup required):
+	 *
+	 * 1. Create + deliver the card instance via
+	 *    POST /v1.0/card/instances/createAndDeliver (conversationType 0 = single,
+	 *    receiverUserIdList; 1 = group, openConversationId).
+	 * 2. Push the full content as ONE streaming frame with isFinalize=true
+	 *    (PUT /v1.0/card/streaming, key "content", isFull=true — mandatory for
+	 *    markdown variables). This flips the card from 输入中 to 完成 and runs
+	 *    the full GFM renderer (tables render natively).
+	 *
+	 * Requires "互动卡片实例写权限" (Card.Instance.Write) + "AI卡片流式更新权限"
+	 * (Card.Streaming.Write) on the app. Throws on failure so callers can fall
+	 * back to the native markdown message.
 	 */
 	private async sendInteractiveCard(
 		text: string,
 		target: { isSingle: boolean; userId?: string; openConversationId?: string },
 	): Promise<boolean> {
 		const token = await this.accessToken();
+		const content = ensureMarkdownTableBlankLines(text);
 		const body: Record<string, unknown> = {
 			cardTemplateId: this.cardTemplateId,
 			outTrackId: randomUUID(),
 			robotCode: this.appId,
 			conversationType: target.isSingle ? 0 : 1,
-			cardData: { cardParamMap: { title: digestTitle(text), content: text } },
+			cardData: { cardParamMap: { title: digestTitle(text), content: "" } },
 		};
 		if (target.isSingle) {
 			if (!target.userId) throw new Error("卡片发送缺少 userId");
@@ -327,14 +370,31 @@ export class DingtalkAdapter implements IMAdapter {
 			if (!target.openConversationId) throw new Error("卡片发送缺少 openConversationId");
 			body.openConversationId = target.openConversationId;
 		}
-		const res = await fetch("https://api.dingtalk.com/v1.0/im/interactiveCards/send", {
+		const res = await fetch("https://api.dingtalk.com/v1.0/card/instances/createAndDeliver", {
 			method: "POST",
 			headers: { "Content-Type": "application/json", "x-acs-dingtalk-access-token": token },
 			body: JSON.stringify(body),
 		});
 		if (!res.ok) {
 			const detail = await res.text().catch(() => "");
-			throw new Error(`interactiveCards/send HTTP ${res.status}: ${detail.slice(0, 200)}`);
+			throw new Error(`createAndDeliver HTTP ${res.status}: ${detail.slice(0, 200)}`);
+		}
+		// Finalize in one full frame — the card goes 输入中 → 完成 with full GFM.
+		const streamRes = await fetch("https://api.dingtalk.com/v1.0/card/streaming", {
+			method: "PUT",
+			headers: { "Content-Type": "application/json", "x-acs-dingtalk-access-token": token },
+			body: JSON.stringify({
+				outTrackId: body.outTrackId,
+				guid: randomUUID(),
+				key: "content",
+				content,
+				isFull: true,
+				isFinalize: true,
+			}),
+		});
+		if (!streamRes.ok) {
+			const detail = await streamRes.text().catch(() => "");
+			throw new Error(`card/streaming HTTP ${streamRes.status}: ${detail.slice(0, 200)}`);
 		}
 		return true;
 	}
