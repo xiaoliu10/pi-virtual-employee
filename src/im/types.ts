@@ -10,6 +10,14 @@ export interface IMConfig {
 	channel: string;
 	appId: string;
 	appSecret: string;
+	/**
+	 * DingTalk interactive-card template id (高级版). When set for DingTalk,
+	 * replies/pushes are sent as interactive cards with a full GFM renderer
+	 * (tables, alignment render natively). Empty → native markdown messages
+	 * (pipe tables get flattened to lists). Card-send failures fall back to
+	 * native markdown automatically.
+	 */
+	cardTemplateId?: string;
 	/** On-receipt ack (instant short reply before the model runs). Channel-agnostic. */
 	ack?: { enabled: boolean; text: string };
 }

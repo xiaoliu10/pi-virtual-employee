@@ -17,6 +17,8 @@ export interface ImChannelConfig {
 	name: string;
 	appId: string;
 	appSecret: string;
+	/** DingTalk only: interactive-card (高级版) template id for GFM/table rendering. */
+	cardTemplateId?: string;
 }
 
 const CHANNEL_LABELS: Record<IMChannelType, string> = {
@@ -40,6 +42,7 @@ export function newChannelConfig(partial: Partial<ImChannelConfig> = {}): ImChan
 		name: partial.name?.trim() || CHANNEL_LABELS[type],
 		appId: partial.appId ?? "",
 		appSecret: partial.appSecret ?? "",
+		cardTemplateId: partial.cardTemplateId?.trim() || "",
 	};
 }
 

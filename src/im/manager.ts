@@ -97,6 +97,7 @@ export class IMAdapterManager {
 					channel: ch.type,
 					appId: ch.appId,
 					appSecret: ch.appSecret,
+					cardTemplateId: ch.cardTemplateId,
 					ack: c.im.ack,
 				});
 				this.active.set(id, adapter);
@@ -278,10 +279,15 @@ function friendlyError(err: string | undefined): string {
 	return err.length > 200 ? err.slice(0, 200) + "…" : err;
 }
 
-/** Whether the adapter must be restarted (credentials/type changed). */
+/** Whether the adapter must be restarted (credentials/type/template changed). */
 function credChanged(prev: ImChannelConfig | undefined, next: ImChannelConfig): boolean {
 	if (!prev) return true;
-	return prev.type !== next.type || prev.appId !== next.appId || prev.appSecret !== next.appSecret;
+	return (
+		prev.type !== next.type ||
+		prev.appId !== next.appId ||
+		prev.appSecret !== next.appSecret ||
+		(prev.cardTemplateId ?? "") !== (next.cardTemplateId ?? "")
+	);
 }
 
 function parseCommand(text: string): { name: "version" } | { name: "models" } | { name: "model"; arg: string } | null {

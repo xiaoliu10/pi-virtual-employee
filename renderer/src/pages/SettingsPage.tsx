@@ -433,7 +433,30 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 														<Field label={selectedChannel.type === "dingtalk" ? "ClientID（AppKey）" : "App ID"}><input value={selectedChannel.appId} onChange={(e) => updateChannel(selectedChannel.id, { appId: e.target.value })} className={inputCls} /></Field>
 														<Field label={selectedChannel.type === "dingtalk" ? "ClientSecret（AppSecret）" : "App Secret"}><input type="password" value={selectedChannel.appSecret} onChange={(e) => updateChannel(selectedChannel.id, { appSecret: e.target.value })} className={inputCls} /></Field>
 													</div>
-													{selectedChannel.type === "dingtalk" && <div className="rounded-2xl border border-amber-100 bg-amber-50 px-5 py-4 text-xs leading-relaxed text-slate-600">钉钉开发者后台：创建企业内部应用 → 获取 ClientID / ClientSecret → 添加机器人能力并选择 Stream 模式 → 发布。无需公网回调地址。</div>}
+													{selectedChannel.type === "dingtalk" && (
+														<>
+															<Field label="互动卡片模板 ID（可选，用于表格渲染）">
+																<input
+																	value={selectedChannel.cardTemplateId ?? ""}
+																	onChange={(e) => updateChannel(selectedChannel.id, { cardTemplateId: e.target.value })}
+																	className={inputCls}
+																	placeholder="留空 = 普通 Markdown 消息（表格转列表）"
+																/>
+															</Field>
+															<div className="rounded-2xl border border-amber-100 bg-amber-50 px-5 py-4 text-xs leading-relaxed text-slate-600">
+																钉钉开发者后台：创建企业内部应用 → 获取 ClientID / ClientSecret → 添加机器人能力并选择 Stream 模式 → 发布。无需公网回调地址。
+															</div>
+															<div className="rounded-2xl border border-blue-100 bg-blue-50 px-5 py-4 text-xs leading-relaxed text-slate-600">
+																<div className="font-medium text-slate-700">表格/富文本渲染（互动卡片）一次性配置：</div>
+																<div className="mt-1">普通 Markdown 消息不支持表格语法。要让日报里的表格正常渲染，需到
+																	<a href="https://open-dev.dingtalk.com/" target="_blank" rel="noreferrer" className="text-blue-600 underline">钉钉开放平台 → 卡片平台（互动卡片高级版搭建工具）</a>
+																	新建模板：放一个「Markdown 组件」，内容绑定变量 <code className="rounded bg-white px-1 font-mono">${"{content}"}</code>，
+																	另建纯文本变量 <code className="rounded bg-white px-1 font-mono">title</code>；发布后把模板 ID 填入上方输入框。
+																	模板创建后所有回复/推送自动走卡片通道；卡片发送失败会自动降级为普通 Markdown，不影响消息送达。
+																</div>
+															</div>
+														</>
+													)}
 												</div>
 											)}
 

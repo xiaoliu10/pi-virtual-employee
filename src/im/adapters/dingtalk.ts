@@ -19,6 +19,7 @@
  */
 import { readFile, stat } from "node:fs/promises";
 import { extname } from "node:path";
+import { randomUUID } from "node:crypto";
 import { DWClient, TOPIC_ROBOT } from "dingtalk-stream";
 import type { DWClientDownStream, RobotMessage } from "dingtalk-stream";
 import type { IMAdapter, IMConfig, IMIO, InboundImage } from "../types.js";
@@ -119,11 +120,28 @@ function flattenMarkdownTables(markdown: string): string {
 	return out.join("\n").replace(/\n{3,}/g, "\n\n");
 }
 
+/** Routing info needed to deliver a reply — the session webhook for the
+ *  native-markdown fallback, plus the ids the interactive-card API needs. */
+interface ReplyRoute {
+	webhook: string;
+	isSingle: boolean;
+	/** 1:1 recipient staff id (senderStaffId/senderId). */
+	userId?: string;
+	/** Group openConversationId (msg.conversationId in stream mode). */
+	openConversationId?: string;
+}
+
 export class DingtalkAdapter implements IMAdapter {
 	readonly channel = "dingtalk";
 	private client?: DWClient;
 	private appId = "";
 	private appSecret = "";
+	/**
+	 * Optional 高级版互动卡片 template id. When set, replies and pushes go out as
+	 * interactive cards (full GFM renderer — tables render natively). Empty →
+	 * native markdown messages with tables flattened to lists.
+	 */
+	private cardTemplateId = "";
 	private token: { value: string; expiresAt: number } | null = null;
 
 	constructor(private readonly reportService?: ReportService) {}
@@ -134,6 +152,7 @@ export class DingtalkAdapter implements IMAdapter {
 		}
 		this.appId = config.appId;
 		this.appSecret = config.appSecret;
+		this.cardTemplateId = (config.cardTemplateId ?? "").trim();
 
 		const client = new DWClient({
 			clientId: config.appId,
@@ -205,9 +224,10 @@ export class DingtalkAdapter implements IMAdapter {
 						},
 					{
 						// Push mid-turn progress (e.g. long-task heartbeat) back through the
-						// same session webhook (valid ~2h), rendered as Markdown like replies.
+						// same session webhook (valid ~2h), rendered like replies (card when
+						// a template is configured, else Markdown).
 						onProgress: async (progressText) => {
-							if (msg.sessionWebhook) await this.reply(msg.sessionWebhook, progressText);
+							if (msg.sessionWebhook) await this.deliverReply(progressText, this.routeFromMsg(msg));
 						},
 						// Deliver a file into this chat as a robot file message (used by the
 						// provide_document tool). On any failure the tool falls back to an
@@ -217,7 +237,7 @@ export class DingtalkAdapter implements IMAdapter {
 						sendImage: (filePath) => this.sendImageFor(msg, filePath),
 					},
 				);
-				if (msg.sessionWebhook && reply) await this.reply(msg.sessionWebhook, reply);
+				if (msg.sessionWebhook && reply) await this.deliverReply(reply, this.routeFromMsg(msg));
 			} catch (err) {
 				console.error("[im:dingtalk] handle/reply failed", err);
 			} finally {
@@ -237,7 +257,9 @@ export class DingtalkAdapter implements IMAdapter {
 
 	/** Reply through the robot's temporary session webhook (no access token).
 	 * Sent as Markdown so headings/bold/lists render in DingTalk; the title is a
-	 * plain-text digest used for the message-list preview and push notification. */
+	 * plain-text digest used for the message-list preview and push notification.
+	 * Tables are flattened to lists — the native markdown renderer can't draw
+	 * pipe tables. */
 	private async reply(webhook: string, text: string): Promise<void> {
 		const res = await fetch(webhook, {
 			method: "POST",
@@ -245,6 +267,76 @@ export class DingtalkAdapter implements IMAdapter {
 			body: JSON.stringify({ msgtype: "markdown", markdown: { title: digestTitle(text), text: flattenMarkdownTables(text) } }),
 		});
 		if (!res.ok) console.warn(`[im:dingtalk] reply failed: HTTP ${res.status}`);
+	}
+
+	/** Build the card/markdown routing info from an inbound stream message. */
+	private routeFromMsg(msg: AnyRobotMsg): ReplyRoute {
+		const isSingle = msg.conversationType === "1";
+		return {
+			webhook: msg.sessionWebhook,
+			isSingle,
+			userId: isSingle ? msg.senderStaffId || msg.senderId : undefined,
+			openConversationId: isSingle ? undefined : msg.conversationId,
+		};
+	}
+
+	/**
+	 * Deliver a reply as an interactive card when a template is configured
+	 * (full GFM renderer — tables/alignment render natively); fall back to the
+	 * native markdown webhook message (tables flattened) when no template is set
+	 * or the card send fails (missing permission, bad template id, …). The
+	 * fallback keeps every reply deliverable regardless of card-platform state.
+	 */
+	private async deliverReply(text: string, route: ReplyRoute): Promise<void> {
+		if (this.cardTemplateId) {
+			const ok = await this.sendInteractiveCard(text, {
+				isSingle: route.isSingle,
+				userId: route.userId,
+				openConversationId: route.openConversationId,
+			}).catch((err) => {
+				console.warn(`[im:dingtalk] interactive card send failed, falling back to markdown: ${(err as Error).message}`);
+				return false;
+			});
+			if (ok) return;
+		}
+		await this.reply(route.webhook, text);
+	}
+
+	/**
+	 * Send one interactive card (高级版) via /v1.0/im/interactiveCards/send.
+	 * The template must expose two variables: `title` (plain text) and `content`
+	 * (markdown component, bound to ${content}). Returns true on success; throws
+	 * on HTTP failure so callers can fall back.
+	 */
+	private async sendInteractiveCard(
+		text: string,
+		target: { isSingle: boolean; userId?: string; openConversationId?: string },
+	): Promise<boolean> {
+		const token = await this.accessToken();
+		const body: Record<string, unknown> = {
+			cardTemplateId: this.cardTemplateId,
+			outTrackId: randomUUID(),
+			robotCode: this.appId,
+			conversationType: target.isSingle ? 0 : 1,
+			cardData: { cardParamMap: { title: digestTitle(text), content: text } },
+		};
+		if (target.isSingle) {
+			if (!target.userId) throw new Error("卡片发送缺少 userId");
+			body.receiverUserIdList = [target.userId];
+		} else {
+			if (!target.openConversationId) throw new Error("卡片发送缺少 openConversationId");
+			body.openConversationId = target.openConversationId;
+		}
+		const res = await fetch("https://api.dingtalk.com/v1.0/im/interactiveCards/send", {
+			method: "POST",
+			headers: { "Content-Type": "application/json", "x-acs-dingtalk-access-token": token },
+			body: JSON.stringify(body),
+		});
+		if (!res.ok) {
+			const detail = await res.text().catch(() => "");
+			throw new Error(`interactiveCards/send HTTP ${res.status}: ${detail.slice(0, 200)}`);
+		}
+		return true;
 	}
 
 	/**
@@ -402,18 +494,39 @@ export class DingtalkAdapter implements IMAdapter {
 		try {
 			if (!this.appId) return { ok: false, error: "dingtalk 未配置 appId" };
 			if (!text.trim()) return { ok: false, error: "推送内容为空" };
-			const msgParam = JSON.stringify({ title: digestTitle(text), text: flattenMarkdownTables(text) });
-			if (conversationId.startsWith("dt:group:")) {
-				const openConversationId = conversationId.slice("dt:group:".length);
-				if (!openConversationId) return { ok: false, error: "缺少 openConversationId" };
-				await this.sendProactive({ isSingle: false, msgKey: "sampleMarkdown", msgParam, openConversationId });
-			} else if (conversationId.startsWith("dt:")) {
-				const userId = conversationId.slice("dt:".length);
-				if (!userId) return { ok: false, error: "缺少 userId" };
-				await this.sendProactive({ isSingle: true, msgKey: "sampleMarkdown", msgParam, userIds: [userId] });
-			} else {
+			const isGroup = conversationId.startsWith("dt:group:");
+			const isSingle = !isGroup && conversationId.startsWith("dt:");
+			if (!isGroup && !isSingle) {
 				return { ok: false, error: `非钉钉会话，无法推送：${conversationId}` };
 			}
+			const openConversationId = isGroup ? conversationId.slice("dt:group:".length) : undefined;
+			const userId = isSingle ? conversationId.slice("dt:".length) : undefined;
+			if (isGroup && !openConversationId) return { ok: false, error: "缺少 openConversationId" };
+			if (isSingle && !userId) return { ok: false, error: "缺少 userId" };
+
+			// Preferred path: interactive card with the full GFM renderer (tables
+			// render natively). Fall back to the native markdown message (tables
+			// flattened to lists) when no template is set or the card send fails.
+			if (this.cardTemplateId) {
+				const cardOk = await this.sendInteractiveCard(text, {
+					isSingle,
+					userId,
+					openConversationId,
+				}).catch((err) => {
+					console.warn(`[im:dingtalk] push interactive card failed, falling back to markdown: ${(err as Error).message}`);
+					return false;
+				});
+				if (cardOk) return { ok: true };
+			}
+
+			const msgParam = JSON.stringify({ title: digestTitle(text), text: flattenMarkdownTables(text) });
+			await this.sendProactive({
+				isSingle,
+				msgKey: "sampleMarkdown",
+				msgParam,
+				userIds: userId ? [userId] : undefined,
+				openConversationId,
+			});
 			return { ok: true };
 		} catch (err) {
 			return { ok: false, error: (err as Error).message };

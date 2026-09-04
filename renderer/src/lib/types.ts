@@ -11,6 +11,8 @@ export interface ImChannelConfig {
 	name: string;
 	appId: string;
 	appSecret: string;
+	/** DingTalk only: interactive-card (高级版) template id for GFM/table rendering. */
+	cardTemplateId?: string;
 }
 
 export interface Supplier {
