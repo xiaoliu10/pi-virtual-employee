@@ -585,6 +585,7 @@ function startInstallWatchdog(): void {
 		const relaunch = runningProfiles.map((p) => `'${escapePowerShellSingleQuoted(p)}'`).join(", ");
 		const script = [
 			"$ErrorActionPreference = 'SilentlyContinue'",
+			"function Log($m) { Add-Content -Path $log -Value \"[$([DateTime]::UtcNow.ToString('o'))] $m\" }",
 			`$log = '${escapePowerShellSingleQuoted(updaterLogPath())}'`,
 			`$appExe = '${escapePowerShellSingleQuoted(appExe)}'`,
 			`$marker = '${escapePowerShellSingleQuoted(markerPath)}'`,
@@ -600,7 +601,6 @@ function startInstallWatchdog(): void {
 			// machine-level consecutive-failure counter itself when the installer
 			// wedges — belt-and-braces alongside the app-side pending marker.
 			`$failuresFile = Join-Path (Split-Path (Split-Path $log -Parent) -Parent) '${FAILURE_FILE}'`,
-			"function Log($m) { Add-Content -Path $log -Value \"[$([DateTime]::UtcNow.ToString('o'))] $m\" }",
 			"function TestApp { return [bool](Get-Process -Name $exeName -ErrorAction SilentlyContinue) }",
 			"function TestInstaller { return [bool](Get-Process | Where-Object { $_.ProcessName -like 'Pi-Virtual-Employee-Setup*' }) }",
 			"function KillStaleInstallers {",
@@ -640,7 +640,6 @@ function startInstallWatchdog(): void {
 			"Log 'watchdog phase0a: waiting for app to exit (max 120s)'",
 			"$grace = (Get-Date).AddSeconds(120)",
 			"while ((Get-Date) -lt $grace -and (TestApp)) { Start-Sleep -Seconds 5 }",
-			"if (TestApp) { Log 'watchdog: app never exited — install abandoned, standing down'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
 			"if (TestApp) { Log 'watchdog: app never exited — install abandoned, standing down'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
 			// Phase 1: the app tree is gone — install exactly the way the manual
 			// repair does on every successful outage fix: clear stale installers,
