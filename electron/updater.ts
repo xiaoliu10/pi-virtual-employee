@@ -553,10 +553,12 @@ function snapshotRunningProfiles(): string[] {
  *    multi-profile box gets every instance restored). Direct launch needs no
  *    interactive desktop, which --force-run's ExecShellAsUser did.
  * 2. If the installer is still running past the deadline (wedged on the
- *    uninstall-old step), kills it so it stops holding the install lock, bumps
- *    the machine-level failure counter, and relaunches the current exe. No
- *    install retry — a retry runs the same broken old-uninstaller (proven by
- *    three outages). Service first; the update waits for a manual repair.
+ *    uninstall-old step), kills it, bumps the machine-level failure counter,
+ *    then self-heals exactly the way the on-machine manual repair does: with
+ *    the app tree dead and the wedged installer gone, run the watchdog's
+ *    installer copy SILENTLY once (proven to complete in seconds), then
+ *    relaunch. If that attempt also fails, fall back to restoring the current
+ *    exe — service first, update waits for a manual repair.
  */
 function startInstallWatchdog(): void {
 	if (process.platform !== "win32" || !downloadedInstallerPath) {
@@ -585,6 +587,7 @@ function startInstallWatchdog(): void {
 			`$marker = '${escapePowerShellSingleQuoted(markerPath)}'`,
 			`$profileLaunch = @(${relaunch})`,
 			`$exeName = '${escapePowerShellSingleQuoted(exeName)}'`,
+			`$installerCopy = '${escapePowerShellSingleQuoted(installerCopy)}'`,
 			// Remove the scheduled task that launched us — the app also sweeps a
 			// stale task at startup, this covers the normal exit paths.
 			`& schtasks.exe /Delete /TN '${escapePowerShellSingleQuoted(WATCHDOG_TASK_NAME)}' /F | Out-Null`,
@@ -602,6 +605,12 @@ function startInstallWatchdog(): void {
 			"}",
 			"function LaunchApp {",
 			"  if (-not (Test-Path $appExe)) { return $false }",
+			// A watchdog spawned from the app process inherits its environment —
+			// on hosts where ELECTRON_RUN_AS_NODE (or any ELECTRON_*) is set,
+			// Start-Process would launch the exe as a bare Node process that
+			// exits instantly ("direct app launch failed"). Launch the app with
+			// a clean environment, like a fresh user launch.
+			"  Get-ChildItem Env:ELECTRON_* -ErrorAction SilentlyContinue | Remove-Item -ErrorAction SilentlyContinue",
 			"  # NSIS kills by image name, so ALL instances go down together (a",
 			"  # sibling --profile 小派 on the same install has no watchdog of its",
 			"  # own). Bring back exactly the set snapshotted before the quit.",
@@ -643,16 +652,34 @@ function startInstallWatchdog(): void {
 			"  Start-Sleep -Seconds 5",
 			"}",
 			// Phase 1: the installer wedged (typically stuck in "uninstall old
-			// app" against a broken/unremovable old tree). Do NOT retry the
-			// install — a retry runs the same broken old-uninstaller and hangs
-			// the same way (three outages proved this). Kill the wedged
-			// installer so it stops holding the install lock, then try to bring
-			// the CURRENT exe back up (a wedged uninstall usually left it
-			// intact). Service first; the update waits for a manual repair.
+			// app" against a broken/unremovable old tree). Kill the wedged
+			// installer so it stops holding the install lock, then self-heal
+			// with the on-machine-proven manual sequence: the app tree is dead
+			// and the lock is released, so a single silent install from the
+			// watchdog's installer copy completes in seconds (the earlier
+			// no-retry policy predates the tree-kill + kill-stale sequence —
+			// retries now run under the same conditions as the manual repair
+			// that has succeeded every time). On failure fall back to
+			// restoring the current exe; service first.
 			"if (-not $installerFinished) {",
-			"  Log 'watchdog: installer did not finish in time; killing wedged installers (no retry) and restoring current app'",
+			"  Log 'watchdog: installer did not finish in time; killing wedged installers'",
 			"  BumpFailureCount",
 			"  KillStaleInstallers",
+			"  Start-Sleep -Seconds 5",
+			"  Log 'watchdog phase1: attempting silent install from watchdog copy'",
+			"  $instProc = Start-Process -FilePath $installerCopy -ArgumentList '/S' -PassThru",
+			"  $instDeadline = (Get-Date).AddSeconds(300)",
+			"  while ($instProc -and (-not $instProc.HasExited) -and ((Get-Date) -lt $instDeadline)) { Start-Sleep -Seconds 5 }",
+			"  if (-not $instProc) {",
+			"    Log 'watchdog phase1: silent install failed to start'",
+			"  } elseif (-not $instProc.HasExited) {",
+			"    Log 'watchdog phase1: silent install wedged again; killing it'",
+			"    Stop-Process -Id $instProc.Id -Force",
+			"  } else {",
+			"    Log ('watchdog phase1: silent install exited code=' + $instProc.ExitCode)",
+			"  }",
+			"  $d2 = (Get-Date).AddSeconds(120)",
+			"  while ((Get-Date) -lt $d2 -and (TestInstaller)) { Start-Sleep -Seconds 5 }",
 			"  Start-Sleep -Seconds 5",
 			"} else {",
 			"  Log 'watchdog: installer finished; launching updated app'",
@@ -707,12 +734,19 @@ function startInstallWatchdog(): void {
 	}
 }
 
-/** Fallback watchdog launch (previous, less reliable mechanism). */
+/** Fallback watchdog launch (previous, less reliable mechanism). The child
+ *  powershell inherits our environment — strip ELECTRON_* (notably
+ *  ELECTRON_RUN_AS_NODE) so nothing it launches degrades to a bare Node
+ *  process, and so its own child processes start from a clean slate. */
 function spawnWatchdogDirect(scriptPath: string, installerCopy: string): void {
+	const env = { ...process.env };
+	for (const key of Object.keys(env)) {
+		if (/^ELECTRON_/i.test(key)) delete env[key];
+	}
 	const child = spawn(
 		"powershell.exe",
 		["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
-		{ detached: true, stdio: "ignore", windowsHide: true },
+		{ detached: true, stdio: "ignore", windowsHide: true, env },
 	);
 	child.once("error", (err) => log("ERROR", `watchdog process failed: ${err.message}`));
 	child.unref();
