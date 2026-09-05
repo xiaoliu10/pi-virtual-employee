@@ -498,10 +498,17 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 												<input type="checkbox" checked={draft.general.autostart} onChange={(event) => setGeneral({ autostart: event.target.checked })} className="h-5 w-5 accent-blue-500" />
 											</label>
 
-											<label className="flex cursor-pointer items-center justify-between rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
-												<div><div className="text-sm font-medium text-slate-800">无人值守自动更新</div><div className="mt-1 text-xs text-slate-400">适用于不常看界面的服务器：发现新版本自动下载，等待员工空闲时自动重启安装。默认开启，仅 Windows 打包版生效；管理员也可在对话中通过 manage_update 开关。</div></div>
-												<input type="checkbox" checked={draft.general.autoUpdate} onChange={(event) => setGeneral({ autoUpdate: event.target.checked })} className="h-5 w-5 accent-blue-500" />
-											</label>
+											<Field label="无人值守自动更新" hint="仅 Windows 打包版生效。完全自动=发现新版本自动下载并在空闲时重启安装；仅下载=自动下载但不自动安装，等管理员确认（适合自动安装会卡死的机器）；关闭=仅提示。管理员也可在对话中通过 manage_update 切换。">
+												<select
+													value={draft.general.autoUpdate === "download_only" ? "download_only" : draft.general.autoUpdate === false || draft.general.autoUpdate === "off" ? "off" : "full"}
+													onChange={(event) => setGeneral({ autoUpdate: event.target.value as boolean | "full" | "download_only" | "off" })}
+													className={inputCls + " cursor-pointer"}
+												>
+													<option value="full">完全自动（下载并自动安装）</option>
+													<option value="download_only">仅下载（安装需管理员确认）</option>
+													<option value="off">关闭</option>
+												</select>
+											</Field>
 
 											<Field label="回复语言" hint="员工的回复语言，默认中文。仅控制回复内容，不影响界面。保存后对新对话生效。">
 												<select value={draft.general.language} onChange={(e) => setGeneral({ language: e.target.value as AppConfig["general"]["language"] })} className={inputCls + " cursor-pointer"}>

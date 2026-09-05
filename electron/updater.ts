@@ -298,6 +298,16 @@ let requestedInstall = false;
  */
 let unattendedEnabled: () => boolean = () => false;
 let isEngineIdle: () => boolean = () => true;
+/**
+ * download_only mode: auto-check + auto-download still run, but the install
+ * step NEVER runs unattended — the update stays "ready" until an admin
+ * explicitly requests it (IM manage_update update, or the settings button).
+ * Intended for hosts whose unattended NSIS install wedges (proven: the manual
+ * silent install finishes in 14s, the unattended one wedges every time).
+ */
+let unattendedInstallBlocked: () => boolean = () => false;
+/** Notifies admins (via IM) when a download_only update sits ready for install. */
+let notifyReady: ((version: string, manualUrl: string) => void) | null = null;
 /** Before installing, pause new IM turns; released on failure/timeout. */
 let beginDrain: (() => void) | null = null;
 let endDrain: (() => void) | null = null;
@@ -306,12 +316,18 @@ let endDrain: (() => void) | null = null;
 export function setupUnattended(opts: {
 	enabled: () => boolean;
 	isIdle: () => boolean;
+	/** True when unattended INSTALL must not run (download_only mode). */
+	installBlocked?: () => boolean;
+	/** Called once per download when the update sits ready in download_only mode. */
+	notifyReady?: (version: string, manualUrl: string) => void;
 	beginDrain?: () => void;
 	endDrain?: () => void;
 	prepareToInstall?: () => Promise<void>;
 }): void {
 	unattendedEnabled = opts.enabled;
 	isEngineIdle = opts.isIdle;
+	unattendedInstallBlocked = opts.installBlocked ?? (() => false);
+	notifyReady = opts.notifyReady ?? null;
 	beginDrain = opts.beginDrain ?? null;
 	endDrain = opts.endDrain ?? null;
 	prepareToInstall = opts.prepareToInstall ?? null;
@@ -394,6 +410,15 @@ function wireEvents(): void {
 		const targetVersion = info.version ?? pendingVersion ?? "unknown";
 		log("INFO", `update downloaded: version=${targetVersion} file=${downloadedInstallerPath ?? "unknown"}`);
 		setState({ phase: "ready", currentVersion: app.getVersion(), version: targetVersion });
+		// download_only mode: never install unattended — park at "ready" and tell
+		// an admin the update is waiting (once per download). Explicit requests
+		// (IM manage_update update / settings button) set requestedInstall and
+		// still proceed below.
+		if (unattendedInstallBlocked() && !requestedInstall) {
+			log("INFO", `download_only: update ${targetVersion} parked at ready — install requires an explicit admin request`);
+			notifyReady?.(targetVersion, manualUrl(targetVersion));
+			return;
+		}
 		if (!unattendedEnabled() && !requestedInstall) return;
 		// Machine-level breaker: consecutive installs failed across DIFFERENT
 		// target versions (0.2.17→0.2.18→0.2.21 pattern). Each per-version

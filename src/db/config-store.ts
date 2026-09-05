@@ -220,12 +220,16 @@ export interface AppConfig {
 		 */
 		maxToolSteps: number;
 		/**
-		 * Unattended auto-update (headless servers): check → download → wait for
-		 * the engine to be idle → restart & install, all without a human at the
-		 * UI. Default-on for new installs and configs predating this setting;
-		 * an explicitly stored `false` remains off. Off = interactive flow.
+		 * Unattended auto-update mode. "full" (default for fresh installs and
+		 * configs predating this tri-state): check → download → idle → restart &
+		 * install without a human. "download_only": check + download, but STOP at
+		 * ready — the install only happens on an explicit admin request (IM
+		 * manage_update update with confirmation, or the settings-page button).
+		 * Intended for hosts where the unattended NSIS install wedges. "off":
+		 * interactive flow (announce, download on click). Legacy persisted values
+		 * map: true → "full", false → "off".
 		 */
-		autoUpdate: boolean;
+		autoUpdate: boolean | "full" | "download_only" | "off";
 	};
 	/**
 	 * Computer-use / browser automation. When enabled the employee gets Playwright

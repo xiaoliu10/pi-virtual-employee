@@ -1067,9 +1067,27 @@ async function main(): Promise<void> {
 	// pushes an "idle" so the UI shows the current version without update buttons.
 	if (mainWindow) setupAutoUpdater(mainWindow);
 	// Unattended auto-update wiring: re-read config + engine idle on each use
-	// so toggling the setting takes effect without a restart.
+	// so toggling the setting takes effect without a restart. Legacy tri-state:
+	// boolean true / "full" → full unattended; "download_only" → check+download
+	// but park at ready (install only on explicit admin request); false / "off".
+	const updateMode = () => {
+		const v = config.all().general.autoUpdate;
+		return v === "download_only" ? "download_only" : v === true || v === "full" ? "full" : "off";
+	};
+	const firstAdminId = () => config.all().security.adminStaffIds[0];
 	setupUnattended({
-		enabled: () => config.all().general.autoUpdate,
+		enabled: () => updateMode() !== "off",
+		installBlocked: () => updateMode() === "download_only",
+		notifyReady: (version, manualUrl) => {
+			// IM admins, not the console: this fires on headless servers where the
+			// UI is never opened. Push once per download to the first admin's 1:1.
+			const admin = firstAdminId();
+			if (!admin) return;
+			void im.pushToConversation(
+				`dt:${admin}`,
+				`🔔 新版本 v${version} 已下载完成。本机为「仅下载」更新模式，不会自动安装——请回复「确认更新到最新版」安装，或手动下载：${manualUrl}`,
+			).catch(() => {});
+		},
 		isIdle: () => engine.isIdle(),
 		beginDrain: () => im.setDraining(true),
 		endDrain: () => im.setDraining(false),

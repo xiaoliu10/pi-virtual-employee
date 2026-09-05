@@ -141,7 +141,7 @@ export interface AppConfig {
 		channels: ImChannelConfig[];
 		ack: { enabled: boolean; text: string };
 	};
-	general: { autostart: boolean; language: "zh-CN" | "en-US"; requestTimeoutMin: number; longTaskProgressMin: number; maxToolSteps: number; autoUpdate: boolean };
+	general: { autostart: boolean; language: "zh-CN" | "en-US"; requestTimeoutMin: number; longTaskProgressMin: number; maxToolSteps: number; autoUpdate: boolean | "full" | "download_only" | "off" };
 	browser: { enabled: boolean; headless: boolean; allowedDomains: string[]; downloadHost: string };
 	scheduler: { enabled: boolean };
 	prompt: { extra: string; rules: string };

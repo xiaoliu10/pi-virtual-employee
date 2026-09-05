@@ -38,8 +38,22 @@ export interface UpdateToolDeps {
 	updates: UpdateOperations;
 }
 
+/** Auto-update modes (tri-state; legacy booleans map true→full, false→off). */
+export type AutoUpdateMode = "full" | "download_only" | "off";
+
+/** Normalize the persisted config value (boolean or string) to a mode. */
+export function normalizeAutoUpdate(v: boolean | "full" | "download_only" | "off"): AutoUpdateMode {
+	return v === "download_only" ? "download_only" : v === true || v === "full" ? "full" : "off";
+}
+
+const MODE_TEXT: Record<AutoUpdateMode, string> = {
+	full: "完全自动（发现新版本自动下载并在空闲时重启安装）",
+	download_only: "仅下载（自动下载新版本但不自动安装，安装需管理员确认）",
+	off: "已关闭（发现新版本仅提示，需管理员明确发起）",
+};
+
 /** Compact textual status used by both tool responses and the model's context. */
-function describeStatus(status: UpdateToolStatus, autoUpdate: boolean): string {
+function describeStatus(status: UpdateToolStatus, mode: AutoUpdateMode): string {
 	const lines = [`当前版本：v${status.currentVersion}`];
 	switch (status.phase) {
 		case "idle":
@@ -58,13 +72,17 @@ function describeStatus(status: UpdateToolStatus, autoUpdate: boolean): string {
 			lines.push(`更新状态：正在下载 v${status.targetVersion ?? "未知"}${typeof status.percent === "number" ? `（${status.percent}%）` : ""}`);
 			break;
 		case "ready":
-			lines.push(`更新状态：新版本 v${status.targetVersion ?? "未知"} 已下载完成，等待空闲后安装`);
+			lines.push(
+				mode === "download_only"
+					? `更新状态：新版本 v${status.targetVersion ?? "未知"} 已下载完成，本机为仅下载模式，回复「确认更新到最新版」即可安装`
+					: `更新状态：新版本 v${status.targetVersion ?? "未知"} 已下载完成，等待空闲后安装`,
+			);
 			break;
 		case "error":
 			lines.push(`更新状态：失败（${status.error ?? "未知错误"}）`);
 			break;
 	}
-	lines.push(`无人值守自动更新：${autoUpdate ? "已开启" : "已关闭"}`);
+	lines.push(`自动更新模式：${MODE_TEXT[mode]}`);
 	return lines.join("；");
 }
 
@@ -89,12 +107,14 @@ export function createManageUpdateTool(deps: UpdateToolDeps): AgentTool {
 				[Type.Literal("status"), Type.Literal("check"), Type.Literal("update"), Type.Literal("set_auto")],
 				{ description: "status=查看；check=检查；update=下载并空闲时安装；set_auto=开关无人值守自动更新" },
 			),
-			enabled: Type.Optional(Type.Boolean({ description: "仅 set_auto 必填：true=开启无人值守自动更新，false=关闭" })),
+			enabled: Type.Optional(Type.Union([Type.Boolean(), Type.Literal("full"), Type.Literal("download_only"), Type.Literal("off")], {
+				description: "仅 set_auto 必填：true/false 或 \"full\"（完全自动）/ \"download_only\"（仅下载不自动装）/ \"off\"",
+			})),
 		}),
 		async execute(_toolCallId, params) {
 			const { action, enabled } = params as {
 				action: "status" | "check" | "update" | "set_auto";
-				enabled?: boolean;
+				enabled?: boolean | "full" | "download_only" | "off";
 			};
 
 			if (action === "status") {
@@ -104,7 +124,7 @@ export function createManageUpdateTool(deps: UpdateToolDeps): AgentTool {
 				const status = deps.updates.getStatus();
 				const unsupported = capability.supported ? "" : `更新能力：不可用（${capability.reason ?? "当前环境不支持"}）；`;
 				return {
-					content: [{ type: "text", text: unsupported + describeStatus(status, deps.config.all().general.autoUpdate) }],
+					content: [{ type: "text", text: unsupported + describeStatus(status, normalizeAutoUpdate(deps.config.all().general.autoUpdate)) }],
 					details: { action, supported: capability.supported, status },
 				};
 			}
@@ -121,7 +141,7 @@ export function createManageUpdateTool(deps: UpdateToolDeps): AgentTool {
 				const after = await deps.updates.checkNow();
 				const status = after.phase === before.phase ? { ...after, phase: "checking" as const } : after;
 				return {
-					content: [{ type: "text", text: `已提交检查。${describeStatus(status, deps.config.all().general.autoUpdate)}` }],
+					content: [{ type: "text", text: `已提交检查。${describeStatus(status, normalizeAutoUpdate(deps.config.all().general.autoUpdate))}` }],
 					details: { action, status },
 				};
 			}
@@ -137,15 +157,17 @@ export function createManageUpdateTool(deps: UpdateToolDeps): AgentTool {
 			console.log(`[update] action=${action} authorized by ${maskId(gate.actor.senderId)}`);
 
 			if (action === "set_auto") {
-				if (typeof enabled !== "boolean") {
-					return refuse("set_auto 需要显式传入 enabled=true 或 false，用于开启或关闭无人值守自动更新。");
+				if (typeof enabled !== "boolean" && enabled !== "full" && enabled !== "download_only" && enabled !== "off") {
+					return refuse("set_auto 需要显式传入 enabled：true（完全自动）/ false（关闭）/ \"download_only\"（仅下载，安装需确认）。");
 				}
-				const updated = deps.config.update({ general: { autoUpdate: enabled } });
+				const value = enabled === true ? "full" : enabled === false ? "off" : enabled;
+				const updated = deps.config.update({ general: { autoUpdate: value } });
 				deps.onConfigChanged();
+				const mode = normalizeAutoUpdate(updated.general.autoUpdate);
 				return {
 					content: [{
 						type: "text",
-						text: `✅ 无人值守自动更新已${updated.general.autoUpdate ? "开启" : "关闭"}。${updated.general.autoUpdate ? "之后发现新版本会自动下载，并在员工空闲时重启安装。" : "之后发现新版本仍需管理员明确发起更新。"}`,
+						text: `✅ 自动更新模式已设为：${MODE_TEXT[mode]}。`,
 					}],
 					details: { action, autoUpdate: updated.general.autoUpdate },
 				};
@@ -155,7 +177,7 @@ export function createManageUpdateTool(deps: UpdateToolDeps): AgentTool {
 			const result = deps.updates.requestUpdateAndInstall();
 			if (!result.started) {
 				return {
-					content: [{ type: "text", text: `⛔ 无法安排更新：${result.reason}。${describeStatus(result.status, deps.config.all().general.autoUpdate)}` }],
+					content: [{ type: "text", text: `⛔ 无法安排更新：${result.reason}。${describeStatus(result.status, normalizeAutoUpdate(deps.config.all().general.autoUpdate))}` }],
 					details: { action, started: false, status: result.status },
 				};
 			}
@@ -168,7 +190,7 @@ export function createManageUpdateTool(deps: UpdateToolDeps): AgentTool {
 			return {
 				content: [{
 					type: "text",
-					text: `✅ 已安排更新：${modeText}。当前对话答复发送完成后，系统会等待所有任务空闲，再自动重启安装；安装完成后新版本立即生效。${describeStatus(result.status, deps.config.all().general.autoUpdate)}`,
+					text: `✅ 已安排更新：${modeText}。当前对话答复发送完成后，系统会等待所有任务空闲，再自动重启安装；安装完成后新版本立即生效。${describeStatus(result.status, normalizeAutoUpdate(deps.config.all().general.autoUpdate))}`,
 				}],
 				details: { action, started: true, mode: result.mode, status: result.status },
 			};
