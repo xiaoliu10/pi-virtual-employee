@@ -23,6 +23,7 @@ import { randomUUID } from "node:crypto";
 import { DWClient, TOPIC_ROBOT } from "dingtalk-stream";
 import type { DWClientDownStream, RobotMessage } from "dingtalk-stream";
 import type { IMAdapter, IMConfig, IMIO, InboundImage } from "../types.js";
+import { diag } from "../diag.js";
 import type { ReportService } from "../../reports/report-service.js";
 
 /** Robot-message payload for a picture the user sent (Stream mode). The SDK's
@@ -132,14 +133,15 @@ interface ReplyRoute {
 }
 
 /**
- * Official DingTalk AI-card streaming template (the same hardcoded default the
- * 现场/OpenClaw dingtalk connector ships — card templates are bound to an
+ * Official DingTalk AI-card streaming template (the one the current
+ * openclaw-channel-dingtalk connector ships — card templates are bound to an
  * app at creation time, but this one works as a system shared template for any
- * app with the card permissions enabled). It has a streaming markdown component
- * bound to the `content` variable, rendered with the FULL GFM engine (tables /
- * alignment render natively — unlike the castrated native-markdown renderer).
+ * app with the card permissions enabled; verified by
+ * scripts/test-dingtalk-card.mjs). Streaming markdown component is bound to
+ * the `content` variable, rendered with the FULL GFM engine (tables/alignment
+ * render natively — unlike the castrated native-markdown renderer).
  */
-const AI_CARD_TEMPLATE_ID = "02fcf2f4-5e02-4a85-b672-46d1f715543e.schema";
+const AI_CARD_TEMPLATE_ID = "675cde2f-f526-40cb-b828-f5b2b57b8b77.schema";
 
 /**
  * DingTalk's AI-card markdown renderer refuses to render a table whose first
@@ -272,6 +274,7 @@ export class DingtalkAdapter implements IMAdapter {
 				if (msg.sessionWebhook && reply) await this.deliverReply(reply, this.routeFromMsg(msg));
 			} catch (err) {
 				console.error("[im:dingtalk] handle/reply failed", err);
+				void diag("dingtalk", `handle/reply failed: ${(err as Error).message}`, "warn");
 			} finally {
 				if (target) await this.emotionRecall(target).catch(() => {});
 			}
@@ -298,7 +301,7 @@ export class DingtalkAdapter implements IMAdapter {
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ msgtype: "markdown", markdown: { title: digestTitle(text), text: flattenMarkdownTables(text) } }),
 		});
-		if (!res.ok) console.warn(`[im:dingtalk] reply failed: HTTP ${res.status}`);
+		if (!res.ok) void diag("dingtalk", `reply failed: HTTP ${res.status}`, "warn");
 	}
 
 	/** Build the card/markdown routing info from an inbound stream message. */
@@ -326,7 +329,7 @@ export class DingtalkAdapter implements IMAdapter {
 				userId: route.userId,
 				openConversationId: route.openConversationId,
 			}).catch((err) => {
-				console.warn(`[im:dingtalk] interactive card send failed, falling back to markdown: ${(err as Error).message}`);
+				void diag("dingtalk", `interactive card send failed, falling back to markdown: ${(err as Error).message}`, "warn");
 				return false;
 			});
 			if (ok) return;
@@ -335,20 +338,27 @@ export class DingtalkAdapter implements IMAdapter {
 	}
 
 	/**
-	 * Send one AI card (现场-style streaming chain), defaulting to the
-	 * official AI-card template (no manual template setup required):
+	 * Send one AI card (openclaw-channel-dingtalk-style streaming chain),
+	 * defaulting to the plugin's current built-in template (no manual template
+	 * setup required). The request body mirrors that connector's working
+	 * implementation field-for-field (verified via scripts/test-dingtalk-card.mjs
+	 * — the old conversationType/receiverUserIdList shape gets HTTP 400
+	 * MissingopenSpaceId, and openSpaceId alone without the space/deliver models
+	 * silently drops the delivery):
 	 *
 	 * 1. Create + deliver the card instance via
-	 *    POST /v1.0/card/instances/createAndDeliver (conversationType 0 = single,
-	 *    receiverUserIdList; 1 = group, openConversationId).
+	 *    POST /v1.0/card/instances/createAndDeliver. The target space is encoded
+	 *    in openSpaceId (IM_ROBOT.{userId} single / IM_GROUP.{openConversationId}
+	 *    group) together with its OpenSpaceModel + DeliverModel.
 	 * 2. Push the full content as ONE streaming frame with isFinalize=true
 	 *    (PUT /v1.0/card/streaming, key "content", isFull=true — mandatory for
 	 *    markdown variables). This flips the card from 输入中 to 完成 and runs
 	 *    the full GFM renderer (tables render natively).
 	 *
 	 * Requires "互动卡片实例写权限" (Card.Instance.Write) + "AI卡片流式更新权限"
-	 * (Card.Streaming.Write) on the app. Throws on failure so callers can fall
-	 * back to the native markdown message.
+	 * (Card.Streaming.Write) on the app. Throws on failure (including a failed
+	 * per-space entry in deliverResults) so callers can fall back to the native
+	 * markdown message.
 	 */
 	private async sendInteractiveCard(
 		text: string,
@@ -356,20 +366,35 @@ export class DingtalkAdapter implements IMAdapter {
 	): Promise<boolean> {
 		const token = await this.accessToken();
 		const content = ensureMarkdownTableBlankLines(text);
+		const deliverExtension = { dynamicSummary: "true" };
+		if (target.isSingle) {
+			if (!target.userId) throw new Error("卡片发送缺少 userId");
+		} else {
+			if (!target.openConversationId) throw new Error("卡片发送缺少 openConversationId");
+		}
 		const body: Record<string, unknown> = {
 			cardTemplateId: this.cardTemplateId,
 			outTrackId: randomUUID(),
-			robotCode: this.appId,
-			conversationType: target.isSingle ? 0 : 1,
-			cardData: { cardParamMap: { title: digestTitle(text), content: "" } },
+			cardData: {
+				cardParamMap: {
+					config: JSON.stringify({ autoLayout: true, enableForward: true }),
+					content: "",
+					flowStatus: "2", // INPUTING
+					hasAction: "true",
+					stop_action: "true",
+				},
+			},
+			callbackType: "STREAM",
+			imGroupOpenSpaceModel: { supportForward: true },
+			imRobotOpenSpaceModel: { supportForward: true },
+			openSpaceId: target.isSingle
+				? `dtv1.card//IM_ROBOT.${target.userId}`
+				: `dtv1.card//IM_GROUP.${target.openConversationId}`,
+			userIdType: 1,
+			...(target.isSingle
+				? { imRobotOpenDeliverModel: { spaceType: "IM_ROBOT", robotCode: this.appId, extension: deliverExtension } }
+				: { imGroupOpenDeliverModel: { robotCode: this.appId, extension: deliverExtension } }),
 		};
-		if (target.isSingle) {
-			if (!target.userId) throw new Error("卡片发送缺少 userId");
-			body.receiverUserIdList = [target.userId];
-		} else {
-			if (!target.openConversationId) throw new Error("卡片发送缺少 openConversationId");
-			body.openConversationId = target.openConversationId;
-		}
 		const res = await fetch("https://api.dingtalk.com/v1.0/card/instances/createAndDeliver", {
 			method: "POST",
 			headers: { "Content-Type": "application/json", "x-acs-dingtalk-access-token": token },
@@ -379,6 +404,12 @@ export class DingtalkAdapter implements IMAdapter {
 			const detail = await res.text().catch(() => "");
 			throw new Error(`createAndDeliver HTTP ${res.status}: ${detail.slice(0, 200)}`);
 		}
+		// HTTP 200 ≠ delivered: each space has its own success/errorMsg.
+		const deliverResults = ((await res.json().catch(() => ({}))) as {
+			result?: { deliverResults?: Array<{ success?: boolean; spaceType?: string; errorMsg?: string }> };
+		})?.result?.deliverResults;
+		const failed = deliverResults?.find((r) => r?.success === false);
+		if (failed) throw new Error(`投放失败 ${failed.spaceType ?? ""}: ${failed.errorMsg ?? "unknown"}`.trim());
 		// Finalize in one full frame — the card goes 输入中 → 完成 with full GFM.
 		const streamRes = await fetch("https://api.dingtalk.com/v1.0/card/streaming", {
 			method: "PUT",
@@ -396,6 +427,7 @@ export class DingtalkAdapter implements IMAdapter {
 			const detail = await streamRes.text().catch(() => "");
 			throw new Error(`card/streaming HTTP ${streamRes.status}: ${detail.slice(0, 200)}`);
 		}
+		void diag("dingtalk", `AI card delivered (${target.isSingle ? "single" : "group"}, template ${this.cardTemplateId})`);
 		return true;
 	}
 
@@ -572,10 +604,10 @@ export class DingtalkAdapter implements IMAdapter {
 					isSingle,
 					userId,
 					openConversationId,
-				}).catch((err) => {
-					console.warn(`[im:dingtalk] push interactive card failed, falling back to markdown: ${(err as Error).message}`);
-					return false;
-				});
+			}).catch((err) => {
+				void diag("dingtalk", `push interactive card failed, falling back to markdown: ${(err as Error).message}`, "warn");
+				return false;
+			});
 				if (cardOk) return { ok: true };
 			}
 

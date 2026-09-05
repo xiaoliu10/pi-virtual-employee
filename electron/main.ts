@@ -29,6 +29,7 @@ import { startHttpTransport } from "../src/transport/http.js";
 import { setupAutoUpdater, getUpdateState, checkNow, downloadNow, quitAndInstall, stopUpdater, setupUnattended, updateCapability, requestUpdateAndInstall, type UpdateState } from "./updater.js";
 import type { UpdateToolStatus } from "../src/engine/tools/update.js";
 import { IMAdapterManager, availableChannels } from "../src/im/manager.js";
+import { setDiagFile } from "../src/im/diag.js";
 import {
 	buildEmployeePackage,
 	importEmployeePackage,
@@ -404,6 +405,10 @@ async function main(): Promise<void> {
 	// If the task was created in an IM conversation, the result is proactively
 	// pushed back to that group/1:1 through the active IM adapter.
 	const im = new IMAdapterManager(engine, config, { reportService });
+	// Persist IM send-path outcomes (card delivered / markdown fallback + reason)
+	// to userData/logs/im.log — packaged builds have no visible console, and the
+	// fallback reason is the #1 clue when IM formatting looks wrong.
+	setDiagFile(path.join(userData, "logs", "im.log"));
 	scheduler.setRunner({
 		async runTask(task) {
 			// Execute in an isolated background conversation, NOT the originating IM
