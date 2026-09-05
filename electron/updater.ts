@@ -38,10 +38,9 @@ const IDLE_POLL_MS = 60_000;
 const IDLE_WAIT_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 /** Let the final IM/HTTP response flush after draining new work. */
 const REPLY_FLUSH_DELAY_MS = 5_000;
-/** Installer watchdog: restore service if NSIS never relaunches the app. */
-const WATCHDOG_TIMEOUT_SECONDS = 10 * 60;
-/** Watchdog: how long to wait for the (force-run-free) installer to finish. */
-const INSTALLER_WAIT_SECONDS = 10 * 60;
+/** Watchdog: how long the app waits for its own graceful exit before the hard
+ *  tree-kill hands the install to the detached watchdog. */
+const APP_EXIT_GRACE_MS = 10_000;
 const WATCHDOG_DIR = "update-watchdog";
 const UPDATE_LOG_DIR = "logs";
 const UPDATE_LOG_FILE = "updater.log";
@@ -540,25 +539,29 @@ function snapshotRunningProfiles(): string[] {
 }
 
 /**
- * Independent PowerShell watchdog — the sole restarter of the app after an
- * update. Runs outside Electron, launched via the Task Scheduler (a detached
- * child_process spawn proved unreliable: on the 0.2.23 outage the watchdog was
- * "armed" yet produced zero script output — the detached powershell likely died
- * with the parent's job/endpoint-security kill; schtasks children have no such
- * parent linkage). A detached spawn is kept only as fallback.
+ * Independent PowerShell watchdog — the sole INSTALLER DRIVER and restarter of
+ * the app after an update. Runs outside Electron, launched via the Task
+ * Scheduler (schtasks children have no parent linkage to the dying app); when
+ * schtasks is unavailable the fallback chain is WMI Win32_Process.Create
+ * (reparented to WmiPrvSE, survives the app's taskkill /T) and last a detached
+ * spawn.
  *
- * 1. Waits for the NSIS installer process to exit (max INSTALLER_WAIT_SECONDS)
- *    — or for the app to come back on its own — then relaunches the installed
- *    app exe DIRECTLY via Start-Process (with the same --profile, so a
- *    multi-profile box gets every instance restored). Direct launch needs no
- *    interactive desktop, which --force-run's ExecShellAsUser did.
- * 2. If the installer is still running past the deadline (wedged on the
- *    uninstall-old step), kills it, bumps the machine-level failure counter,
- *    then self-heals exactly the way the on-machine manual repair does: with
- *    the app tree dead and the wedged installer gone, run the watchdog's
- *    installer copy SILENTLY once (proven to complete in seconds), then
- *    relaunch. If that attempt also fails, fall back to restoring the current
- *    exe — service first, update waits for a manual repair.
+ * Why the watchdog RUNS the installer instead of watching electron-updater's:
+ * electron-updater starts NSIS while the app is still tearing down, and that
+ * race wedged the uninstall-old step on at least one host SEVEN outages in a
+ * row — while the identical manual sequence (app fully dead → kill stale
+ * installers → installer /S → relaunch) succeeded every single time (12-14s).
+ * So the app now exits itself and the watchdog performs the install:
+ *
+ * 1. Waits for the app to exit (max 120s) — if it never exits, the install was
+ *    abandoned and the watchdog stands down.
+ * 2. Kills stale installers, runs the captured installer copy with /S (max
+ *    300s — the proven silent install takes seconds), and relaunches the app
+ *    exe DIRECTLY via Start-Process with the pre-quit profile snapshot (a
+ *    multi-profile box gets every instance restored; no interactive desktop
+ *    needed). A wedged install is killed, bumped to the machine-level failure
+ *    counter, and the launch proceeds on whatever is installed — service
+ *    first; a failed update waits for a manual repair.
  */
 function startInstallWatchdog(): void {
 	if (process.platform !== "win32" || !downloadedInstallerPath) {
@@ -638,54 +641,33 @@ function startInstallWatchdog(): void {
 			"$grace = (Get-Date).AddSeconds(120)",
 			"while ((Get-Date) -lt $grace -and (TestApp)) { Start-Sleep -Seconds 5 }",
 			"if (TestApp) { Log 'watchdog: app never exited — install abandoned, standing down'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
-			// Phase 0b: wait for the already-running installer (no --force-run →
-			// it exits by itself; no interactive desktop needed). The moment it is
-			// gone the new version is in place — relaunch immediately instead of
-			// sitting out the full timeout (0.2.22's script only acted on the
-			// 10-minute deadline, so even successful installs stayed down 10 min).
-			`Log ("watchdog phase0b: waiting up to ${INSTALLER_WAIT_SECONDS}s for installer to finish")`,
-			`$deadline = (Get-Date).AddSeconds(${INSTALLER_WAIT_SECONDS})`,
-			"$installerFinished = $false",
-			"while ((Get-Date) -lt $deadline) {",
-			"  if (TestApp) { Log 'watchdog: application recovered'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
-			"  if (-not (TestInstaller)) { $installerFinished = $true; break }",
-			"  Start-Sleep -Seconds 5",
-			"}",
-			// Phase 1: the installer wedged (typically stuck in "uninstall old
-			// app" against a broken/unremovable old tree). Kill the wedged
-			// installer so it stops holding the install lock, then self-heal
-			// with the on-machine-proven manual sequence: the app tree is dead
-			// and the lock is released, so a single silent install from the
-			// watchdog's installer copy completes in seconds (the earlier
-			// no-retry policy predates the tree-kill + kill-stale sequence —
-			// retries now run under the same conditions as the manual repair
-			// that has succeeded every time). On failure fall back to
-			// restoring the current exe; service first.
-			"if (-not $installerFinished) {",
-			"  Log 'watchdog: installer did not finish in time; killing wedged installers'",
+			"if (TestApp) { Log 'watchdog: app never exited — install abandoned, standing down'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
+			// Phase 1: the app tree is gone — install exactly the way the manual
+			// repair does on every successful outage fix: clear stale installers,
+			// run the captured installer copy silently, wait, relaunch. The
+			// in-app quitAndInstall NSIS race (7/7 wedges) is gone by design:
+			// nothing but this watchdog touches the installer.
+			"Log 'watchdog phase1: app exited; killing stale installers and running the update silently'",
+			"KillStaleInstallers",
+			"Start-Sleep -Seconds 2",
+			"$instProc = Start-Process -FilePath $installerCopy -ArgumentList '/S' -PassThru",
+			"$instDeadline = (Get-Date).AddSeconds(300)",
+			"while ($instProc -and (-not $instProc.HasExited) -and ((Get-Date) -lt $instDeadline)) { Start-Sleep -Seconds 5 }",
+			"if (-not $instProc) {",
+			"  Log 'watchdog phase1: silent install failed to start'",
+			"} elseif (-not $instProc.HasExited) {",
+			"  Log 'watchdog phase1: silent install wedged; killing it and bumping failure count'",
 			"  BumpFailureCount",
-			"  KillStaleInstallers",
-			"  Start-Sleep -Seconds 5",
-			"  Log 'watchdog phase1: attempting silent install from watchdog copy'",
-			"  $instProc = Start-Process -FilePath $installerCopy -ArgumentList '/S' -PassThru",
-			"  $instDeadline = (Get-Date).AddSeconds(300)",
-			"  while ($instProc -and (-not $instProc.HasExited) -and ((Get-Date) -lt $instDeadline)) { Start-Sleep -Seconds 5 }",
-			"  if (-not $instProc) {",
-			"    Log 'watchdog phase1: silent install failed to start'",
-			"  } elseif (-not $instProc.HasExited) {",
-			"    Log 'watchdog phase1: silent install wedged again; killing it'",
-			"    Stop-Process -Id $instProc.Id -Force",
-			"  } else {",
-			"    Log ('watchdog phase1: silent install exited code=' + $instProc.ExitCode)",
-			"  }",
-			"  $d2 = (Get-Date).AddSeconds(120)",
-			"  while ((Get-Date) -lt $d2 -and (TestInstaller)) { Start-Sleep -Seconds 5 }",
+			"  Stop-Process -Id $instProc.Id -Force",
 			"  Start-Sleep -Seconds 5",
 			"} else {",
-			"  Log 'watchdog: installer finished; launching updated app'",
+			"  Log ('watchdog phase1: silent install exited code=' + $instProc.ExitCode)",
 			"}",
+			"$d2 = (Get-Date).AddSeconds(120)",
+			"while ((Get-Date) -lt $d2 -and (TestInstaller)) { Start-Sleep -Seconds 5 }",
+			"Start-Sleep -Seconds 3",
 			// Direct launch of the installed exe — no desktop required.
-			"if (LaunchApp) { Log 'watchdog: restored service by direct app launch'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
+			"if (LaunchApp) { Log 'watchdog: service relaunched (update installed, or previous version restored after a wedged install)'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
 			"Log 'watchdog: direct app launch failed — exe missing or damaged; manual repair install required'",
 			"exit 2",
 		].join("\r\n");
@@ -706,24 +688,24 @@ function startInstallWatchdog(): void {
 			{ stdio: "ignore", windowsHide: true },
 		);
 		task.once("error", (err) => {
-			log("ERROR", `watchdog schtasks create failed: ${err.message} — falling back to detached spawn`);
-			spawnWatchdogDirect(scriptPath, installerCopy);
+			log("ERROR", `watchdog schtasks create failed: ${err.message} — falling back to WMI launch`);
+			spawnWatchdogViaWmi(scriptPath, installerCopy);
 		});
 		task.once("exit", (code) => {
 			if (code !== 0) {
-				log("WARN", `watchdog schtasks create exit=${code} — falling back to detached spawn`);
-				spawnWatchdogDirect(scriptPath, installerCopy);
+				log("WARN", `watchdog schtasks create exit=${code} — falling back to WMI launch`);
+				spawnWatchdogViaWmi(scriptPath, installerCopy);
 				return;
 			}
 			const run = spawn("schtasks.exe", ["/Run", "/TN", WATCHDOG_TASK_NAME], { stdio: "ignore", windowsHide: true });
 			run.once("error", (err) => {
-				log("ERROR", `watchdog schtasks run failed: ${err.message} — falling back to detached spawn`);
-				spawnWatchdogDirect(scriptPath, installerCopy);
+				log("ERROR", `watchdog schtasks run failed: ${err.message} — falling back to WMI launch`);
+				spawnWatchdogViaWmi(scriptPath, installerCopy);
 			});
 			run.once("exit", (runCode) => {
 				if (runCode !== 0) {
-					log("WARN", `watchdog schtasks run exit=${runCode} — falling back to detached spawn`);
-					spawnWatchdogDirect(scriptPath, installerCopy);
+					log("WARN", `watchdog schtasks run exit=${runCode} — falling back to WMI launch`);
+					spawnWatchdogViaWmi(scriptPath, installerCopy);
 					return;
 				}
 				log("INFO", `watchdog armed via schtasks: installer=${installerCopy} relaunchArgs=[${profileArgs().join(" ")}]`);
@@ -732,6 +714,36 @@ function startInstallWatchdog(): void {
 	} catch (err) {
 		log("ERROR", `watchdog setup failed: ${err instanceof Error ? err.message : String(err)}`);
 	}
+}
+
+/** WMI watchdog launch: Win32_Process.Create reparents the new process to
+ *  WmiPrvSE.exe, so it escapes both the app's job object and the taskkill /T
+ *  tree-kill that follows the quit — stronger than a detached spawn, and it
+ *  works on hosts where schtasks /Create is refused. */
+function spawnWatchdogViaWmi(scriptPath: string, installerCopy: string): void {
+	const inner = `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`;
+	const child = spawn(
+		"powershell.exe",
+		[
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			`$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${inner.replace(/'/g, "''")}' }; if ($r.ReturnValue -ne 0) { Write-Output $r.ReturnValue; exit 1 }`,
+		],
+		{ detached: true, stdio: "ignore", windowsHide: true },
+	);
+	child.once("error", (err) => {
+		log("ERROR", `watchdog WMI launch failed: ${err.message} — falling back to WMI launch`);
+		spawnWatchdogDirect(scriptPath, installerCopy);
+	});
+	child.once("exit", (code) => {
+		if (code === 0) log("INFO", `watchdog armed via WMI Win32_Process: installer=${installerCopy}`);
+		else {
+			log("WARN", `watchdog WMI launch exit=${code} — falling back to WMI launch`);
+			spawnWatchdogDirect(scriptPath, installerCopy);
+		}
+	});
+	child.unref();
 }
 
 /** Fallback watchdog launch (previous, less reliable mechanism). The child
@@ -859,23 +871,30 @@ export function quitAndInstall(): void {
 				]);
 			}
 			startInstallWatchdog();
+			// Let the arm settle — the schtasks → WMI fallback chain needs a beat
+			// to create the independent watchdog before the tree dies.
+			await new Promise((resolve) => setTimeout(resolve, 3_000));
 
 			const hardExitTimer = setTimeout(() => {
 				// Forced exit: outcome is unknowable from here, and the watchdog
-				// owns recovery. Failure accounting is the startup reconciliation's
-				// job now (pending marker written above) — double-counting here
-				// made a single failed install trip the breaker twice as fast.
-				log("ERROR", "app.quit() 15s 未退出，强制 process.exit(0) 以放行 NSIS 安装器");
+				// owns the install from here on. Failure accounting is the startup
+				// reconciliation's job now (pending marker written above) —
+				// double-counting here made a single failed install trip the
+				// breaker twice as fast.
+				log("ERROR", "app.quit() 未在宽限期内退出，强制 taskkill 自身进程树，移交 watchdog");
 				killOwnProcessTree();
 				process.exit(0);
-			}, 15_000);
+			}, APP_EXIT_GRACE_MS);
 			hardExitTimer.unref();
-			// isForceRunAfter=false is the root-cause fix: --force-run makes NSIS
-			// relaunch via ExecShellAsUser, which blocks forever on a disconnected
-			// RDP session (three overnight outages). The watchdog launches the app
-			// directly instead — no interactive desktop needed.
-			log("INFO", "calling autoUpdater.quitAndInstall(silent=true, forceRunAfter=false)");
-			autoUpdater.quitAndInstall(true, false);
+			// The app NEVER invokes electron-updater's NSIS path: it starts the
+			// installer while the app is still tearing down, and that race wedged
+			// the uninstall-old step on every attempt on at least one host
+			// (7/7) — while the identical manual sequence (app fully dead →
+			// installer /S → relaunch, which is exactly what the armed watchdog
+			// now performs) succeeded every time. The app just quits; the
+			// watchdog does the rest.
+			log("INFO", "install handed to watchdog: app quitting now; watchdog runs installer /S after exit");
+			app.quit();
 		} catch (err) {
 			installing = false;
 			endDrain?.();
