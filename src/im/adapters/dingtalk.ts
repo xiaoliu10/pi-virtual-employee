@@ -133,13 +133,20 @@ interface ReplyRoute {
 }
 
 /**
- * Official DingTalk AI-card streaming template (the one the current
- * openclaw-channel-dingtalk connector ships — card templates are bound to an
- * app at creation time, but this one works as a system shared template for any
- * app with the card permissions enabled; verified by
- * scripts/test-dingtalk-card.mjs). Streaming markdown component is bound to
- * the `content` variable, rendered with the FULL GFM engine (tables/alignment
- * render natively — unlike the castrated native-markdown renderer).
+ * Official DingTalk AI-card template — the V2 block template the current
+ * openclaw-channel-dingtalk connector ships. Its visible markdown lives in a
+ * `blockList` loopArray variable and MUST be committed through the card
+ * instances update API; driving it with a plain `content` stream alone
+ * delivers a card that renders BLANK (0.2.26/27 regression), and the older
+ * 02fcf2f4… V1 template now 500s on content streams. The V2 contract is:
+ *
+ *   1. createAndDeliver (cardParamMap seeds content="" + flowStatus=2)
+ *   2. PUT card/streaming  — one EMPTY isFull frame, isFinalize=false, to open
+ *      the streaming lifecycle and flip the card PROCESSING → 输入中
+ *   3. finalize: PUT card/streaming (empty, isFinalize=true) to close the
+ *      lifecycle, then PUT card/instances writing blockList
+ *      ([{type:0,markdown}]), content, copy_content and flowStatus=3 in one
+ *      call — the instances update is what actually renders the answer.
  */
 const AI_CARD_TEMPLATE_ID = "675cde2f-f526-40cb-b828-f5b2b57b8b77.schema";
 
@@ -338,27 +345,31 @@ export class DingtalkAdapter implements IMAdapter {
 	}
 
 	/**
-	 * Send one AI card (openclaw-channel-dingtalk-style streaming chain),
-	 * defaulting to the plugin's current built-in template (no manual template
-	 * setup required). The request body mirrors that connector's working
-	 * implementation field-for-field (verified via scripts/test-dingtalk-card.mjs
-	 * — the old conversationType/receiverUserIdList shape gets HTTP 400
-	 * MissingopenSpaceId, and openSpaceId alone without the space/deliver models
-	 * silently drops the delivery):
+	 * Send one AI card (openclaw-channel-dingtalk V2 streaming chain),
+	 * defaulting to that connector's current built-in template (no manual
+	 * template setup required). The request bodies mirror the connector's
+	 * working implementation field-for-field (verified via
+	 * scripts/test-dingtalk-card.mjs — the old conversationType/
+	 * receiverUserIdList shape gets HTTP 400 MissingopenSpaceId, openSpaceId
+	 * alone without the space/deliver models silently drops the delivery, and
+	 * the V2 template renders BLANK unless finalized via the instances API):
 	 *
 	 * 1. Create + deliver the card instance via
 	 *    POST /v1.0/card/instances/createAndDeliver. The target space is encoded
 	 *    in openSpaceId (IM_ROBOT.{userId} single / IM_GROUP.{openConversationId}
 	 *    group) together with its OpenSpaceModel + DeliverModel.
-	 * 2. Push the full content as ONE streaming frame with isFinalize=true
-	 *    (PUT /v1.0/card/streaming, key "content", isFull=true — mandatory for
-	 *    markdown variables). This flips the card from 输入中 to 完成 and runs
-	 *    the full GFM renderer (tables render natively).
+	 * 2. Open the streaming lifecycle: PUT /v1.0/card/streaming with one EMPTY
+	 *    isFull frame, isFinalize=false — flips the card PROCESSING → 输入中.
+	 *    Non-critical: a failure here only loses the 输入中 animation.
+	 * 3. Finalize: close the streaming lifecycle (empty, isFinalize=true), then
+	 *    PUT /v1.0/card/instances writing blockList ([{type:0,markdown}]),
+	 *    content, copy_content and flowStatus=3 in ONE call — the instances
+	 *    update is what actually renders the answer (full GFM, tables native).
 	 *
 	 * Requires "互动卡片实例写权限" (Card.Instance.Write) + "AI卡片流式更新权限"
 	 * (Card.Streaming.Write) on the app. Throws on failure (including a failed
-	 * per-space entry in deliverResults) so callers can fall back to the native
-	 * markdown message.
+	 * per-space entry in deliverResults or a failed instances finalize) so
+	 * callers can fall back to the native markdown message.
 	 */
 	private async sendInteractiveCard(
 		text: string,
@@ -366,15 +377,15 @@ export class DingtalkAdapter implements IMAdapter {
 	): Promise<boolean> {
 		const token = await this.accessToken();
 		const content = ensureMarkdownTableBlankLines(text);
-		const deliverExtension = { dynamicSummary: "true" };
 		if (target.isSingle) {
 			if (!target.userId) throw new Error("卡片发送缺少 userId");
 		} else {
 			if (!target.openConversationId) throw new Error("卡片发送缺少 openConversationId");
 		}
+		const outTrackId = randomUUID();
 		const body: Record<string, unknown> = {
 			cardTemplateId: this.cardTemplateId,
-			outTrackId: randomUUID(),
+			outTrackId,
 			cardData: {
 				cardParamMap: {
 					config: JSON.stringify({ autoLayout: true, enableForward: true }),
@@ -392,8 +403,8 @@ export class DingtalkAdapter implements IMAdapter {
 				: `dtv1.card//IM_GROUP.${target.openConversationId}`,
 			userIdType: 1,
 			...(target.isSingle
-				? { imRobotOpenDeliverModel: { spaceType: "IM_ROBOT", robotCode: this.appId, extension: deliverExtension } }
-				: { imGroupOpenDeliverModel: { robotCode: this.appId, extension: deliverExtension } }),
+				? { imRobotOpenDeliverModel: { spaceType: "IM_ROBOT", robotCode: this.appId, extension: { dynamicSummary: "true" } } }
+				: { imGroupOpenDeliverModel: { robotCode: this.appId, extension: { dynamicSummary: "true" } } }),
 		};
 		const res = await fetch("https://api.dingtalk.com/v1.0/card/instances/createAndDeliver", {
 			method: "POST",
@@ -410,22 +421,61 @@ export class DingtalkAdapter implements IMAdapter {
 		})?.result?.deliverResults;
 		const failed = deliverResults?.find((r) => r?.success === false);
 		if (failed) throw new Error(`投放失败 ${failed.spaceType ?? ""}: ${failed.errorMsg ?? "unknown"}`.trim());
-		// Finalize in one full frame — the card goes 输入中 → 完成 with full GFM.
-		const streamRes = await fetch("https://api.dingtalk.com/v1.0/card/streaming", {
+
+		const stream = async (streamContent: string, isFinalize: boolean): Promise<boolean> => {
+			const r = await fetch("https://api.dingtalk.com/v1.0/card/streaming", {
+				method: "PUT",
+				headers: { "Content-Type": "application/json", "x-acs-dingtalk-access-token": token },
+				body: JSON.stringify({
+					outTrackId,
+					guid: randomUUID(),
+					key: "content",
+					content: streamContent,
+					isFull: true,
+					isFinalize,
+					isError: false,
+				}),
+			});
+			return r.ok;
+		};
+		// Step 2: open the streaming lifecycle (empty frame → 输入中). Failure is
+		// non-critical — the instances finalize below renders the content anyway.
+		let lifecycleOpened = false;
+		try {
+			lifecycleOpened = await stream("", false);
+		} catch (err) {
+			void diag("dingtalk", `streaming lifecycle open failed (non-critical): ${(err as Error).message}`, "warn");
+		}
+		// Step 3a: close the streaming lifecycle (empty frame, isFinalize=true) —
+		// the instances update below commits the visible content exactly once.
+		if (lifecycleOpened) {
+			try {
+				await stream("", true);
+			} catch (err) {
+				void diag("dingtalk", `streaming lifecycle close failed (continuing): ${(err as Error).message}`, "warn");
+			}
+		}
+		// Step 3b: commit the answer through the card instances update API — the
+		// only channel the V2 template actually renders (blockList loopArray).
+		const commitRes = await fetch("https://api.dingtalk.com/v1.0/card/instances", {
 			method: "PUT",
 			headers: { "Content-Type": "application/json", "x-acs-dingtalk-access-token": token },
 			body: JSON.stringify({
-				outTrackId: body.outTrackId,
-				guid: randomUUID(),
-				key: "content",
-				content,
-				isFull: true,
-				isFinalize: true,
+				outTrackId,
+				cardData: {
+					cardParamMap: {
+						blockList: JSON.stringify([{ type: 0, markdown: content }]),
+						content,
+						copy_content: content,
+						flowStatus: "3",
+					},
+				},
+				cardUpdateOptions: { updateCardDataByKey: true },
 			}),
 		});
-		if (!streamRes.ok) {
-			const detail = await streamRes.text().catch(() => "");
-			throw new Error(`card/streaming HTTP ${streamRes.status}: ${detail.slice(0, 200)}`);
+		if (!commitRes.ok) {
+			const detail = await commitRes.text().catch(() => "");
+			throw new Error(`card/instances finalize HTTP ${commitRes.status}: ${detail.slice(0, 200)}`);
 		}
 		void diag("dingtalk", `AI card delivered (${target.isSingle ? "single" : "group"}, template ${this.cardTemplateId})`);
 		return true;

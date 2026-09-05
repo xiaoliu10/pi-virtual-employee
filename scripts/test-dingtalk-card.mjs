@@ -19,7 +19,8 @@ if (!appKey || !appSecret || !target) {
 	process.exit(1);
 }
 const isGroup = isGroupArg === "group";
-// 当前 openclaw-channel-dingtalk 插件内置模板（旧版 02fcf2f4 已废弃）
+// 与生产 adapter 一致的 V2 模板（675cde2f）。注意 V2 的可见内容必须经
+// card/instances 更新接口写 blockList —— 只推 content 流是空白卡。
 const TEMPLATE_ID = "675cde2f-f526-40cb-b828-f5b2b57b8b77.schema";
 const { randomUUID } = await import("node:crypto");
 
@@ -54,7 +55,7 @@ const content = [
 	"| 结论 | 表格应原生渲染 |",
 ].join("\n");
 
-// 请求体逐字段对齐 soimy/openclaw-channel-dingtalk src/card-service.ts 的可工作实现。
+// 请求体与生产 adapter（V2 模板契约）逐字段一致。
 const createBody = {
 	cardTemplateId: TEMPLATE_ID,
 	outTrackId: randomUUID(),
@@ -98,13 +99,40 @@ try {
 	}
 } catch { /* 解析失败交由 streaming 步骤暴露 */ }
 
-const stream = await call("card/streaming", "https://api.dingtalk.com/v1.0/card/streaming", "PUT", {
+// Step 2: 打开流式生命周期（空帧 → 输入中）；失败不致命。
+const kick = await call("card/streaming (open lifecycle)", "https://api.dingtalk.com/v1.0/card/streaming", "PUT", {
 	outTrackId: createBody.outTrackId,
 	guid: randomUUID(),
 	key: "content",
-	content,
+	content: "",
 	isFull: true,
-	isFinalize: true,
+	isFinalize: false,
+	isError: false,
 }, accessToken);
-if (!stream.ok) process.exit(4);
-console.log("\n结论: 创建、投放、流式更新全部成功。看钉钉——应收到一张带表格的卡片。");
+// Step 3a: 关闭流式生命周期（空帧 + isFinalize）。
+if (kick.ok) {
+	await call("card/streaming (close lifecycle)", "https://api.dingtalk.com/v1.0/card/streaming", "PUT", {
+		outTrackId: createBody.outTrackId,
+		guid: randomUUID(),
+		key: "content",
+		content: "",
+		isFull: true,
+		isFinalize: true,
+		isError: false,
+	}, accessToken);
+}
+// Step 3b: 通过 card/instances 更新接口提交可见内容（V2 模板唯一渲染通道）。
+const commit = await call("card/instances (finalize)", "https://api.dingtalk.com/v1.0/card/instances", "PUT", {
+	outTrackId: createBody.outTrackId,
+	cardData: {
+		cardParamMap: {
+			blockList: JSON.stringify([{ type: 0, markdown: content }]),
+			content,
+			copy_content: content,
+			flowStatus: "3",
+		},
+	},
+	cardUpdateOptions: { updateCardDataByKey: true },
+}, accessToken);
+if (!commit.ok) process.exit(4);
+console.log("\n结论: 创建、投放、流式开合、实例提交全部成功。看钉钉——应收到一张带表格的卡片。");
