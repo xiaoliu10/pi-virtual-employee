@@ -563,10 +563,10 @@ function snapshotRunningProfiles(): string[] {
  *    counter, and the launch proceeds on whatever is installed — service
  *    first; a failed update waits for a manual repair.
  */
-function startInstallWatchdog(): void {
+function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
 	if (process.platform !== "win32" || !downloadedInstallerPath) {
 		log("WARN", "watchdog skipped: downloaded installer path unavailable");
-		return;
+		return "failed";
 	}
 	try {
 		const dir = join(app.getPath("userData"), WATCHDOG_DIR);
@@ -675,74 +675,61 @@ function startInstallWatchdog(): void {
 		// keeps it to a single quoted path.
 		writeFileSync(wrapperPath, `@echo off\r\npowershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"\r\n`, "utf8");
 
-		// Primary launch: one-time scheduled task, triggered immediately. Unlike
-		// a detached spawn, the Task Scheduler service owns the process — it
-		// survives the app (and any job object) dying, which is the whole point.
-		// /ST must be in the future for /SC ONCE; we /Run manually anyway.
-		const startAt = new Date(Date.now() + 2 * 60_000);
-		const hhmm = `${String(startAt.getHours()).padStart(2, "0")}:${String(startAt.getMinutes()).padStart(2, "0")}`;
-		const task = spawn(
-			"schtasks.exe",
-			["/Create", "/F", "/TN", WATCHDOG_TASK_NAME, "/SC", "ONCE", "/ST", hhmm, "/TR", `"${wrapperPath}"`],
-			{ stdio: "ignore", windowsHide: true },
-		);
-		task.once("error", (err) => {
-			log("ERROR", `watchdog schtasks create failed: ${err.message} — falling back to WMI launch`);
-			spawnWatchdogViaWmi(scriptPath, installerCopy);
-		});
-		task.once("exit", (code) => {
-			if (code !== 0) {
-				log("WARN", `watchdog schtasks create exit=${code} — falling back to WMI launch`);
-				spawnWatchdogViaWmi(scriptPath, installerCopy);
-				return;
+		// Arm SYNCHRONOUSLY (spawnSync, blocking). The previous chain relied on
+		// async child-exit callbacks — the app could quit (or taskkill its own
+		// tree) before ANY callback fired, leaving zero watchdog processes alive
+		// behind an "install handed to watchdog" line (0.2.31 field failure,
+		// twice). When this function returns, the watchdog either exists outside
+		// our process tree, or the caller knows exactly why not.
+		const inner = `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`;
+		const wmiCommand = `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${inner.replace(/'/g, "''")}' }; if ($r.ReturnValue -ne 0) { Write-Output $r.ReturnValue; exit 1 }`;
+
+		// 1) WMI: Win32_Process.Create parents the watchdog to WmiPrvSE.exe —
+		//    outside both our job object and the taskkill /T tree-kill.
+		try {
+			const wmi = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", wmiCommand], {
+				encoding: "utf8", timeout: 20_000, windowsHide: true,
+			});
+			if (wmi.status === 0) {
+				log("INFO", `watchdog armed via WMI Win32_Process: installer=${installerCopy}`);
+				return "wmi";
 			}
-			const run = spawn("schtasks.exe", ["/Run", "/TN", WATCHDOG_TASK_NAME], { stdio: "ignore", windowsHide: true });
-			run.once("error", (err) => {
-				log("ERROR", `watchdog schtasks run failed: ${err.message} — falling back to WMI launch`);
-				spawnWatchdogViaWmi(scriptPath, installerCopy);
+			log("WARN", `watchdog WMI create failed (exit=${wmi.status}${wmi.stdout?.trim() ? ` out=${wmi.stdout.trim()}` : ""}) — trying schtasks`);
+		} catch (err) {
+			log("WARN", `watchdog WMI create threw: ${err instanceof Error ? err.message : String(err)} — trying schtasks`);
+		}
+
+		// 2) schtasks: the Task Scheduler service owns the watchdog (also tree-
+		//    independent). Create + Run, both synchronous.
+		try {
+			const startAt = new Date(Date.now() + 2 * 60_000);
+			const hhmm = `${String(startAt.getHours()).padStart(2, "0")}:${String(startAt.getMinutes()).padStart(2, "0")}`;
+			const create = spawnSync("schtasks.exe", ["/Create", "/F", "/TN", WATCHDOG_TASK_NAME, "/SC", "ONCE", "/ST", hhmm, "/TR", `"${wrapperPath}"`], {
+				encoding: "utf8", timeout: 20_000, windowsHide: true,
 			});
-			run.once("exit", (runCode) => {
-				if (runCode !== 0) {
-					log("WARN", `watchdog schtasks run exit=${runCode} — falling back to WMI launch`);
-					spawnWatchdogViaWmi(scriptPath, installerCopy);
-					return;
+			if (create.status !== 0) {
+				log("WARN", `watchdog schtasks create exit=${create.status} — falling back to detached spawn`);
+			} else {
+				const run = spawnSync("schtasks.exe", ["/Run", "/TN", WATCHDOG_TASK_NAME], { encoding: "utf8", timeout: 20_000, windowsHide: true });
+				if (run.status === 0) {
+					log("INFO", `watchdog armed via schtasks: installer=${installerCopy} relaunchArgs=[${profileArgs().join(" ")}]`);
+					return "schtasks";
 				}
-				log("INFO", `watchdog armed via schtasks: installer=${installerCopy} relaunchArgs=[${profileArgs().join(" ")}]`);
-			});
-		});
+				log("WARN", `watchdog schtasks run exit=${run.status} — falling back to detached spawn`);
+			}
+		} catch (err) {
+			log("WARN", `watchdog schtasks failed: ${err instanceof Error ? err.message : String(err)} — falling back to detached spawn`);
+		}
+
+		// 3) Last resort: detached spawn. This watchdog is still a child in the
+		//    PPID tree, so the caller MUST NOT taskkill the tree in this mode —
+		//    it signals the mode back via the return value.
+		spawnWatchdogDirect(scriptPath, installerCopy);
+		return "detached";
 	} catch (err) {
 		log("ERROR", `watchdog setup failed: ${err instanceof Error ? err.message : String(err)}`);
+		return "failed";
 	}
-}
-
-/** WMI watchdog launch: Win32_Process.Create reparents the new process to
- *  WmiPrvSE.exe, so it escapes both the app's job object and the taskkill /T
- *  tree-kill that follows the quit — stronger than a detached spawn, and it
- *  works on hosts where schtasks /Create is refused. */
-function spawnWatchdogViaWmi(scriptPath: string, installerCopy: string): void {
-	const inner = `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`;
-	const child = spawn(
-		"powershell.exe",
-		[
-			"-NoProfile",
-			"-NonInteractive",
-			"-Command",
-			`$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${inner.replace(/'/g, "''")}' }; if ($r.ReturnValue -ne 0) { Write-Output $r.ReturnValue; exit 1 }`,
-		],
-		{ detached: true, stdio: "ignore", windowsHide: true },
-	);
-	child.once("error", (err) => {
-		log("ERROR", `watchdog WMI launch failed: ${err.message} — falling back to WMI launch`);
-		spawnWatchdogDirect(scriptPath, installerCopy);
-	});
-	child.once("exit", (code) => {
-		if (code === 0) log("INFO", `watchdog armed via WMI Win32_Process: installer=${installerCopy}`);
-		else {
-			log("WARN", `watchdog WMI launch exit=${code} — falling back to WMI launch`);
-			spawnWatchdogDirect(scriptPath, installerCopy);
-		}
-	});
-	child.unref();
 }
 
 /** Fallback watchdog launch (previous, less reliable mechanism). The child
@@ -870,9 +857,12 @@ export function quitAndInstall(): void {
 				]);
 			}
 			startInstallWatchdog();
-			// Let the arm settle — the schtasks → WMI fallback chain needs a beat
-			// to create the independent watchdog before the tree dies.
-			await new Promise((resolve) => setTimeout(resolve, 3_000));
+			// Arm the watchdog synchronously (spawnSync — blocking). When this
+			// returns, the watchdog either exists OUTSIDE our process tree
+			// ("wmi"/"schtasks" — taskkill /T cannot reach it), or is a PPID
+			// child ("detached" — caller must skip the tree-kill), or every
+			// mechanism failed ("failed" — legacy fallback below).
+			const armed = startInstallWatchdog();
 
 			const hardExitTimer = setTimeout(() => {
 				// Forced exit: outcome is unknowable from here, and the watchdog
@@ -880,11 +870,24 @@ export function quitAndInstall(): void {
 				// reconciliation's job now (pending marker written above) —
 				// double-counting here made a single failed install trip the
 				// breaker twice as fast.
-				log("ERROR", "app.quit() 未在宽限期内退出，强制 taskkill 自身进程树，移交 watchdog");
-				killOwnProcessTree();
+				log("ERROR", "app.quit() 未在宽限期内退出，强制退出，移交 watchdog");
+				// A "detached" watchdog is a PPID child of this process —
+				// taskkill /T would take it down with the tree. Skip the
+				// tree-kill in that mode: the watchdog's own KillStaleInstallers
+				// and wedged-install branch handle the leftovers.
+				if (armed !== "detached") killOwnProcessTree();
 				process.exit(0);
 			}, APP_EXIT_GRACE_MS);
 			hardExitTimer.unref();
+			if (armed === "failed") {
+				// Every arm mechanism failed (WMI, schtasks, detached). Quitting
+				// now would leave the app DOWN with nothing to install — fall
+				// back to the legacy in-process NSIS path and accept the wedge
+				// risk: a possible hang beats a certain outage.
+				log("ERROR", "watchdog arm failed on every mechanism — falling back to legacy quitAndInstall (wedge risk accepted)");
+				autoUpdater.quitAndInstall(true, false);
+				return;
+			}
 			// The app NEVER invokes electron-updater's NSIS path: it starts the
 			// installer while the app is still tearing down, and that race wedged
 			// the uninstall-old step on every attempt on at least one host
@@ -892,7 +895,7 @@ export function quitAndInstall(): void {
 			// installer /S → relaunch, which is exactly what the armed watchdog
 			// now performs) succeeded every time. The app just quits; the
 			// watchdog does the rest.
-			log("INFO", "install handed to watchdog: app quitting now; watchdog runs installer /S after exit");
+			log("INFO", `install handed to watchdog (${armed}): app quitting now; watchdog runs installer /S after exit`);
 			app.quit();
 		} catch (err) {
 			installing = false;
