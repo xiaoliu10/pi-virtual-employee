@@ -595,6 +595,11 @@ function snapshotRunningProfiles(): string[] {
 			const m = /CommandLine=(.*)/.exec(line);
 			if (!m || !m[1].includes("Pi Virtual Employee.exe")) continue;
 			const cl = m[1];
+			// Electron child processes (renderer/GPU/utility) embed the exe path
+			// plus --type=... and carry no --profile — counting them fabricated
+			// an empty default-profile entry and LaunchApp started a bare extra
+			// instance (field: profiles=[实例B,,小派]).
+			if (/--type=/.test(cl)) continue;
 			const p = /--profile[= ]([\w-]+)/.exec(cl);
 			profiles.add(p ? p[1] : "");
 		}
@@ -660,6 +665,12 @@ function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
 			`$profileLaunch = @(${relaunch})`,
 			`$exeName = '${escapePowerShellSingleQuoted(exeName)}'`,
 			`$installerCopy = '${escapePowerShellSingleQuoted(installerCopy)}'`,
+			// The arming app's own PID. phase0a must wait for THIS process to
+			// exit — not for the image name to vanish: a sibling profile on the
+			// same install keeps the image name alive, which made phase0a stand
+			// down forever while the arming instance sat dead (0.2.36 field:
+			// 实例B offline 11 min with 小派 still running).
+			`$armPid = ${process.pid}`,
 			// Remove the scheduled task that launched us — the app also sweeps a
 			// stale task at startup, this covers the normal exit paths.
 			`& schtasks.exe /Delete /TN '${escapePowerShellSingleQuoted(WATCHDOG_TASK_NAME)}' /F | Out-Null`,
@@ -682,9 +693,15 @@ function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
 			// exits instantly ("direct app launch failed"). Launch the app with
 			// a clean environment, like a fresh user launch.
 			"  Get-ChildItem Env:ELECTRON_* -ErrorAction SilentlyContinue | Remove-Item -ErrorAction SilentlyContinue",
-			"  # NSIS kills by image name, so ALL instances go down together (a",
-			"  # sibling --profile 小派 on the same install has no watchdog of its",
-			"  # own). Bring back exactly the set snapshotted before the quit.",
+			"  # The arming instance is already dead, but a sibling profile that",
+			"  # never entered quitAndInstall may still be running the OLD version",
+			"  # from the renamed dir (rename+fresh install leaves it untouched).",
+			"  # Bounce every remaining instance so the snapshotted set comes back",
+			"  # uniformly on the new version — without this the old sibling would",
+			"  # win the single-instance lock and survive the update on the old",
+			"  # version.",
+			"  Get-Process -Name $exeName -ErrorAction SilentlyContinue | Stop-Process -Force",
+			"  Start-Sleep -Seconds 2",
 			"  foreach ($p in $profileLaunch) {",
 			"    if ($p) { Start-Process -FilePath $appExe -ArgumentList @('--profile', $p) }",
 			"    else { Start-Process -FilePath $appExe }",
@@ -700,15 +717,16 @@ function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
 			"    Log ('watchdog: bumped machine-level failure count to ' + $obj.consecutiveFailures)",
 			"  } catch { Log ('watchdog: failed to write failure record: ' + $_.Exception.Message) }",
 			"}",
-			// Phase 0a: this watchdog may come up BEFORE the app has quit (schtasks
-			// round-trip vs. the 5s reply-flush + quit). TestApp being TRUE right
-			// now means nothing yet — wait for the app to actually exit first
-			// (hard-exit timer bounds it at 15s; 120s is generous). If it never
-			// exits the install was abandoned and we can stand down.
+			// Phase 0a: this watchdog may come up BEFORE the app has quit.
+			// Wait for the ARMING PID to exit (the hard-exit timer bounds the
+			// app at ~10-15s; 120s is generous). If it never exits, the install
+			// was abandoned and we stand down — the app is still alive then, so
+			// there is nothing to relaunch. (PID reuse inside the window would
+			// only make us wait out the 120s — fail-safe.)
 			"Log 'watchdog phase0a: waiting for app to exit (max 120s)'",
 			"$grace = (Get-Date).AddSeconds(120)",
-			"while ((Get-Date) -lt $grace -and (TestApp)) { Start-Sleep -Seconds 5 }",
-			"if (TestApp) { Log 'watchdog: app never exited — install abandoned, standing down'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
+			"while ((Get-Date) -lt $grace -and (Get-Process -Id $armPid -ErrorAction SilentlyContinue)) { Start-Sleep -Seconds 2 }",
+			"if (Get-Process -Id $armPid -ErrorAction SilentlyContinue) { Log 'watchdog: arming app never exited — install abandoned, standing down'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
 			// Phase 1: the app tree is gone — install exactly the way the manual
 			// repair does on every successful outage fix: clear stale installers,
 			// run the captured installer copy silently, wait, relaunch. The
