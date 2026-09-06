@@ -21,7 +21,7 @@
  * flight just returns the current state.
  */
 import { app, type BrowserWindow } from "electron";
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { basename, join } from "node:path";
 import electronUpdater from "electron-updater";
@@ -370,6 +370,51 @@ function manualUrl(version: string): string {
 	return `${UPDATE_FEED}/Pi-Virtual-Employee-Setup-${version}-x64.exe`;
 }
 
+/**
+ * Best-effort sweep of stale partial downloads in electron-updater's shared
+ * cache. 小派 failed its download twice (6h apart) with EPERM on the same
+ * temp file — a leftover from an interrupted download that every later
+ * attempt collides with. Two profiles share this user-level cache dir, so
+ * the sweep only removes .tmp/.blocked partials older than an hour (never a
+ * completed installer another instance may be installing).
+ */
+function sweepStaleUpdaterTemps(): void {
+	if (process.platform !== "win32") return;
+	const localAppData = process.env.LOCALAPPDATA;
+	if (!localAppData) return;
+	// Field-observed name ("pi-virtual-employee-updater") plus the productName
+	// variant electron-updater can derive depending on the app identity.
+	const candidates = [join(localAppData, "pi-virtual-employee-updater"), join(localAppData, "Pi Virtual Employee-updater")];
+	for (const cacheDir of candidates) {
+		const pendingDir = join(cacheDir, "pending");
+		for (const dir of [cacheDir, pendingDir]) {
+			let entries: string[];
+			try {
+				entries = readdirSync(dir);
+			} catch {
+				continue;
+			}
+			for (const name of entries) {
+				if (!/\.(tmp|blocked)$/i.test(name)) continue;
+				const full = join(dir, name);
+				try {
+					if (Date.now() - statSync(full).mtimeMs < 60 * 60_000) continue;
+					rmSync(full, { force: true, recursive: true });
+					log("INFO", `swept stale updater temp file: ${full}`);
+				} catch (err) {
+					log("WARN", `could not sweep stale updater temp ${full}: ${err instanceof Error ? err.message : String(err)}`);
+				}
+			}
+		}
+	}
+}
+
+// One EPERM-style download retry per target version (no loops): two instances
+// sharing the updater cache collide on the same temp file — the other side
+// finishes seconds later, so a delayed re-download succeeds.
+let epermRetriedForVersion: string | undefined;
+let epermRetryTimer: NodeJS.Timeout | undefined;
+
 /** Wire electron-updater events → UpdateState. Called once at setup. */
 function wireEvents(): void {
 	autoUpdater.on("checking-for-update", () => {
@@ -445,9 +490,32 @@ function wireEvents(): void {
 	autoUpdater.on("error", (err: Error) => {
 		checking = false;
 		downloading = false;
-		requestedInstall = false;
 		endDrain?.();
-		setState({ phase: "error", currentVersion: app.getVersion(), message: err.message || String(err) });
+		const message = err.message || String(err);
+		setState({ phase: "error", currentVersion: app.getVersion(), message });
+		// 小派 pattern: two profiles share the user-level updater cache and
+		// collided on the same temp file → EPERM/sharing violation. Sweep stale
+		// partials and retry the download ONCE after the other instance has
+		// finished; never loop on repeated failures.
+		if (/EPERM|EBUSY|EACCES|sharing violation|-4082|ENOENT/i.test(message) && pendingVersion && epermRetriedForVersion !== pendingVersion) {
+			epermRetriedForVersion = pendingVersion;
+			log("WARN", `download failed with a file-lock style error (${message}) — sweeping stale temp files, retrying once in 30s`);
+			sweepStaleUpdaterTemps();
+			if (epermRetryTimer) clearTimeout(epermRetryTimer);
+			epermRetryTimer = setTimeout(() => {
+				// Reset to "available" so downloadNow's phase gate lets us back in.
+				setState({
+					phase: "available",
+					currentVersion: app.getVersion(),
+					version: pendingVersion ?? "",
+					releaseNotes: pendingReleaseNotes,
+					manualUrl: manualUrl(pendingVersion ?? ""),
+				});
+				void downloadNow().catch(() => {});
+			}, 30_000);
+			return;
+		}
+		requestedInstall = false;
 	});
 	autoUpdater.on("update-cancelled", () => {
 		downloading = false;
@@ -649,6 +717,23 @@ function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
 			"Log 'watchdog phase1: app exited; killing stale installers and running the update silently'",
 			"KillStaleInstallers",
 			"Start-Sleep -Seconds 2",
+			// Root cause of all 8 outages on the cloud box (现场, 2026-09-06):
+			// NSIS installing IN PLACE over the old tree wedges in the
+			// uninstall-old-files step (5min+, zero file writes, WorkingSet 2.2MB)
+			// every single time — while renaming the old install dir away and
+			// letting NSIS do a FRESH install completes in ~15s. So rename first;
+			// fall back to in-place only if the rename is blocked by a locked file.
+			"$instDir = Split-Path $appExe -Parent",
+			"$oldDir = ''",
+			"try {",
+			"  $oldName = (Split-Path $instDir -Leaf) + '.old-' + (Get-Date -Format 'yyyyMMdd-HHmmss')",
+			"  Rename-Item -Path $instDir -NewName $oldName -ErrorAction Stop",
+			"  $oldDir = Join-Path (Split-Path $instDir -Parent) $oldName",
+			"  Log ('watchdog phase1: old install dir renamed out of the way -> ' + $oldDir)",
+			"} catch {",
+			"  $oldDir = ''",
+			"  Log ('watchdog phase1: rename of old install dir failed (locked?) — installing in place: ' + $_.Exception.Message)",
+			"}",
 			"$instProc = Start-Process -FilePath $installerCopy -ArgumentList '/S' -PassThru",
 			"$instDeadline = (Get-Date).AddSeconds(300)",
 			"while ($instProc -and (-not $instProc.HasExited) -and ((Get-Date) -lt $instDeadline)) { Start-Sleep -Seconds 5 }",
@@ -665,8 +750,22 @@ function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
 			"$d2 = (Get-Date).AddSeconds(120)",
 			"while ((Get-Date) -lt $d2 -and (TestInstaller)) { Start-Sleep -Seconds 5 }",
 			"Start-Sleep -Seconds 3",
+			// Fresh install succeeded → the renamed old tree is junk; reclaim it.
+			// Locked leftovers stay on disk rather than risking the relaunch.
+			"if ($oldDir -and (Test-Path $appExe)) {",
+			"  Remove-Item -Path $oldDir -Recurse -Force -ErrorAction SilentlyContinue",
+			"  if (Test-Path $oldDir) { Log ('watchdog phase1: old install dir kept (locked): ' + $oldDir) } else { Log 'watchdog phase1: old install dir removed' }",
+			"}",
 			// Direct launch of the installed exe — no desktop required.
 			"if (LaunchApp) { Log 'watchdog: service relaunched (update installed, or previous version restored after a wedged install)'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
+			// The fresh install never produced an exe — roll the renamed old tree
+			// back into place and restore service on the previous version.
+			"if ($oldDir -and -not (Test-Path $appExe)) {",
+			"  Log 'watchdog: new install did not produce the exe — rolling back to the renamed old install dir'",
+			"  Remove-Item -Path $instDir -Recurse -Force -ErrorAction SilentlyContinue",
+			"  Rename-Item -Path $oldDir -NewName (Split-Path $instDir -Leaf) -ErrorAction SilentlyContinue",
+			"  if (LaunchApp) { Log 'watchdog: service relaunched (previous version restored after a failed install)'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
+			"}",
 			"Log 'watchdog: direct app launch failed — exe missing or damaged; manual repair install required'",
 			"exit 2",
 		].join("\r\n");
@@ -681,20 +780,34 @@ function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
 		// behind an "install handed to watchdog" line (0.2.31 field failure,
 		// twice). When this function returns, the watchdog either exists outside
 		// our process tree, or the caller knows exactly why not.
-		const inner = `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`;
-		const wmiCommand = `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${inner.replace(/'/g, "''")}' }; if ($r.ReturnValue -ne 0) { Write-Output $r.ReturnValue; exit 1 }`;
+		const psExe = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+		const inner = `${psExe} -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`;
+		// Field finding (0.2.31, twice): Win32_Process.Create returned ReturnValue 0
+		// and the app logged "armed via WMI", yet no watchdog process ever existed
+		// on the box — the created process died instantly (bare `powershell.exe`
+		// fails to resolve inside the WMI host context). The arm now uses the
+		// absolute powershell path, sets an explicit CurrentDirectory, and VERIFIES
+		// the created PID is still alive 3s later — falling through to the next
+		// mechanism when it isn't, instead of trusting ReturnValue.
+		const wmiCommand = [
+			`$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${inner.replace(/'/g, "''")}'; CurrentDirectory = '${escapePowerShellSingleQuoted(dir)}' }`,
+			"if ($r.ReturnValue -ne 0) { Write-Output ('CREATE-FAIL ' + $r.ReturnValue); exit 1 }",
+			"Start-Sleep -Seconds 3",
+			"if (Get-Process -Id $r.ProcessId -ErrorAction SilentlyContinue) { Write-Output ('ALIVE ' + $r.ProcessId) } else { Write-Output ('DIED ' + $r.ProcessId); exit 1 }",
+		].join("; ");
 
 		// 1) WMI: Win32_Process.Create parents the watchdog to WmiPrvSE.exe —
 		//    outside both our job object and the taskkill /T tree-kill.
 		try {
-			const wmi = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", wmiCommand], {
-				encoding: "utf8", timeout: 20_000, windowsHide: true,
+			const wmi = spawnSync(psExe, ["-NoProfile", "-NonInteractive", "-Command", wmiCommand], {
+				encoding: "utf8", timeout: 30_000, windowsHide: true,
 			});
-			if (wmi.status === 0) {
-				log("INFO", `watchdog armed via WMI Win32_Process: installer=${installerCopy}`);
+			const wmiOut = wmi.stdout?.trim() ?? "";
+			if (wmi.status === 0 && wmiOut.startsWith("ALIVE")) {
+				log("INFO", `watchdog armed via WMI Win32_Process: pid=${wmiOut.split(/\s+/)[1] ?? "?"} installer=${installerCopy}`);
 				return "wmi";
 			}
-			log("WARN", `watchdog WMI create failed (exit=${wmi.status}${wmi.stdout?.trim() ? ` out=${wmi.stdout.trim()}` : ""}) — trying schtasks`);
+			log("WARN", `watchdog WMI create failed (exit=${wmi.status} out=${wmiOut || "(none)"}) — trying schtasks`);
 		} catch (err) {
 			log("WARN", `watchdog WMI create threw: ${err instanceof Error ? err.message : String(err)} — trying schtasks`);
 		}
@@ -719,6 +832,34 @@ function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
 			}
 		} catch (err) {
 			log("WARN", `watchdog schtasks failed: ${err instanceof Error ? err.message : String(err)} — falling back to detached spawn`);
+		}
+
+		// 2b) Register-ScheduledTask: same Task Scheduler ownership (tree-kill
+		//     immune) via the cmdlet/CIM surface instead of schtasks.exe — on the
+		//     cloud box schtasks.exe exits 1 on everything while the
+		//     ScheduledTasks module is a different access path. Verify the task
+		//     actually reached Running before trusting it.
+		try {
+			const regCommand = [
+				`$action = New-ScheduledTaskAction -Execute '${escapePowerShellSingleQuoted(psExe)}' -Argument '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"'`,
+				"$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)",
+				`Register-ScheduledTask -TaskName '${WATCHDOG_TASK_NAME}' -Action $action -Trigger $trigger -Force | Out-Null`,
+				`Start-ScheduledTask -TaskName '${WATCHDOG_TASK_NAME}'`,
+				"Start-Sleep -Seconds 3",
+				`$st = (Get-ScheduledTask -TaskName '${WATCHDOG_TASK_NAME}' -ErrorAction SilentlyContinue).State`,
+				"if ($st -eq 'Running') { Write-Output 'TASK-RUNNING' } else { Write-Output ('TASK-STATE ' + $st); exit 1 }",
+			].join("; ");
+			const reg = spawnSync(psExe, ["-NoProfile", "-NonInteractive", "-Command", regCommand], {
+				encoding: "utf8", timeout: 30_000, windowsHide: true,
+			});
+			const regOut = reg.stdout?.trim() ?? "";
+			if (reg.status === 0 && regOut.includes("TASK-RUNNING")) {
+				log("INFO", `watchdog armed via Register-ScheduledTask: installer=${installerCopy}`);
+				return "schtasks";
+			}
+			log("WARN", `watchdog Register-ScheduledTask failed (exit=${reg.status} out=${regOut || "(none)"}) — falling back to detached spawn`);
+		} catch (err) {
+			log("WARN", `watchdog Register-ScheduledTask threw: ${err instanceof Error ? err.message : String(err)} — falling back to detached spawn`);
 		}
 
 		// 3) Last resort: detached spawn. This watchdog is still a child in the
@@ -856,7 +997,6 @@ export function quitAndInstall(): void {
 					),
 				]);
 			}
-			startInstallWatchdog();
 			// Arm the watchdog synchronously (spawnSync — blocking). When this
 			// returns, the watchdog either exists OUTSIDE our process tree
 			// ("wmi"/"schtasks" — taskkill /T cannot reach it), or is a PPID
@@ -912,6 +1052,10 @@ export function quitAndInstall(): void {
 export async function checkNow(): Promise<UpdateState> {
 	if (!enabled()) return lastState;
 	if (checking) return lastState;
+	// 小派 got wedged for 12h+ by one stale temp file in the shared updater
+	// cache — clear old partials before every check so a leftover can't block
+	// the next download.
+	sweepStaleUpdaterTemps();
 	try {
 		await autoUpdater.checkForUpdates();
 	} catch (err) {
