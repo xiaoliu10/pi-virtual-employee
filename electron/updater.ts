@@ -727,12 +727,17 @@ function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
 			"$grace = (Get-Date).AddSeconds(120)",
 			"while ((Get-Date) -lt $grace -and (Get-Process -Id $armPid -ErrorAction SilentlyContinue)) { Start-Sleep -Seconds 2 }",
 			"if (Get-Process -Id $armPid -ErrorAction SilentlyContinue) { Log 'watchdog: arming app never exited — install abandoned, standing down'; Set-Content -Path $marker -Value 'ok'; exit 0 }",
-			// Phase 1: the app tree is gone — install exactly the way the manual
-			// repair does on every successful outage fix: clear stale installers,
-			// run the captured installer copy silently, wait, relaunch. The
-			// in-app quitAndInstall NSIS race (7/7 wedges) is gone by design:
-			// nothing but this watchdog touches the installer.
+			// Phase 1: the arming app is gone, but a sibling profile that never
+			// entered quitAndInstall may still hold the install dir open — the
+			// rename below would then fail and fall back to the in-place NSIS
+			// path whose uninstall-old step wedged 8/8 on the cloud box. Bounce
+			// every remaining instance first (the arming app is already dead,
+			// so this only takes old-version siblings); after this even the
+			// in-place fallback runs in the app-fully-dead configuration that
+			// every manual rescue proved fast.
 			"Log 'watchdog phase1: app exited; killing stale installers and running the update silently'",
+			"Get-Process -Name $exeName -ErrorAction SilentlyContinue | Stop-Process -Force",
+			"Start-Sleep -Seconds 2",
 			"KillStaleInstallers",
 			"Start-Sleep -Seconds 2",
 			// Root cause of all 8 outages on the cloud box (现场, 2026-09-06):
