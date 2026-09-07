@@ -46,7 +46,7 @@ export class GiteeClient {
 	 * Push (create or update) a text file at `relPath` under the configured
 	 * basePath. Returns the repo path + the shareable link.
 	 */
-	async publishFile(relPath: string, content: string, message: string): Promise<PublishResult> {
+	async publishFile(relPath: string, content: string, message: string, _mime?: string): Promise<PublishResult> {
 		return this.pushBase64(relPath, Buffer.from(content, "utf8").toString("base64"), message);
 	}
 

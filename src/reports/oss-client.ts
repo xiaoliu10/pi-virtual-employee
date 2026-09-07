@@ -45,8 +45,8 @@ export class OssClient {
 	}
 
 	/** Put a text object and return its repo-relative path + presigned URL. */
-	async publishFile(relPath: string, content: string, _message: string): Promise<OssPublishResult> {
-		return this.put(relPath, Buffer.from(content, "utf8"), "text/markdown; charset=utf-8");
+	async publishFile(relPath: string, content: string, _message: string, mime = "text/markdown; charset=utf-8"): Promise<OssPublishResult> {
+		return this.put(relPath, Buffer.from(content, "utf8"), mime);
 	}
 
 	/**

@@ -48,8 +48,8 @@ export function createSaveReportTool(reportService: ReportService, conversationI
 					};
 				}
 				return {
-					content: [{ type: "text", text: `已保存「${title}」到产物中心。访问链接：${pub.url}\n\n请把这个链接发给用户。` }],
-					details: { ok: true, published: true, runId, url: pub.url, path: pub.path },
+					content: [{ type: "text", text: `已保存「${title}」到产物中心。访问链接（HTML 排版版）：${pub.url}\n\n请把这个链接发给用户。` }],
+					details: { ok: true, published: true, runId, url: pub.url, mdUrl: pub.mdUrl, path: pub.path },
 				};
 			} catch (err) {
 				return {

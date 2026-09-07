@@ -15,10 +15,11 @@ import type { AppConfig, ConfigStore } from "../db/config-store.js";
 import { ArtifactStore, type ArtifactSource, type RunStatus, type AttachmentType, type Artifact, type ArtifactRun, type ArtifactAttachment } from "../db/artifact-store.js";
 import { GiteeClient } from "./gitee-client.js";
 import { OssClient } from "./oss-client.js";
+import { renderReportHtml } from "./markdown-html.js";
 
 interface Publisher {
 	isConfigured(): boolean;
-	publishFile(relPath: string, content: string, message: string): Promise<{ path: string; url: string }>;
+	publishFile(relPath: string, content: string, message: string, mime?: string): Promise<{ path: string; url: string }>;
 	publishBinary(relPath: string, buffer: Buffer, message: string): Promise<{ path: string; url: string }>;
 }
 
@@ -56,8 +57,11 @@ export interface CompleteRunInput {
 }
 
 export interface PublishOutcome {
+	/** Preferred share link — the styled HTML version when it uploaded, else the raw body link. */
 	url: string;
 	path: string;
+	/** Raw markdown link (always present when the .md upload succeeded). */
+	mdUrl?: string;
 }
 
 export class ReportService {
@@ -99,9 +103,15 @@ export class ReportService {
 	}
 
 	/**
-	 * Push the run body to Gitee and record the link. Returns null when reports
-	 * are disabled, unconfigured, or publishing failed (failure is logged, not
-	 * thrown — see file header).
+	 * Push the run body to the publisher and record the link. The raw markdown
+	 * goes up first (the artifact of record), then a styled HTML rendition of
+	 * the same body — a browser shows a bare .md as an unstyled text wall, and
+	 * the link the employee hands out should open as a readable report. The
+	 * HTML link is returned as the primary URL when it uploaded; an HTML
+	 * failure never fails the publish (md link is the fallback).
+	 *
+	 * Returns null when reports are disabled, unconfigured, or publishing
+	 * failed (failure is logged, not thrown — see file header).
 	 */
 	async publish(runId: string, title: string, content: string): Promise<PublishOutcome | null> {
 		const reports = this.config.all().reports;
@@ -113,8 +123,22 @@ export class ReportService {
 		const message = `report: ${title.slice(0, 60)}`;
 		try {
 			const res = await client.publishFile(relPath, content, message);
-			this.store.createPublish({ runId, target: reports.target, url: res.url, path: res.path, status: "ok" });
-			return { url: res.url, path: res.path };
+			let url = res.url;
+			let path = res.path;
+			try {
+				const html = await client.publishFile(
+					relPath.replace(/\.md$/, ".html"),
+					renderReportHtml(title, content),
+					message,
+					"text/html; charset=utf-8",
+				);
+				url = html.url;
+				path = html.path;
+			} catch (htmlErr) {
+				console.warn(`[reports] HTML rendition failed for run ${runId} (sharing raw markdown link):`, (htmlErr as Error).message);
+			}
+			this.store.createPublish({ runId, target: reports.target, url, path, status: "ok" });
+			return { url, path, mdUrl: res.url };
 		} catch (err) {
 			const error = (err as Error).message;
 			console.warn(`[reports] publish (${reports.target}) failed for run ${runId}:`, error);
