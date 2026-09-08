@@ -10,7 +10,7 @@
  * Alias / relay model ids (not in the pi-ai registry) are supported by cloning a
  * base model of the matching api type and overriding id + baseUrl.
  */
-import { Agent, convertToLlm } from "@earendil-works/pi-agent-core";
+import { Agent, convertToLlm, estimateContextTokens } from "@earendil-works/pi-agent-core";
 import type { AgentEvent, AgentMessage, Skill, StreamFn } from "@earendil-works/pi-agent-core";
 import { createModels } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
@@ -481,6 +481,26 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.history.ensureConversation(conversationId, null);
 		if (override) this.history.setModelOverride(conversationId, override.supplierId, override.modelId);
 		this.sessions.delete(conversationId);
+	}
+
+	/**
+	 * /compact: force a compaction pass on this conversation — summarize older
+	 * turns into a compaction-summary message while keeping the recent tail
+	 * verbatim. Runs through the IM queue (an in-flight turn must settle
+	 * first). Returns a channel-ready reply describing what happened.
+	 */
+	async compactSession(conversationId: string): Promise<string> {
+		const agent = this.getOrCreateSession(conversationId);
+		if (agent.state.isStreaming) {
+			return "⏳ 当前有回合正在进行，等它结束后再试 /compact。";
+		}
+		const before = estimateContextTokens(agent.state.messages).tokens;
+		const done = await maybeCompact(agent, this.models, true);
+		if (!done) {
+			return `上下文很短（约 ${before} tokens），无需压缩。`;
+		}
+		const after = estimateContextTokens(agent.state.messages).tokens;
+		return `🧹 上下文已压缩：约 ${before} → ${after} tokens（较早的对话已汇总为摘要，近期对话原样保留）。`;
 	}
 
 	/**

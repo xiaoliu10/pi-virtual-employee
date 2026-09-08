@@ -164,6 +164,17 @@ export class IMAdapterManager {
 	private makeIO(): IMIO {
 		return {
 			handle: (msg, ctx) => {
+				// /stop aborts the in-flight turn WITHOUT wiping context — also
+				// outside the queue, same reason as /new (a wedged turn must not
+				// block its own escape hatch).
+				if (msg.text.trim() === "/stop") {
+					const aborted = this.engine.abortSession(msg.conversationId);
+					return Promise.resolve(
+						aborted
+							? "⏹️ 已中断当前回合（上下文保留）。需要彻底清空上下文请发 /new。"
+							: "当前没有正在进行的回合。",
+					);
+				}
 				// /new bypasses the per-conversation queue on purpose: a wedged
 				// in-flight turn would otherwise block this command forever.
 				// Abort the live agent FIRST (unblocks the queue), then run the
@@ -230,10 +241,24 @@ export class IMAdapterManager {
 	/** Handle deterministic slash commands, returning a text reply for the channel. */
 	private runCommand(
 		conversationId: string,
-		cmd: { name: "version" } | { name: "models" } | { name: "model"; arg: string },
-	): string {
+		cmd: { name: "version" } | { name: "models" } | { name: "model"; arg: string } | { name: "compact" } | { name: "help" },
+	): string | Promise<string> {
+		if (cmd.name === "help") {
+			return [
+				"可用命令：",
+				"/new — 中断当前回合并清空上下文，开启新会话",
+				"/compact — 压缩上下文（较早对话汇总为摘要，近期对话保留）",
+				"/stop — 中断当前回合（上下文保留）",
+				"/version — 查看应用版本",
+				"/models — 列出可用模型",
+				"/model <序号或模型名> — 切换模型",
+			].join("\n");
+		}
+		if (cmd.name === "compact") {
+			return this.engine.compactSession(conversationId);
+		}
 		if (cmd.name === "version") {
-			return `当前应用版本：v${this.engine.appVersion()}。发送「检查更新」可让 实例B 调用 manage_update 检查最新版；发送 /new 可清空上下文开启新会话。`;
+			return `当前应用版本：v${this.engine.appVersion()}。发送 /help 查看全部命令；发送 /new 可清空上下文开启新会话。`;
 		}
 
 		const options = this.engine.availableModels();
@@ -308,11 +333,15 @@ function credChanged(prev: ImChannelConfig | undefined, next: ImChannelConfig): 
 	);
 }
 
-function parseCommand(text: string): { name: "version" } | { name: "models" } | { name: "model"; arg: string } | null {
+/** The deterministic IM slash commands. /new and /stop are intercepted in
+ * makeIO (they must bypass the queue); the rest run through runCommand. */
+function parseCommand(text: string): { name: "version" } | { name: "models" } | { name: "model"; arg: string } | { name: "compact" } | { name: "help" } | null {
 	const t = text.trim();
 	if (t === "/version" || t === "/ver") return { name: "version" };
 	if (t === "/models" || t === "/model") return { name: "models" };
 	const m = /^\/model\s+(.+)$/.exec(t);
 	if (m) return { name: "model", arg: m[1] };
+	if (t === "/compact") return { name: "compact" };
+	if (t === "/help" || t === "/?" ) return { name: "help" };
 	return null;
 }

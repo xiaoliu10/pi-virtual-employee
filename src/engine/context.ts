@@ -103,14 +103,18 @@ function contentText(content: string | { type: string; text?: string }[]): strin
  * Runs after a turn settles; keeps a tail of roughly `keepRecentTokens`,
  * chains onto any previous compaction summary, and replaces the head with a
  * fresh summary message (the harness `convertToLlm` renders it to the model).
- * Best-effort: failures leave the transcript untouched.
+ * `force=true` (the /compact command) skips the threshold check but keeps the
+ * same tail guard — recent turns stay verbatim, only the old head is
+ * summarized. Returns false when there was nothing to do (below threshold, or
+ * the transcript is too short to split); failures leave the transcript
+ * untouched.
  */
-export async function maybeCompact(agent: Agent, models: Models): Promise<boolean> {
+export async function maybeCompact(agent: Agent, models: Models, force = false): Promise<boolean> {
 	const settings = DEFAULT_COMPACTION_SETTINGS;
 	const messages = agent.state.messages;
 	const model = agent.state.model;
 	const contextWindow = model.contextWindow || FALLBACK_CONTEXT_WINDOW;
-	if (!shouldCompact(estimateContextTokens(messages).tokens, contextWindow, settings)) {
+	if (!force && !shouldCompact(estimateContextTokens(messages).tokens, contextWindow, settings)) {
 		return false;
 	}
 
