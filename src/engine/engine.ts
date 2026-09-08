@@ -27,6 +27,7 @@ import type { ReportService } from "../reports/report-service.js";
 import type { DownloadService } from "../downloads/download-service.js";
 import { buildSystemPrompt, buildTools } from "./definition.js";
 import type { UpdateOperations } from "./tools/update.js";
+import { hasActiveShellCommands } from "./tools/shell.js";
 import { maybeCompact, rehydrateMessages } from "./context.js";
 import { SkillLoader, pickActiveSkills } from "./skills/skill-loader.js";
 import { SkillWriter } from "./skills/skill-writer.js";
@@ -813,8 +814,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 		return this.sessions.size;
 	}
 
-	/** True when no agent is mid-turn — the updater's "safe to restart" signal. */
+	/** True when neither agent turns nor supervised commands are active. */
 	isIdle(): boolean {
+		if (hasActiveShellCommands(this.config)) return false;
 		for (const [, agent] of this.sessions) {
 			if (agent.state.isStreaming) return false;
 		}

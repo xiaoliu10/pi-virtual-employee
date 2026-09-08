@@ -54,7 +54,7 @@ const ROOT_CATALOG: Record<string, string> = {
 	kb: "知识库（kb.enabled/kb.mode/kb.local.*/kb.embedding.* 等）",
 	documents: "文档资源（documents.enabled/documents.dir）",
 	filesystem: "本地文件访问（filesystem.enabled/filesystem.allowedDirs[]）",
-	capabilities: "能力开关（capabilities.shell.enabled 与 shell 白名单）",
+	capabilities: "命令执行（capabilities.shell.enabled/allowedCommands/timeoutSec/backgroundTimeoutSec/pollTimeoutSec；时限单位秒：同步默认 60，后台默认 0=不限时，单次轮询等待默认 30）",
 	reports: "报告中心与发布目标（reports.enabled/reports.target/gitee.*/oss.*）",
 	skills: "已禁用技能列表（skills.disabled[]）",
 };
@@ -151,6 +151,7 @@ export function createManageSettingsTool(deps: SettingsToolDeps): AgentTool {
 			"读取或修改本系统的任意配置项（仅限 IM 单聊；写入需管理员并在当前消息包含「确认」）。" +
 			"action=list 列出全部可配置的根块；action=get 按 path 读单个值（如 general.longTaskProgressMin、kb.local.topK、browser.headless、filesystem.allowedDirs）；" +
 			"action=set 按 path 写入 value（数值段访问数组元素，如 im.channels.0.enabled）。" +
+			"run_command 同步命令超时用 capabilities.shell.timeoutSec（秒，默认 60，0=不限制）；后台命令时限用 capabilities.shell.backgroundTimeoutSec（默认 0=不限时）；单次轮询等待用 capabilities.shell.pollTimeoutSec（默认 30 秒，0=立即返回，等待结束不杀进程）；模型请求超时用 general.requestTimeoutMin（分钟）。" +
 			"path 根块：" + Object.keys(ROOT_CATALOG).join("、") + "。" +
 			"安全边界：security 块不可通过本工具修改（用 manage_admin/update_identity）；apiKey/appSecret/Token 等可设置但回显自动打码。" +
 			"注意修改 model 块（供应商/默认模型）有失联风险——配错将无法再通过对话恢复，请谨慎核对。",

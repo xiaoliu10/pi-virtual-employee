@@ -57,9 +57,39 @@ npm run build
 
 > 国内网络已在 `.npmrc` 配置 `ELECTRON_MIRROR`。对话需在 **设置 → 模型配置** 填入 API key(或依赖环境变量 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`)。
 
+## 命令执行与后台会话
+
+短命令使用 `run_command` 同步等待；长时间采集使用 `background: true`，启动后拿到 `sessionId`，由 `manage_process` 继续等待和读取输出。后台进程的运行时限与单次查询的等待时间相互独立，**一次等待结束不会终止后台进程**。
+
+在 **设置 → 通用 → 受限命令执行** 可分别配置：
+
+| 配置项（前缀 `capabilities.shell.`） | 默认值 | 作用 |
+| --- | --- | --- |
+| `timeoutSec` | 60 秒 | 同步命令的运行时限，0 = 不限制 |
+| `backgroundTimeoutSec` | 0 | 后台命令的运行时限，0 = 不限制 |
+| `pollTimeoutSec` | 30 秒 | 单次 `poll` 默认等待时间，0 = 立即返回 |
+
+三项均支持管理员在 IM 单聊中通过 `manage_settings` 修改，例如「确认，把后台命令运行时限设为 0，把单次轮询等待改为 120 秒」。运行时限对新启动的命令生效，正在运行的命令沿用启动时的值；等待时间对下一次 `poll` 生效，无需重启。`general.requestTimeoutMin` 单独控制模型请求超时，单位为分钟。旧配置自动补齐默认值；非法值回退到默认值，正数按整数秒处理且最少 1 秒，最大 2,147,483 秒（避免定时器溢出）。
+
+先把采集逻辑和参数写入本地脚本/配置文件，脚本启动时向 stdout 输出 `observer start` 和时间戳，完整采集结果写入文件。启动命令只保留一行，例如以下工具参数（解释器需已加入命令白名单）：
+
+```json
+{"command":"powershell -NoProfile -File collect.ps1","workingDir":"C:\\jobs","background":true}
+```
+
+拿到会话 ID 后，用 `manage_process` 的 `log` 检查启动日志，再用 `poll` 等待到结束，核对退出码和结果。`poll` 可传 `waitSec` 覆盖本次等待时间；几分钟以上的任务可用 `840` 秒长等待，减少短轮询。读取结果会返回 `nextOffset`，下次传入 `offset` 即可读新增输出：
+
+```json
+{"action":"poll","sessionId":"上一步返回的会话 ID","waitSec":30,"offset":0}
+```
+
+`list` 列出当前对话的会话，`log` 立即读取日志，`kill` 终止进程树。每次操作校验当前管理员身份，只能访问自己在当前对话启动的命令；查询无需重复确认，启动和终止仍需当前消息明确确认。定时任务沿用创建者管理员身份，可启动并跟踪自身命令。取消一次 `poll` 仅停止等待，进程继续运行。
+
+会话由应用托管，工具或对话模型重建不会丢失会话；应用退出会终止进程，重启后不能续接。后台命令计入忙碌状态，自动更新会等它们结束。最多同时运行 16 条命令，完成会话最多保留 24 小时、总计最多 100 个；每个会话保留最近 256 KB stdout/stderr，每页返回最多 32 KB。完整日志和敏感参数使用本地文件，不在命令行或 stdout 回显密钥；不需要再用 `nohup` 或自行编写脱离托管的 launcher。
+
 ## 发布
 
-每次发版同时产出 **Windows(NSIS)** 与 **Linux(AppImage)** 两套安装包,发布到 Gitee 的 `latest` tag release;已安装的 Windows 客户端会通过 `electron-updater` 自动检查并提示更新(仅打包后的 Windows 生效,dev / macOS 为 no-op)。
+当前发布脚本将 **Windows(NSIS)** 安装包与自动更新文件上传到 Gitee 的 `latest` tag release；Linux(AppImage) 支持本地构建，尚未接入发布上传。已安装的 Windows 客户端会通过 `electron-updater` 自动检查更新（仅打包后的 Windows 生效，dev / macOS 为 no-op）。
 
 ### 一次性准备
 
@@ -78,9 +108,9 @@ cp .env.example .env
 # 1) 升版本号(会改 package.json 并打 git tag)
 npm version patch        # 或 minor / major
 
-# 2) 打包两套安装包(各自完成 typecheck + build + 拉取平台原生二进制 + electron-builder)
+# 2) 打包 Windows 安装包（typecheck + build + 平台原生二进制 + electron-builder）
 npm run package:win
-npm run package:linux
+# Linux 如需本地构建：npm run package:linux
 
 # 3) 预览将要上传的产物(不碰 Gitee)
 npm run release:dry
@@ -88,6 +118,8 @@ npm run release:dry
 # 4) 实发:删旧 latest release+tag → 新建 → 上传全部产物 → 校验每个链接可达
 npm run release
 ```
+
+发布说明从 `docs/releases/v<版本号>.md` 读取；发布前先将对应源码提交和版本标签推送到远端，使安装包与源码版本一致。
 
 token 的取值优先级:命令行 `GITEE_TOKEN=xxx npm run release` > `.env` 文件 > 报错。
 

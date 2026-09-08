@@ -128,6 +128,7 @@ function capabilityRules(c: RulesCtx): string {
 	// desktop UI". security.* is deliberately not reachable (manage_admin).
 	lines.push(
 		"- **系统配置修改用 manage_settings（仅管理员单聊）**：对方要求调整任何配置参数——通用参数（请求超时、长任务进度提醒、工具步数上限）、IM 渠道、浏览器域名白名单、知识库参数、报告发布目标、员工身份展示等——用 manage_settings：action=list 列出可配置块，get <path> 查看当前值，set <path> <value> 修改（写入需管理员当前消息明确包含「确认」）。" +
+			"run_command 同步命令运行时限对应 capabilities.shell.timeoutSec（秒，默认 60）；后台运行时限对应 capabilities.shell.backgroundTimeoutSec（秒，默认 0=不限时）；manage_process 单次轮询等待对应 capabilities.shell.pollTimeoutSec（秒，默认 30，等待结束不杀进程）。这三项都能由管理员在对话中修改。单次模型请求超时对应 general.requestTimeoutMin（分钟）。" +
 			"数组元素用数字段定位（如 im.channels.0.enabled）；apiKey 等密钥可设置但回显会自动打码。管理员名单与员工身份请分别引导到 manage_admin / update_identity。" +
 			"严禁回答「该配置只能在桌面设置页修改 / 我这边没有操作 UI 的通道」——只要在 IM 单聊里就有完整配置能力。",
 	);
@@ -203,6 +204,8 @@ function capabilityRules(c: RulesCtx): string {
 		"- **系统信息与命令执行用 run_command（仅管理员、需「确认」）**：对方要求查看/结束进程（tasklist / 查 PID / taskkill）、查看本机系统/网络信息（systeminfo/whoami/hostname/netstat/ping/ipconfig）等系统级操作时，用 run_command 执行白名单命令。" +
 			"powershell/node/npx 等解释器只有管理员显式加入 shell 白名单后才可用；安装浏览器内核优先使用 manage_capabilities setup_browser，不要改走 run_command。" +
 			"执行前对方当前消息必须明确包含「确认」；非管理员无权限，先说明需要管理员授权。" +
+			"长时间采集/脚本任务使用 run_command background=true，拿 sessionId 后先用 manage_process log 或短等待 poll 检查脚本输出的 observer start 与时间戳，再用 poll 阻塞等候，必要时增大 waitSec（如 840 秒）减少短轮询。poll 的等待结束不会杀进程，只有运行时限到期或 kill 才会终止。用上次 nextOffset 作为下次 offset 增量读日志；running 仅表示仍在运行，必须等结束并核对退出码和结果，不能报告已完成。查询无需管理员重复确认，终止仍须确认。" +
+			"脚本逻辑先落盘到 .ps1/.py 文件，只执行 powershell -File xxx.ps1 / python xxx.py 并传 workingDir；参数/JSON 从本地文件读取，敏感值不写进命令或标准输出，避免在命令行做变量展开。不要用 nohup 或 launcher 再脱离托管；应用退出会结束这些后台会话，重启不可续接。" +
 			"严禁回答「我这边没有直接查看系统进程信息的工具 / windows 上没有命令工具 / 我没有权限执行命令」等——除非当前会话不是 IM 单聊或对方不是管理员，才可说明权限要求并请其联系管理员。",
 	);
 	return lines.join("\n");

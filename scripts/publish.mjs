@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * Publish Windows + Linux installers to the Gitee `latest` release.
+ * Publish the Windows installer and update feed to the Gitee `latest` release.
  *
  * Flow:
- *   1. require electron-builder's output under release/ (exe, AppImage, both
- *      latest*.yml + .blockmap). Fail fast if anything's missing — partial
+ *   1. require electron-builder's output under release/ (exe, latest.yml and
+ *      .blockmap). Fail fast if anything's missing — partial
  *      uploads are the failure mode we can least afford (auto-update would
  *      see a latest.yml pointing at a not-yet-uploaded asset).
  *   2. delete the existing `latest` release + tag on Gitee (the user-chosen
@@ -25,6 +25,12 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
 const releaseDir = join(root, "release");
+const version = JSON.parse(await readFile(join(root, "package.json"), "utf8")).version;
+const notesPath = join(root, "docs", "releases", `v${version}.md`);
+const releaseNotes = await readFile(notesPath, "utf8").catch((err) => {
+	if (err.code === "ENOENT") return `Windows x64 v${version} 安装包与自动更新文件。`;
+	throw err;
+});
 
 /**
  * Load .env (git-ignored) so `npm run release` works without exporting env
@@ -63,7 +69,6 @@ if (!token && !dryRun) {
 
 /** The artifacts a complete release needs: build outputs + their yml + blockmap. */
 async function collectArtifacts() {
-	const version = JSON.parse(await readFile(join(root, "package.json"), "utf8")).version;
 	// Windows only: Gitee caps a single release asset at 100 MB, and the Linux
 	// AppImage (~135 MB) / tar.gz (~111 MB) both exceed it. Linux distribution
 	// will move to GitHub Releases (no such cap) — for now this release carries
@@ -83,7 +88,7 @@ async function collectArtifacts() {
 				const s = await stat(p);
 				out.push({ name, path: p, size: s.size });
 			} catch {
-				console.error(`[publish] missing artifact: ${name} (run package:win + package:linux first)`);
+				console.error(`[publish] missing artifact: ${name} (run package:win first)`);
 				process.exit(1);
 			}
 		}
@@ -126,8 +131,8 @@ async function createLatestRelease() {
 	const body = {
 		access_token: token,
 		tag_name: TAG,
-		name: `最新版 (自动发布)`,
-		body: `由 scripts/publish.mjs 自动发布的最新安装包。Windows 与 Linux 版本同步。`,
+		name: `最新版 v${version}`,
+		body: releaseNotes,
 		target_commitish: sha,
 		prerelease: false,
 	};

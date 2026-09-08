@@ -98,6 +98,7 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 					return `- ${key}：${on ? "✅ 已开启" : "❌ 已关闭"}（${CAPABILITY_LABELS[key]}）`;
 				});
 				lines.push(`  shell 白名单：${cfg.capabilities.shell.allowedCommands.length ? cfg.capabilities.shell.allowedCommands.join("、") : "（空，全部拒绝）"}`);
+				lines.push(`  shell 同步运行时限：${cfg.capabilities.shell.timeoutSec === 0 ? "不限制" : `${cfg.capabilities.shell.timeoutSec} 秒`}；后台运行时限：${cfg.capabilities.shell.backgroundTimeoutSec === 0 ? "不限制" : `${cfg.capabilities.shell.backgroundTimeoutSec} 秒`}；轮询等待：${cfg.capabilities.shell.pollTimeoutSec} 秒（用 manage_settings 修改 capabilities.shell.timeoutSec/backgroundTimeoutSec/pollTimeoutSec）`);
 				lines.push(`- 浏览器内核（Chromium）：${kernelReady ? "✅ 已就绪" : "❌ 未安装（可用 setup_browser 安装）"}`);
 				return {
 					content: [{ type: "text", text: `当前能力开关：\n${lines.join("\n")}\n如需变更，请说明要开关的能力并包含「确认」。` }],

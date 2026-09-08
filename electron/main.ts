@@ -24,6 +24,7 @@ import { ReportService } from "../src/reports/report-service.js";
 import { DownloadStore } from "../src/downloads/download-store.js";
 import { DownloadService } from "../src/downloads/download-service.js";
 import { EmployeeEngine } from "../src/engine/engine.js";
+import { disposeShellCommands } from "../src/engine/tools/shell.js";
 import { buildSystemPrompt, defaultCoreRules } from "../src/engine/prompt.js";
 import { startHttpTransport } from "../src/transport/http.js";
 import { setupAutoUpdater, getUpdateState, checkNow, downloadNow, quitAndInstall, stopUpdater, setupUnattended, updateCapability, requestUpdateAndInstall, type UpdateState } from "./updater.js";
@@ -1054,6 +1055,7 @@ async function main(): Promise<void> {
 	consolidateTimer = setInterval(tickConsolidation, 60_000);
 	app.on("will-quit", () => {
 		if (consolidateTimer) clearInterval(consolidateTimer);
+		disposeShellCommands(config);
 		scheduler.stop();
 		stopUpdater();
 		// Ordinary quits are best-effort. The update path awaits browser/IM/HTTP
@@ -1095,6 +1097,7 @@ async function main(): Promise<void> {
 			// electron-updater spawns NSIS before app.quit(). Release every process /
 			// listener that can keep the old app tree alive before calling it.
 			scheduler.stop();
+			disposeShellCommands(config);
 			await im.stopAll();
 			await browser.close();
 			await new Promise<void>((resolve) => {

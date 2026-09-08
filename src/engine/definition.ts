@@ -32,7 +32,7 @@ import { createSendImageTool, type ImageSenderResolver } from "./tools/send-imag
 import { createManageAdminTool, createUpdateIdentityTool, type AdminToolDeps } from "./tools/admin.js";
 import { createManageUpdateTool, type UpdateOperations } from "./tools/update.js";
 import { createManageCapabilitiesTool } from "./tools/capabilities.js";
-import { createRunCommandTool } from "./tools/shell.js";
+import { createRunCommandTool, createManageProcessTool, type ShellToolDeps } from "./tools/shell.js";
 import { createManageSettingsTool } from "./tools/settings.js";
 import { orderTool } from "./tools/orders.js";
 import { escalateTool } from "./tools/escalate.js";
@@ -172,13 +172,14 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 	// Restricted shell execution for headless-server ops (process inspect/kill,
 	// system/network checks). Registered always; the tool itself gates on
 	// capabilities.shell.enabled + allowedCommands + admin confirmation.
-	tools.push(createRunCommandTool({
+	const shellDeps: ShellToolDeps = {
 		config: options.config,
 		resolveActor: options.resolveActor,
 		onConfigChanged: options.onConfigChanged,
 		conversationId: options.conversationId,
 		auditLogPath: options.shellAuditLogPath,
-	}));
+	};
+	tools.push(createRunCommandTool(shellDeps), createManageProcessTool(shellDeps));
 	// Full-config read/write for headless deployments — every block the desktop
 	// settings UI exposes, editable from an admin's 1:1 chat (security excluded).
 	tools.push(createManageSettingsTool({

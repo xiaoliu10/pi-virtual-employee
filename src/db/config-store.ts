@@ -5,6 +5,7 @@
  */
 import { randomUUID } from "node:crypto";
 import type { DB } from "./sqlite.js";
+import { normalizeTimeoutSec } from "../shared/timeouts.js";
 
 export type ApiType = "anthropic" | "openai";
 export type IMChannelType = "dingtalk" | "feishu" | "wecom" | "echo";
@@ -274,7 +275,16 @@ export interface AppConfig {
 	 * a stolen admin IM account then equals full server control).
 	 */
 	capabilities: {
-		shell: { enabled: boolean; allowedCommands: string[] };
+		shell: {
+			enabled: boolean;
+			allowedCommands: string[];
+			/** Synchronous-command runtime limit in seconds. Default 60; 0 = unlimited. */
+			timeoutSec: number;
+			/** Background-command runtime limit in seconds. Default 0 = unlimited. */
+			backgroundTimeoutSec: number;
+			/** Default blocking wait for a process poll. 0 = return immediately. */
+			pollTimeoutSec: number;
+		};
 	};
 	/**
 	 * Report / artifact center. Generated reports (scheduled-task outputs, etc.)
@@ -375,7 +385,7 @@ const DEFAULTS: AppConfig = {
 	prompt: { extra: "", rules: "" },
 	documents: { enabled: false, dir: "" },
 	filesystem: { enabled: false, allowedDirs: ["~/Downloads"] },
-	capabilities: { shell: { enabled: false, allowedCommands: ["tasklist", "taskkill", "ping", "ipconfig", "systeminfo", "whoami", "hostname", "netstat", "where"] } },
+	capabilities: { shell: { enabled: false, allowedCommands: ["tasklist", "taskkill", "ping", "ipconfig", "systeminfo", "whoami", "hostname", "netstat", "where"], timeoutSec: 60, backgroundTimeoutSec: 0, pollTimeoutSec: 30 } },
 	reports: {
 		enabled: false,
 		target: "gitee",
@@ -452,7 +462,7 @@ function normalizeSecurity(merged: AppConfig): AppConfig["security"] {
 	return { adminStaffIds: normalizedAdminIds(merged.security?.adminStaffIds) };
 }
 
-/** Normalize the capabilities block (restricted shell command whitelist). */
+/** Normalize the restricted shell whitelist and runtime limit. */
 function normalizeCapabilities(merged: AppConfig): AppConfig["capabilities"] {
 	const shell = merged.capabilities?.shell;
 	const allowed = Array.isArray(shell?.allowedCommands)
@@ -462,7 +472,13 @@ function normalizeCapabilities(merged: AppConfig): AppConfig["capabilities"] {
 			.filter((c) => c === "*" || /^[a-z0-9._-]+$/.test(c)))]
 		: [];
 	return {
-		shell: { enabled: shell?.enabled === true, allowedCommands: allowed },
+		shell: {
+			enabled: shell?.enabled === true,
+			allowedCommands: allowed,
+			timeoutSec: normalizeTimeoutSec(shell?.timeoutSec, DEFAULTS.capabilities.shell.timeoutSec),
+			backgroundTimeoutSec: normalizeTimeoutSec(shell?.backgroundTimeoutSec, DEFAULTS.capabilities.shell.backgroundTimeoutSec),
+			pollTimeoutSec: normalizeTimeoutSec(shell?.pollTimeoutSec, DEFAULTS.capabilities.shell.pollTimeoutSec),
+		},
 	};
 }
 

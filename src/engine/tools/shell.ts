@@ -6,8 +6,8 @@
  * `capabilities.shell.allowedCommands` whitelist, and runs the command via
  * `cmd /c` on Windows (the target deployment is a locked-down Windows server
  * with no visible desktop). Every execution is audited (masked admin id +
- * command), truncated to avoid flooding the reply, and bounded by a hard
- * timeout so a hung `taskkill`/install can never wedge the conversation.
+ * command), truncated to avoid flooding the reply, and bounded by the
+ * configured runtime limit (sync: 60 seconds; background: unlimited by default).
  *
  * Safety posture:
  *  - Shell execution is OFF by default (`capabilities.shell.enabled=false`).
@@ -27,7 +27,9 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ConfigStore } from "../../db/config-store.js";
-import { maskId, refuse, requireAdminForCommand, isSchedulerActor, type ActorContext } from "./admin.js";
+import { MAX_TIMEOUT_SEC } from "../../shared/timeouts.js";
+import { CommandSession } from "../command-session.js";
+import { maskId, refuse, requireAdminForCommand, isSchedulerActor, isExplicitConfirmation, type ActorContext } from "./admin.js";
 
 export interface ShellToolDeps {
 	config: ConfigStore;
@@ -50,10 +52,44 @@ function audit(path: string | undefined, event: Record<string, unknown>): void {
 	}
 }
 
-/** Output cap per run — commands like `dir /s` or VM stats can be large. */
-const MAX_OUTPUT_BYTES = 32_000;
-/** Hard runtime cap; taskkill/install/VM operations must return or be killed. */
-const RUN_TIMEOUT_MS = 60_000;
+interface SessionEntry {
+	process: CommandSession;
+	command: string;
+	conversationId: string;
+	ownerId: string;
+	channel: string;
+	background: boolean;
+}
+
+// ConfigStore is instance-scoped and survives tool/session rebuilds. Logs stay
+// in memory, with bounded retention; command output is never written to audit.
+const sessionStores = new WeakMap<ConfigStore, Map<string, SessionEntry>>();
+const MAX_RUNNING_COMMANDS = 16;
+const MAX_RETAINED_SESSIONS = 100;
+const SESSION_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+function sessionsFor(config: ConfigStore): Map<string, SessionEntry> {
+	let sessions = sessionStores.get(config);
+	if (!sessions) {
+		sessions = new Map();
+		sessionStores.set(config, sessions);
+	}
+	const cutoff = Date.now() - SESSION_RETENTION_MS;
+	for (const [id, entry] of sessions) {
+		if (entry.process.endedAt !== null && (entry.process.endedAt < cutoff || sessions.size >= MAX_RETAINED_SESSIONS)) sessions.delete(id);
+	}
+	return sessions;
+}
+
+export function hasActiveShellCommands(config: ConfigStore): boolean {
+	return [...(sessionStores.get(config)?.values() ?? [])].some((entry) => entry.process.status === "running");
+}
+
+/** Application-owned sessions end on app shutdown, including detached POSIX groups. */
+export function disposeShellCommands(config: ConfigStore): void {
+	for (const entry of sessionStores.get(config)?.values() ?? []) entry.process.stop();
+	sessionStores.delete(config);
+}
 
 /** Extract the first executable token from a command line (quotes/args stripped). */
 function executableToken(command: string): { raw: string; name: string; tokenLength: number; extension: string } {
@@ -235,68 +271,44 @@ function killProcessTree(pid: number | undefined): void {
 	}
 }
 
-/** Run the planned execution; resolve stdout+stderr, truncate, enforce timeout. */
-function runCommand(command: string, workingDir?: string): Promise<{ output: string; code: number | null; timedOut: boolean }> {
+/** Spawn once and retain supervision independently of any tool's wait. */
+function startCommand(command: string, timeoutSec: number, workingDir?: string): CommandSession {
 	const plan = planExecution(command);
-	return new Promise((resolve) => {
-		const common = {
-			stdio: ["ignore", "pipe", "pipe"] as ("ignore" | "pipe" | "ipc" | number)[],
-			windowsHide: true,
-			detached: process.platform !== "win32",
-			cwd: workingDir,
-			env: {
-				...process.env,
-				COMSPEC: `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`,
-				// Packed app: process.execPath is the GUI exe; anything we exec as a
-				// plain Node script needs this flag instead of launching a second GUI.
-				...(process.platform === "win32" ? {} : { ELECTRON_RUN_AS_NODE: "1" }),
-			},
-		};
-		let child: ChildProcess;
-		if (plan.mode === "direct") {
-			child = spawn(plan.file, plan.args, common);
-		} else if (process.platform === "win32") {
-			child = spawn(`${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`, ["/d", "/s", "/c", plan.command], common);
-		} else {
-			child = spawn("/bin/sh", ["-c", plan.command], common);
-		}
-		const kept: Buffer[] = [];
-		let keptBytes = 0;
-		let totalBytes = 0;
-		let settled = false;
-		const collect = (chunk: Buffer) => {
-			totalBytes += chunk.length;
-			const remaining = MAX_OUTPUT_BYTES - keptBytes;
-			if (remaining <= 0) return;
-			const part = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining);
-			kept.push(part);
-			keptBytes += part.length;
-		};
-		const outputText = () => {
-			const body = Buffer.concat(kept, keptBytes).toString("utf8").trim();
-			return body + (totalBytes > MAX_OUTPUT_BYTES ? `\n…（输出 ${totalBytes} 字节，已截断）` : "");
-		};
-		const timer = setTimeout(() => {
-			if (settled) return;
-			settled = true;
-			killProcessTree(child.pid);
-			resolve({ output: outputText(), code: null, timedOut: true });
-		}, RUN_TIMEOUT_MS);
-		child.stdout?.on("data", collect);
-		child.stderr?.on("data", collect);
-		child.once("error", (e) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			resolve({ output: `⚠️ 无法启动命令：${e.message}`, code: null, timedOut: false });
-		});
-		child.once("exit", (code) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			resolve({ output: outputText(), code, timedOut: false });
-		});
-	});
+	const common = {
+		stdio: ["ignore", "pipe", "pipe"] as ("ignore" | "pipe" | "ipc" | number)[],
+		windowsHide: true,
+		detached: process.platform !== "win32",
+		cwd: workingDir,
+		env: {
+			...process.env,
+			COMSPEC: `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`,
+			...(process.platform === "win32" ? {} : { ELECTRON_RUN_AS_NODE: "1" }),
+		},
+	};
+	let child: ChildProcess;
+	if (plan.mode === "direct") child = spawn(plan.file, plan.args, common);
+	else if (process.platform === "win32") child = spawn(`${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`, ["/d", "/s", "/c", plan.command], common);
+	else child = spawn("/bin/sh", ["-c", plan.command], common);
+	return new CommandSession(child, timeoutSec, killProcessTree);
+}
+
+function sessionResult(entry: SessionEntry, offset?: number) {
+	const proc = entry.process;
+	const log = proc.readLog(offset);
+	const timeoutKey = entry.background ? "backgroundTimeoutSec" : "timeoutSec";
+	const state = proc.status === "running" ? "⏳ 仍在运行；等待结束不会终止进程，请继续用 manage_process poll/log 跟踪。"
+		: proc.status === "timed_out" ? `⏱️ 命令超过 ${proc.timeoutSec} 秒未结束，已请求强制终止进程树（可能未完成任务）。可调整 capabilities.shell.${timeoutKey}。`
+			: proc.status === "killed" ? "命令已取消，已请求终止进程树。"
+				: proc.status === "failed" ? "⚠️ 命令启动失败。" : `exit code = ${proc.code}`;
+	return {
+		content: [{ type: "text" as const, text: `命令：${entry.command}\n会话：${proc.id}（pid=${proc.pid ?? "无"}）\n${state}\n日志 nextOffset=${log.nextOffset}${log.hasMore ? "，仍有后续日志" : ""}${log.truncated ? "；较早日志已超出保留范围" : ""}\n\n${log.output || "（暂无输出；进程已创建不等于脚本已就绪）"}` }],
+		details: {
+			sessionId: proc.id, pid: proc.pid ?? null, command: entry.command, background: entry.background,
+			status: proc.status, code: proc.code, timedOut: proc.status === "timed_out", timeoutSec: proc.timeoutSec,
+			startedAt: proc.startedAt, durationMs: (proc.endedAt ?? Date.now()) - proc.startedAt,
+			...log, output: log.output.slice(0, 2000),
+		},
+	};
 }
 
 /**
@@ -311,16 +323,21 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 		description:
 			"在部署机器上执行受限的 shell 命令（仅限 IM 单聊，需系统管理员身份且在当条消息明确「确认」）。" +
 			"默认用于运维诊断：tasklist 查看进程、taskkill 按单个 PID 结束进程、systeminfo/whoami/hostname/netstat/ping/ipconfig 查看本机状态。" +
-			"只允许执行 capabilities.shell.allowedCommands 白名单内的可执行文件（* 表示全部）；命令输出自动截断、60 秒超时；串联、管道、重定向、变量展开、脚本扩展名和可执行文件路径均拒绝。" +
+			"只允许执行 capabilities.shell.allowedCommands 白名单内的可执行文件（* 表示全部）；串联、管道、重定向、变量展开、脚本扩展名和可执行文件路径均拒绝。" +
+			"长任务传 background=true：启动后立即返回 sessionId，用 manage_process poll 阻塞等待、log 增量读日志、kill 终止；等待超时只返回当前状态，不杀后台进程。同步命令运行时限用 capabilities.shell.timeoutSec（默认 60 秒）；后台进程时限用 backgroundTimeoutSec（默认 0=不限制），管理员可用 manage_settings 修改。" +
+			"采集逻辑先写入 .ps1/.py 脚本，命令只用 powershell -File xxx.ps1 或 python xxx.py，参数通过本地文件传递；脚本先输出 observer start 与时间戳，首次 poll/log 检查启动日志，不能把返回 sessionId 当成任务完成。会话由本应用托管，应用退出会终止进程，重启后不可续接；不要再用 nohup 或自制脱管 launcher。" +
 			"powershell/node/npx 等解释器需管理员显式加入白名单；安装 Chromium 请改用 manage_capabilities setup_browser。" +
 			"安全规则：默认关闭；每次执行必须由管理员在当前消息中明确包含「确认」/confirm/yes/ok；群聊一律拒绝。命令以当前应用用户权限运行，不会自动提权。" +
 			"可选 workingDir：命令的工作目录（绝对路径，如 C:\\Users\\me\\project），脚本用相对路径读写数据文件时需要；不影响可执行文件白名单。定时任务无人值守执行时，run_command 以任务创建者（管理员）身份放行，无需消息内含「确认」，但命令与可执行文件白名单照常校验。",
 		parameters: Type.Object({
 			command: Type.String({ description: `要执行的命令，如「tasklist /FI "PID eq 19060"」「taskkill /PID 19060 /F」「python scripts/gen_report.py」。跑脚本直接给脚本文件路径，不要用 python -c 内联代码（括号会被拦截）。` }),
 			workingDir: Type.Optional(Type.String({ description: "可选：命令的工作目录绝对路径，如 C:\\Users\\admin\\assistant-home\\project。脚本按相对路径找数据文件时必填。" })),
+			background: Type.Optional(Type.Boolean({ description: "true=后台启动并返回 sessionId，再用 manage_process poll/log 跟踪；默认 false=同步等待命令结束。" })),
 		}),
-		async execute(_toolCallId, params) {
-			const { command, workingDir } = params as { command?: string; workingDir?: string };
+		async execute(_toolCallId, params, signal) {
+			const { command, workingDir, background = false } = params as { command?: string; workingDir?: string; background?: boolean };
+			if (typeof background !== "boolean") return refuse("background 必须是布尔值。");
+			if (signal?.aborted) return refuse("本次命令执行已取消。");
 			const raw = (command ?? "").trim();
 			if (!raw) return refuse("command 不能为空。");
 			if (raw.length > 512) return refuse("命令过长（>512 字符），拒绝执行。");
@@ -354,20 +371,85 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 			// creator's re-attached identity.
 			const actorId = maskId(gate.actor.senderId);
 			const via = isSchedulerActor(gate.actor) ? "scheduler" : gate.actor.channel;
-			console.log(`[shell] run_command by ${actorId} (${via})${cwd ? ` cwd=${cwd}` : ""}: ${raw}`);
-			audit(deps.auditLogPath, { event: "start", actor: actorId, channel: via, command: raw, cwd: cwd ?? null });
+			const timeoutSec = background ? shell.backgroundTimeoutSec : shell.timeoutSec;
+			const sessions = sessionsFor(deps.config);
+			if ([...sessions.values()].filter((entry) => entry.process.status === "running").length >= MAX_RUNNING_COMMANDS) {
+				return refuse(`已有 ${MAX_RUNNING_COMMANDS} 条命令在运行，请先用 manage_process 查看或结束已有任务。`);
+			}
+			const proc = startCommand(raw, timeoutSec, cwd);
+			const entry: SessionEntry = { process: proc, command: raw, conversationId: deps.conversationId, ownerId: gate.actor.senderId, channel: via, background };
+			sessions.set(proc.id, entry);
+			console.log(`[shell] run_command by ${actorId} (${via}) session=${proc.id} background=${background} timeout=${timeoutSec}s: ${raw}`);
+			audit(deps.auditLogPath, { event: "start", actor: actorId, channel: via, sessionId: proc.id, command: raw, cwd: cwd ?? null, timeoutSec, background });
+			void proc.completed.then(() => {
+				audit(deps.auditLogPath, { event: "finish", actor: actorId, sessionId: proc.id, command: raw, code: proc.code, status: proc.status, timedOut: proc.status === "timed_out", durationMs: (proc.endedAt ?? Date.now()) - proc.startedAt, timeoutSec, background });
+			});
+			await proc.started;
+			if (!background) {
+				const abort = () => proc.stop();
+				signal?.addEventListener("abort", abort, { once: true });
+				if (signal?.aborted) abort();
+				try { await proc.completed; }
+				finally { signal?.removeEventListener("abort", abort); }
+			}
+			return sessionResult(entry);
+		},
+	};
+}
 
-			const startedAt = Date.now();
-			const { output, code, timedOut } = await runCommand(raw, cwd);
-			const durationMs = Date.now() - startedAt;
-			audit(deps.auditLogPath, { event: "finish", actor: actorId, command: raw, code, timedOut, durationMs });
-			const head = timedOut
-				? `⏱️ 命令超过 60 秒未结束，已强制终止（可能未完成任务）。`
-				: `exit code = ${code}`;
-			return {
-				content: [{ type: "text", text: `已执行：${raw}\n${head}\n\n${output || "（无输出）"}` }],
-				details: { command: raw, code, timedOut, output: output.slice(0, 2000) },
-			};
+function confirmsProcessStop(text: string): boolean {
+	// The ordinary command gate treats "stop/终止" as cancellation. For the
+	// explicit kill action those words name the requested operation instead.
+	if (/不(?:用|要|能|该|应|得|许)?(?:终止|停止|结束|杀|执行)|禁止|请勿|\b(?:cannot|can't)\b/i.test(text)) return false;
+	return isExplicitConfirmation(text.replace(/终止|停止|\bstop\b/gi, "执行"));
+}
+
+/** Inspect only the caller's sessions in this conversation; mutations remain confirmed. */
+export function createManageProcessTool(deps: ShellToolDeps): AgentTool {
+	return {
+		name: "manage_process",
+		label: "命令会话管理",
+		description:
+			"管理 run_command 创建的进程会话：list 列出当前会话中的命令；poll 阻塞等到进程结束或单次等待超时；log 立即读日志；kill 终止进程树（管理员当前消息需「确认」）。" +
+			"poll/log/list 无需重复确认，但每次都校验当前管理员身份，只能访问自己在当前对话启动的命令。定时任务可跟踪自身会话。关闭 shell 开关后仍可查询和终止已有会话。" +
+			"poll 的 waitSec 仅控制此次等待，默认 capabilities.shell.pollTimeoutSec（30 秒），0=立即返回；无论等待超时还是取消等待，都不会终止后台进程。长等待可提高 waitSec（如 840 秒），避免连续短轮询。" +
+			"log/poll 返回 stdout+stderr 与 nextOffset；下次传 offset=nextOffset 只读新增输出。未传 offset 默认显示最新一页，每页最多 32KB，内存保留最近 256KB；完整结果请脚本写文件。先确认 observer start 启动日志，再持续跟踪到退出并核对退出码，不能把 running 当作成功。应用退出会终止进程，重启后会话失效。",
+		parameters: Type.Object({
+			action: Type.Union([Type.Literal("list"), Type.Literal("poll"), Type.Literal("log"), Type.Literal("kill")]),
+			sessionId: Type.Optional(Type.String({ description: "poll/log/kill 必填：run_command 返回的 sessionId。" })),
+			waitSec: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_TIMEOUT_SEC, description: "仅 poll：单次最长等待秒数，默认读配置（30 秒），0=立即返回；不影响命令运行时限。" })),
+			offset: Type.Optional(Type.Integer({ minimum: 0, description: "日志字节游标，传上次 nextOffset 读取增量；0 从保留日志开头读取，省略显示最新一页。" })),
+		}),
+		async execute(_toolCallId, params, signal) {
+			const { action, sessionId, waitSec, offset } = params as { action: string; sessionId?: string; waitSec?: number; offset?: number };
+			if (!["list", "poll", "log", "kill"].includes(action)) return refuse("action 必须是 list/poll/log/kill。");
+			const gate = requireAdminForCommand(deps, { needConfirmation: false });
+			if ("content" in gate) return gate;
+			if (action === "kill" && !isSchedulerActor(gate.actor) && !confirmsProcessStop(gate.actor.text)) {
+				return refuse("终止命令进程树需要管理员在当前消息中明确确认，例如「确认终止这个任务」。");
+			}
+			const own = (entry: SessionEntry) => entry.ownerId === gate.actor.senderId && entry.channel === gate.actor.channel && entry.conversationId === deps.conversationId;
+			const sessions = sessionsFor(deps.config);
+			if (action === "list") {
+				const rows = [...sessions.values()].filter(own).map((entry) => ({
+					sessionId: entry.process.id, pid: entry.process.pid ?? null, command: entry.command,
+					status: entry.process.status, code: entry.process.code, timeoutSec: entry.process.timeoutSec,
+					startedAt: entry.process.startedAt, background: entry.background,
+				}));
+				return { content: [{ type: "text", text: rows.length ? JSON.stringify(rows, null, 2) : "当前对话没有可访问的命令会话。" }], details: { sessions: rows } };
+			}
+			const entry = sessionId ? sessions.get(sessionId) : undefined;
+			if (!entry || !own(entry)) return refuse("找不到可访问的命令会话；请使用当前对话的 manage_process list 查询。应用重启后旧会话失效。");
+			if (offset !== undefined && (!Number.isSafeInteger(offset) || offset < 0)) return refuse("offset 必须是非负安全整数。");
+			if (action === "poll") {
+				const seconds = waitSec ?? deps.config.all().capabilities.shell.pollTimeoutSec;
+				if (!Number.isInteger(seconds) || seconds < 0 || seconds > MAX_TIMEOUT_SEC) return refuse(`waitSec 必须是 0～${MAX_TIMEOUT_SEC} 的整数秒数。`);
+				await entry.process.wait(seconds, signal);
+			} else if (action === "kill") {
+				audit(deps.auditLogPath, { event: "kill", actor: maskId(gate.actor.senderId), sessionId: entry.process.id });
+				entry.process.stop();
+			}
+			return sessionResult(entry, offset);
 		},
 	};
 }

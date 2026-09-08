@@ -7,6 +7,7 @@ import { MigrationSection } from "../components/MigrationSection";
 import { DocumentsSection } from "../components/DocumentsSection";
 import { ReportsSection } from "../components/ReportsSection";
 import { SkillsSection } from "../components/SkillsSection";
+import { MAX_TIMEOUT_SEC, normalizeTimeoutSec } from "../../../src/shared/timeouts";
 
 interface SettingsPageProps {
 	config: AppConfig | null;
@@ -132,6 +133,12 @@ function Field({ label, children, hint }: { label: string; children: JSX.Element
 }
 
 const inputCls = "h-11 w-full rounded-xl border border-slate-200 bg-[#f7f8fa] px-3.5 text-sm text-slate-800 outline-none transition focus:border-blue-400 focus:bg-white focus:ring-2 focus:ring-blue-100";
+
+const SHELL_TIMEOUT_FIELDS = [
+	{ key: "timeoutSec", label: "同步命令运行时限（秒）", fallback: 60, hint: "同步执行命令的最长运行时间，默认 60 秒，0 = 不限制。超时会终止进程树。保存后对下一次命令执行生效。" },
+	{ key: "backgroundTimeoutSec", label: "后台命令运行时限（秒）", fallback: 0, hint: "后台任务独立运行，默认 0 = 不限制。设为正数时，达到时限会终止进程树；长时间采集任务可保持不限时。" },
+	{ key: "pollTimeoutSec", label: "后台任务单次等待时间（秒）", fallback: 30, hint: "查询后台任务时，最多阻塞等待的默认秒数，0 = 立即返回。等待结束不会终止进程；长任务可调大以减少轮询次数。" },
+] as const;
 
 export function SettingsPage({ config, onChange, updater, onClose }: SettingsPageProps) {
 	const [tab, setTab] = useState<Tab>("model");
@@ -613,6 +620,17 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 														<div><div className="text-sm font-medium text-slate-800">启用受限命令执行</div><div className="mt-0.5 text-xs text-amber-700/70">开启后为员工提供 run_command；命令以当前应用用户权限运行，不会自动提权。</div></div>
 														<input type="checkbox" checked={draft.capabilities.shell.enabled} onChange={(e) => setShell({ enabled: e.target.checked })} className="h-5 w-5 accent-amber-500" />
 													</label>
+													{SHELL_TIMEOUT_FIELDS.map((field) => <Field key={field.key} label={field.label} hint={field.hint}>
+														<input
+															type="number"
+															min={0}
+															max={MAX_TIMEOUT_SEC}
+															step={1}
+															value={draft.capabilities.shell[field.key]}
+															onChange={(e) => setShell({ [field.key]: normalizeTimeoutSec(e.target.valueAsNumber, field.fallback) })}
+															className={inputCls}
+														/>
+													</Field>)}
 													<Field label="允许执行的命令（每行一个）" hint="只匹配可执行文件名，不含参数；默认仅含进程/系统/网络诊断命令。留空 = 全部拒绝。powershell、node、npx 属任意代码执行解释器，只有明确需要时才添加；填写 * = 允许任意可执行文件，强烈不建议。">
 														<textarea
 															value={shellCommandsText}

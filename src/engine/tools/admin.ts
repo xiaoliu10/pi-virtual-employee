@@ -61,8 +61,8 @@ export function isExplicitConfirmation(userText: string): boolean {
  * for an unattended run (`sched:` conversation). The senderId was captured at
  * creation time in a verified 1:1 admin chat and is re-checked against the live
  * whitelist on every use, so revoking admin access disables the task's guarded
- * tools immediately. Only whitelisted for run_command — see
- * requireConfirmedAdminOrScheduler.
+ * tools immediately. Command execution/supervision uses requireAdminForCommand;
+ * configuration/admin mutations stay interactive-only.
  */
 export function isSchedulerActor(actor: NonNullable<ActorContext>): boolean {
 	return actor.channel === "scheduler";
@@ -83,11 +83,11 @@ export function requireSingleChatActor(deps: Pick<AdminToolDeps, "resolveActor" 
 		return refuse("管理操作只允许在单聊中进行，群聊不开放（群内无法可靠鉴别操作者）。");
 	}
 	if (isSchedulerActor(actor)) {
-		// Unattended scheduled runs may ONLY use run_command (via
+		// Unattended scheduled runs may only execute/supervise commands (via
 		// requireAdminForCommand, which checks the actor before calling here).
 		// Every other admin tool stays interactive-only: a fixed task prompt
 		// must never be able to rotate the admin list or rewrite config.
-		return refuse("定时任务会话不能执行该管理操作（仅允许 run_command 受控命令）。");
+		return refuse("定时任务会话不能执行该管理操作（仅允许 run_command 受控命令及 manage_process 命令会话管理）。");
 	}
 	if (!actor.senderId) {
 		return refuse("无法识别发送者身份（senderId 为空），拒绝执行。");
@@ -124,16 +124,19 @@ export function requireConfirmedAdmin(
 }
 
 /**
- * run_command gate: identical to requireConfirmedAdmin, except a scheduler
+ * Command execution/supervision gate: identical to requireConfirmedAdmin, except a scheduler
  * actor (unattended scheduled-task run) passes WITHOUT the per-message
  * confirmation — the task prompt is fixed text, so requiring 「确认」 in it is
  * meaningless. The admin whitelist check above still applies live on every
- * fire, and the command whitelist still gates what can run. Every other admin
+ * fire, and the command whitelist still gates what can run. Read-only process
+ * supervision may omit confirmation; starting/stopping commands requires it.
+ * Every other admin
  * tool keeps using requireConfirmedAdmin, which rejects scheduler actors
  * through requireSingleChatActor's non-IM refusal.
  */
 export function requireAdminForCommand(
 	deps: Pick<AdminToolDeps, "config" | "resolveActor" | "conversationId">,
+	opts: { needConfirmation: boolean } = { needConfirmation: true },
 ): AdminRefusal | { actor: NonNullable<ActorContext> } {
 	const actor = deps.resolveActor(deps.conversationId);
 	if (actor && isSchedulerActor(actor)) {
@@ -154,7 +157,7 @@ export function requireAdminForCommand(
 			"该定时任务创建时未记录管理员身份，无法无人值守执行受控命令。请管理员在 IM 单聊中使用 authorize_scheduled_task 给该任务授权（消息中明确「确认」），无需删除重建。",
 		);
 	}
-	return requireConfirmedAdmin(deps, { needConfirmation: true });
+	return requireConfirmedAdmin(deps, opts);
 }
 
 export interface AdminToolDeps {
