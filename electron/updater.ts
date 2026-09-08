@@ -1072,6 +1072,14 @@ export function quitAndInstall(): void {
 }
 
 /** User-initiated check (and the periodic recheck path). Returns current state. */
+// The Gitee `latest` release is deleted + recreated on every publish, so for
+// ~1-2 minutes per publish the feed 404s. A scheduled check landing in that
+// window must not stick as an error until the next 6h tick — retry quickly,
+// bounded (2 consecutive transient failures then wait for the schedule), and
+// reset on any successful check.
+let feedRetryStreak = 0;
+let feedRetryTimer: NodeJS.Timeout | undefined;
+
 export async function checkNow(): Promise<UpdateState> {
 	if (!enabled()) return lastState;
 	if (checking) return lastState;
@@ -1081,8 +1089,20 @@ export async function checkNow(): Promise<UpdateState> {
 	sweepStaleUpdaterTemps();
 	try {
 		await autoUpdater.checkForUpdates();
+		feedRetryStreak = 0;
 	} catch (err) {
-		setState({ phase: "error", currentVersion: app.getVersion(), message: (err as Error).message || String(err) });
+		const message = (err as Error).message || String(err);
+		setState({ phase: "error", currentVersion: app.getVersion(), message });
+		// Transient feed failure (publish-window 404, Gitee/CDN hiccup)? Retry
+		// after 90s instead of waiting out the 6h schedule.
+		if (/404|403|429|5\d\d|timeout|ENOTFOUND|ECONNRESET/i.test(message) && feedRetryStreak < 2) {
+			feedRetryStreak += 1;
+			if (feedRetryTimer) clearTimeout(feedRetryTimer);
+			feedRetryTimer = setTimeout(() => {
+				void checkNow().catch(() => {});
+			}, 90_000);
+			log("WARN", `update check failed transiently (${message}) — rechecking in 90s (attempt ${feedRetryStreak}/2)`);
+		}
 	}
 	return lastState;
 }
