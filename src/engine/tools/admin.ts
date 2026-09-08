@@ -87,7 +87,7 @@ export function requireSingleChatActor(deps: Pick<AdminToolDeps, "resolveActor" 
 		// requireAdminForCommand, which checks the actor before calling here).
 		// Every other admin tool stays interactive-only: a fixed task prompt
 		// must never be able to rotate the admin list or rewrite config.
-		return refuse("定时任务会话不能执行该管理操作（仅允许 run_command 受控命令及 manage_process 命令会话管理）。");
+		return refuse("定时任务会话不能修改管理设置；只允许已授权的受控命令、命令会话管理及已单独开启的桌面操作。");
 	}
 	if (!actor.senderId) {
 		return refuse("无法识别发送者身份（senderId 为空），拒绝执行。");

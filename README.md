@@ -10,6 +10,7 @@
 - **配置 GUI**:模型(provider / modelId / API key)、IM(渠道 / appId / secret / 开关)、开机自启动。配置存 SQLite,可在界面修改并持久化。
 - **任务展示**:侧边栏列出历史会话(每个会话即一个"任务"),可切换 / 删除。
 - **IM 接入**:已接入**钉钉**(Stream 模式长连接,无需公网地址)与 `echo` 测试通道;在设置页配置 ClientID / ClientSecret 并启用。
+- **桌面控制**:接入 [Cua Driver](https://github.com/trycua/cua/tree/main/libs/cua-driver)，支持应用发现、窗口截图、控件读取、点击、输入、滚动和拖拽。管理员可在设置页或 IM 单聊中配置应用允许列表与超时。
 
 ## 架构
 
@@ -17,6 +18,7 @@
 Electron 主进程
 ├─ src/db        better-sqlite3:config / conversations / messages
 ├─ src/engine    单员工引擎:Agent 内核 + 会话管理 + 持久化 + 模型/key 解析
+├─ src/computer  Cua Driver 安装、stdio MCP 连接与桌面会话管理
 ├─ src/transport HTTP+SSE(复用上一轮),渲染进程经 localhost 读流
 └─ src/im        IMAdapter 抽象 + manager + echo 适配器
 渲染进程(renderer/, React + Vite + Tailwind)
@@ -86,6 +88,16 @@ npm run build
 `list` 列出当前对话的会话，`log` 立即读取日志，`kill` 终止进程树。每次操作校验当前管理员身份，只能访问自己在当前对话启动的命令；查询无需重复确认，启动和终止仍需当前消息明确确认。定时任务沿用创建者管理员身份，可启动并跟踪自身命令。取消一次 `poll` 仅停止等待，进程继续运行。
 
 会话由应用托管，工具或对话模型重建不会丢失会话；应用退出会终止进程，重启后不能续接。后台命令计入忙碌状态，自动更新会等它们结束。最多同时运行 16 条命令，完成会话最多保留 24 小时、总计最多 100 个；每个会话保留最近 256 KB stdout/stderr，每页返回最多 32 KB。完整日志和敏感参数使用本地文件，不在命令行或 stdout 回显密钥；不需要再用 `nohup` 或自行编写脱离托管的 launcher。
+
+## Cua 桌面控制
+
+在 **设置 → 通用 → Computer Use · 桌面控制** 安装 Cua Driver，开启桌面控制并填写允许操作的应用，例如 `notepad.exe`，保存后检测连接。Windows/Linux 支持下载并校验固定版本驱动；macOS 使用官方 CuaDriver.app。已有安装可直接填写驱动可执行文件的绝对路径。
+
+**全部应用内设置也支持管理员对话完成**：在 IM 单聊中说「确认，开启 Computer Use」，通过 `manage_capabilities` 启用；安装驱动、连接检测、停止使用 `manage_computer`；驱动路径、应用允许列表、前台操作、定时任务权限及全部超时通过 `manage_settings` 修改，无需打开设置页。
+
+桌面操作仅向已登记管理员的 IM 单聊开放。先让员工「列出桌面应用和窗口」，再指定应用任务，例如「在记事本里输入 hello，并截图检查」。默认关闭桌面控制，应用列表为空时拒绝所有应用；前台操作和定时任务分别需要显式开启。
+
+管理员也可在单聊中说「确认，把桌面动作超时改为 600 秒，桌面任务总时限设为 0」，通过 `manage_settings` 持久化修改 `computer.*`。Cua 进程在动作之间保持连接，同一桌面的任务串行执行。安装步骤、配置项、工具参数及平台限制见 [Cua 接入说明](docs/computer-use.md)。
 
 ## 发布
 

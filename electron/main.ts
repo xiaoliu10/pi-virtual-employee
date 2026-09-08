@@ -15,6 +15,7 @@ import { ConfigStore, normalizeModelConfig, type ExternalProviderConfig, type Su
 import { HistoryStore } from "../src/db/history-store.js";
 import { KnowledgeService } from "../src/knowledge/knowledge-service.js";
 import { BrowserService } from "../src/browser/browser-service.js";
+import { ComputerService } from "../src/computer/computer-service.js";
 import { ScheduledTaskStore } from "../src/db/scheduled-task-store.js";
 import { SchedulerService } from "../src/scheduler/scheduler-service.js";
 import { DocumentService } from "../src/documents/document-service.js";
@@ -340,6 +341,7 @@ async function main(): Promise<void> {
 	const history = new HistoryStore(db);
 	const knowledge = new KnowledgeService(db, config, vecExtension);
 	const browser = new BrowserService(config, userData);
+	const computer = new ComputerService(config, userData);
 	const scheduler = new SchedulerService(new ScheduledTaskStore(db));
 
 	// Document resources: uploaded files live under the configured documents dir
@@ -380,6 +382,7 @@ async function main(): Promise<void> {
 		userSkillsDir,
 		shellAuditLogPath: path.join(userData, "logs", "shell-audit.log"),
 	}, { timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000 });
+	engine.setComputerService(computer);
 	// The packaged playwright package sits under app.asar/node_modules; its CLI
 	// can install the Chromium kernel into the user's ms-playwright cache.
 	engine.setPlaywrightCliPath(path.join(__dirname, "../node_modules/playwright/cli.js"));
@@ -509,9 +512,24 @@ async function main(): Promise<void> {
 	scheduler.start();
 
 	ipcMain.handle("server:port", () => port);
+	const computerAction = async (event: Electron.IpcMainInvokeEvent, action: string) => {
+		if (!mainWindow || event.sender !== mainWindow.webContents || event.senderFrame !== mainWindow.webContents.mainFrame) throw new Error("桌面控制只能由本应用设置页管理。");
+		if (action === "install") return computer.startInstall();
+		if (action === "connect") await computer.connect();
+		else if (action === "disconnect") await computer.disconnect();
+		else if (action !== "status") throw new Error("未知桌面管理动作。");
+		return computer.status();
+	};
+	ipcMain.handle("computer:manage", computerAction);
+	ipcMain.handle("computer:pickDriver", async event => {
+		if (!mainWindow || event.sender !== mainWindow.webContents || event.senderFrame !== mainWindow.webContents.mainFrame) throw new Error("非法设置请求。");
+		const result = await dialog.showOpenDialog(mainWindow, { title: "选择 Cua Driver 可执行文件", properties: ["openFile"] });
+		return result.canceled ? null : result.filePaths[0] ?? null;
+	});
 	ipcMain.handle("config:get", () => config.all());
 	ipcMain.handle("config:set", async (_e, patch) => {
 		const updated = config.update(patch);
+		await computer.syncConfig();
 		applyAutostart(updated.general.autostart);
 		await im.sync().catch((err) => console.error("[im] sync failed", err));
 		engine.setRequestTimeoutMs((updated.general.requestTimeoutMin || 0) * 60_000);
@@ -1061,6 +1079,7 @@ async function main(): Promise<void> {
 		// Ordinary quits are best-effort. The update path awaits browser/IM/HTTP
 		// cleanup explicitly in prepareToInstall BEFORE electron-updater spawns NSIS.
 		void browser.close();
+		void computer.close();
 	});
 
 	createWindow();
@@ -1100,6 +1119,7 @@ async function main(): Promise<void> {
 			disposeShellCommands(config);
 			await im.stopAll();
 			await browser.close();
+			await computer.close();
 			await new Promise<void>((resolve) => {
 				if (!httpServer.listening) return resolve();
 				httpServer.close(() => resolve());

@@ -6,6 +6,7 @@
 import { randomUUID } from "node:crypto";
 import type { DB } from "./sqlite.js";
 import { normalizeTimeoutSec } from "../shared/timeouts.js";
+import { DEFAULT_COMPUTER_CONFIG, normalizeComputerConfig, type ComputerConfig } from "../shared/computer.js";
 
 export type ApiType = "anthropic" | "openai";
 export type IMChannelType = "dingtalk" | "feishu" | "wecom" | "echo";
@@ -238,6 +239,7 @@ export interface AppConfig {
 	 * restricts which hosts it may open (empty = unrestricted — use with care).
 	 */
 	browser: { enabled: boolean; headless: boolean; allowedDomains: string[]; downloadHost: string };
+	computer: ComputerConfig;
 	/** Scheduled tasks: the employee may create timed tasks in conversation; the scheduler runs them at their cron time. */
 	scheduler: { enabled: boolean };
 	prompt: {
@@ -381,6 +383,7 @@ const DEFAULTS: AppConfig = {
 	im: { enabled: false, channels: [], ack: { enabled: true, text: "👍 收到，正在处理…" } },
 	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 30, maxToolSteps: 20, autoUpdate: true },
 	browser: { enabled: false, headless: true, allowedDomains: [], downloadHost: "" },
+	computer: DEFAULT_COMPUTER_CONFIG,
 	scheduler: { enabled: true },
 	prompt: { extra: "", rules: "" },
 	documents: { enabled: false, dir: "" },
@@ -790,6 +793,7 @@ export class ConfigStore {
 					kb: { ...merged.kb, external: normalizeExternalProviders(merged.kb.external) },
 					security: normalizeSecurity(merged),
 					capabilities: normalizeCapabilities(merged),
+					computer: normalizeComputerConfig(merged.computer),
 				};
 				if (JSON.stringify(normalized) !== JSON.stringify(parsed)) this.persist(normalized);
 				return normalized;
@@ -861,6 +865,7 @@ export class ConfigStore {
 			kb: { ...merged.kb, external: normalizeExternalProviders(merged.kb.external) },
 			security: normalizeSecurity(merged),
 			capabilities: normalizeCapabilities(merged),
+			computer: normalizeComputerConfig(merged.computer),
 		};
 		this.persist(normalized);
 		return normalized;
@@ -881,6 +886,7 @@ export class ConfigStore {
 			kb: { ...merged.kb, external: normalizeExternalProviders(merged.kb.external) },
 			security: normalizeSecurity(merged),
 			capabilities: normalizeCapabilities(merged),
+			computer: normalizeComputerConfig(merged.computer),
 		};
 		this.persist(normalized);
 		return normalized;

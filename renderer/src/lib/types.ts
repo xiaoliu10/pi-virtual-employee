@@ -143,6 +143,7 @@ export interface AppConfig {
 	};
 	general: { autostart: boolean; language: "zh-CN" | "en-US"; requestTimeoutMin: number; longTaskProgressMin: number; maxToolSteps: number; autoUpdate: boolean | "full" | "download_only" | "off" };
 	browser: { enabled: boolean; headless: boolean; allowedDomains: string[]; downloadHost: string };
+	computer: import("../../../src/shared/computer").ComputerConfig;
 	scheduler: { enabled: boolean };
 	prompt: { extra: string; rules: string };
 	kb: KbConfig;

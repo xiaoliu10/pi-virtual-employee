@@ -7,6 +7,7 @@ import { MigrationSection } from "../components/MigrationSection";
 import { DocumentsSection } from "../components/DocumentsSection";
 import { ReportsSection } from "../components/ReportsSection";
 import { SkillsSection } from "../components/SkillsSection";
+import { ComputerSection } from "../components/ComputerSection";
 import { MAX_TIMEOUT_SEC, normalizeTimeoutSec } from "../../../src/shared/timeouts";
 
 interface SettingsPageProps {
@@ -556,6 +557,8 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 													className={inputCls}
 												/>
 											</Field>
+
+											<ComputerSection value={draft.computer} saved={config?.computer ?? draft.computer} onChange={(computer) => setDraft(value => value ? { ...value, computer } : value)} />
 
 											<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
 												<div className="mb-3">

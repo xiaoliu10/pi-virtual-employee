@@ -8,6 +8,8 @@ export interface RendererApi {
 	getServerPort(): Promise<number>;
 	getConfig(): Promise<AppConfig>;
 	setConfig(patch: unknown): Promise<AppConfig>;
+	manageComputer(action: "status" | "install" | "connect" | "disconnect"): Promise<import("../../src/shared/computer").ComputerStatus>;
+	pickComputerDriver(): Promise<string | null>;
 	previewPrompt(): Promise<string>;
 	defaultPromptRules(): Promise<string>;
 	listScheduledTasks(): Promise<ScheduledTaskRow[]>;

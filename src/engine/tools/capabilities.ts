@@ -25,11 +25,12 @@ let kernelInstall:
 	| null = null;
 
 /** Toggleable capabilities exposed to conversation-side admins. */
-const TOGGLEABLE = ["browser", "documents", "filesystem", "reports", "downloads", "shell"] as const;
+const TOGGLEABLE = ["browser", "computer", "documents", "filesystem", "reports", "downloads", "shell"] as const;
 type ToggleKey = (typeof TOGGLEABLE)[number];
 
 const CAPABILITY_LABELS: Record<ToggleKey, string> = {
 	browser: "浏览器自动化（navigate/click/type/screenshot/read 等）",
+	computer: "Cua 桌面控制（应用窗口、截图、点击与输入；驱动用 manage_computer 管理）",
 	documents: "文档资源（list/provide/save 文档）",
 	filesystem: "本地文件访问（受限目录列表与授权删除）",
 	reports: "报告中心（生成报告并发布链接）",
@@ -54,7 +55,7 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 		description:
 			"查看或变更本应用的能力开关（仅限 IM 单聊）。action=list 查看各项能力及其开关状态；" +
 			"action=set 开启或关闭某项能力（传 capability 和 enabled）；设置 shell 时可同时传 allowedCommands 更新命令白名单；action=setup_browser 安装/检查浏览器内核（Chromium）。" +
-			"可管理能力：browser（浏览器自动化）、documents（文档资源）、filesystem（本地文件访问）、" +
+			"可管理能力：browser（浏览器自动化）、computer（Cua 桌面控制）、documents（文档资源）、filesystem（本地文件访问）、" +
 			"reports（报告中心）、downloads（浏览器下载工作区）、shell（受限命令执行）。" +
 			"安全规则：list 需单聊；set 和 setup_browser 必须由管理员在当前消息中明确包含「确认」（或同义明确肯定语），群聊一律拒绝。" +
 			"setup_browser 已装则直接报告已安装；未装则后台下载（约 150MB，需几分钟），用 status 查询进度。下载源由 browser.downloadHost 决定（留空 = 国内默认走 npmmirror 镜像；如需改用 manage_settings 设置 browser.downloadHost）。",
@@ -66,6 +67,7 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 				Type.Union(
 					[
 						Type.Literal("browser"),
+						Type.Literal("computer"),
 						Type.Literal("documents"),
 						Type.Literal("filesystem"),
 						Type.Literal("reports"),
@@ -172,6 +174,9 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 						`✅ 能力「${capability}」（${CAPABILITY_LABELS[capability]}）已${enabled ? "开启" : "关闭"}，从下一条消息起生效。` +
 						(capability === "browser" && enabled
 							? "若首次使用浏览器工具提示缺少内核，请管理员在部署机器上执行：npx playwright install chromium。"
+							: "") +
+						(capability === "computer" && enabled
+							? `当前应用允许列表：${updated.computer.allowedApps.length ? updated.computer.allowedApps.join("、") : "（空，尚不能操作应用）"}。可继续在管理员单聊中用 manage_computer 安装驱动、检测连接和停止操作；用 manage_settings 修改 computer.driverPath、allowedApps、allowForeground、allowScheduled 及 connectTimeoutSec/actionTimeoutSec/sessionTimeoutSec，无需打开设置页。`
 							: "") +
 						(capability === "shell" && enabled
 							? `当前白名单：${updated.capabilities.shell.allowedCommands.length ? updated.capabilities.shell.allowedCommands.join("、") : "（空，全部拒绝）"}。可在设置页或 manage_capabilities allowedCommands 调整；powershell/node/npx 等解释器需显式加入。`

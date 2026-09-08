@@ -5,6 +5,8 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { KnowledgeService } from "../knowledge/knowledge-service.js";
 import type { BrowserService } from "../browser/browser-service.js";
+import type { ComputerService } from "../computer/computer-service.js";
+import { createComputerTools } from "./tools/computer.js";
 import type { SchedulerService } from "../scheduler/scheduler-service.js";
 import type { DocumentService, FileSenderResolver } from "../documents/document-service.js";
 import type { FileSystemService } from "../filesystem/filesystem-service.js";
@@ -52,6 +54,7 @@ export interface ToolSetOptions {
 	downloadsEnabled: boolean;
 	knowledge: KnowledgeService;
 	browser: BrowserService;
+	computer?: ComputerService;
 	scheduler: SchedulerService;
 	documents: DocumentService;
 	filesystem: FileSystemService;
@@ -160,6 +163,8 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 		conversationId: options.conversationId,
 	};
 	tools.push(createManageAdminTool(adminDeps), createUpdateIdentityTool(adminDeps));
+	if (options.computer) tools.push(...createComputerTools({ ...adminDeps, computer: options.computer,
+		isVisionModel: options.isVisionModel, screenshotDir: options.screenshotDir }));
 	// Conversation-side capability switches — headless deployments have no desktop
 	// settings UI, so admins toggle browser/documents/… from a 1:1 chat.
 	tools.push(createManageCapabilitiesTool({

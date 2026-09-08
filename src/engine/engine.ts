@@ -20,6 +20,7 @@ import type { HistoryStore } from "../db/history-store.js";
 import type { InboundActor } from "../im/types.js";
 import type { KnowledgeService } from "../knowledge/knowledge-service.js";
 import type { BrowserService } from "../browser/browser-service.js";
+import type { ComputerService } from "../computer/computer-service.js";
 import type { SchedulerService } from "../scheduler/scheduler-service.js";
 import type { DocumentService, FileSender } from "../documents/document-service.js";
 import type { FileSystemService } from "../filesystem/filesystem-service.js";
@@ -163,6 +164,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.updates = updates;
 	}
 
+	private computer?: ComputerService;
+	setComputerService(computer: ComputerService): void { this.computer = computer; }
+
 	/** Path of the packaged playwright CLI (browser-kernel installs from chat). */
 	private playwrightCliPath: () => string = () => "";
 
@@ -196,6 +200,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * is lost — only transient Agent state resets.
 	 */
 	async invalidate(): Promise<void> {
+		await this.computer?.syncConfig();
 		await this.refreshSkills();
 		for (const [, agent] of this.sessions) {
 			try {
@@ -426,7 +431,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 					isScheduledRun: conversationId.startsWith("sched:"),
 				}),
 				model: this.buildModel(supplier, modelId),
-				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } } }),
+				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } } }),
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
 				messages: rehydrateMessages(this.history.listMessages(conversationId)),
@@ -461,6 +466,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * in-flight turn is allowed to finish; its next inbound message rebuilds the
 	 * Agent from the newly-persisted config. */
 	markConfigChanged(): void {
+		void this.computer?.syncConfig();
 		this.skillsRevision += 1;
 	}
 
@@ -638,6 +644,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			this.turnSendFile.delete(conversationId);
 			this.turnSendImage.delete(conversationId);
 			this.turnActor.delete(conversationId);
+			await this.computer?.release(conversationId);
 		}
 
 		const errorMessage = agent.state.errorMessage;
@@ -817,6 +824,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** True when neither agent turns nor supervised commands are active. */
 	isIdle(): boolean {
 		if (hasActiveShellCommands(this.config)) return false;
+		if (this.computer?.busy) return false;
 		for (const [, agent] of this.sessions) {
 			if (agent.state.isStreaming) return false;
 		}

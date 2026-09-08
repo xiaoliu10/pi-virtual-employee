@@ -49,6 +49,7 @@ const ROOT_CATALOG: Record<string, string> = {
 	im: "IM 渠道（im.enabled/channels[].appId/appSecret 等）",
 	general: "通用（autostart/language/requestTimeoutMin/longTaskProgressMin/maxToolSteps/autoUpdate）",
 	browser: "浏览器自动化（enabled/headless/allowedDomains）",
+	computer: "Cua 桌面控制（enabled/driverPath/allowedApps/allowForeground/allowScheduled/connectTimeoutSec/actionTimeoutSec/sessionTimeoutSec；单位秒，总时限 0=不限时；allowedApps 空数组=拒绝全部，*=全部应用）",
 	scheduler: "定时任务总开关（scheduler.enabled）",
 	prompt: "提示词追加（prompt.extra/prompt.rules；rules 为空时用内置默认）",
 	kb: "知识库（kb.enabled/kb.mode/kb.local.*/kb.embedding.* 等）",
