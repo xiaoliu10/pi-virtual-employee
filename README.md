@@ -115,7 +115,7 @@ npm run package:win
 # 3) 预览将要上传的产物(不碰 Gitee)
 npm run release:dry
 
-# 4) 实发:删旧 latest release+tag → 新建 → 上传全部产物 → 校验每个链接可达
+# 4) 实发：同步 latest 源码标签 → 重建 release → 上传产物 → 校验源码与下载链接
 npm run release
 ```
 

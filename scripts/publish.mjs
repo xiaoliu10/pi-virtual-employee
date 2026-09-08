@@ -7,8 +7,8 @@
  *      .blockmap). Fail fast if anything's missing — partial
  *      uploads are the failure mode we can least afford (auto-update would
  *      see a latest.yml pointing at a not-yet-uploaded asset).
- *   2. delete the existing `latest` release + tag on Gitee (the user-chosen
- *      "rebuild latest" strategy — latest.yml always matches the newest build).
+ *   2. explicitly move the remote `latest` Git tag to HEAD, then delete the
+ *      existing release (the user-chosen "rebuild latest" strategy).
  *   3. create a fresh `latest` release targeting the current HEAD commit.
  *   4. upload every artifact to the new release.
  *   5. re-fetch the release and verify every asset's browser_download_url is
@@ -117,13 +117,23 @@ function headSha() {
 	return execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
 }
 
+/** Gitee may reuse an old tag despite target_commitish; update the Git ref first. */
+function syncLatestTag() {
+	const sha = headSha();
+	if (dryRun) { console.log(`[publish] (dry-run) would move remote ${TAG} tag to ${sha.slice(0, 8)}`); return; }
+	const ref = `refs/tags/${TAG}`;
+	const current = execFileSync("git", ["ls-remote", "origin", ref], { cwd: root, encoding: "utf8" }).trim().split(/\s+/)[0];
+	// An empty expected value only permits creating a missing tag. A changed
+	// remote value refuses the push rather than overwriting a concurrent release.
+	execFileSync("git", ["push", `--force-with-lease=${ref}:${current}`, "origin", `${sha}:${ref}`], { cwd: root, stdio: "inherit" });
+	const updated = execFileSync("git", ["ls-remote", "origin", ref], { cwd: root, encoding: "utf8" }).trim().split(/\s+/)[0];
+	if (updated !== sha) throw new Error(`remote ${TAG} tag does not match release source`);
+}
+
 async function deleteRelease(releaseId) {
 	if (dryRun) { console.log(`[publish] (dry-run) would delete release ${releaseId}`); return; }
 	const r = await fetch(`${API}/repos/${OWNER}/${REPO}/releases/${releaseId}?access_token=${encodeURIComponent(token)}`, { method: "DELETE" });
-	if (!r.ok) console.warn(`[publish] delete release ${releaseId} returned ${r.status} (continuing)`);
-	// Tag may linger even after the release is gone; delete it so create doesn't 409.
-	const rt = await fetch(`${API}/repos/${OWNER}/${REPO}/tags/${TAG}?access_token=${encodeURIComponent(token)}`, { method: "DELETE" });
-	if (!rt.ok && rt.status !== 404) console.warn(`[publish] delete tag ${TAG} returned ${rt.status} (continuing)`);
+	if (!r.ok) throw new Error(`delete release ${releaseId} returned ${r.status}`);
 }
 
 async function createLatestRelease() {
@@ -170,6 +180,7 @@ async function verifyAssets(releaseId, artifacts) {
 	const r = await fetch(`${API}/repos/${OWNER}/${REPO}/releases/${releaseId}?access_token=${encodeURIComponent(token)}`);
 	if (!r.ok) throw new Error(`verify: re-fetch release ${r.status}`);
 	const j = await r.json();
+	if (j.target_commitish !== headSha()) throw new Error(`verify: release source does not match HEAD (${j.target_commitish})`);
 	const got = new Set((j.assets || []).map((a) => a.name));
 	for (const a of artifacts) {
 		if (!got.has(a.name)) throw new Error(`verify: ${a.name} missing from release assets`);
@@ -186,6 +197,7 @@ console.log(`[publish] ${artifacts.length} artifacts to publish (${dryRun ? "DRY
 for (const a of artifacts) console.log(`  ${a.name}  ${(a.size / 1048576).toFixed(1)} MiB`);
 
 const existing = await findLatestRelease();
+syncLatestTag();
 if (existing) {
 	console.log(`[publish] found existing ${TAG} release (id=${existing}); rebuilding`);
 	await deleteRelease(existing);
