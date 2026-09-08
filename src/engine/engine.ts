@@ -451,6 +451,39 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/**
+	 * /new phase 1: abort an in-flight turn on this conversation so the IM
+	 * per-conversation queue can drain. Returns true when a live session was
+	 * aborted. The actual reset runs as phase 2 ({@link resetSession}) at the
+	 * BACK of that queue, so it lands strictly after the aborted turn's final
+	 * persistence — a partial reply from the dead turn can never re-seed the
+	 * fresh transcript.
+	 */
+	abortSession(conversationId: string): boolean {
+		const cached = this.sessions.get(conversationId);
+		if (!cached) return false;
+		try {
+			cached.abort();
+		} catch {
+			/* session may already be gone */
+		}
+		return true;
+	}
+
+	/**
+	 * /new phase 2: wipe the persisted transcript and drop the cached agent, so
+	 * the next inbound message rehydrates an EMPTY session under the same
+	 * conversation id. The per-conversation model override survives the reset.
+	 * History deletion is final — this is the "start over" escape hatch.
+	 */
+	resetSession(conversationId: string): void {
+		const override = this.history.getModelOverride(conversationId);
+		this.history.deleteConversation(conversationId);
+		this.history.ensureConversation(conversationId, null);
+		if (override) this.history.setModelOverride(conversationId, override.supplierId, override.modelId);
+		this.sessions.delete(conversationId);
+	}
+
+	/**
 	 * Reload skills from disk and mark every cached session stale. Used after a
 	 * skill is written (save_to_skill) or imported/deleted via IPC. Unlike
 	 * {@link invalidate}, this does NOT abort in-flight turns: it only bumps a

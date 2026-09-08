@@ -163,8 +163,25 @@ export class IMAdapterManager {
 	/** Build the inbound-message IO shared by every adapter. */
 	private makeIO(): IMIO {
 		return {
-			handle: (msg, ctx) =>
-				this.serialize(msg.conversationId, async () => {
+			handle: (msg, ctx) => {
+				// /new bypasses the per-conversation queue on purpose: a wedged
+				// in-flight turn would otherwise block this command forever.
+				// Abort the live agent FIRST (unblocks the queue), then run the
+				// wipe enqueued at the BACK of the chain so it lands after the
+				// dead turn's final persistence.
+				if (msg.text.trim() === "/new") {
+					if (this.draining) {
+						return Promise.resolve("⏳ 系统正在安装应用更新，当前消息不会被执行；请稍后重新发送。");
+					}
+					const aborted = this.engine.abortSession(msg.conversationId);
+					return this.serialize(msg.conversationId, async () => {
+						this.engine.resetSession(msg.conversationId);
+						return aborted
+							? "🆕 已中断进行中的回合，新会话已开启（上下文清空，模型设置保留）。直接说你的需求即可。"
+							: "🆕 新会话已开启（上下文清空，模型设置保留）。";
+					});
+				}
+				return this.serialize(msg.conversationId, async () => {
 					if (this.draining) {
 						return "⏳ 系统正在安装应用更新，当前消息不会被执行；请稍后重新发送。";
 					}
@@ -205,8 +222,9 @@ export class IMAdapterManager {
 					} finally {
 						if (heartbeat) clearInterval(heartbeat);
 					}
-				}),
-			};
+				});
+			},
+		};
 	}
 
 	/** Handle deterministic slash commands, returning a text reply for the channel. */
@@ -215,7 +233,7 @@ export class IMAdapterManager {
 		cmd: { name: "version" } | { name: "models" } | { name: "model"; arg: string },
 	): string {
 		if (cmd.name === "version") {
-			return `当前应用版本：v${this.engine.appVersion()}。发送「检查更新」可让 实例B 调用 manage_update 检查最新版。`;
+			return `当前应用版本：v${this.engine.appVersion()}。发送「检查更新」可让 实例B 调用 manage_update 检查最新版；发送 /new 可清空上下文开启新会话。`;
 		}
 
 		const options = this.engine.availableModels();
