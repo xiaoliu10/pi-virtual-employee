@@ -17,13 +17,15 @@
  * (AppKey) / ClientSecret (AppSecret) → add the Robot capability, choose Stream
  * mode, publish. Put ClientID/ClientSecret into Settings → IM.
  */
-import { readFile, stat } from "node:fs/promises";
-import { extname } from "node:path";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { extname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { DWClient, TOPIC_ROBOT } from "dingtalk-stream";
 import type { DWClientDownStream, RobotMessage } from "dingtalk-stream";
 import type { IMAdapter, IMConfig, IMIO, InboundImage } from "../types.js";
 import { diag } from "../diag.js";
+import { extractText } from "../../knowledge/file-parser.js";
 import type { ReportService } from "../../reports/report-service.js";
 
 /** Robot-message payload for a picture the user sent (Stream mode). The SDK's
@@ -42,8 +44,38 @@ interface RobotPictureMessage {
 	downloadCode?: string;
 }
 
-/** Either a text or picture inbound robot message — enough to route a reply. */
-type AnyRobotMsg = RobotMessage | RobotPictureMessage;
+/** Robot-message payload for a file the user sent (Stream mode). The content
+ *  carries a temporary downloadCode; fileName is present on most payloads but
+ *  not guaranteed — we fall back to the download response's headers. */
+interface RobotFileMessage {
+	msgtype: "file";
+	conversationId: string;
+	conversationType: string;
+	senderStaffId: string;
+	senderId: string;
+	robotCode: string;
+	msgId: string;
+	sessionWebhook: string;
+	text?: { content?: string };
+	content?: { downloadCode?: string; fileName?: string };
+	downloadCode?: string;
+}
+
+/** Either a text, picture or file inbound robot message — enough to route a reply. */
+type AnyRobotMsg = RobotMessage | RobotPictureMessage | RobotFileMessage;
+
+/** Extensions whose bytes are worth inlining into the prompt. extractText
+ *  falls back to a raw utf8 read, which would turn a .zip into mojibake —
+ *  so unknown/binary extensions get the saved path only. */
+const EXTRACTABLE_FILE_EXTS = new Set([
+	".pdf", ".docx", ".xlsx", ".xls", ".html", ".htm",
+	".txt", ".md", ".markdown", ".csv", ".tsv", ".log", ".json", ".xml",
+	".yaml", ".yml", ".ini", ".conf", ".sql", ".js", ".mjs", ".ts", ".tsx",
+	".jsx", ".py", ".java", ".c", ".h", ".cpp", ".cs", ".go", ".rs", ".rb",
+	".php", ".sh", ".bat", ".ps1", ".toml", ".srt", ".vtt",
+]);
+const INBOUND_FILE_MAX_BYTES = 25 * 1024 * 1024;
+const INBOUND_INLINE_MAX_CHARS = 12_000;
 
 /** "Thinking" text-emoji metadata accepted by DingTalk's emotion API. */
 const THINKING_EMOTION = {
@@ -231,9 +263,27 @@ export class DingtalkAdapter implements IMAdapter {
 					if (fetched) images = [fetched];
 				}
 			}
+			// Inbound files arrive as msgtype "file" with a downloadCode. Save the
+			// bytes to disk (so the model's file/shell tools can work with them) and
+			// inline the extracted text for document formats — mirrors how the
+			// employee reads any other local file.
+			let fileNote = "";
+			if (msg.msgtype === "file") {
+				const file = msg as RobotFileMessage;
+				const downloadCode = file.content?.downloadCode ?? file.downloadCode;
+				if (downloadCode) {
+					fileNote = await this.downloadInboundFile(downloadCode, file.robotCode, file.content?.fileName).catch((err) => {
+						console.warn("[im:dingtalk] inbound file download failed:", (err as Error).message);
+						void diag("dingtalk", `inbound file download failed: ${(err as Error).message}`, "warn");
+						return `（用户发来一个文件，但接收失败：${(err as Error).message}。请告知用户重新发送或换个格式。）`;
+					});
+				}
+			}
 			const hasImage = !!images?.length;
-			if (!text && !hasImage) return;
-			const promptText = text || (hasImage ? "（用户发来一张图片，请查看图片内容并按需要回应）" : "");
+			if (!text && !hasImage && !fileNote) return;
+			const promptText = [text || (hasImage ? "（用户发来一张图片，请查看图片内容并按需要回应）" : ""), fileNote]
+				.filter(Boolean)
+				.join("\n\n");
 
 			// Session isolation: 1:1 → per sender; group → per conversation.
 			const conversationId =
@@ -544,6 +594,64 @@ export class DingtalkAdapter implements IMAdapter {
 		const buf = Buffer.from(await fileRes.arrayBuffer());
 		const mime = (fileRes.headers.get("content-type") || "image/jpeg").split(";")[0].trim();
 		return { data: buf.toString("base64"), mimeType: mime };
+	}
+
+	/** Extensions whose bytes are worth inlining into the prompt. extractText
+	 *  falls back to a raw utf8 read, which would turn a .zip into mojibake —
+	 *  so unknown/binary extensions get the saved path only. */
+	private async downloadInboundFile(downloadCode: string, robotCode: string, fileNameHint?: string): Promise<string> {
+		const token = await this.accessToken();
+		const res = await fetch("https://api.dingtalk.com/v1.0/robot/messageFiles/download", {
+			method: "POST",
+			headers: { "Content-Type": "application/json", "x-acs-dingtalk-access-token": token },
+			body: JSON.stringify({ downloadCode, robotCode }),
+		});
+		if (!res.ok) {
+			const detail = await res.text().catch(() => "");
+			throw new Error(`messageFiles/download HTTP ${res.status}: ${detail.slice(0, 200)}`);
+		}
+		const { downloadUrl } = (await res.json()) as { downloadUrl?: string };
+		if (!downloadUrl) throw new Error("messageFiles/download 未返回 downloadUrl");
+		const fileRes = await fetch(downloadUrl);
+		if (!fileRes.ok) throw new Error(`下载文件失败 HTTP ${fileRes.status}`);
+		const buf = Buffer.from(await fileRes.arrayBuffer());
+		if (buf.length > INBOUND_FILE_MAX_BYTES) {
+			throw new Error(`文件超过 ${Math.round(INBOUND_FILE_MAX_BYTES / 1024 / 1024)}MB 上限`);
+		}
+		// Prefer the payload's fileName; the download response's content-disposition
+		// is the next best (DingTalk serves the original name there); last resort a
+		// timestamped name. Strip path separators and control characters.
+		const disposition = fileRes.headers.get("content-disposition") ?? "";
+		const dispositionName = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disposition)?.[1];
+		const rawName = fileNameHint || (dispositionName ? decodeURIComponent(dispositionName) : "") || `file-${Date.now()}`;
+		const safeName = rawName.replace(/[\\/:*?"<>|\r\n]+/g, "_").slice(0, 120) || "file";
+
+		const dir = join(tmpdir(), "pi-ve-inbound");
+		await mkdir(dir, { recursive: true });
+		const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+		const savedPath = join(dir, `${stamp}-${randomUUID().slice(0, 6)}-${safeName}`);
+		await writeFile(savedPath, buf);
+
+		const ext = extname(safeName).toLowerCase();
+		const sizeText = buf.length >= 1024 * 1024
+			? `${(buf.length / 1024 / 1024).toFixed(1)} MB`
+			: `${Math.max(1, Math.round(buf.length / 1024))} KB`;
+		if (!EXTRACTABLE_FILE_EXTS.has(ext)) {
+			return `（用户发来文件「${safeName}」（${sizeText}），已保存到：${savedPath}。二进制/未知格式未内联解析，可用文件或 shell 工具查看内容。）`;
+		}
+		try {
+			const text = await extractText(savedPath);
+			const cleaned = text.replace(/\u0000/g, "").trim();
+			if (!cleaned) {
+				return `（用户发来文件「${safeName}」（${sizeText}），已保存到：${savedPath}。内容为空或无法提取文本。）`;
+			}
+			const truncated = cleaned.length > INBOUND_INLINE_MAX_CHARS;
+			const body = truncated ? `${cleaned.slice(0, INBOUND_INLINE_MAX_CHARS)}\n…（已截断，完整文件在 ${savedPath}）` : cleaned;
+			return `（用户发来文件「${safeName}」（${sizeText}），已保存到：${savedPath}。内容如下：）\n\n--- 文件内容开始 ---\n${body}\n--- 文件内容结束${truncated ? "（有截断）" : ""} ---`;
+		} catch (err) {
+			void diag("dingtalk", `inbound file text extraction failed for ${safeName}: ${(err as Error).message}`, "warn");
+			return `（用户发来文件「${safeName}」（${sizeText}），已保存到：${savedPath}。文本提取失败（${(err as Error).message}），可用文件或 shell 工具查看。）`;
+		}
 	}
 
 	/**
