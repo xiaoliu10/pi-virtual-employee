@@ -74,7 +74,12 @@ const EXTRACTABLE_FILE_EXTS = new Set([
 	".jsx", ".py", ".java", ".c", ".h", ".cpp", ".cs", ".go", ".rs", ".rb",
 	".php", ".sh", ".bat", ".ps1", ".toml", ".srt", ".vtt",
 ]);
-const INBOUND_FILE_MAX_BYTES = 25 * 1024 * 1024;
+const INBOUND_FILE_MAX_BYTES = 100 * 1024 * 1024;
+// Parsing (xlsx/pdf/docx) loads the whole file into memory and can balloon
+// several-fold — a 100MB workbook would hurt the main process. Above this cap
+// the file is still received and saved; the model is pointed at file/shell
+// tools instead (the right pattern for big data anyway).
+const INBOUND_EXTRACT_MAX_BYTES = 20 * 1024 * 1024;
 const INBOUND_INLINE_MAX_CHARS = 12_000;
 
 /** "Thinking" text-emoji metadata accepted by DingTalk's emotion API. */
@@ -638,6 +643,9 @@ export class DingtalkAdapter implements IMAdapter {
 			: `${Math.max(1, Math.round(buf.length / 1024))} KB`;
 		if (!EXTRACTABLE_FILE_EXTS.has(ext)) {
 			return `（用户发来文件「${safeName}」（${sizeText}），已保存到：${savedPath}。二进制/未知格式未内联解析，可用文件或 shell 工具查看内容。）`;
+		}
+		if (buf.length > INBOUND_EXTRACT_MAX_BYTES) {
+			return `（用户发来文件「${safeName}」（${sizeText}），已保存到：${savedPath}。文件较大未内联解析，请用文件或 shell 工具（如 python/pandas）读取分析。）`;
 		}
 		try {
 			const text = await extractText(savedPath);
