@@ -172,5 +172,50 @@ export function createSchedulerTools(
 		},
 	};
 
-	return [create, list, remove, toggle, authorize];
+	const updateTask: AgentTool = {
+		name: "update_scheduled_task",
+		label: "修改定时任务",
+		description:
+			"修改已有定时任务的标题 / 执行指令 / cron / 推送目标，无需删除重建（执行历史保留）。" +
+			"改推送目标最常用的方式是 bindCurrent=true：在正确的群聊/单聊里调用，把任务的结果推送改绑到当前会话——" +
+			"例如任务当初建错了群，现在在正确的群里改绑即可。只传想改的字段。",
+		parameters: Type.Object({
+			id: Type.String({ description: "任务 id（来自 list_scheduled_tasks）" }),
+			title: Type.Optional(Type.String({ description: "新的任务标题" })),
+			prompt: Type.Optional(Type.String({ description: "新的到点执行指令" })),
+			cron: Type.Optional(Type.String({ description: "新的 5 字段 cron（本地时间），如 0 9 * * *" })),
+			bindCurrent: Type.Optional(Type.Boolean({ description: "true=把推送目标改绑为当前会话" })),
+		}),
+		async execute(_toolCallId, params) {
+			const p = params as { id: string; title?: string; prompt?: string; cron?: string; bindCurrent?: boolean };
+			const patch: { title?: string; prompt?: string; cron?: string; conversationId?: string | null } = {};
+			if (p.title !== undefined) patch.title = p.title;
+			if (p.prompt !== undefined) patch.prompt = p.prompt;
+			if (p.cron !== undefined) patch.cron = p.cron;
+			if (p.bindCurrent) patch.conversationId = conversationId;
+			if (Object.keys(patch).length === 0) {
+				return { content: [{ type: "text", text: "没有给出任何要修改的字段（title / prompt / cron / bindCurrent）。" }], details: { ok: false } };
+			}
+			const updated = scheduler.update(p.id, patch);
+			if (!updated) {
+				const badCron = patch.cron !== undefined && p.cron !== undefined && !updated;
+				return {
+					content: [{ type: "text", text: badCron ? `cron 表达式无效：${p.cron}` : `未找到 id 为 ${p.id} 的定时任务，请先用 list_scheduled_tasks 确认。` }],
+					details: { ok: false },
+				};
+			}
+			const changes = [
+				patch.title !== undefined ? "标题" : null,
+				patch.prompt !== undefined ? "执行指令" : null,
+				patch.cron !== undefined ? `cron（下次执行 ${fmtTime(updated.next_run_at)}）` : null,
+				patch.conversationId !== undefined ? `推送目标→${patch.conversationId?.startsWith("dt:group:") ? "当前群聊" : "当前单聊"}` : null,
+			].filter(Boolean) as string[];
+			return {
+				content: [{ type: "text", text: `✅ 已更新定时任务「${updated.title}」：${changes.join("、")}。执行历史保留，下次执行：${fmtTime(updated.next_run_at)}。` }],
+				details: { ok: true, id: updated.id, nextRunAt: updated.next_run_at },
+			};
+		},
+	};
+
+	return [create, list, remove, toggle, authorize, updateTask];
 }

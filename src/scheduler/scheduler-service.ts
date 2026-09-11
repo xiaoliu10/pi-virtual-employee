@@ -73,6 +73,30 @@ export class SchedulerService {
 		return this.store.setCreatedBy(id, senderId);
 	}
 
+	/**
+	 * Patch an existing task (title/prompt/cron/push target) without deleting it
+	 * — keeps run history. A cron change is validated and recomputes next_run_at;
+	 * other fields leave the schedule untouched. Returns undefined for an
+	 * unknown id or an invalid cron.
+	 */
+	update(
+		id: string,
+		patch: { title?: string; prompt?: string; cron?: string; conversationId?: string | null },
+	): ScheduledTaskRow | undefined {
+		const task = this.store.get(id);
+		if (!task) return undefined;
+		let nextRunAt: number | null | undefined = undefined;
+		if (patch.cron !== undefined && patch.cron !== task.cron) {
+			try {
+				this.validateCron(patch.cron);
+			} catch {
+				return undefined;
+			}
+			nextRunAt = this.safeNext(patch.cron);
+		}
+		return this.store.update(id, patch, nextRunAt);
+	}
+
 	/** Start the periodic tick. Idempotent; fires once immediately. */
 	start(): void {
 		if (this.timer) return;

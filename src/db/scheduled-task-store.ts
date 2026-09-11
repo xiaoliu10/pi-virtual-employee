@@ -91,6 +91,38 @@ export class ScheduledTaskStore {
 	}
 
 	/**
+	 * Patch an existing task's editable fields (title/prompt/cron/push target).
+	 * Only provided fields change; nextRunAt is passed by the scheduler (recomputed
+	 * when cron changes, kept otherwise). Returns the updated row, or undefined
+	 * when the id doesn't exist.
+	 */
+	update(
+		id: string,
+		patch: { title?: string; prompt?: string; cron?: string; conversationId?: string | null },
+		nextRunAt?: number | null,
+	): ScheduledTaskRow | undefined {
+		const task = this.get(id);
+		if (!task) return undefined;
+		const merged = {
+			title: patch.title ?? task.title,
+			prompt: patch.prompt ?? task.prompt,
+			cron: patch.cron ?? task.cron,
+			conversation_id: patch.conversationId !== undefined ? patch.conversationId : task.conversation_id,
+		};
+		this.db
+			.prepare(
+				"UPDATE scheduled_tasks SET title = @title, prompt = @prompt, cron = @cron, conversation_id = @conversation_id, next_run_at = @next_run_at, updated_at = @updated_at WHERE id = @id",
+			)
+			.run({
+				id,
+				...merged,
+				next_run_at: nextRunAt === undefined ? task.next_run_at : nextRunAt,
+				updated_at: Date.now(),
+			});
+		return this.get(id);
+	}
+
+	/**
 	 * Attach (or replace) the creator identity on an existing task, so
 	 * unattended runs can re-attach it for run_command. Used by the
 	 * authorize_scheduled_task conversation action after a verified admin
