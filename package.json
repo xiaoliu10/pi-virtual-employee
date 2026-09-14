@@ -2,7 +2,7 @@
 	"name": "pi-virtual-employee",
 	"private": true,
 	"type": "module",
-	"version": "0.2.50",
+	"version": "0.2.51",
 	"description": "Desktop virtual-employee app (Electron) built on the pi agent SDK (@earendil-works/pi-agent-core).",
 	"author": "Pi Virtual Employee",
 	"main": "dist-electron/main.js",

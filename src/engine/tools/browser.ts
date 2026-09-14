@@ -135,20 +135,65 @@ export function createBrowserTools(
 		name: "browser_click",
 		label: "浏览器：点击",
 		description:
-			"点击当前页面上的元素。selector 用 CSS 选择器，如 'button.submit'、'#login'、'a:has-text(\"登录\")'。点击后页面可能跳转，可再 browser_read 确认。复杂组件示例：AntD 日期/时间选择器，先 browser_click 输入框展开面板（面板渲染在 body 下），每个日期格带 title 属性，可直接点 '.ant-picker-dropdown .ant-picker-cell[title=\"2026-07-30\"]' 选中某天；范围选择则依次点起止两天。",
+			"点击当前页面上的元素。selector 用 CSS 选择器，如 'button.submit'、'#login'、'a:has-text(\"登录\")'。点击后页面可能跳转，可再 browser_read 确认。若结果 tabSwitched=true（如 target=_blank、堡垒机在新标签页打开终端），已自动跟随到新标签页，后续工具直接作用于新页；需要回旧页用 browser_tabs action=switch。复杂组件示例：AntD 日期/时间选择器，先 browser_click 输入框展开面板（面板渲染在 body 下），每个日期格带 title 属性，可直接点 '.ant-picker-dropdown .ant-picker-cell[title=\"2026-07-30\"]' 选中某天；范围选择则依次点起止两天。",
 		parameters: Type.Object({
 			selector: Type.String({ description: "目标元素的 CSS 选择器" }),
 		}),
 		async execute(_id, params) {
 			try {
 				const r = await browser.click(resolveOwnerId(), (params as { selector: string }).selector);
-				const changeNote = r.urlChanged ? "页面已变化。" : "页面 URL 未变化（可能是弹层/原地刷新，可再 browser_read 确认）。";
+				const changeNote = r.tabSwitched
+					? "点击打开了新标签页，已自动切换过去。"
+					: r.urlChanged
+						? "页面已变化。"
+						: "页面 URL 未变化（可能是弹层/原地刷新，可再 browser_read 确认）。";
 				return textResult(`已点击。${changeNote}当前页面：${r.url}`, {
 					ok: r.ok,
 					url: r.url,
 					beforeUrl: r.beforeUrl,
 					urlChanged: r.urlChanged,
+					tabSwitched: r.tabSwitched,
 				});
+			} catch (err) {
+				return errorResult(err);
+			}
+		},
+	};
+
+	const tabs: AgentTool = {
+		name: "browser_tabs",
+		label: "浏览器：管理标签页",
+		description:
+			"列出/切换/关闭浏览器的标签页。action=list 查看所有标签页（含序号、URL、标题、哪个是当前页）；" +
+			"action=switch + index 切换当前页到指定序号（如从新标签页切回堡垒机主页）；action=close + index 关闭某个标签页。" +
+			"点击打开的新标签页会自动跟随，一般无需手动切换。",
+		parameters: Type.Object({
+			action: Type.String({ description: "list | switch | close" }),
+			index: Type.Optional(Type.Number({ description: "标签页序号（switch/close 时必填，来自 list）" })),
+		}),
+		async execute(_id, params) {
+			try {
+				const p = params as { action: string; index?: number };
+				const ownerId = resolveOwnerId();
+				if (p.action === "list") {
+					const tabs2 = await browser.listPages(ownerId);
+					if (tabs2.length === 0) return textResult("当前没有打开的标签页。", { ok: true, tabs: [] });
+					const lines = tabs2.map(
+						(t) => `${t.index}${t.current ? " ◀ 当前" : ""}. ${t.title || "(无标题)"} — ${t.url}`,
+					);
+					return textResult(`共 ${tabs2.length} 个标签页：\n${lines.join("\n")}`, { ok: true, tabs: tabs2 });
+				}
+				if (p.action === "switch") {
+					if (p.index === undefined) return textResult("switch 需要提供 index（先用 action=list 查看）。", { ok: false });
+					const r = await browser.switchPage(ownerId, p.index);
+					return textResult(`已切换到标签页 ${p.index}：「${r.title || r.url}」（${r.url}）。可用 browser_read 确认内容。`, { ok: true, ...r });
+				}
+				if (p.action === "close") {
+					if (p.index === undefined) return textResult("close 需要提供 index（先用 action=list 查看）。", { ok: false });
+					await browser.closePage(ownerId, p.index);
+					return textResult(`已关闭标签页 ${p.index}。`, { ok: true });
+				}
+				return textResult(`未知 action：${p.action}（可用 list / switch / close）。`, { ok: false });
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -220,5 +265,5 @@ export function createBrowserTools(
 		},
 	};
 
-	return [navigate, read, screenshot, click, type, pressKey, evaluate];
+	return [navigate, read, screenshot, click, type, pressKey, evaluate, tabs];
 }

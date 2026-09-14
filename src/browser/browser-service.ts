@@ -102,7 +102,9 @@ export class BrowserService {
 	/**
 	 * 获取 owner 专属 Page：存在且未关闭则复用；否则在共享 context 上 newPage。
 	 * 首次调用会先确保 context 已启动。新页挂导航超时；下载监听由 context 层
-	 * 的 page 事件统一挂载（launch 内），无需重复。
+	 * 的 page 事件统一挂载（launch 内），无需重复。页面触发的弹窗（target=_blank、
+	 * window.open，如堡垒机/后台系统在新标签页打开终端或详情）会自动接管为该
+	 * owner 的当前页——后续工具直接作用在新标签页上。
 	 */
 	async getPage(ownerId: string): Promise<Page> {
 		await this.ensureContext();
@@ -111,8 +113,57 @@ export class BrowserService {
 		if (!this.context) throw new Error("浏览器上下文不可用");
 		const page = await this.context.newPage();
 		page.setDefaultNavigationTimeout(NAV_TIMEOUT);
+		page.on("popup", (popup) => this.adoptPopup(ownerId, popup));
 		this.pages.set(ownerId, page);
 		return page;
+	}
+
+	/** 把弹窗接管为 owner 的当前页（递归：弹窗再开弹窗同样跟随）。 */
+	private adoptPopup(ownerId: string, popup: Page): void {
+		popup.setDefaultNavigationTimeout(NAV_TIMEOUT);
+		this.pages.set(ownerId, popup);
+		popup.on("popup", (child) => this.adoptPopup(ownerId, child));
+		console.log(`[browser] popup adopted for owner ${ownerId}: ${popup.url() || "(about:blank)"}`);
+	}
+
+	/** 当前打开着的标签页（index 即 list/switch/close 共用的序号）。 */
+	private openPages(): Page[] {
+		return (this.context?.pages() ?? []).filter((p) => !p.isClosed());
+	}
+
+	/** 列出共享浏览器里的所有标签页（多 owner 共享一个 context，列表是全局的）。 */
+	async listPages(ownerId: string): Promise<{ index: number; url: string; title: string; current: boolean }[]> {
+		await this.ensureContext();
+		const pages = this.openPages();
+		const current = this.pages.get(ownerId);
+		return Promise.all(
+			pages.map(async (p, index) => ({
+				index,
+				url: p.url(),
+				title: await p.title().catch(() => ""),
+				current: p === current,
+			})),
+		);
+	}
+
+	/** 把 owner 的当前页切换到指定序号的标签页。 */
+	async switchPage(ownerId: string, index: number): Promise<{ url: string; title: string }> {
+		await this.ensureContext();
+		const target = this.openPages()[index];
+		if (!target) throw new Error(`标签页序号 ${index} 不存在（可用 browser_tabs action=list 查看列表）`);
+		this.pages.set(ownerId, target);
+		return { url: target.url(), title: await target.title().catch(() => "") };
+	}
+
+	/** 关闭指定序号的标签页；若它是 owner 的当前页，下次工具调用会自动开新页。 */
+	async closePage(ownerId: string, index: number): Promise<{ ok: boolean }> {
+		await this.ensureContext();
+		const pages = this.openPages();
+		const target = pages[index];
+		if (!target) throw new Error(`标签页序号 ${index} 不存在（可用 browser_tabs action=list 查看列表）`);
+		await target.close().catch(() => {});
+		if (this.pages.get(ownerId) === target) this.pages.delete(ownerId);
+		return { ok: true };
 	}
 
 	/** 关闭并移除某 owner 的 Page（会话结束可选调用；默认保留以复用登录态产物）。 */
@@ -203,15 +254,21 @@ export class BrowserService {
 	/**
 	 * 点击后回读状态避免“假成功”：返回点击前后 URL 与是否发生 URL/hash 变化。
 	 * urlChanged=false 不代表失败（弹层/原地刷新），但可提示模型再次 read 确认。
+	 * tabSwitched=true 表示点击打开了新标签页且已自动跟随——后续工具作用于新页。
 	 */
-	async click(ownerId: string, selector: string): Promise<{ ok: boolean; url: string; beforeUrl: string; urlChanged: boolean }> {
+	async click(ownerId: string, selector: string): Promise<{ ok: boolean; url: string; beforeUrl: string; urlChanged: boolean; tabSwitched: boolean }> {
 		const page = await this.getPage(ownerId);
 		const beforeUrl = page.url();
 		await page.click(selector, { timeout: NAV_TIMEOUT });
-		// 点击可能触发跳转，稍等一拍再取最终 URL，减少竞态误判。
+		// 点击可能触发跳转，稍等一拍再取最终 URL，减少竞态误判；短暂停留也给
+		// target=_blank 的弹窗事件留出触发窗口（popup 事件先于页面加载完成）。
 		await page.waitForLoadState("domcontentloaded").catch(() => {});
-		const url = page.url();
-		return { ok: true, url, beforeUrl, urlChanged: url !== beforeUrl };
+		await page.waitForTimeout(250).catch(() => {});
+		// 重新取 owner 当前页：若弹窗接管已发生，page 与 now 不同。
+		const now = await this.getPage(ownerId);
+		const tabSwitched = now !== page;
+		const url = now.url();
+		return { ok: true, url, beforeUrl, urlChanged: url !== beforeUrl, tabSwitched };
 	}
 
 	/**
