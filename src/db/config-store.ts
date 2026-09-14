@@ -214,6 +214,12 @@ export interface AppConfig {
 		 */
 		longTaskProgressMin: number;
 		/**
+		 * Turn watchdog (minutes): an IM turn still running after this is aborted
+		 * so a wedged tool/LLM call can't block that conversation forever (the
+		 * per-conversation queue is strict). 0 = disabled.
+		 */
+		turnTimeoutMin: number;
+		/**
 		 * Per-turn tool-loop cap. Each "step" is one assistant response that fired
 		 * tool calls and received their results. After this many steps the agent
 		 * loop is stopped gracefully and the model is asked to produce a final
@@ -381,7 +387,7 @@ const DEFAULTS: AppConfig = {
 	model: { suppliers: [], defaultSupplierId: "", defaultModelId: "" },
 	identity: { name: "客服小派", role: "虚拟客服", duty: "在线为客户提供专业、礼貌、高效的服务", serviceHours: "7×24h" },
 	im: { enabled: false, channels: [], ack: { enabled: true, text: "👍 收到，正在处理…" } },
-	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 30, maxToolSteps: 20, autoUpdate: true },
+	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 30, turnTimeoutMin: 20, maxToolSteps: 20, autoUpdate: true },
 	browser: { enabled: false, headless: true, allowedDomains: [], downloadHost: "" },
 	computer: DEFAULT_COMPUTER_CONFIG,
 	scheduler: { enabled: true },

@@ -13,7 +13,7 @@ import type { EmployeeEngine, ModelOption } from "../engine/engine.js";
 import type { ReportService } from "../reports/report-service.js";
 import { EchoAdapter } from "./adapters/echo.js";
 import { DingtalkAdapter } from "./adapters/dingtalk.js";
-import type { IMAdapter, IMIO } from "./types.js";
+import type { IMAdapter, IMIO, InboundActor } from "./types.js";
 
 /** Shared deps handed to adapter factories that need them (e.g. image hosting). */
 export interface AdapterDeps {
@@ -38,6 +38,8 @@ export class IMAdapterManager {
 	private draining = false;
 	/** Notified after an inbound message is stored, so the UI can refresh the task list. */
 	private onActivity?: (conversationId: string) => void;
+	/** Main-process restart hook (relaunch + exit), wired by electron/main. */
+	private onRestart?: () => void;
 
 	constructor(
 		private readonly engine: EmployeeEngine,
@@ -48,6 +50,11 @@ export class IMAdapterManager {
 	/** Inject the UI-refresh callback (main process wires it to a webContents.send). */
 	setOnActivity(fn: (conversationId: string) => void): void {
 		this.onActivity = fn;
+	}
+
+	/** Inject the app-restart callback (main process wires it to relaunch+exit). */
+	setOnRestart(fn: () => void): void {
+		this.onRestart = fn;
 	}
 
 	/** Pause/resume new IM turns while an app update is about to restart. */
@@ -196,9 +203,9 @@ export class IMAdapterManager {
 					if (this.draining) {
 						return "⏳ 系统正在安装应用更新，当前消息不会被执行；请稍后重新发送。";
 					}
-					// IM slash commands (OpenClaw-style): /version, /models, /model <n|id>
+					// IM slash commands (OpenClaw-style): /help /new /stop /restart /version /models /model <n|id>
 					const cmd = parseCommand(msg.text);
-					if (cmd) return this.runCommand(msg.conversationId, cmd);
+					if (cmd) return this.runCommand(msg.conversationId, cmd, msg.actor, msg.text);
 
 					const agent = this.engine.getOrCreateSession(msg.conversationId);
 
@@ -214,6 +221,20 @@ export class IMAdapterManager {
 							void onProgress(note).catch((err) => console.warn("[im] progress push failed:", (err as Error).message));
 						}, progressMin * 60_000)
 						: undefined;
+					// Turn watchdog: the per-conversation queue is strict, so ONE wedged
+					// turn (hung LLM call / tool) would block that chat forever — field
+					// incident: a group went silent while single chats kept working, and
+					// only an app restart cleared it. Abort the turn after the cap; the
+					// queue then drains on its own.
+					const turnTimeoutMin = this.config.all().general.turnTimeoutMin ?? 0;
+					let turnTimedOut = false;
+					const watchdog = turnTimeoutMin > 0
+						? setTimeout(() => {
+							turnTimedOut = true;
+							console.warn(`[im] turn exceeded ${turnTimeoutMin}min — aborting: ${msg.conversationId}`);
+							this.engine.abortSession(msg.conversationId);
+						}, turnTimeoutMin * 60_000)
+						: undefined;
 
 					try {
 						const result = await this.engine.send(
@@ -223,6 +244,9 @@ export class IMAdapterManager {
 						);
 						// Final turn complete — signal the UI to refresh the task list.
 						this.onActivity?.(msg.conversationId);
+						if (turnTimedOut) {
+							return `⏱️ 本回合超过 ${turnTimeoutMin} 分钟未完成，已自动中断以防会话卡死。请重新发送指令重试；若反复出现，请把任务拆小或分步执行。`;
+						}
 						if (!result.reply) {
 							console.error(`[im] no reply for ${msg.conversationId}:`, result.error ?? "(no error reported)");
 							// Never go silent on the channel — surface a short error so the
@@ -232,6 +256,7 @@ export class IMAdapterManager {
 						return result.reply;
 					} finally {
 						if (heartbeat) clearInterval(heartbeat);
+						if (watchdog) clearTimeout(watchdog);
 					}
 				});
 			},
@@ -241,7 +266,9 @@ export class IMAdapterManager {
 	/** Handle deterministic slash commands, returning a text reply for the channel. */
 	private runCommand(
 		conversationId: string,
-		cmd: { name: "version" } | { name: "models" } | { name: "model"; arg: string } | { name: "compact" } | { name: "help" },
+		cmd: { name: "version" } | { name: "models" } | { name: "model"; arg: string } | { name: "compact" } | { name: "help" } | { name: "restart" },
+		actor?: InboundActor,
+		userText?: string,
 	): string | Promise<string> {
 		if (cmd.name === "help") {
 			return [
@@ -249,10 +276,22 @@ export class IMAdapterManager {
 				"/new — 中断当前回合并清空上下文，开启新会话",
 				"/compact — 压缩上下文（较早对话汇总为摘要，近期对话保留）",
 				"/stop — 中断当前回合（上下文保留）",
+				"/restart — 重启应用（仅管理员，单聊）",
 				"/version — 查看应用版本",
 				"/models — 列出可用模型",
 				"/model <序号或模型名> — 切换模型",
 			].join("\n");
+		}
+		if (cmd.name === "restart") {
+			// Same authorization model as admin identity tools: whitelisted admin,
+			// 1:1 only (a group has no reliable notion of who is allowed).
+			if (!actor || actor.chatType !== "single") return "⛔ /restart 仅限管理员在单聊中使用。";
+			const admins = this.config.all().security.adminStaffIds;
+			if (admins.length === 0 || !admins.includes(actor.senderId)) return "⛔ 仅管理员可以重启应用。";
+			if (!this.onRestart) return "当前运行方式不支持 IM 重启。";
+			// Let the reply flush to the channel before the process exits.
+			setTimeout(() => this.onRestart?.(), 1200);
+			return "🔄 收到，应用将在 1~2 秒后自动重启（进程退出并自动拉起）。半分钟后即可继续使用。";
 		}
 		if (cmd.name === "compact") {
 			return this.engine.compactSession(conversationId);
@@ -335,13 +374,14 @@ function credChanged(prev: ImChannelConfig | undefined, next: ImChannelConfig): 
 
 /** The deterministic IM slash commands. /new and /stop are intercepted in
  * makeIO (they must bypass the queue); the rest run through runCommand. */
-function parseCommand(text: string): { name: "version" } | { name: "models" } | { name: "model"; arg: string } | { name: "compact" } | { name: "help" } | null {
+function parseCommand(text: string): { name: "version" } | { name: "models" } | { name: "model"; arg: string } | { name: "compact" } | { name: "help" } | { name: "restart" } | null {
 	const t = text.trim();
 	if (t === "/version" || t === "/ver") return { name: "version" };
 	if (t === "/models" || t === "/model") return { name: "models" };
 	const m = /^\/model\s+(.+)$/.exec(t);
 	if (m) return { name: "model", arg: m[1] };
 	if (t === "/compact") return { name: "compact" };
+	if (t === "/restart") return { name: "restart" };
 	if (t === "/help" || t === "/?" ) return { name: "help" };
 	return null;
 }

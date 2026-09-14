@@ -8,8 +8,9 @@
  */
 import { app, BrowserWindow, dialog, ipcMain } from "electron";
 import { mkdir, readFile, writeFile, copyFile, readdir, rm } from "node:fs/promises";
-import { existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import util from "node:util";
 import { openDatabase, closeDatabase } from "../src/db/sqlite.js";
 import { ConfigStore, normalizeModelConfig, type ExternalProviderConfig, type Supplier } from "../src/db/config-store.js";
 import { HistoryStore } from "../src/db/history-store.js";
@@ -298,6 +299,34 @@ function profileDir(name: string): string {
 	return path.join(app.getPath("appData"), "pi-virtual-employee", "profiles", name);
 }
 
+/**
+ * Tee main-process console output to a log file. Packaged builds have no
+ * visible console, so engine/im errors printed with console.* were invisible
+ * to anyone debugging a headless box — an entire outage class ("this one group
+ * went silent") stayed undiagnosable from the machine itself. ~5MB rotation
+ * (main.log → main.log.old); original console behavior is preserved.
+ */
+function teeConsoleToDisk(file: string): void {
+	try { mkdirSync(path.dirname(file), { recursive: true }); } catch { /* exists */ }
+	const append = (line: string): void => {
+		try {
+			if (existsSync(file) && statSync(file).size > 5 * 1024 * 1024) {
+				try { unlinkSync(`${file}.old`); } catch { /* no old yet */ }
+				renameSync(file, `${file}.old`);
+			}
+		} catch { /* best effort */
+		}
+		try { appendFileSync(file, line); } catch { /* read-only volume etc. */
+		}
+	};
+	const fmt = (parts: unknown[]): string => util.format(...parts);
+	const orig = { log: console.log.bind(console), warn: console.warn.bind(console), error: console.error.bind(console) };
+	const stamped = (parts: unknown[]): string => `[${new Date().toISOString()}] ${fmt(parts)}\n`;
+	console.log = (...parts: unknown[]) => { orig.log(...parts); append(stamped(parts)); };
+	console.warn = (...parts: unknown[]) => { orig.warn(...parts); append(stamped(parts)); };
+	console.error = (...parts: unknown[]) => { orig.error(...parts); append(stamped(parts)); };
+}
+
 /** Relaunch the app into a different profile (used by "import as new employee"). */
 function relaunchInto(profile: string): void {
 	const args: string[] = [];
@@ -329,6 +358,9 @@ function briefSummary(markdown: string, max = 1200): string {
 
 async function main(): Promise<void> {
 	const userData = app.getPath("userData");
+	// From here on, everything printed with console.* also lands in
+	// logs/main.log — the headless box's only window into main-process errors.
+	teeConsoleToDisk(path.join(userData, "logs", "main.log"));
 	// Cross-platform packages ship target-native binaries as extraResources. In
 	// dev, omit these overrides and let each npm package resolve its local build.
 	const nativeDir = app.isPackaged ? path.join(process.resourcesPath, "native") : null;
@@ -409,6 +441,11 @@ async function main(): Promise<void> {
 	// If the task was created in an IM conversation, the result is proactively
 	// pushed back to that group/1:1 through the active IM adapter.
 	const im = new IMAdapterManager(engine, config, { reportService });
+	// /restart command hook: relaunch the same binary with the same args.
+	im.setOnRestart(() => {
+		app.relaunch();
+		app.exit(0);
+	});
 	// Persist IM send-path outcomes (card delivered / markdown fallback + reason)
 	// to userData/logs/im.log — packaged builds have no visible console, and the
 	// fallback reason is the #1 clue when IM formatting looks wrong.
