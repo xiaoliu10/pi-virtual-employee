@@ -252,7 +252,11 @@ export class DingtalkAdapter implements IMAdapter {
 				return;
 			}
 
-			const text = msg.text?.content?.trim() ?? "";
+			// Group @-mentions ride INSIDE the text content ("@小派 /help"), which
+			// breaks slash-command detection (startsWith "/") and feeds a stray
+			// "@小派" into prompts. Strip leading mention tokens; 1:1 chats have
+			// no mention so this is a no-op there.
+			const text = (msg.text?.content ?? "").replace(/^(?:@[^\s@]+\s+)+/, "").trim();
 			// Inbound images arrive as msgtype "picture" with a downloadCode; fetch
 			// the bytes so a vision model can see them. Image-only messages carry no
 			// text — supply a short prompt so the model knows a photo arrived.
