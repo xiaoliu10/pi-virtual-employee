@@ -12,7 +12,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { SchedulerService } from "../../scheduler/scheduler-service.js";
 import type { ConfigStore } from "../../db/config-store.js";
-import { requireConfirmedAdmin, type ActorContext } from "./admin.js";
+import { maskId, requireConfirmedAdmin, type ActorContext } from "./admin.js";
 
 function fmtTime(ms: number | null): string {
 	return ms ? new Date(ms).toLocaleString("zh-CN", { hour12: false }) : "—";
@@ -74,6 +74,12 @@ export function createSchedulerTools(
 								? `已创建定时任务「${task.title}」。下次执行：${fmtTime(task.next_run_at)}。到点后我会自动执行，并把结果主动推送回当前${conversationId.startsWith("dt:group:") ? "群聊" : "单聊"}。`
 								: `已创建定时任务「${task.title}」。下次执行：${fmtTime(task.next_run_at)}。到点后我会自动执行并把结果记入对话。`,
 					},
+					...(createdBy
+						? []
+						: [{
+								type: "text" as const,
+								text: "⚠️ 该任务未记录执行身份（创建时不在管理员单聊并含「确认」）：到点后它只能对话与查知识库，无法使用命令/浏览器/文件等受控工具。若需要，请管理员在单聊里用 authorize_scheduled_task 补授权（传 all=true 可一次授权全部）。",
+							}]),
 				],
 				details: { ok: true, id: task.id, nextRunAt: task.next_run_at, createdBy },
 			};
@@ -83,20 +89,30 @@ export function createSchedulerTools(
 	const list: AgentTool = {
 		name: "list_scheduled_tasks",
 		label: "查看定时任务",
-		description: "列出当前所有定时任务及其启用状态、cron、上次与下次执行时间。",
+		description:
+			"列出当前所有定时任务及其启用状态、cron、上次与下次执行时间，以及**无人值守执行身份**是否已授权。" +
+			"「身份：未授权」的任务到点只能对话与查知识库，无法使用命令/浏览器/文件等受控工具，需要管理员在单聊中用 authorize_scheduled_task 补授权。",
 		parameters: Type.Object({}),
 		async execute() {
 			const rows = scheduler.list();
 			if (rows.length === 0) {
 				return { content: [{ type: "text", text: "当前没有任何定时任务。" }], details: { count: 0 } };
 			}
+			const pending = rows.filter((r) => !r.created_by).length;
 			const lines = rows.map(
 				(r, i) =>
-					`${i + 1}. [${r.enabled ? "启用" : "停用"}] ${r.title}（id=${r.id}）\n   cron: ${r.cron}  下次: ${fmtTime(r.next_run_at)}  上次: ${fmtTime(r.last_run_at)}${r.last_status ? ` (${r.last_status})` : ""}`,
+					`${i + 1}. [${r.enabled ? "启用" : "停用"}] ${r.title}（id=${r.id}）\n   cron: ${r.cron}  下次: ${fmtTime(r.next_run_at)}  上次: ${fmtTime(r.last_run_at)}${r.last_status ? ` (${r.last_status})` : ""}\n   身份: ${r.created_by ? `已授权（${maskId(r.created_by)}）` : "未授权——无人值守只能用对话与知识库"}`,
 			);
 			return {
-				content: [{ type: "text", text: `共 ${rows.length} 个定时任务：\n${lines.join("\n")}` }],
-				details: { count: rows.length },
+				content: [{
+					type: "text",
+					text:
+						`共 ${rows.length} 个定时任务：\n${lines.join("\n")}` +
+						(pending
+							? `\n其中 ${pending} 个未授权。若这些任务都是当前管理员创建的，可在单聊里说「给所有定时任务授权，确认」一次性补上（无需删除重建）。`
+							: ""),
+				}],
+				details: { count: rows.length, unauthorized: pending },
 			};
 		},
 	};
@@ -116,39 +132,78 @@ export function createSchedulerTools(
 		name: "authorize_scheduled_task",
 		label: "授权定时任务",
 		description:
-			"给已有定时任务补记管理员创建者身份（仅限管理员在 IM 单聊中使用，且当前消息须明确包含「确认」）。" +
-			"适用于任务创建时未记录身份（旧版本创建/控制台创建），导致无人值守无法执行 run_command 的情况——授权后无需删除重建，保留原 cron、prompt 与执行历史。" +
-			"授权后任务的无人值守执行将以你（当前管理员）的身份实时校验白名单；若你日后被移出管理员名单，任务随即失去受控命令权限。",
+			"给已有定时任务补记创建者身份（仅限管理员在 IM 单聊中使用，且当前消息须明确包含「确认」）。" +
+			"适用于任务创建时未记录身份（群聊/旧版本/控制台创建）导致无人值守无法使用受控工具的情况——授权后**无需删除重建**，原 cron、prompt 与执行历史全部保留。" +
+			"传 id 授权单个；传 all=true 一次授权**所有尚未授权的任务**（管理员自己建的任务批量补授权用这个，不必逐个来）。" +
+			"授权后任务以你（当前管理员）的身份执行，每次开跑前实时重新校验：你被移出管理员名单，任务立即失去受控权限。",
 		parameters: Type.Object({
-			id: Type.String({ description: "任务 id（来自 list_scheduled_tasks）" }),
+			id: Type.Optional(Type.String({ description: "要授权的任务 id（来自 list_scheduled_tasks）；用 all=true 时省略" })),
+			all: Type.Optional(Type.Boolean({ description: "true=授权当前所有未授权的任务" })),
 		}),
 		async execute(_id, params) {
-			const taskId = (params as { id: string }).id;
+			const { id, all } = params as { id?: string; all?: boolean };
+			const taskId = (id ?? "").trim();
+			if (!all && !taskId) {
+				const pending = scheduler.list().filter((r) => !r.created_by);
+				return {
+					content: [{
+						type: "text",
+						text: pending.length
+							? `请给出要授权的任务 id，或传 all=true 一次授权全部 ${pending.length} 个未授权任务：\n${pending.map((r) => `  · ${r.title}（id=${r.id}）`).join("\n")}`
+							: "没有需要授权的任务：所有定时任务都已带执行身份。",
+					}],
+					details: { ok: false, unauthorized: pending.length },
+				};
+			}
 			if (!config || !resolveActor) {
 				return { content: [{ type: "text", text: "当前会话不支持授权操作（需要在 IM 单聊中进行）。" }], details: { ok: false } };
 			}
 			// Same gate as creating an admin-backed task: verified 1:1 admin chat
-			// WITH explicit confirmation in the current message.
+			// WITH explicit confirmation in the current message. One confirmation
+			// covers the whole batch — the risk being accepted (these prompts will
+			// run unattended with the admin's identity) is identical per task.
 			const gate = requireConfirmedAdmin(
 				{ config, resolveActor, conversationId },
 				{
 					needConfirmation: true,
-					confirmationHint:
-						"授权后该定时任务将无人值守以你的管理员身份执行受控命令。请确认要授权的任务，并在当前消息中包含「确认」。",
+					confirmationHint: all
+						? "授权后所有未授权的定时任务都将无人值守以你的管理员身份执行。请确认，并在当前消息中包含「确认」。"
+						: "授权后该定时任务将无人值守以你的管理员身份执行受控命令。请确认要授权的任务，并在当前消息中包含「确认」。",
 				},
 			);
 			if ("content" in gate) return gate;
-			const updated = scheduler.setCreatedBy(taskId, gate.actor.senderId);
+			const actorId = gate.actor.senderId;
+
+			if (all) {
+				const pending = scheduler.list().filter((r) => !r.created_by);
+				const done: string[] = [];
+				for (const row of pending) {
+					const updated = scheduler.setCreatedBy(row.id, actorId);
+					if (updated) done.push(updated.title);
+				}
+				if (done.length === 0) {
+					return { content: [{ type: "text", text: "没有需要授权的任务：所有定时任务都已带执行身份。" }], details: { ok: true, authorized: 0 } };
+				}
+				return {
+					content: [{
+						type: "text",
+						text:
+							`✅ 已授权全部 ${done.length} 个未授权的定时任务（以后以你的身份执行）：${done.join("、")}。` +
+							`cron、prompt 与执行历史均未改动；从现在起它们到点可用命令/浏览器/文件等受控工具。`,
+					}],
+					details: { ok: true, authorized: done.length, titles: done },
+				};
+			}
+
+			const updated = scheduler.setCreatedBy(taskId, actorId);
 			if (!updated) {
 				return { content: [{ type: "text", text: `未找到 id 为 ${taskId} 的定时任务，请先用 list_scheduled_tasks 确认。` }], details: { ok: false } };
 			}
 			return {
-				content: [
-					{
-						type: "text",
-						text: `✅ 已授权定时任务「${updated.title}」：无人值守执行将以你的管理员身份校验，下次执行 ${fmtTime(updated.next_run_at)} 起可正常调用 run_command。`,
-					},
-				],
+				content: [{
+					type: "text",
+					text: `✅ 已授权定时任务「${updated.title}」：无人值守执行将以你的管理员身份校验，下次执行 ${fmtTime(updated.next_run_at)} 起可正常调用受控工具。`,
+				}],
 				details: { ok: true, id: updated.id, title: updated.title },
 			};
 		},

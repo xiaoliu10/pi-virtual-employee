@@ -109,6 +109,10 @@ test("the admin-facing rules never ask for an unlookupable id, and don't nag", (
 	for (const marker of ["list_people", "list_members", "set_role person=<姓名>", "conversationName=<群名>"]) {
 		assert.ok(prompt.includes(marker), `the rules must name what does the resolving: ${marker}`);
 	}
+	// The batch remedy for identity-less scheduled tasks must be reachable by
+	// wording alone ("我建的任务都要能用"), not by the admin discovering an id.
+	assert.ok(prompt.includes("authorize_scheduled_task 授权"), "scheduled-task repair is routed");
+	assert.ok(prompt.includes("直接传 all=true 一次授权全部"), "…in one batch, not one by one");
 	assert.ok(prompt.includes("风险提示只说一次，说完就执行"), "no repeated risk lectures");
 	assert.ok(prompt.includes("不要反复劝阻、不要要求二次确认"), "explicit acceptance is enough (one exception: group-wide admin)");
 });

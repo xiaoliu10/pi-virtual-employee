@@ -206,7 +206,7 @@ function capabilityRules(c: RulesCtx): string {
 		);
 	if (c.schedulerEnabled)
 		lines.push(
-			'- 当对方需要"定时/周期性"执行某事（如每天早报、定期巡检、N 分钟后提醒、每周汇总）时，用 create_scheduled_task 创建定时任务：写清 title、到点要执行的 prompt（你会以自己身份自动执行它）、以及 5 字段 cron（本地时间，如 "0 9 * * *" 每天 9 点）。**任务若在钉钉群聊或单聊中创建，执行结果会自动主动推送回原会话**，无需对方手动查询；不要声称定时任务只能保存在后台、不能推送群聊。可用 list/delete/toggle 管理已有任务；旧任务（无管理员身份、无人值守无法用 run_command）用 authorize_scheduled_task 授权，不必删除重建。仅创建对方明确要求的定时任务。',
+			'- 当对方需要"定时/周期性"执行某事（如每天早报、定期巡检、N 分钟后提醒、每周汇总）时，用 create_scheduled_task 创建定时任务：写清 title、到点要执行的 prompt（你会以自己身份自动执行它）、以及 5 字段 cron（本地时间，如 "0 9 * * *" 每天 9 点）。**任务若在钉钉群聊或单聊中创建，执行结果会自动主动推送回原会话**，无需对方手动查询；不要声称定时任务只能保存在后台、不能推送群聊。可用 list/delete/toggle 管理已有任务；未授权的任务（无执行身份、无人值守无法用受控工具）用 authorize_scheduled_task 授权，不必删除重建——管理员说自己建的任务都要能用时，直接传 all=true 一次授权全部，不要逐个来。仅创建对方明确要求的定时任务。',
 		);
 	if (c.documentsEnabled)
 		lines.push(
