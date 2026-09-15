@@ -49,6 +49,7 @@ export function refuse(reason: string): AdminRefusal {
  */
 const CONFIRM_RE = /(^|[^a-z])((请)?确认|confirm|yes|ok)([^a-z]|$)/i;
 
+// #region immutable:tool-gates
 export function isExplicitConfirmation(userText: string): boolean {
 	const text = userText.trim();
 	// A confirmation word inside an explicit cancellation/negation must never
@@ -100,7 +101,8 @@ export function requireSingleChatActor(
 }
 
 /**
- * Whitelisted-admin gate shared by guarded tools. Unlike `authorize`, an empty
+ * Whitelisted-admin gate shared by guarded tools.
+// #endregion immutable:tool-gates Unlike `authorize`, an empty
  * whitelist NEVER claims the caller — update/restart tools are denied on an
  * unclaimed deployment until a first admin explicitly uses manage_admin claim.
  */

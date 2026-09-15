@@ -47,6 +47,7 @@ const UPDATE_LOG_FILE = "updater.log";
 /** Circuit-breaker state: repeated failures for the same target version. */
 const FAILURE_FILE = "update-failures.json";
 /** After this many failed install attempts for one target version, stop auto-installing it. */
+// #region immutable:updater-breakers
 const MAX_ATTEMPTS_PER_VERSION = 2;
 /**
  * MACHINE-level breaker: consecutive failed installs ACROSS different target
@@ -57,6 +58,7 @@ const MAX_ATTEMPTS_PER_VERSION = 2;
  * work) until one successful manual repair install clears the streak.
  */
 const MAX_CONSECUTIVE_INSTALL_FAILURES = 2;
+// #endregion immutable:updater-breakers
 
 interface FailureRecord {
 	attempts: number;

@@ -1,0 +1,82 @@
+{
+	"version": 1,
+	"entries": [
+		{
+			"id": "prompt-red-lines",
+			"path": "src/engine/prompt.ts",
+			"kind": "region",
+			"why": "安全红线（凭据不外泄）——常驻、不可被 prompt.rules 覆盖",
+			"sha256": "20bc68cf2657360bb1e56e1d74c5372b4ed7ffa346ae3eb25b1a1d934ac7669f"
+		},
+		{
+			"id": "prompt-integrity",
+			"path": "src/engine/prompt.ts",
+			"kind": "region",
+			"why": "数据真实性（禁止编造业务数据）——用户红线，见 no-fabricated-data-rule",
+			"sha256": "39641a1dc66c4907e4ec28793ceac3a192b21e7cd203fd76a5f794583c54e575"
+		},
+		{
+			"id": "rbac-gate",
+			"path": "src/security/permissions.ts",
+			"kind": "region",
+			"why": "角色解析与能力判定：所有权限结论的唯一出处",
+			"sha256": "4d8372647f2c1a8f33cc227b210a9681fc5a870dd56690983442111e6f851c06"
+		},
+		{
+			"id": "rbac-defaults",
+			"path": "src/security/permissions.ts",
+			"kind": "region",
+			"why": "能力到最低角色的默认表（policy）：改动等于放宽/收紧全局默认权限",
+			"sha256": "1c7565453a0175921714031a17de8c6f2731522cc44a492c215246197391fcc7"
+		},
+		{
+			"id": "rbac-trust-boundary",
+			"path": "src/security/permissions.ts",
+			"kind": "region",
+			"why": "本机控制台 vs 远端会话的信任边界（决定谁可以无 actor 直接是 admin）",
+			"sha256": "6856cf1a764ae8d16ca922e424f46cc14386546f8f0fc2ed6088fdf0302c5a41"
+		},
+		{
+			"id": "tool-gates",
+			"path": "src/engine/tools/admin.ts",
+			"kind": "region",
+			"why": "单聊要求 + 「确认」口令解析：所有特权工具共用的门",
+			"sha256": "3bb97f9ca8d55f0dc489f67a22d0b9161fd598243f152bd5d5bda86b9f3b44dd"
+		},
+		{
+			"id": "updater-breakers",
+			"path": "electron/updater.ts",
+			"kind": "region",
+			"why": "自动更新熔断阈值（坏版本的最后一道网）",
+			"sha256": "bb25f4ddf2e615261d868fcd26938c355736aa55d17a320dc690bca772308ee2"
+		},
+		{
+			"id": "publish-target",
+			"path": "scripts/publish.mjs",
+			"kind": "region",
+			"why": "发布上传目标（OWNER/REPO/TAG）：不可被静默改指",
+			"sha256": "2604518618b50302e489373e954453bae5b1cc482f5fb541c0dc62c77c0b50f4"
+		},
+		{
+			"id": "test-prompt",
+			"path": "scripts/test-prompt.mjs",
+			"kind": "file",
+			"why": "守护提示词红线的断言本身（改测试而不是改行为是 RSI 最经典的失败模式）",
+			"sha256": "eecaf09c4f9a95739f4327da7b3e440298cab6339921fa7a343723183907a20c"
+		},
+		{
+			"id": "test-permissions",
+			"path": "scripts/test-permissions.mjs",
+			"kind": "file",
+			"why": "守护权限模型的断言本身",
+			"sha256": "1f8b40daf339df958864b7fceb234d95c0015d63b960a2afd8c1f1bb1b630420"
+		},
+		{
+			"id": "test-immutable",
+			"path": "scripts/test-immutable.mjs",
+			"kind": "file",
+			"why": "守护不可变清单本身的断言（删条目/丢标记/移 pin 都会是护栏变更）",
+			"sha256": "e88e3320c356676cd4fa2f8d51cf92e62f890871a2adef8558bc67b6178ffd2e"
+		}
+	]
+}

@@ -44,6 +44,7 @@ export const CAPABILITY_LABEL: Record<string, string> = {
 	admin: "管理员操作",
 };
 
+// #region immutable:rbac-defaults
 /** Default minimum role per capability (floors may raise it per conversation). */
 const CAPABILITY_MIN: Record<string, Role> = {
 	chat: "viewer",
@@ -64,6 +65,7 @@ const CAPABILITY_MIN: Record<string, Role> = {
 	settings: "admin",
 	admin: "admin",
 };
+// #endregion immutable:rbac-defaults
 
 export interface PermissionRefusal {
 	ok: false;
@@ -79,6 +81,7 @@ function asRole(v: string | undefined): Role | undefined {
 	return v === "viewer" || v === "operator" || v === "admin" ? v : undefined;
 }
 
+// #region immutable:rbac-gate
 /** Resolve a person's role from the verified senderId (never from text). */
 export function resolveRole(config: ConfigStore, senderId: string | undefined | null): Role {
 	if (!senderId) return "viewer";
@@ -137,9 +140,11 @@ export function conversationFloors(config: ConfigStore, conversationId: string):
  * sched:) is treated as remote, so a turn that arrives without verified sender
  * metadata gets the default role instead of inheriting trust.
  */
+// #region immutable:rbac-trust-boundary
 export function isLocalConversation(conversationId: string): boolean {
 	return inferConversationOrigin(conversationId) === "console";
 }
+// #endregion immutable:rbac-trust-boundary
 
 /**
  * Check a capability for the CURRENT turn's actor in a conversation. Returns
@@ -179,6 +184,7 @@ export function checkPermission(
 	}
 	return { ok: true, role };
 }
+// #endregion immutable:rbac-gate
 
 /** Uniform refusal content block for tool results. */
 export function permissionRefusal(refusal: PermissionRefusal): { content: { type: "text"; text: string }[]; details: { refused: true; reason: string } } {
