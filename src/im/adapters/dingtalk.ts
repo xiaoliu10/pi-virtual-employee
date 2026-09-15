@@ -318,6 +318,7 @@ export class DingtalkAdapter implements IMAdapter {
 							images,
 							actor: {
 								senderId: msg.senderStaffId || msg.senderId || "",
+								senderName: (msg as { senderNick?: string }).senderNick?.trim() || undefined,
 								channel: "dingtalk",
 								chatType: msg.conversationType === "1" ? "single" : "group",
 							},

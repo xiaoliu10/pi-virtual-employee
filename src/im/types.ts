@@ -31,6 +31,9 @@ export interface InboundImage {
 export interface InboundActor {
 	/** Stable platform user id (e.g. DingTalk senderStaffId). */
 	senderId: string;
+	/** Platform display name when the payload carries one. Display-only: role
+	 *  resolution never uses it (names aren't unique and are user-editable). */
+	senderName?: string;
 	/** Source channel, used for audit details and future per-channel policies. */
 	channel: string;
 	/** Admin operations are allowed only in a direct 1:1 chat. */

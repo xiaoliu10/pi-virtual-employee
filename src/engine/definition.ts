@@ -38,6 +38,8 @@ import { createRunCommandTool, createManageProcessTool, type ShellToolDeps } fro
 import { createManageSettingsTool } from "./tools/settings.js";
 import { orderTool } from "./tools/orders.js";
 import { escalateTool } from "./tools/escalate.js";
+import { checkPermission, permissionRefusal } from "../security/permissions.js";
+import { createCheckMyAccessTool, createManageAccessTool, type AccessToolDeps } from "./tools/access.js";
 
 export { buildSystemPrompt, BASE_RULES_SUMMARY } from "./prompt.js";
 
@@ -111,45 +113,67 @@ export interface ToolSetOptions {
 	 * only. Provided by the engine from the downloads dir.
 	 */
 	screenshotDir?: () => Promise<string | undefined>;
+	/**
+	 * Known conversations for the RBAC policy editor (so an admin can find a
+	 * group's id to apply floors to without knowing DingTalk's openConversationId).
+	 */
+	listConversations?: () => { id: string; title: string | null; origin: string }[];
 }
 
 /** Assemble the employee's tools; capability tools are conditional on their config flags. */
 export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 	const tools: AgentTool<any>[] = [];
+	/**
+	 * Capability guard (RBAC): wraps a tool's execute with a server-side
+	 * permission check against the CURRENT turn's platform-verified actor —
+	 * the model never mediates who may call what, so prompt injection in
+	 * message/web/file content cannot escalate access. The check is per-turn
+	 * (resolveActor reads the live turn actor), so one group conversation
+	 * serves different senders at their own roles.
+	 */
+	const guarded = (capability: string, tool: AgentTool<any>): AgentTool<any> => ({
+		...tool,
+		async execute(toolCallId, params, signal, onUpdate) {
+			const gate = checkPermission(options.config, options.resolveActor(options.conversationId), options.conversationId, capability);
+			if (!gate.ok) return permissionRefusal(gate);
+			return tool.execute(toolCallId, params, signal, onUpdate);
+		},
+	});
+	const guardAll = (capability: string, list: AgentTool<any>[]): AgentTool<any>[] => list.map((t) => guarded(capability, t));
+
 	if (options.kbEnabled) {
-		tools.push(createKnowledgeTool(options.knowledge));
+		tools.push(guarded("knowledge", createKnowledgeTool(options.knowledge)));
 		if (options.learnEnabled) {
-			tools.push(createSaveToKnowledgeTool(options.knowledge));
-			tools.push(createRememberTool(options.knowledge, options.onMemoryChanged));
+			tools.push(...guardAll("learn", [createSaveToKnowledgeTool(options.knowledge), createRememberTool(options.knowledge, options.onMemoryChanged)]));
 		}
-		if (options.manageEnabled) tools.push(createManageKnowledgeTool(options.knowledge));
-		if (options.researchEnabled) tools.push(createResearchWebTool(options.knowledge));
+		if (options.manageEnabled) tools.push(guarded("knowledge_manage", createManageKnowledgeTool(options.knowledge)));
+		if (options.researchEnabled) tools.push(guarded("browser", createResearchWebTool(options.knowledge)));
 	}
 	if (options.browserEnabled)
 		tools.push(
-			...createBrowserTools(options.browser, options.isVisionModel, options.screenshotDir, () => options.conversationId),
+			...guardAll("browser", createBrowserTools(options.browser, options.isVisionModel, options.screenshotDir, () => options.conversationId)),
 		);
 	if (options.browserEnabled && options.downloadsEnabled)
-		tools.push(...createDownloadTools(options.downloadService, options.browser, () => options.conversationId));
+		tools.push(...guardAll("browser", createDownloadTools(options.downloadService, options.browser, () => options.conversationId)));
 	if (options.documentsEnabled)
-		tools.push(...createDocumentTools(options.documents, options.conversationId, options.resolveFileSender));
-	if (options.filesystemEnabled) tools.push(...createFilesystemTools(options.filesystem));
+		tools.push(...guardAll("documents", createDocumentTools(options.documents, options.conversationId, options.resolveFileSender)));
+	if (options.filesystemEnabled) tools.push(...guardAll("filesystem", createFilesystemTools(options.filesystem)));
 	if (options.schedulerEnabled) {
 		const origin = inferConversationOrigin(options.conversationId);
 		tools.push(
-			...createSchedulerTools(
+			...guardAll("scheduler", createSchedulerTools(
 				options.scheduler,
 				options.conversationId,
 				origin,
 				options.config,
 				options.resolveActor,
-			),
+			)),
 		);
 	}
-	if (options.reportsEnabled) tools.push(createSaveReportTool(options.reportService, options.conversationId));
+	if (options.reportsEnabled) tools.push(guarded("reports", createSaveReportTool(options.reportService, options.conversationId)));
 	// Skill authoring is an always-on channel: explicit 技能/Skill intent writes
 	// here; everything else defaults to the knowledge base (see prompt routing rules).
-	tools.push(createSaveToSkillTool(options.skillWriter, options.onSkillsChanged));
+	tools.push(guarded("learn", createSaveToSkillTool(options.skillWriter, options.onSkillsChanged)));
 	// Read-only access to a skill's bundled assets (scripts/templates that shipped
 	// alongside SKILL.md in a zip or directory import). Always-on with skills.
 	tools.push(createReadSkillAssetTool(options.userSkillsDir));
@@ -167,9 +191,23 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 		onConfigChanged: options.onConfigChanged,
 		conversationId: options.conversationId,
 	};
+	const accessDeps: AccessToolDeps = {
+		config: options.config,
+		resolveActor: options.resolveActor,
+		onConfigChanged: options.onConfigChanged,
+		conversationId: options.conversationId,
+		listConversations: options.listConversations,
+	};
 	tools.push(createManageAdminTool(adminDeps), createUpdateIdentityTool(adminDeps));
-	if (options.computer) tools.push(...createComputerTools({ ...adminDeps, computer: options.computer,
-		isVisionModel: options.isVisionModel, screenshotDir: options.screenshotDir }));
+	// RBAC: one read-only self-query for any sender (check_my_access) plus the
+	// admin-only policy editor (manage_access: per-person roles, default role,
+	// per-conversation capability floors).
+	tools.push(
+		createCheckMyAccessTool(accessDeps),
+		createManageAccessTool(accessDeps),
+	);
+	if (options.computer) tools.push(...guardAll("computer", createComputerTools({ ...adminDeps, computer: options.computer,
+		isVisionModel: options.isVisionModel, screenshotDir: options.screenshotDir })));
 	// Conversation-side capability switches — headless deployments have no desktop
 	// settings UI, so admins toggle browser/documents/… from a 1:1 chat.
 	tools.push(createManageCapabilitiesTool({

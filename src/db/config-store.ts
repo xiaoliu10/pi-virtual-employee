@@ -380,6 +380,26 @@ export interface AppConfig {
 	 */
 	security: {
 		adminStaffIds: string[];
+		/**
+		 * Role-based access control. Roles (per PERSON, resolved from the
+		 * platform-verified senderStaffId — never from message text):
+		 *   viewer   — chat, KB search, memory/learn. Default for unknown senders.
+		 *   operator — + browser/computer/documents/filesystem/scheduler +
+		 *              allowlisted run_command.
+		 *   admin    — everything: full shell, settings, admin/identity ops.
+		 * Source precedence: people[] entry > adminStaffIds (=admin) > defaultRole.
+		 */
+		people?: { staffId: string; name?: string; role: "viewer" | "operator" | "admin" }[];
+		defaultRole?: "viewer" | "operator" | "admin";
+		/**
+		 * Per-conversation capability floors (per GROUP/CHAT). Each entry RAISES
+		 * the minimum role required for a capability inside that conversation
+		 * (e.g. a production-data group may require operator for browser).
+		 * Floors can only tighten — they never grant beyond the person's role.
+		 * Keys are conversation ids (e.g. "dt:group:cid…"); "chat" = serve the
+		 * conversation at all.
+		 */
+		conversations?: { id: string; name?: string; floors?: Record<string, string> }[];
 	};
 }
 
@@ -423,7 +443,7 @@ const DEFAULTS: AppConfig = {
 	},
 	downloads: { enabled: true, dir: "", maxSizeMb: 200, retainDays: 30 },
 	skills: { disabled: [] },
-	security: { adminStaffIds: [] },
+	security: { adminStaffIds: [], people: [], defaultRole: "viewer", conversations: [] },
 	kb: {
 		enabled: true,
 		mode: "local",
@@ -466,9 +486,51 @@ function normalizedAdminIds(value: unknown): string[] {
 		.filter(Boolean))];
 }
 
-/** Normalize the security block (admin whitelist) of a merged config. */
+/**
+ * Normalize the security block: admin whitelist + the RBAC policy (per-person
+ * roles, default role, per-conversation capability floors). Hand-edited config
+ * files are untrusted input, so unknown roles are dropped, ids are trimmed and
+ * de-duplicated, and people/conversation entries must be well-formed.
+ *
+ * Floor VALUES are kept even when unrecognized (only blanks are dropped):
+ * permissions.ts then fails CLOSED on them (admin-only + an explanatory
+ * refusal) instead of silently relaxing the floor to the capability default.
+ * Floor KEYS are free-form: an unknown capability name never matches a
+ * capability check, so a typo there affects nothing.
+ */
 function normalizeSecurity(merged: AppConfig): AppConfig["security"] {
-	return { adminStaffIds: normalizedAdminIds(merged.security?.adminStaffIds) };
+	const raw = merged.security ?? { adminStaffIds: [] };
+	const isRole = (v: unknown): v is "viewer" | "operator" | "admin" =>
+		v === "viewer" || v === "operator" || v === "admin";
+
+	const byId = new Map<string, { staffId: string; name?: string; role: "viewer" | "operator" | "admin" }>();
+	for (const entry of Array.isArray(raw.people) ? raw.people : []) {
+		const staffId = typeof entry?.staffId === "string" ? entry.staffId.trim() : "";
+		if (!staffId || !isRole(entry?.role)) continue;
+		const name = typeof entry?.name === "string" && entry.name.trim() ? entry.name.trim() : undefined;
+		byId.set(staffId, { staffId, ...(name ? { name } : {}), role: entry.role });
+	}
+
+	const byConv = new Map<string, { id: string; name?: string; floors: Record<string, string> }>();
+	for (const entry of Array.isArray(raw.conversations) ? raw.conversations : []) {
+		const id = typeof entry?.id === "string" ? entry.id.trim() : "";
+		if (!id) continue;
+		const floors: Record<string, string> = {};
+		for (const [key, value] of Object.entries(entry?.floors ?? {})) {
+			const capability = key.trim();
+			const role = typeof value === "string" ? value.trim() : "";
+			if (capability && role) floors[capability] = role;
+		}
+		const name = typeof entry?.name === "string" && entry.name.trim() ? entry.name.trim() : undefined;
+		byConv.set(id, { id, ...(name ? { name } : {}), floors });
+	}
+
+	return {
+		adminStaffIds: normalizedAdminIds(raw.adminStaffIds),
+		people: [...byId.values()],
+		defaultRole: isRole(raw.defaultRole) ? raw.defaultRole : "viewer",
+		conversations: [...byConv.values()],
+	};
 }
 
 /** Normalize the restricted shell whitelist and runtime limit. */

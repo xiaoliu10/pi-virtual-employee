@@ -29,7 +29,45 @@ import { dirname } from "node:path";
 import type { ConfigStore } from "../../db/config-store.js";
 import { MAX_TIMEOUT_SEC } from "../../shared/timeouts.js";
 import { CommandSession } from "../command-session.js";
-import { maskId, refuse, requireAdminForCommand, isSchedulerActor, isExplicitConfirmation, type ActorContext } from "./admin.js";
+import { maskId, refuse, isSchedulerActor, isExplicitConfirmation, type ActorContext } from "./admin.js";
+import { resolveRole, type Role } from "../../security/permissions.js";
+
+/**
+ * Role-tiered command gate (replaces the admin-only gate for run_command):
+ *   viewer   — no command execution at all.
+ *   operator — interactive confirmation required; executable whitelist applies
+ *              (composition still rejected).
+ *   admin    — interactive confirmation required; whitelist BYPASSED (full
+ *              shell: composition/script files allowed — 现场-equivalent
+ *              capability on a dedicated jump box).
+ * Scheduled-task actors inherit their creator's role (re-checked live every
+ * fire); unattended runs skip the per-message confirmation as before.
+ */
+function gateCommandRole(
+	deps: Pick<ShellToolDeps, "config" | "resolveActor" | "conversationId">,
+	opts: { needConfirmation: boolean } = { needConfirmation: true },
+): ReturnType<typeof refuse> | { actor: NonNullable<ActorContext>; role: Role } {
+	const actor = deps.resolveActor(deps.conversationId);
+	if (actor && isSchedulerActor(actor)) {
+		const role = resolveRole(deps.config, actor.senderId);
+		if (role === "viewer") return refuse("创建该任务的用户没有命令执行权限，任务无法继续。");
+		return { actor, role };
+	}
+	if (!actor && deps.conversationId.startsWith("sched:")) {
+		return refuse("该定时任务创建时未记录创建者身份，无法无人值守执行命令。请管理员在 IM 单聊中使用 authorize_scheduled_task 给该任务授权。");
+	}
+	if (!actor) return refuse("当前会话不是 IM 单聊（无经过验证的发送者身份），命令执行只能在 IM 单聊中进行。");
+	if (actor.chatType !== "single") return refuse("命令执行只允许在单聊中进行，群聊不开放（群内无法可靠鉴别操作者）。");
+	if (!actor.senderId) return refuse("无法识别发送者身份（senderId 为空），拒绝执行。");
+	const role = resolveRole(deps.config, actor.senderId);
+	if (role === "viewer") {
+		return refuse("当前用户没有命令执行权限（需要 operator 及以上）。如需开通请联系管理员在 security.people 中指派角色。");
+	}
+	if (opts.needConfirmation && !isExplicitConfirmation(actor.text)) {
+		return refuse("该操作会执行命令。请明确说明要执行的操作，并在当前消息中包含「确认」（或同义明确肯定语）。");
+	}
+	return { actor, role };
+}
 
 export interface ShellToolDeps {
 	config: ConfigStore;
@@ -319,16 +357,17 @@ function sessionResult(entry: SessionEntry, offset?: number) {
 export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 	return {
 		name: "run_command",
-		label: "受限命令执行",
+		label: "命令执行（分级）",
 		description:
-			"在部署机器上执行受限的 shell 命令（仅限 IM 单聊，需系统管理员身份且在当条消息明确「确认」）。" +
+			"在部署机器上按角色分级执行 shell 命令（仅限 IM 单聊，需在当前消息明确「确认」）。" +
+			"权限分级：viewer 不可执行；operator 只能执行 capabilities.shell.allowedCommands 白名单内的可执行文件（* 表示全部），且串联、管道、重定向、变量展开、脚本扩展名和可执行文件路径均被拒绝，每次只跑一条独立命令；" +
+			"admin 不受白名单与组合语法限制（完整 shell：可用 powershell -Command 管道、重定向、脚本串联等），仅工作目录仍须为不含引号的绝对路径。" +
 			"默认用于运维诊断：tasklist 查看进程、taskkill 按单个 PID 结束进程、systeminfo/whoami/hostname/netstat/ping/ipconfig 查看本机状态。" +
-			"只允许执行 capabilities.shell.allowedCommands 白名单内的可执行文件（* 表示全部）；串联、管道、重定向、变量展开、脚本扩展名和可执行文件路径均拒绝。" +
 			"长任务传 background=true：启动后立即返回 sessionId，用 manage_process poll 阻塞等待、log 增量读日志、kill 终止；等待超时只返回当前状态，不杀后台进程。同步命令运行时限用 capabilities.shell.timeoutSec（默认 60 秒）；后台进程时限用 backgroundTimeoutSec（默认 0=不限制），管理员可用 manage_settings 修改。" +
 			"采集逻辑先写入 .ps1/.py 脚本，命令只用 powershell -File xxx.ps1 或 python xxx.py，参数通过本地文件传递；脚本先输出 observer start 与时间戳，首次 poll/log 检查启动日志，不能把返回 sessionId 当成任务完成。会话由本应用托管，应用退出会终止进程，重启后不可续接；不要再用 nohup 或自制脱管 launcher。" +
-			"powershell/node/npx 等解释器需管理员显式加入白名单；安装 Chromium 请改用 manage_capabilities setup_browser。" +
-			"安全规则：默认关闭；每次执行必须由管理员在当前消息中明确包含「确认」/confirm/yes/ok；群聊一律拒绝。命令以当前应用用户权限运行，不会自动提权。" +
-			"可选 workingDir：命令的工作目录（绝对路径，如 C:\\Users\\me\\project），脚本用相对路径读写数据文件时需要；不影响可执行文件白名单。定时任务无人值守执行时，run_command 以任务创建者（管理员）身份放行，无需消息内含「确认」，但命令与可执行文件白名单照常校验。",
+			"powershell/node/npx 等解释器需管理员显式加入白名单（admin 角色无需）；安装 Chromium 请改用 manage_capabilities setup_browser。" +
+			"安全规则：默认关闭；每次执行必须由操作者在当前消息中明确包含「确认」/confirm/yes/ok；群聊一律拒绝。命令以当前应用用户权限运行，不会自动提权。" +
+			"可选 workingDir：命令的工作目录（绝对路径，如 C:\\Users\\me\\project），脚本用相对路径读写数据文件时需要；不影响可执行文件白名单。定时任务无人值守执行时，run_command 以任务创建者身份放行（按该用户当前角色定级），无需消息内含「确认」，但 operator 的白名单校验照常生效。",
 		parameters: Type.Object({
 			command: Type.String({ description: `要执行的命令，如「tasklist /FI "PID eq 19060"」「taskkill /PID 19060 /F」「python scripts/gen_report.py」。跑脚本直接给脚本文件路径，不要用 python -c 内联代码（括号会被拦截）。` }),
 			workingDir: Type.Optional(Type.String({ description: "可选：命令的工作目录绝对路径，如 C:\\Users\\admin\\assistant-home\\project。脚本按相对路径找数据文件时必填。" })),
@@ -340,17 +379,22 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 			if (signal?.aborted) return refuse("本次命令执行已取消。");
 			const raw = (command ?? "").trim();
 			if (!raw) return refuse("command 不能为空。");
-			if (raw.length > 512) return refuse("命令过长（>512 字符），拒绝执行。");
+			if (raw.length > 2000) return refuse("命令过长（>2000 字符），拒绝执行。");
 
-			const gate = requireAdminForCommand(deps);
+			const gate = gateCommandRole(deps);
 			if ("content" in gate) return gate;
 
 			const shell = deps.config.all().capabilities?.shell;
 			if (!shell?.enabled) {
 				return refuse("受限命令执行能力未开启。管理员可在单聊使用 manage_capabilities set shell true 开启（需确认），或在设置页开启。");
 			}
-			const gateResult = checkWhitelist(raw, shell.allowedCommands);
-			if (!gateResult.ok) return refuse(gateResult.reason);
+			// Operator: allowlist + composition-free single command (the original
+			// restricted-shell contract). Admin: full shell — the jump box is a
+			// dedicated VM, admins are human-verified, and every run is audited.
+			if (gate.role !== "admin") {
+				const gateResult = checkWhitelist(raw, shell.allowedCommands);
+				if (!gateResult.ok) return refuse(gateResult.reason);
+			}
 
 			// Validate workingDir: an absolute, composition-free path. It only
 			// sets where the process runs, not what runs — but it must not be a
@@ -423,7 +467,7 @@ export function createManageProcessTool(deps: ShellToolDeps): AgentTool {
 		async execute(_toolCallId, params, signal) {
 			const { action, sessionId, waitSec, offset } = params as { action: string; sessionId?: string; waitSec?: number; offset?: number };
 			if (!["list", "poll", "log", "kill"].includes(action)) return refuse("action 必须是 list/poll/log/kill。");
-			const gate = requireAdminForCommand(deps, { needConfirmation: false });
+			const gate = gateCommandRole(deps, { needConfirmation: false });
 			if ("content" in gate) return gate;
 			if (action === "kill" && !isSchedulerActor(gate.actor) && !confirmsProcessStop(gate.actor.text)) {
 				return refuse("终止命令进程树需要管理员在当前消息中明确确认，例如「确认终止这个任务」。");

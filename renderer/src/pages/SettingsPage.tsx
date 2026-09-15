@@ -135,6 +135,24 @@ function Field({ label, children, hint }: { label: string; children: JSX.Element
 
 const inputCls = "h-11 w-full rounded-xl border border-slate-200 bg-[#f7f8fa] px-3.5 text-sm text-slate-800 outline-none transition focus:border-blue-400 focus:bg-white focus:ring-2 focus:ring-blue-100";
 
+/** Capability keys accepted by conversation floors — must match
+ *  CAPABILITY_LABEL in src/security/permissions.ts. */
+const SECURITY_CAPABILITY_LABEL: Record<string, string> = {
+	chat: "对话服务",
+	knowledge: "知识库检索",
+	learn: "知识/记忆沉淀",
+	browser: "浏览器操作",
+	computer: "桌面控制",
+	shell: "命令执行",
+	filesystem: "文件系统",
+	documents: "文档处理",
+	scheduler: "定时任务",
+	reports: "产物中心",
+	knowledge_manage: "知识库管理",
+	settings: "系统设置",
+	admin: "管理员操作",
+};
+
 const SHELL_TIMEOUT_FIELDS = [
 	{ key: "timeoutSec", label: "同步命令运行时限（秒）", fallback: 60, hint: "同步执行命令的最长运行时间，默认 60 秒，0 = 不限制。超时会终止进程树。保存后对下一次命令执行生效。" },
 	{ key: "backgroundTimeoutSec", label: "后台命令运行时限（秒）", fallback: 0, hint: "后台任务独立运行，默认 0 = 不限制。设为正数时，达到时限会终止进程树；长时间采集任务可保持不限时。" },
@@ -488,6 +506,70 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 														</div>
 													))}
 													<button type="button" onClick={() => setSecurity({ adminStaffIds: [...draft.security.adminStaffIds, ""] })} className="text-xs text-blue-500 hover:text-blue-600">＋ 添加管理员</button>
+												</div>
+											</div>
+
+											<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
+												<div className="text-sm font-medium text-slate-800">分级权限（角色与会话门槛）</div>
+												<div className="mt-1 text-xs text-slate-400">
+													角色按平台验证的发送者身份判定，消息内容无法影响：viewer（对话/知识库检索/记忆沉淀）＜ operator（+浏览器/桌面/文档/文件系统/定时任务/白名单命令）＜ admin（+完整命令/系统设置/权限管理）。会话门槛只能收紧，不能超过对方自身角色；未单独指派的人使用默认角色。管理员也可在 IM 单聊里用 manage_access 远程配置（发送 /perm 可查看自己的权限）。
+												</div>
+												<Field label="默认角色（未单独指派的人）" hint="建议保持 viewer：未知发送者仅能对话与检索知识库。">
+													<select value={draft.security.defaultRole ?? "viewer"} onChange={(e) => setSecurity({ defaultRole: e.target.value as "viewer" | "operator" | "admin" })} className={inputCls}>
+														<option value="viewer">viewer — 只读</option>
+														<option value="operator">operator — 可操作</option>
+														<option value="admin">admin — 管理员</option>
+													</select>
+												</Field>
+												<div className="mt-3 space-y-2">
+													<div className="text-xs font-medium text-slate-600">人员角色指派</div>
+													{(draft.security.people ?? []).map((p, idx) => (
+														<div key={`person-${idx}`} className="flex items-center gap-2">
+															<input value={p.staffId} onChange={(e) => setSecurity({ people: (draft.security.people ?? []).map((v, i) => (i === idx ? { ...v, staffId: e.target.value } : v)) })} placeholder="钉钉 staffId" className={inputCls} />
+															<input value={p.name ?? ""} onChange={(e) => setSecurity({ people: (draft.security.people ?? []).map((v, i) => (i === idx ? { ...v, name: e.target.value } : v)) })} placeholder="备注名（可选）" className={inputCls + " max-w-[10rem]"} />
+															<select value={p.role} onChange={(e) => setSecurity({ people: (draft.security.people ?? []).map((v, i) => (i === idx ? { ...v, role: e.target.value as "viewer" | "operator" | "admin" } : v)) })} className={inputCls + " max-w-[9rem]"}>
+																<option value="viewer">viewer</option>
+																<option value="operator">operator</option>
+																<option value="admin">admin</option>
+															</select>
+															<button type="button" onClick={() => setSecurity({ people: (draft.security.people ?? []).filter((_, i) => i !== idx) })} className="shrink-0 text-xs text-rose-400 hover:text-rose-600">删除</button>
+														</div>
+													))}
+													<button type="button" onClick={() => setSecurity({ people: [...(draft.security.people ?? []), { staffId: "", role: "viewer" }] })} className="text-xs text-blue-500 hover:text-blue-600">＋ 添加人员角色</button>
+												</div>
+												<div className="mt-3 space-y-2">
+													<div className="text-xs font-medium text-slate-600">会话门槛（按群/单聊收紧某项能力）</div>
+													{(draft.security.conversations ?? []).map((c, ci) => (
+														<div key={`conv-${ci}`} className="rounded-lg border border-slate-200 px-3 py-2">
+															<div className="flex items-center gap-2">
+																<input value={c.id} onChange={(e) => setSecurity({ conversations: (draft.security.conversations ?? []).map((v, i) => (i === ci ? { ...v, id: e.target.value } : v)) })} placeholder="会话 ID，如 dt:group:cidaXXX" className={inputCls} />
+																<button type="button" onClick={() => setSecurity({ conversations: (draft.security.conversations ?? []).filter((_, i) => i !== ci) })} className="shrink-0 text-xs text-rose-400 hover:text-rose-600">删除</button>
+															</div>
+															{Object.entries(c.floors ?? {}).map(([cap, floor]) => (
+																<div key={`${cap}`} className="mt-2 flex items-center gap-2">
+																	<select value={cap} onChange={(e) => {
+																		const floors = { ...(c.floors ?? {}) };
+																		delete floors[cap];
+																		floors[e.target.value] = floor;
+																		setSecurity({ conversations: (draft.security.conversations ?? []).map((v, i) => (i === ci ? { ...v, floors } : v)) });
+																	}} className={inputCls + " max-w-[12rem]"}>
+																		{Object.entries(SECURITY_CAPABILITY_LABEL).map(([k, label]) => <option key={k} value={k}>{label}</option>)}
+																	</select>
+																	<select value={floor} onChange={(e) => setSecurity({ conversations: (draft.security.conversations ?? []).map((v, i) => (i === ci ? { ...v, floors: { ...(v.floors ?? {}), [cap]: e.target.value } } : v)) })} className={inputCls + " max-w-[9rem]"}>
+																		<option value="operator">≥ operator</option>
+																		<option value="admin">≥ admin</option>
+																	</select>
+																	<button type="button" onClick={() => {
+																		const floors = { ...(c.floors ?? {}) };
+																		delete floors[cap];
+																		setSecurity({ conversations: (draft.security.conversations ?? []).map((v, i) => (i === ci ? { ...v, floors } : v)) });
+																	}} className="shrink-0 text-xs text-rose-400 hover:text-rose-600">删除</button>
+																</div>
+															))}
+															<button type="button" onClick={() => setSecurity({ conversations: (draft.security.conversations ?? []).map((v, i) => (i === ci ? { ...v, floors: { ...(v.floors ?? {}), knowledge: "operator" } } : v)) })} className="mt-2 text-xs text-blue-500 hover:text-blue-600">＋ 添加能力门槛</button>
+														</div>
+													))}
+													<button type="button" onClick={() => setSecurity({ conversations: [...(draft.security.conversations ?? []), { id: "", floors: {} }] })} className="text-xs text-blue-500 hover:text-blue-600">＋ 添加会话门槛</button>
 												</div>
 											</div>
 										</>

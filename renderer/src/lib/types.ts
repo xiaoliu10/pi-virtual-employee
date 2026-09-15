@@ -177,7 +177,15 @@ export interface AppConfig {
 			urlTtlSec: number;
 		};
 	};
-	security: { adminStaffIds: string[] };
+	security: {
+		adminStaffIds: string[];
+		/** Per-person roles, resolved from the platform-verified sender id. */
+		people?: { staffId: string; name?: string; role: "viewer" | "operator" | "admin" }[];
+		/** Role for senders with no explicit entry (default "viewer"). */
+		defaultRole?: "viewer" | "operator" | "admin";
+		/** Per-conversation capability floors — they only ever tighten access. */
+		conversations?: { id: string; name?: string; floors?: Record<string, string> }[];
+	};
 }
 
 /** A deliverable document resource (file or online link) for integration partners. */

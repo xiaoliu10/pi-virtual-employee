@@ -14,6 +14,8 @@ import type { ReportService } from "../reports/report-service.js";
 import { EchoAdapter } from "./adapters/echo.js";
 import { DingtalkAdapter } from "./adapters/dingtalk.js";
 import type { IMAdapter, IMIO, InboundActor } from "./types.js";
+import { CAPABILITY_LABEL, checkPermission, describeAccess, isAdmin } from "../security/permissions.js";
+import { maskId } from "../engine/tools/admin.js";
 
 /** Shared deps handed to adapter factories that need them (e.g. image hosting). */
 export interface AdapterDeps {
@@ -207,6 +209,13 @@ export class IMAdapterManager {
 					const cmd = parseCommand(msg.text);
 					if (cmd) return this.runCommand(msg.conversationId, cmd, msg.actor, msg.text);
 
+					// Conversation admission floor (RBAC): a conversation may RAISE the
+					// minimum role needed to be served at all (security.conversations
+					// floors.chat). Checked server-side on the platform-verified actor —
+					// message text can never influence it.
+					const admission = checkPermission(this.config, msg.actor, msg.conversationId, "chat");
+					if (!admission.ok) return admission.reason;
+
 					const agent = this.engine.getOrCreateSession(msg.conversationId);
 
 					// Long-task progress heartbeat: every `longTaskProgressMin` while a
@@ -266,7 +275,7 @@ export class IMAdapterManager {
 	/** Handle deterministic slash commands, returning a text reply for the channel. */
 	private runCommand(
 		conversationId: string,
-		cmd: { name: "version" } | { name: "models" } | { name: "model"; arg: string } | { name: "compact" } | { name: "help" } | { name: "restart" },
+		cmd: { name: "version" } | { name: "models" } | { name: "model"; arg: string } | { name: "compact" } | { name: "help" } | { name: "perm" } | { name: "restart" },
 		actor?: InboundActor,
 		userText?: string,
 	): string | Promise<string> {
@@ -276,18 +285,32 @@ export class IMAdapterManager {
 				"/new — 中断当前回合并清空上下文，开启新会话",
 				"/compact — 压缩上下文（较早对话汇总为摘要，近期对话保留）",
 				"/stop — 中断当前回合（上下文保留）",
+				"/perm — 查看我在当前会话的权限（角色 + 各项能力是否放行）",
 				"/restart — 重启应用（仅管理员，单聊）",
 				"/version — 查看应用版本",
 				"/models — 列出可用模型",
 				"/model <序号或模型名> — 切换模型",
 			].join("\n");
 		}
+		if (cmd.name === "perm") {
+			const summary = describeAccess(this.config, actor, conversationId);
+			const who = summary.local || !actor
+				? "本机控制台会话（等同管理员）"
+				: `${actor.senderName ? `${actor.senderName}（` : ""}${actor.senderId ? maskId(actor.senderId) : "身份未知"}${actor.senderName ? "）" : ""}`;
+			const detail = Object.entries(CAPABILITY_LABEL)
+				.map(([key, label]) => `${checkPermission(this.config, actor, conversationId, key).ok ? "✅" : "⛔"} ${label}`)
+				.join("；");
+			return (
+				`当前身份：${who}；本会话有效角色：${summary.role}\n` +
+				`能力明细：${detail}\n` +
+				(summary.denied.length ? "被拒的能力请联系管理员开通（管理员在单聊中使用 manage_access）。" : "你当前拥有本会话的全部能力。")
+			);
+		}
 		if (cmd.name === "restart") {
-			// Same authorization model as admin identity tools: whitelisted admin,
+			// Same authorization model as admin identity tools: admin role,
 			// 1:1 only (a group has no reliable notion of who is allowed).
 			if (!actor || actor.chatType !== "single") return "⛔ /restart 仅限管理员在单聊中使用。";
-			const admins = this.config.all().security.adminStaffIds;
-			if (admins.length === 0 || !admins.includes(actor.senderId)) return "⛔ 仅管理员可以重启应用。";
+			if (!isAdmin(this.config, actor.senderId)) return "⛔ 仅管理员可以重启应用。";
 			if (!this.onRestart) return "当前运行方式不支持 IM 重启。";
 			// Let the reply flush to the channel before the process exits.
 			setTimeout(() => this.onRestart?.(), 1200);
@@ -374,13 +397,14 @@ function credChanged(prev: ImChannelConfig | undefined, next: ImChannelConfig): 
 
 /** The deterministic IM slash commands. /new and /stop are intercepted in
  * makeIO (they must bypass the queue); the rest run through runCommand. */
-function parseCommand(text: string): { name: "version" } | { name: "models" } | { name: "model"; arg: string } | { name: "compact" } | { name: "help" } | { name: "restart" } | null {
+function parseCommand(text: string): { name: "version" } | { name: "models" } | { name: "model"; arg: string } | { name: "compact" } | { name: "help" } | { name: "perm" } | { name: "restart" } | null {
 	const t = text.trim();
 	if (t === "/version" || t === "/ver") return { name: "version" };
 	if (t === "/models" || t === "/model") return { name: "models" };
 	const m = /^\/model\s+(.+)$/.exec(t);
 	if (m) return { name: "model", arg: m[1] };
 	if (t === "/compact") return { name: "compact" };
+	if (t === "/perm" || t === "/whoami" || t === "/me") return { name: "perm" };
 	if (t === "/restart") return { name: "restart" };
 	if (t === "/help" || t === "/?" ) return { name: "help" };
 	return null;

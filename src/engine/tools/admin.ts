@@ -23,6 +23,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { ConfigStore } from "../../db/config-store.js";
 import type { InboundActor } from "../../im/types.js";
+import { hasAnyAdmin, isAdmin } from "../../security/permissions.js";
 
 /** The actor context a tool call executes under (undefined = non-IM channel). */
 export type ActorContext = (InboundActor & { text: string }) | undefined;
@@ -107,12 +108,11 @@ export function requireConfirmedAdmin(
 	const gate = requireSingleChatActor(deps);
 	if ("content" in gate) return gate;
 	const { actor } = gate;
-	const adminIds = deps.config.all().security.adminStaffIds;
-	if (adminIds.length === 0) {
+	if (!hasAnyAdmin(deps.config)) {
 		return refuse("管理员尚未设置。请先在单聊中使用 manage_admin 的 claim 动作认领首位管理员。");
 	}
-	if (!adminIds.includes(actor.senderId)) {
-		return refuse("你不是本系统的管理员，无权执行此操作。如需管理员权限，请联系现有管理员在单聊中添加。");
+	if (!isAdmin(deps.config, actor.senderId)) {
+		return refuse("你不是本系统的管理员，无权执行此操作。如需管理员权限，请联系现有管理员在单聊中添加，或用 manage_access 指派 admin 角色。");
 	}
 	if (opts.needConfirmation && !isExplicitConfirmation(actor.text)) {
 		return refuse(
@@ -140,12 +140,11 @@ export function requireAdminForCommand(
 ): AdminRefusal | { actor: NonNullable<ActorContext> } {
 	const actor = deps.resolveActor(deps.conversationId);
 	if (actor && isSchedulerActor(actor)) {
-		const adminIds = deps.config.all().security.adminStaffIds;
-		if (adminIds.length === 0) {
+		if (!hasAnyAdmin(deps.config)) {
 			return refuse("管理员尚未设置，定时任务无法以任何管理员身份执行受控命令。");
 		}
-		if (!adminIds.includes(actor.senderId)) {
-			return refuse("创建该定时任务的管理员已被移出白名单，任务无法继续执行受控命令。");
+		if (!isAdmin(deps.config, actor.senderId)) {
+			return refuse("创建该定时任务的用户已被降权（不再是管理员/admin 角色），任务无法继续执行受控命令。");
 		}
 		return { actor };
 	}
@@ -180,8 +179,7 @@ function authorize(
 	const gate = requireSingleChatActor(deps);
 	if ("content" in gate) return gate;
 	const { actor } = gate;
-	const adminIds = deps.config.all().security.adminStaffIds;
-	if (adminIds.length === 0) {
+	if (!hasAnyAdmin(deps.config)) {
 		// Unclaimed deployment: the first explicit confirmer becomes first admin.
 		if (needConfirmation && !isExplicitConfirmation(actor.text)) {
 			return refuse(
@@ -191,8 +189,8 @@ function authorize(
 		console.log(`[admin] bootstrap: first admin claimed by ${actor.senderId} (${actor.channel})`);
 		return { actor, claimed: true };
 	}
-	if (!adminIds.includes(actor.senderId)) {
-		return refuse("你不是本系统的管理员，无权执行此操作。如需管理员权限，请联系现有管理员在单聊中添加。");
+	if (!isAdmin(deps.config, actor.senderId)) {
+		return refuse("你不是本系统的管理员，无权执行此操作。如需管理员权限，请联系现有管理员在单聊中添加，或用 manage_access 指派 admin 角色。");
 	}
 	return { actor, claimed: false };
 }
@@ -231,21 +229,30 @@ export function createManageAdminTool(deps: AdminToolDeps): AgentTool {
 				const actor = deps.resolveActor(deps.conversationId);
 				const isSingle = actor?.chatType === "single" && !!actor.senderId;
 				if (!isSingle) return refuse("管理员名单只能在 IM 单聊中查看。");
-				if (adminIds.length === 0) {
+				// Admins come from two places: the legacy whitelist plus role-assigned
+				// admins in security.people — report both so the list is complete.
+				const roleAdmins = (deps.config.all().security.people ?? []).filter((p) => p.role === "admin").map((p) => p.staffId);
+				const all = [...new Set([...adminIds, ...roleAdmins])];
+				if (all.length === 0) {
 					return {
 						content: [{ type: "text", text: "当前尚未设置任何管理员（系统未认领）。第一位在单聊中明确确认身份修改的人将成为首位管理员。" }],
 						details: { adminCount: 0 },
 					};
 				}
-				if (!adminIds.includes(actor!.senderId)) {
+				if (!isAdmin(deps.config, actor!.senderId)) {
 					return {
-						content: [{ type: "text", text: `当前已设置 ${adminIds.length} 位管理员。名单详情仅管理员可见。` }],
-						details: { adminCount: adminIds.length },
+						content: [{ type: "text", text: `当前已设置 ${all.length} 位管理员。名单详情仅管理员可见。` }],
+						details: { adminCount: all.length },
 					};
 				}
 				return {
-					content: [{ type: "text", text: `当前管理员共 ${adminIds.length} 位：${adminIds.join("、")}。` }],
-					details: { adminCount: adminIds.length },
+					content: [{
+						type: "text",
+						text:
+							`当前管理员共 ${all.length} 位：${all.join("、")}。` +
+							(roleAdmins.length ? `（其中 ${roleAdmins.length} 位来自 manage_access 的 admin 角色指派）` : ""),
+					}],
+					details: { adminCount: all.length, roleAssigned: roleAdmins.length },
 				};
 			}
 
@@ -290,7 +297,12 @@ export function createManageAdminTool(deps: AdminToolDeps): AgentTool {
 				return { content: [{ type: "text", text: `「${target}」不在管理员名单中。` }], details: { action, unchanged: true } };
 			}
 			if (current.length <= 1) {
-				return refuse("不能移除最后一位管理员（否则将没有任何人能通过对话管理系统）。如需更换，请先添加新的管理员。");
+				// Removing the last whitelist entry is only safe when another admin
+				// still exists via a role assignment in security.people.
+				const roleAdmins = (deps.config.all().security.people ?? []).filter((p) => p.role === "admin" && p.staffId !== target);
+				if (roleAdmins.length === 0) {
+					return refuse("不能移除最后一位管理员（否则将没有任何人能通过对话管理系统）。如需更换，请先添加新的管理员，或用 manage_access 指派另一位 admin 角色。");
+				}
 			}
 			const updated = deps.config.update({ security: { adminStaffIds: current.filter((id) => id !== target) } });
 			deps.onConfigChanged();
