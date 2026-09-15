@@ -399,6 +399,8 @@ test("list_members resolves a group by NAME and never guesses members", async (t
 	res = await tool.execute("m3", { action: "list_members", conversationName: "安静群" });
 	assert.equal(res.details.memberCount, 0);
 	assert.match(res.content[0].text, /不要凭群名推测成员/);
+	assert.match(res.content[0].text, /在这个群里 @ 我 随便说一句话/, "it hands over a usable next step");
+	assert.doesNotMatch(res.content[0].text, /staffId/, "and never sends the admin looking for an id");
 
 	res = await tool.execute("m3b", { action: "list_members", conversationName: "示例群" });
 	assert.equal(res.details.refused, true);
@@ -585,6 +587,8 @@ test("set_conversation_roles grants the whole observed roster, but spares the la
 	res = await tool.execute("b2", { action: "set_conversation_roles", conversationName: "安静群", role: "admin" });
 	assert.equal(res.details.refused, true);
 	assert.match(res.content[0].text, /没有已记录成员/);
+	assert.match(res.content[0].text, /@ 我 随便说一句话/, "the remedy is the group @, stated as an action");
+	assert.match(res.content[0].text, /不要去向对方索要 staffId/, "and the id route is refused explicitly");
 
 	// Bulk DEMOTION must skip the only admin and still apply to everyone else.
 	res = await tool.execute("b3", { action: "set_conversation_roles", conversationName: "内部群", role: "operator" });

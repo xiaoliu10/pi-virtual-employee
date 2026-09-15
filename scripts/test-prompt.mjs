@@ -113,6 +113,10 @@ test("the admin-facing rules never ask for an unlookupable id, and don't nag", (
 	// wording alone ("我建的任务都要能用"), not by the admin discovering an id.
 	assert.ok(prompt.includes("authorize_scheduled_task 授权"), "scheduled-task repair is routed");
 	assert.ok(prompt.includes("直接传 all=true 一次授权全部"), "…in one batch, not one by one");
+	// The bot must not OFFER the id route either — it did twice, and it is a dead
+	// end for anyone who isn't an enterprise admin in the developer console.
+	assert.ok(prompt.includes("不要建议对方去「钉钉后台查 staffId」"), "the id route must not be offered as a fallback");
+	assert.ok(prompt.includes("让对方在群里 @ 我 说一句话"), "the only real registration path is stated");
 	assert.ok(prompt.includes("风险提示只说一次，说完就执行"), "no repeated risk lectures");
 	assert.ok(prompt.includes("不要反复劝阻、不要要求二次确认"), "explicit acceptance is enough (one exception: group-wide admin)");
 });

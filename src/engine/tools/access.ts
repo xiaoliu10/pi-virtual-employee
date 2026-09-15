@@ -487,7 +487,9 @@ export function createManageAccessTool(deps: AccessToolDeps): AgentTool {
 							type: "text",
 							text:
 								`会话 ${convLabel} 目前没有已记录成员：机器人只登记**给机器人发过消息的人**（平台未必授予列群成员权限），` +
-								`该群还没有人发言过，或所指的群不对（可用 list 核对群名）。可让对方在群里 @ 我 说一句话后重试。不要凭群名推测成员。`,
+								`该群还没有人发言过，或所指的群不对（可用 list 核对群名）。` +
+								`让成员登记的办法只有一条（也能一次把整群人登记上）：**在这个群里 @ 我 随便说一句话**（例如「在」）。` +
+								`不要凭群名推测成员，也不要让对方去查任何 ID。`,
 						}],
 						details: { action, conversationId: conv, memberCount: 0 },
 					};
@@ -523,7 +525,9 @@ export function createManageAccessTool(deps: AccessToolDeps): AgentTool {
 				const members = deps.listMembers?.(conv) ?? [];
 				if (members.length === 0) {
 					return refuse(
-						`会话 ${convLabel} 没有已记录成员，无法批量授权：机器人只登记给机器人发过消息的人。请先用 list 核对群名，或让对方在群里 @ 我 发一条消息后重试；也可以改用 set_role person=<姓名> 逐个指派。`,
+						`会话 ${convLabel} 没有已记录成员，无法批量授权：机器人只登记**给机器人发过消息的人**，名单为空时它无从知道该给谁设权（平台未必授予读取群成员的权限）。` +
+							`解决办法：请该群的成员在群里 **@ 我 随便说一句话**（例如「在」），每个人说过一次就会被登记；之后再用 set_conversation_roles 传同一个群名即可整体设权。` +
+							`不要去向对方索要 staffId 之类的 ID——除企业管理员在开发者后台外，没人查得到。`,
 					);
 				}
 				const next = [...(sec.people ?? [])];
