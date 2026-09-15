@@ -97,7 +97,7 @@ function extractText(message: AgentMessage): string {
  * an intentional abort must not be retried.
  */
 const TRANSIENT_STREAM_ERROR =
-	/terminated|fetch failed|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|ETIMEDOUT|UND_ERR|overloaded|502|503/i;
+	/terminated|fetch failed|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|ETIMEDOUT|UND_ERR|overloaded|502|503|connection error|network error/i;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
