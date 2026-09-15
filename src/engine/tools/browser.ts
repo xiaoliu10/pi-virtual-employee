@@ -118,12 +118,13 @@ export function createBrowserTools(
 					savedPath = undefined;
 				}
 				const note = savedPath ? `\n（已保存到 ${savedPath}，可用 send_image 发给对方）` : "";
+				const coordNote = `\n（截图与视口 ${shot.viewport.width}x${shot.viewport.height} 1:1 对应——Canvas/远程桌面类页面上，可用 browser_click_at 按画面中的像素坐标点击）`;
 				return {
 					content: [
-						{ type: "text", text: `当前页面截图（${url}）：${note}` },
+						{ type: "text", text: `当前页面截图（${url}）：${note}${coordNote}` },
 						{ type: "image", data: shot.base64, mimeType: shot.mimeType },
 					],
-					details: { ok: true, url, mimeType: shot.mimeType, savedPath },
+					details: { ok: true, url, mimeType: shot.mimeType, savedPath, viewport: shot.viewport },
 				};
 			} catch (err) {
 				return errorResult(err);
@@ -265,5 +266,50 @@ export function createBrowserTools(
 		},
 	};
 
-	return [navigate, read, screenshot, click, type, pressKey, evaluate, tabs];
+	const clickAt: AgentTool = {
+		name: "browser_click_at",
+		label: "浏览器：坐标点击",
+		description:
+			"按屏幕坐标点击（原始鼠标输入），用于 Canvas 画布类页面——堡垒机/H5 远程桌面把远程屏幕画在 canvas 里，Navicat 等远程程序的按钮不是 DOM 元素，browser_click 点不到。" +
+			"用法：先 browser_screenshot 看清画面（截图与视口 1:1，1280x800），把目标按钮的像素坐标传进来；点击后目标（如远程会话）获得焦点。" +
+			"需要双击传 double=true，右键传 button=right。普通网页仍优先用 browser_click（按元素点更稳）。",
+		parameters: Type.Object({
+			x: Type.Number({ description: "像素 X 坐标（以 browser_screenshot 画面为准）" }),
+			y: Type.Number({ description: "像素 Y 坐标" }),
+			double: Type.Optional(Type.Boolean({ description: "true=双击" })),
+			button: Type.Optional(Type.String({ description: "left（默认）| right" })),
+		}),
+		async execute(_id, params) {
+			try {
+				const p = params as { x: number; y: number; double?: boolean; button?: string };
+				const r = await browser.mouseClick(resolveOwnerId(), p.x, p.y, {
+					double: p.double,
+					button: p.button === "right" ? "right" : "left",
+				});
+				return textResult(`已在坐标 (${r.x}, ${r.y}) 点击。目标若获得焦点，可用 browser_type_text / browser_press_key 键入，或再 screenshot 看结果。`, { x: r.x, y: r.y, double: !!p.double, button: p.button === "right" ? "right" : "left" });
+			} catch (err) {
+				return errorResult(err);
+			}
+		},
+	};
+
+	const typeText: AgentTool = {
+		name: "browser_type_text",
+		label: "浏览器：逐键输入文本",
+		description:
+			"把文本逐键敲进当前焦点（原始键盘输入）。主要用于 Canvas/远程桌面场景：先用 browser_click_at 点中远程会话里的输入框，再用本工具输入文本——远程程序不是 DOM，browser_type 填不进去。普通网页输入框仍优先 browser_type（有回读校验）。输入后通常接 browser_press_key Enter 提交。",
+		parameters: Type.Object({
+			text: Type.String({ description: "要键入的文本（逐键发送，约每键 30ms）" }),
+		}),
+		async execute(_id, params) {
+			try {
+				const r = await browser.keyboardType(resolveOwnerId(), (params as { text: string }).text);
+				return textResult(`已逐键输入 ${r.length} 个字符到当前焦点。`, { ok: true, length: r.length });
+			} catch (err) {
+				return errorResult(err);
+			}
+		},
+	};
+
+	return [navigate, read, screenshot, click, clickAt, type, typeText, pressKey, evaluate, tabs];
 }

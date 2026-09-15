@@ -55,6 +55,8 @@ const SCREENSHOT_QUALITY = 70;
 export interface BrowserScreenshot {
 	base64: string;
 	mimeType: "image/jpeg";
+	/** Viewport size — screenshot pixels map 1:1 to coordinate tools (mouseClick). */
+	viewport: { width: number; height: number };
 }
 
 export class BrowserService {
@@ -310,6 +312,39 @@ export class BrowserService {
 	}
 
 	/**
+	 * Raw coordinate click — for CANVAS apps (H5 remote-desktop clients, 堡垒机
+	 * web terminals, games): the remote UI is painted pixels, not DOM elements,
+	 * so selector-based click can't reach it. `page.mouse` operates at the
+	 * browser input level, exactly like a real user's mouse. Pair with
+	 * screenshot (viewport 1:1) for the model to pick coordinates.
+	 */
+	async mouseClick(
+		ownerId: string,
+		x: number,
+		y: number,
+		opts: { button?: "left" | "right"; double?: boolean } = {},
+	): Promise<{ ok: boolean; x: number; y: number }> {
+		const page = await this.getPage(ownerId);
+		if (x < 0 || y < 0 || x > VIEWPORT.width || y > VIEWPORT.height) {
+			throw new Error(`坐标 (${x}, ${y}) 超出视口 ${VIEWPORT.width}x${VIEWPORT.height}——请以 browser_screenshot 的画面为准（1:1 对应）`);
+		}
+		await page.mouse.move(x, y);
+		await page.mouse.click(x, y, { button: opts.button ?? "left", clickCount: opts.double ? 2 : 1 });
+		return { ok: true, x, y };
+	}
+
+	/**
+	 * Type text key-by-key into whatever has focus (raw keyboard input). After
+	 * mouseClick lands focus inside a canvas remote session, this is how text
+	 * reaches the remote machine — browser_type (DOM fill) can't see it.
+	 */
+	async keyboardType(ownerId: string, text: string): Promise<{ ok: boolean; length: number }> {
+		const page = await this.getPage(ownerId);
+		await page.keyboard.type(text, { delay: 30 });
+		return { ok: true, length: text.length };
+	}
+
+	/**
 	 * Run arbitrary JS in the current page and return the result as short text.
 	 * `script` is evaluated as an expression (wrap multi-statement logic in an
 	 * IIFE: `(() => { …; return x; })()`). Runs only on the already-allowed page,
@@ -356,11 +391,12 @@ export class BrowserService {
 		return { url: page.url(), title: await page.title(), text: raw.slice(0, TEXT_LIMIT), truncated };
 	}
 
-	/** Full-page-ish screenshot (current viewport) as base64 JPEG (see SCREENSHOT_QUALITY). */
+	/** Full-page-ish screenshot (current viewport) as base64 JPEG (see SCREENSHOT_QUALITY).
+	 *  Dimensions equal the viewport (1:1 with coordinate tools — mouseClick etc.). */
 	async screenshot(ownerId: string): Promise<BrowserScreenshot> {
 		const page = await this.getPage(ownerId);
 		const buf = await page.screenshot({ type: "jpeg", quality: SCREENSHOT_QUALITY });
-		return { base64: buf.toString("base64"), mimeType: "image/jpeg" };
+		return { base64: buf.toString("base64"), mimeType: "image/jpeg", viewport: { ...VIEWPORT } };
 	}
 
 	async currentUrl(ownerId: string): Promise<string> {
