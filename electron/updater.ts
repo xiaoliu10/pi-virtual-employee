@@ -415,6 +415,44 @@ function sweepStaleUpdaterTemps(): void {
 let epermRetriedForVersion: string | undefined;
 let epermRetryTimer: NodeJS.Timeout | undefined;
 
+/**
+ * Sweep old install-dir backups (`<instDir>.old-*`) older than 7 days. The
+ * watchdog removes its own backup after a successful install, and manual
+ * rescues (rename + fresh install per the runbook) leave theirs for rollback —
+ * either way, leftovers accumulate (~0.4GB each). 7 days is a comfortable
+ * observation window; anything older is junk. Runs at startup and before each
+ * update check (idempotent, near-free).
+ */
+const BACKUP_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+function sweepOldInstallBackups(): void {
+	if (process.platform !== "win32") return;
+	const localAppData = process.env.LOCALAPPDATA;
+	if (!localAppData) return;
+	const programsDir = join(localAppData, "Programs");
+	const prefix = "Pi Virtual Employee.old-";
+	let entries: string[];
+	try {
+		entries = readdirSync(programsDir);
+	} catch {
+		return;
+	}
+	const cutoff = Date.now() - BACKUP_RETENTION_MS;
+	for (const name of entries) {
+		if (!name.startsWith(prefix)) continue;
+		const full = join(programsDir, name);
+		try {
+			if (statSync(full).mtimeMs > cutoff) continue;
+			rmSync(full, { recursive: true, force: true });
+			log("INFO", `swept old install backup (>7d): ${full}`);
+		} catch (err) {
+			// Locked leftovers (files held open during a wedged install) retry on
+			// the next sweep — never fatal.
+			log("WARN", `could not sweep old install backup ${full}: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+}
+
 /** Wire electron-updater events → UpdateState. Called once at setup. */
 function wireEvents(): void {
 	autoUpdater.on("checking-for-update", () => {
@@ -1085,8 +1123,10 @@ export async function checkNow(): Promise<UpdateState> {
 	if (checking) return lastState;
 	// 小派 got wedged for 12h+ by one stale temp file in the shared updater
 	// cache — clear old partials before every check so a leftover can't block
-	// the next download.
+	// the next download. Also piggyback the 7-day .old-* install-backup sweep
+	// so manual-rescue leftovers can't accumulate (a check runs every 6h).
 	sweepStaleUpdaterTemps();
+	sweepOldInstallBackups();
 	try {
 		await autoUpdater.checkForUpdates();
 		feedRetryStreak = 0;
@@ -1195,6 +1235,7 @@ export function setupAutoUpdater(win: BrowserWindow): void {
 	// target, that install actually succeeded before relaunch — clear the count
 	// so future updates to NEW versions aren't blocked by stale breakers.
 	reconcilePendingInstall();
+	sweepOldInstallBackups();
 	const current = app.getVersion();
 	for (const [version, record] of Object.entries(loadFailures().versions ?? {})) {
 		if (compareVersions(current, version) >= 0) {
