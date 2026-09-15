@@ -18,7 +18,7 @@ import type { InboundActor } from "../im/types.js";
 import { inferConversationOrigin } from "../db/history-store.js";
 import { buildSystemPrompt } from "./prompt.js";
 import { createKnowledgeTool } from "./tools/knowledge.js";
-import { createSaveToKnowledgeTool } from "./tools/save-knowledge.js";
+import { createSaveToKnowledgeTool, createRememberTool } from "./tools/save-knowledge.js";
 import { createManageKnowledgeTool } from "./tools/manage-knowledge.js";
 import { createSaveToSkillTool } from "./tools/save-skill.js";
 import { createRefreshSkillsTool } from "./tools/refresh-skills.js";
@@ -53,6 +53,8 @@ export interface ToolSetOptions {
 	reportsEnabled: boolean;
 	downloadsEnabled: boolean;
 	knowledge: KnowledgeService;
+	/** Fired after a memory entry is saved — bumps the prompt revision so live sessions rebuild with the fresh index. */
+	onMemoryChanged?: () => void;
 	browser: BrowserService;
 	computer?: ComputerService;
 	scheduler: SchedulerService;
@@ -116,7 +118,10 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 	const tools: AgentTool<any>[] = [];
 	if (options.kbEnabled) {
 		tools.push(createKnowledgeTool(options.knowledge));
-		if (options.learnEnabled) tools.push(createSaveToKnowledgeTool(options.knowledge));
+		if (options.learnEnabled) {
+			tools.push(createSaveToKnowledgeTool(options.knowledge));
+			tools.push(createRememberTool(options.knowledge, options.onMemoryChanged));
+		}
 		if (options.manageEnabled) tools.push(createManageKnowledgeTool(options.knowledge));
 		if (options.researchEnabled) tools.push(createResearchWebTool(options.knowledge));
 	}

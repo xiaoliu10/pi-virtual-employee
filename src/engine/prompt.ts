@@ -31,6 +31,12 @@ export interface PromptParts {
 	/** Running packaged application version, injected into the non-overridable identity block. */
 	appVersion?: string;
 	skillsBlock?: string;
+	/**
+	 * Always-on memory index (one line per entry: "标题 — 摘要"). User-specific
+	 * long-term facts that surface in every session WITHOUT a KB query; full
+	 * text lives in the knowledge base (entries tagged memory).
+	 */
+	memoryLines?: string[];
 	/** Employee reply language (drives the language directive). Defaults to zh-CN. */
 	language?: Language;
 	/** Optional override for the core behavioral rules (replaces the built-in 工作准则). */
@@ -57,6 +63,13 @@ export function buildSystemPrompt(parts: PromptParts): string {
 	const serviceHours = parts.serviceHours?.trim() || FALLBACK_HOURS;
 	const base = buildBase({ displayName, role, duty, serviceHours, appVersion: parts.appVersion, kbEnabled: parts.kbEnabled, learnEnabled: parts.learnEnabled ?? false, manageEnabled: parts.manageEnabled ?? false, researchEnabled: parts.researchEnabled ?? false, browserEnabled: parts.browserEnabled ?? false, schedulerEnabled: parts.schedulerEnabled ?? false, documentsEnabled: parts.documentsEnabled ?? false, filesystemEnabled: parts.filesystemEnabled ?? false, reportsEnabled: parts.reportsEnabled ?? false, downloadsEnabled: parts.downloadsEnabled ?? false, customRules: parts.rules, language: parts.language ?? "zh-CN" });
 	const sections = [base];
+	if (parts.memoryLines?.length) {
+		sections.push(
+			"## 长期记忆（关于本用户/管理者，自动携带）\n" +
+				parts.memoryLines.map((l) => `- ${l}`).join("\n") +
+				"\n（以上记忆全文在知识库中，可用 search_knowledge_base 检索；发现过时或有补充，用 remember 以同标题重存即更新。）",
+		);
+	}
 	if (parts.skillsBlock?.trim()) sections.push(parts.skillsBlock.trim());
 	if (parts.extra?.trim()) {
 		sections.push(`## 管理者追加指令\n以下补充要求同样必须遵守：\n\n${parts.extra.trim()}`);
@@ -132,9 +145,9 @@ function capabilityRules(c: RulesCtx): string {
 			"数组元素用数字段定位（如 im.channels.0.enabled）；apiKey 等密钥可设置但回显会自动打码。管理员名单与员工身份请分别引导到 manage_admin / update_identity。" +
 			"严禁回答「该配置只能在桌面设置页修改 / 我这边没有操作 UI 的通道」——只要在 IM 单聊里就有完整配置能力。",
 	);
-	// Knowledge-vs-skill routing is an always-on rule (skill authoring is always
-	// available), and it must override a vague "整理一下" default rather than be
-	// guessed from content shape.
+	// Knowledge-vs-skill-vs-memory routing is an always-on rule (skill authoring
+	// is always available), and it must override a vague "整理一下" default
+	// rather than be guessed from content shape.
 	lines.push(
 		"- **知识库 vs 技能（Skill）二选一**：整理/沉淀内容时，只按对方是否**明确提到技能**来分流，不要凭内容像不像流程自行判断。" +
 			"只有对方明确说「做成技能 / 创建 Skill / 整理成技能 / 更新或修改某个技能」时，才调用 save_to_skill 写一个技能；" +
@@ -150,7 +163,8 @@ function capabilityRules(c: RulesCtx): string {
 	);
 	if (c.learnEnabled)
 		lines.push(
-			"- 发现可复用的规则、操作经验、对方偏好或纠错信息时，主动调用 save_to_knowledge 工具沉淀成知识库条目（标题简明、内容写清适用条件），让后续能被 search_knowledge_base 检索复用，减少重复解释。注意：save_to_knowledge 只写知识库、不创建技能；如对方明确要技能，改用 save_to_skill。",
+			"- 发现可复用的规则、操作经验时，主动调用 save_to_knowledge 工具沉淀成知识库条目（标题简明、内容写清适用条件），让后续能被 search_knowledge_base 检索复用，减少重复解释。注意：save_to_knowledge 只写知识库、不创建技能；如对方明确要技能，改用 save_to_skill。" +
+				"而关于对方个人的偏好、纠错、自身/环境情况（「我是…」「以后…」「记住…」「别再…」），不要写知识库——用 remember 写入记忆，之后每个会话自动携带；被对方明确纠错时也应立即 remember，避免重复犯错。",
 		);
 	if (c.manageEnabled)
 		lines.push(

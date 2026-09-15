@@ -130,6 +130,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * without aborting any other in-flight turn.
 	 */
 	private skillsRevision = 0;
+	/** Bumped when a memory entry is written — sessions rebuild so the always-on memory index stays fresh. */
+	private memoryRevision = 0;
 	/** Conversation-side updater operations; absent outside packaged Electron. */
 	private updates?: UpdateOperations;
 	/** Per-conversation file-sender for the turn in flight (set/cleared in send()). */
@@ -395,7 +397,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// will be rebuilt on its next inbound message.
 		if (cached) {
 			const builtAt = (cached as Agent & { __skillsRevision?: number }).__skillsRevision ?? 0;
-			if (builtAt >= this.skillsRevision || cached.state.isStreaming) return cached;
+			if ((builtAt >= this.skillsRevision && builtAt >= this.memoryRevision) || cached.state.isStreaming) return cached;
 			this.sessions.delete(conversationId);
 		}
 
@@ -404,24 +406,29 @@ export class EmployeeEngine implements EmployeeRuntime {
 		const skills = this.getCachedSkills();
 		const disabled = new Set(cfg.skills?.disabled ?? []);
 		const activeSkills = pickActiveSkills(skills, disabled);
-		const agent = new Agent({
-			initialState: {
-				systemPrompt: buildSystemPrompt({
-					name: cfg.identity.name,
-					appVersion: this.updates?.getStatus().currentVersion,
-					role: cfg.identity.role,
-					duty: cfg.identity.duty,
-					serviceHours: cfg.identity.serviceHours,
-					kbEnabled: cfg.kb.enabled,
-					learnEnabled: cfg.kb.learn.enabled,
-					manageEnabled: cfg.kb.manage.enabled,
-					researchEnabled: cfg.kb.research.enabled,
-					browserEnabled: cfg.browser.enabled,
-					schedulerEnabled: cfg.scheduler.enabled,
-					documentsEnabled: cfg.documents.enabled,
-					filesystemEnabled: cfg.filesystem.enabled,
-					reportsEnabled: cfg.reports.enabled,
-					skillsBlock: formatInlineSkills(activeSkills),
+			const agent = new Agent({
+				initialState: {
+					systemPrompt: buildSystemPrompt({
+						name: cfg.identity.name,
+						appVersion: this.updates?.getStatus().currentVersion,
+						role: cfg.identity.role,
+						duty: cfg.identity.duty,
+						serviceHours: cfg.identity.serviceHours,
+						kbEnabled: cfg.kb.enabled,
+						learnEnabled: cfg.kb.learn.enabled,
+						manageEnabled: cfg.kb.manage.enabled,
+						researchEnabled: cfg.kb.research.enabled,
+						browserEnabled: cfg.browser.enabled,
+						schedulerEnabled: cfg.scheduler.enabled,
+						documentsEnabled: cfg.documents.enabled,
+						filesystemEnabled: cfg.filesystem.enabled,
+						reportsEnabled: cfg.reports.enabled,
+						skillsBlock: formatInlineSkills(activeSkills),
+						// Always-on memory index: user-specific facts (preferences,
+						// corrections, standing context) visible WITHOUT a KB query.
+						memoryLines: this.knowledge
+							.listMemoryIndex()
+							.map((m) => `${m.title} — ${m.snippet}`),
 					rules: cfg.prompt.rules,
 					extra: cfg.prompt.extra,
 					language: cfg.general.language,
@@ -431,7 +438,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 					isScheduledRun: conversationId.startsWith("sched:"),
 				}),
 				model: this.buildModel(supplier, modelId),
-				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } } }),
+				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } } }),
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
 				messages: rehydrateMessages(this.history.listMessages(conversationId)),
@@ -445,7 +452,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 		});
 
 		this.applyToolStepCap(agent);
-		(agent as Agent & { __skillsRevision?: number }).__skillsRevision = this.skillsRevision;
+		const revision = Math.max(this.skillsRevision, this.memoryRevision);
+		(agent as Agent & { __skillsRevision?: number }).__skillsRevision = revision;
 		this.sessions.set(conversationId, agent);
 		return agent;
 	}
@@ -513,6 +521,14 @@ export class EmployeeEngine implements EmployeeRuntime {
 	async markSkillsChanged(): Promise<void> {
 		await this.refreshSkills();
 		this.markConfigChanged();
+	}
+
+	/**
+	 * A memory entry was written (remember tool) — bump the revision so cached
+	 * sessions rebuild with the fresh always-on memory index on their next turn.
+	 */
+	markMemoryChanged(): void {
+		this.memoryRevision += 1;
 	}
 
 	/** Mark cached sessions stale after a prompt/tool/config change. The current

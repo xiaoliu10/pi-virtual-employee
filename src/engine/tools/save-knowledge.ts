@@ -99,3 +99,38 @@ export function createSaveToKnowledgeTool(knowledge: KnowledgeService): AgentToo
 		},
 	};
 }
+
+/**
+ * Build the memory-capture tool. Memory entries are KB entries tagged "memory";
+ * their index is injected into EVERY session prompt (query-free recall), so
+ * user-specific facts — preferences, corrections, standing context — survive
+ * across conversations. Same-title saves merge (update-over-append). `onSaved`
+ * bumps the engine's prompt revision so live sessions pick up the new index.
+ */
+export function createRememberTool(knowledge: KnowledgeService, onSaved?: () => void): AgentTool {
+	return {
+		name: "remember",
+		label: "记住要点",
+		description:
+			"把关于当前用户/管理者的长期事实写入记忆：对方的偏好、对做法的纠正、自身或环境情况（「我是…」「以后…」「记住…」「别再…」）、进行中的重要状态。" +
+			"记忆之后每个会话自动携带，避免重复犯错、重复询问、重复自我介绍。同标题自动合并（重存即更新）。" +
+			"不要用于客观知识（规则/流程/地址 → save_to_knowledge）或操作步骤（→ save_to_skill）。",
+		parameters: Type.Object({
+			title: Type.String({ description: "记忆标题，简明点名主题（如「张工偏好：prompt 用可复制文本框交付」）" }),
+			content: Type.String({ description: "记忆正文：一到三句话写清事实与适用语境" }),
+		}),
+		async execute(_toolCallId, params) {
+			const p = params as { title: string; content: string };
+			try {
+				const r = knowledge.saveMemory({ title: p.title, content: p.content });
+				onSaved?.();
+				return {
+					content: [{ type: "text", text: r.merged ? `已更新记忆「${p.title}」。` : `已记住「${p.title}」，后续所有会话自动携带。` }],
+					details: { ok: true, id: r.id, merged: r.merged },
+				};
+			} catch (err) {
+				return { content: [{ type: "text", text: `记忆保存失败：${(err as Error).message}` }], details: { ok: false } };
+			}
+		},
+	};
+}

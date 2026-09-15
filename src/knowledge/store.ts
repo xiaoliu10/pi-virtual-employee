@@ -118,6 +118,21 @@ export class KnowledgeContentStore {
 			.all() as KnowledgeEntry[];
 	}
 
+	/**
+	 * Memory-layer entries: live entries carrying the "memory" tag (the
+	 * always-injected user-specific memory index rides on the KB store — no
+	 * separate schema). Newest first.
+	 */
+	listMemory(limit = 30): KnowledgeEntry[] {
+		return this.db
+			.prepare(
+				`SELECT * FROM kb_entries
+				 WHERE archived = 0 AND (',' || COALESCE(tags, '') || ',') LIKE '%,memory,%'
+				 ORDER BY updated_at DESC LIMIT ?`,
+			)
+			.all(limit) as KnowledgeEntry[];
+	}
+
 	upsertEntry(input: { id?: string; title: string; tags: string; content: string }): KnowledgeEntry {
 		const now = Date.now();
 		const id = input.id ?? randomUUID();

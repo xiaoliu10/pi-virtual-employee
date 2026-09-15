@@ -110,6 +110,26 @@ export class KnowledgeService {
 	}
 
 	/**
+	 * Memory layer (rides on the KB): entries tagged "memory" are user-specific
+	 * long-term facts injected as an always-on index into every session prompt —
+	 * unlike regular knowledge they surface WITHOUT a query. Same-title saves
+	 * merge (update-over-append), so correcting a memory is just re-saving it.
+	 */
+	saveMemory(input: { title: string; content: string }): { id: string; merged: boolean } {
+		return this.saveLearned({ ...input, tags: "memory" });
+	}
+
+	/** Compact memory index for prompt injection (one line per entry). */
+	listMemoryIndex(limit = 30): { id: string; title: string; snippet: string; updatedAt: number }[] {
+		return this.store.listMemory(limit).map((e) => ({
+			id: e.id,
+			title: e.title,
+			snippet: e.content.replace(/\s+/g, " ").trim().slice(0, 100),
+			updatedAt: e.updated_at,
+		}));
+	}
+
+	/**
 	 * Revise an existing entry — the corrective-overwrite path. mode="replace"
 	 * overwrites content (a correction); mode="append" adds to it. Bumps version.
 	 * Used by save_to_knowledge when the LLM refines an existing entry by id.
