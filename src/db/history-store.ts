@@ -29,6 +29,15 @@ export interface MessageRow {
 	created_at: number;
 }
 
+/** One observed participant of an IM conversation (the roster row). */
+export interface MemberRow {
+	staff_id: string;
+	name: string | null;
+	first_seen_at: number;
+	last_seen_at: number;
+	message_count: number;
+}
+
 export class HistoryStore {
 	constructor(private readonly db: DB) {}
 
@@ -121,6 +130,36 @@ export class HistoryStore {
 			.run(id, conversationId, role, content, now);
 		this.touch(conversationId);
 		return { id, conversation_id: conversationId, role, content, created_at: now };
+	}
+
+	/**
+	 * Record that a platform-verified sender appeared in a conversation. Called
+	 * for EVERY inbound IM message — including ones we refuse to serve — because
+	 * the roster is what lets an admin say "给这个群的人设权限" without knowing
+	 * staffIds. Idempotent per (conversation, sender): repeats bump the counter and
+	 * last-seen, and fill in a name the first time one is known.
+	 */
+	recordMember(conversationId: string, staffId: string, name?: string): void {
+		const now = Date.now();
+		this.db
+			.prepare(
+				`INSERT INTO conversation_members (conversation_id, staff_id, name, first_seen_at, last_seen_at, message_count)
+				 VALUES (?, ?, ?, ?, ?, 1)
+				 ON CONFLICT(conversation_id, staff_id) DO UPDATE SET
+					last_seen_at = excluded.last_seen_at,
+					message_count = message_count + 1,
+					name = COALESCE(NULLIF(excluded.name, ''), name)`,
+			)
+			.run(conversationId, staffId, name?.trim() || null, now, now);
+	}
+
+	/** Observed participants of one conversation, most recently active first. */
+	listMembers(conversationId: string): MemberRow[] {
+		return this.db
+			.prepare(
+				"SELECT staff_id, name, first_seen_at, last_seen_at, message_count FROM conversation_members WHERE conversation_id = ? ORDER BY last_seen_at DESC",
+			)
+			.all(conversationId) as MemberRow[];
 	}
 }
 

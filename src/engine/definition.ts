@@ -118,6 +118,11 @@ export interface ToolSetOptions {
 	 * group's id to apply floors to without knowing DingTalk's openConversationId).
 	 */
 	listConversations?: () => { id: string; title: string | null; origin: string }[];
+	/**
+	 * Observed participants of a conversation (senders whose messages we've seen).
+	 * Resolves "给这个群的人设权限" to real staffIds instead of a guess.
+	 */
+	listMembers?: (conversationId: string) => { staffId: string; name: string | null; lastSeenAt: number; messageCount: number }[];
 }
 
 /** Assemble the employee's tools; capability tools are conditional on their config flags. */
@@ -197,6 +202,7 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 		onConfigChanged: options.onConfigChanged,
 		conversationId: options.conversationId,
 		listConversations: options.listConversations,
+		listMembers: options.listMembers,
 	};
 	tools.push(createManageAdminTool(adminDeps), createUpdateIdentityTool(adminDeps));
 	// RBAC: one read-only self-query for any sender (check_my_access) plus the

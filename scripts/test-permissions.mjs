@@ -8,7 +8,7 @@
  * the last-admin guards, and normalization of hand-edited config files.
  */
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { after, test } from "node:test";
 import { dirname, join } from "node:path";
@@ -23,6 +23,7 @@ await build({
 	stdin: {
 		contents: `
 			export { ConfigStore } from "./src/db/config-store.ts";
+			export { HistoryStore } from "./src/db/history-store.ts";
 			export { checkPermission, resolveRole, hasAnyAdmin, isAdmin, describeAccess, CAPABILITY_LABEL } from "./src/security/permissions.ts";
 			export { createManageAccessTool, createCheckMyAccessTool } from "./src/engine/tools/access.ts";
 		`,
@@ -37,6 +38,7 @@ await build({
 });
 const {
 	ConfigStore,
+	HistoryStore,
 	checkPermission,
 	resolveRole,
 	hasAnyAdmin,
@@ -57,6 +59,31 @@ function store(t, seed = {}) {
 }
 
 const actor = (senderId, chatType = "single", text = "") => ({ senderId, chatType, channel: "dingtalk", text });
+
+/** Roster store on an in-memory DB carrying the real schema's columns. */
+function roster(t) {
+	const db = new DatabaseSync(":memory:");
+	db.exec(`
+		CREATE TABLE conversation_members (
+			conversation_id TEXT NOT NULL,
+			staff_id        TEXT NOT NULL,
+			name            TEXT,
+			first_seen_at   INTEGER NOT NULL,
+			last_seen_at    INTEGER NOT NULL,
+			message_count   INTEGER NOT NULL DEFAULT 1,
+			PRIMARY KEY (conversation_id, staff_id)
+		);
+	`);
+	t.after(() => db.close());
+	return new HistoryStore(db);
+}
+
+/** The exact member shape engine.ts hands to the access tool. */
+const asDep = (members) =>
+	members.map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count }));
+
+/** Tie-break the roster's recency ordering when a test asserts on it. */
+const tick = () => new Promise((r) => setTimeout(r, 3));
 
 test("role precedence: people[] > adminStaffIds > defaultRole", (t) => {
 	const { config } = store(t, {
@@ -287,4 +314,150 @@ test("normalization keeps the policy through a save/load round trip and drops ju
 	], "invalid floor values are KEPT so the permission check can fail closed on them");
 	assert.equal(checkPermission(reloadedStore, actor("boss"), "dt:group:prod", "knowledge").ok, false,
 		"a typo'd floor value (sudo) denies everyone until an admin fixes it");
+});
+
+test("the roster accumulates inbound senders: idempotent, name-backfilling, per-conversation", (t) => {
+	const store = roster(t);
+	store.recordMember("dt:group:g1", "alice", "成员A");
+	store.recordMember("dt:group:g1", "bob");
+	store.recordMember("dt:other", "alice");
+
+	let rows = store.listMembers("dt:group:g1");
+	assert.equal(rows.length, 2);
+	assert.equal(rows.find((r) => r.staff_id === "alice").message_count, 1);
+
+	// A repeat from the same sender must bump the counter, not add a row…
+	store.recordMember("dt:group:g1", "alice");
+	rows = store.listMembers("dt:group:g1");
+	assert.equal(rows.length, 2, "the same sender never appears twice");
+	assert.equal(rows.find((r) => r.staff_id === "alice").message_count, 2);
+	assert.equal(rows.find((r) => r.staff_id === "alice").name, "成员A");
+	assert.ok(rows.find((r) => r.staff_id === "alice").last_seen_at >= rows.find((r) => r.staff_id === "bob").last_seen_at);
+
+	// …a late name fills in, but a nameless repeat must NOT erase a known name.
+	store.recordMember("dt:group:g1", "bob", "成员B");
+	store.recordMember("dt:group:g1", "bob");
+	assert.equal(store.listMembers("dt:group:g1").find((r) => r.staff_id === "bob").name, "成员B");
+
+	// The roster is keyed by conversation: another chat's members are not leaked.
+	assert.deepEqual(store.listMembers("dt:other").map((r) => r.staff_id), ["alice"]);
+	assert.deepEqual(store.listMembers("dt:unknown"), []);
+});
+
+test("the roster table in sqlite.ts matches the upsert's conflict target", async () => {
+	// The store and the schema drift silently if this ever changes: an upsert
+	// against a missing/renamed PRIMARY KEY throws at the worst moment (first IM
+	// message after an upgrade), and the error is swallowed by the best-effort
+	// wrapper, so the roster would just stay empty.
+	const source = await readFile(join(root, "src/db/sqlite.ts"), "utf8");
+	const block = source.slice(source.indexOf("CREATE TABLE IF NOT EXISTS conversation_members"));
+	const ddl = block.slice(0, block.indexOf(");") + 2);
+	for (const column of ["conversation_id", "staff_id", "name", "first_seen_at", "last_seen_at", "message_count"]) {
+		assert.ok(ddl.includes(column), `schema is missing column ${column}`);
+	}
+	assert.match(ddl, /PRIMARY KEY\s*\(\s*conversation_id\s*,\s*staff_id\s*\)/, "the upsert's ON CONFLICT target must exist");
+});
+
+test("list_members demands an explicit conversation and never guesses members", async (t) => {
+	const { config } = store(t, { security: { adminStaffIds: ["boss"] } });
+	const store2 = roster(t);
+	store2.recordMember("dt:group:prod", "alice", "成员A");
+	await tick();
+	store2.recordMember("dt:group:prod", "bob", "成员B");
+	const tool = createManageAccessTool({
+		config,
+		resolveActor: () => actor("boss", "single", "看看成员"),
+		onConfigChanged: () => {},
+		conversationId: "dt:boss",
+		listConversations: () => [
+			{ id: "dt:group:prod", title: "生产群", origin: "im" },
+			{ id: "9f0c-console", title: "本地会话", origin: "console" },
+		],
+		listMembers: (cid) => asDep(store2.listMembers(cid)),
+	});
+
+	// No conversationId: the whole point of the group-identity fix — in a 1:1 chat
+	// there is no "current group", so the tool must ask instead of assuming one.
+	let res = await tool.execute("m1", { action: "list_members" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /缺少 conversationId/);
+	assert.match(res.content[0].text, /生产群/, "it offers the known IM conversations to pick from");
+
+	res = await tool.execute("m2", { action: "list_members", conversationId: "dt:group:prod" });
+	assert.equal(res.details.memberCount, 2);
+	assert.match(res.content[0].text, /只含给机器人发过消息的人/, "the roster's incompleteness is stated, not hidden");
+	assert.match(res.content[0].text, /成员A/);
+	assert.deepEqual(res.details.members.map((m) => m.staffId), ["bob", "alice"], "most recently active first");
+
+	res = await tool.execute("m3", { action: "list_members", conversationId: "dt:group:quiet" });
+	assert.equal(res.details.memberCount, 0);
+	assert.match(res.content[0].text, /不要凭群名推测成员/);
+
+	// Non-admins cannot enumerate who is in which chat.
+	const member = createManageAccessTool({
+		config, resolveActor: () => actor("alice", "single", "名单"), onConfigChanged: () => {},
+		conversationId: "dt:alice", listMembers: (cid) => asDep(store2.listMembers(cid)),
+	});
+	res = await member.execute("m4", { action: "list_members", conversationId: "dt:group:prod" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /不是本系统的管理员/);
+});
+
+test("set_conversation_roles grants the whole observed roster, but spares the last admin", async (t) => {
+	const { config } = store(t, { security: { adminStaffIds: [], defaultRole: "viewer", people: [{ staffId: "solo", role: "admin", name: "我" }] } });
+	const store2 = roster(t);
+	store2.recordMember("dt:group:prod", "solo", "我");
+	await tick();
+	store2.recordMember("dt:group:prod", "alice", "成员A");
+	const tool = createManageAccessTool({
+		config,
+		resolveActor: () => actor("solo", "single", "确认"),
+		onConfigChanged: () => {},
+		conversationId: "dt:solo",
+		listMembers: (cid) => asDep(store2.listMembers(cid)),
+	});
+
+	// No target conversation ⇒ refuse (this is what "给群内所有人加管理员" hits).
+	let res = await tool.execute("b1", { action: "set_conversation_roles", role: "admin" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /没有「当前群」的语境/);
+
+	// Unknown/quiet conversation ⇒ refuse rather than silently granting nobody.
+	res = await tool.execute("b2", { action: "set_conversation_roles", conversationId: "dt:group:quiet", role: "admin" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /没有已记录成员/);
+
+	// Bulk DEMOTION must skip the only admin and still apply to everyone else.
+	res = await tool.execute("b3", { action: "set_conversation_roles", conversationId: "dt:group:prod", role: "operator" });
+	assert.equal(res.details.changed, 1);
+	assert.match(res.content[0].text, /成员A/);
+	assert.ok(res.details.skipped.some((s) => s.includes("最后一位管理员")));
+	assert.equal(resolveRole(config, "solo"), "admin", "the deployment keeps an admin");
+	assert.equal(resolveRole(config, "alice"), "operator");
+
+	// Promoting the roster to admin is applied per member, with the scope warning.
+	res = await tool.execute("b4", { action: "set_conversation_roles", conversationId: "dt:group:prod", role: "admin" });
+	assert.equal(res.details.changed, 1, "solo already is admin — no redundant write");
+	assert.deepEqual(res.details.skipped, ["我（已是 admin）"]);
+	assert.match(res.content[0].text, /⚠️/, "it warns that these are system-wide admins, not group-local");
+	assert.match(res.content[0].text, /默认角色/);
+	assert.equal(isAdmin(config, "alice"), true);
+
+	// A bulk demotion can never empty the admin seat, even when every member of
+	// the roster is currently admin: whoever gets processed last is skipped.
+	res = await tool.execute("b5", { action: "set_conversation_roles", conversationId: "dt:group:prod", role: "viewer" });
+	assert.equal(res.details.changed, 1);
+	assert.equal(res.details.skipped.length, 1);
+	assert.match(res.details.skipped[0], /最后一位管理员/);
+	assert.equal(
+		[isAdmin(config, "alice"), isAdmin(config, "solo")].filter(Boolean).length,
+		1,
+		"exactly one admin survives — the seat is never emptied by a bulk write",
+	);
+
+	// A refused call must not write anything.
+	const beforeRefused = config.all().security.people;
+	res = await tool.execute("b6", { action: "set_conversation_roles", conversationId: "dt:group:prod", role: "root" });
+	assert.equal(res.details.refused, true);
+	assert.deepEqual(config.all().security.people, beforeRefused);
 });

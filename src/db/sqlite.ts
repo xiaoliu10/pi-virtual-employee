@@ -97,6 +97,19 @@ function migrate(db: DB): void {
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		);
+		-- IM 会话成员花名册：由入站消息逐条累积（staff_id 来自平台签名载荷，不是
+		-- 消息文本）。用途：管理员在单聊里说「给这个群的人设权限」时，能列出该群
+		-- 真实出现过的成员，而不是让模型猜 staffId。只含发过消息的人——机器人
+		-- 未必有平台「列出群成员」的权限，这是唯一可核实的来源，工具会如实标注。
+		CREATE TABLE IF NOT EXISTS conversation_members (
+			conversation_id TEXT NOT NULL,
+			staff_id        TEXT NOT NULL,
+			name            TEXT,
+			first_seen_at   INTEGER NOT NULL,
+			last_seen_at    INTEGER NOT NULL,
+			message_count   INTEGER NOT NULL DEFAULT 1,
+			PRIMARY KEY (conversation_id, staff_id)
+		);
 	`);
 	// Add per-conversation model columns to pre-existing tables.
 	const cols = new Set(

@@ -375,6 +375,20 @@ export class EmployeeEngine implements EmployeeRuntime {
 		}
 	}
 
+	/**
+	 * Record an inbound IM sender into the conversation's roster (the row's key
+	 * comes from the platform-verified actor, never from message text). Best
+	 * effort: a failed insert must never block the reply.
+	 */
+	recordConversationMember(conversationId: string, actor?: InboundActor): void {
+		if (!actor?.senderId) return;
+		try {
+			this.history.recordMember(conversationId, actor.senderId, actor.senderName);
+		} catch (err) {
+			console.warn("[engine] recordConversationMember failed:", (err as Error).message);
+		}
+	}
+
 	/** All supplier×model combos available for selection. */
 	availableModels(): ModelOption[] {
 		const c = this.config.all();
@@ -439,7 +453,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 					isScheduledRun: conversationId.startsWith("sched:"),
 				}),
 				model: this.buildModel(supplier, modelId),
-				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })) }),
+				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })) }),
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
 				messages: rehydrateMessages(this.history.listMessages(conversationId)),
@@ -782,7 +796,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// Enforce the instruction structurally: the final-summary turn must not be
 			// able to start another tool loop after the safety cap has already fired.
 			agent.state.tools = [];
-			await agent.prompt("现在请不要调用任何工具，直接用一段简明的中文总结：你刚才为完成用户请求做了哪些尝试？最终是成功还是失败？如果没成功，具体卡在哪一步、需要用户怎么配合或提供什么？只输出这段总结。");
+			await agent.prompt("现在请不要调用任何工具，直接用一段简明的中文总结：你刚才为完成用户请求做了哪些尝试？最终是成功还是失败？如果没成功，具体卡在哪一步、需要用户怎么配合或提供什么？只输出这段总结。只依据本次对话中真实发生的事与工具真实返回的数据，不要补充任何你没实际取到的数字、结论或「大概是这样」的推测；没取到就直说没取到。");
 		} catch (err) {
 			console.warn("[engine] final summary prompt failed:", err instanceof Error ? err.message : err);
 		} finally {

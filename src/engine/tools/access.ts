@@ -42,6 +42,12 @@ export interface AccessToolDeps {
 	 * group id to apply floors to without knowing DingTalk's openConversationId.
 	 */
 	listConversations?: () => { id: string; title: string | null; origin: string }[];
+	/**
+	 * Observed participants of a conversation — every sender whose message the
+	 * bot has seen in that chat (platform-verified ids, accumulated on inbound).
+	 * This is how "给这个群的人设权限" resolves to real staffIds instead of a guess.
+	 */
+	listMembers?: (conversationId: string) => { staffId: string; name: string | null; lastSeenAt: number; messageCount: number }[];
 }
 
 const ROLE_LABEL: Record<Role, string> = {
@@ -145,6 +151,8 @@ export function createManageAccessTool(deps: AccessToolDeps): AgentTool {
 		description:
 			"配置本系统的分级权限（仅限 IM 单聊、仅管理员）。角色体系：viewer（只读：对话/知识库检索/记忆沉淀）＜ operator（+浏览器/桌面/文档/文件系统/定时任务/白名单命令）＜ admin（+完整命令/系统设置/权限管理）。\n" +
 			"action=list：查看当前人员角色、默认角色、各会话门槛（免确认）。\n" +
+			"action=list_members：列出某个会话里**实际出现过的人**（平台验证的 staffId + 名字 + 最近发言时间），免确认。想知道「某群里都有谁」就只能靠这个——机器人未必有平台「列出群成员」的权限，名单只含发过消息的人，人数不全时如实说明，不要凭群名推测成员。\n" +
+			"action=set_conversation_roles（本工具是给「整个群的人一起设权限」用的）：按会话批量给已在名单里的人指派角色（conversationId + role），返回逐个变更结果。需要确认。\n" +
 			"action=set_role：给某个人指派角色（staffId + role，可带 name 便于辨认）。\n" +
 			"action=remove_person：移除某人的角色指派（staffId），移除后回到默认角色。\n" +
 			"action=set_default_role：设置未知发送者的默认角色（role，建议 viewer）。\n" +
@@ -155,25 +163,31 @@ export function createManageAccessTool(deps: AccessToolDeps): AgentTool {
 			"「运维群允许值班同学操作浏览器」→ 给值班同学 set_role role=operator，并给该群 floors={\"browser\":\"operator\"}；" +
 			"「某群只服务管理员」→ 该群 floors={\"chat\":\"admin\"}。\n" +
 			"安全规则：写入类操作必须由管理员在当前消息中明确包含「确认」（或同义明确肯定语），否则先复述变更内容征求确认；群聊一律拒绝；" +
-			"不要把 staffId 猜测填空——不确定对方 ID 时先用 list 查看已有条目，或让对方向你发送一条消息后从日志/名单中确认。",
+			"**目标必须由对方明确给出，绝不能自行推断**：本工具只在单聊可用，而单聊里没有「当前群」这个语境——对方说「给群里的人设权限」「给这个群开权限」时，你不知道是哪个群，" +
+			"必须先用 list 列出最近的 IM 会话（含标题），或让对方给出群名/会话 ID，复述「我理解是「XX 群」（<会话 ID>），成员是 A、B、C」并等到对方确认后再执行，不要挑一个看起来像的群直接改。" +
+			"对方给的 staffId 也必须来自 list/list_members 的输出或对方原话，不要猜测或补全 ID。" +
+			"给整个群开 admin 通常不是对方真正需要的：admin 是系统级（完整命令/系统设置/权限管理），一个群全员 admin 等于放弃按人授权。若对方只想让这个群能用某项能力，先提示更小的做法——" +
+			"按人 set_role operator，或对该群 set_conversation 设门槛；对方仍坚持全员 admin 时再执行，并说明后果。",
 		parameters: Type.Object({
 			action: Type.Union(
 				[
 					Type.Literal("list"),
+					Type.Literal("list_members"),
 					Type.Literal("set_role"),
+					Type.Literal("set_conversation_roles"),
 					Type.Literal("remove_person"),
 					Type.Literal("set_default_role"),
 					Type.Literal("set_conversation"),
 					Type.Literal("remove_conversation"),
 				],
-				{ description: "list=查看；set_role/remove_person=人员角色；set_default_role=默认角色；set_conversation/remove_conversation=会话门槛" },
+				{ description: "list=查看策略；list_members=查看某会话实际出现过的人；set_role/remove_person=单人角色；set_conversation_roles=按会话批量授权；set_default_role=默认角色；set_conversation/remove_conversation=会话门槛" },
 			),
 			staffId: Type.Optional(Type.String({ description: "set_role/remove_person 必填：目标用户的平台用户 ID（钉钉 senderStaffId）" })),
 			name: Type.Optional(Type.String({ description: "set_role 可选：备注名，便于后续辨认（如「张工-运维」）" })),
 			role: Type.Optional(ROLE_ENUM),
 			conversationId: Type.Optional(
 				Type.String({
-					description: "set_conversation/remove_conversation 必填：会话 ID，群聊形如 dt:group:<openConversationId>，单聊形如 dt:<staffId>；可用 list 查看已知会话",
+					description: "会话 ID：set_conversation/remove_conversation/set_conversation_roles/list_members 必填（群聊形如 dt:group:<openConversationId>，单聊形如 dt:<staffId>）；可用 list 查看已知会话。必须来自 list 的输出或对方原话",
 				}),
 			),
 			floors: Type.Optional(
@@ -184,7 +198,7 @@ export function createManageAccessTool(deps: AccessToolDeps): AgentTool {
 		}),
 		async execute(_toolCallId, params) {
 			const { action, staffId, name, role, conversationId, floors } = params as {
-				action: "list" | "set_role" | "remove_person" | "set_default_role" | "set_conversation" | "remove_conversation";
+				action: "list" | "list_members" | "set_role" | "set_conversation_roles" | "remove_person" | "set_default_role" | "set_conversation" | "remove_conversation";
 				staffId?: string;
 				name?: string;
 				role?: string;
@@ -242,10 +256,111 @@ export function createManageAccessTool(deps: AccessToolDeps): AgentTool {
 				};
 			}
 
+			if (action === "list_members") {
+				// Read-only but still admin-only: a roster maps people to a chat.
+				const gate = requireSingleChatActor(deps);
+				if ("content" in gate) return gate;
+				if (!hasAnyAdmin(deps.config)) {
+					return refuse("管理员尚未设置。请先在单聊中使用 manage_admin 的 claim 动作认领首位管理员。");
+				}
+				if (!isAdmin(deps.config, gate.actor.senderId)) {
+					return refuse("你不是本系统的管理员，无权查看成员名单。");
+				}
+				const conv = (conversationId ?? "").trim();
+				if (!conv) {
+					const known = deps.listConversations?.().filter((c) => c.origin === "im").slice(0, 20) ?? [];
+					return refuse(
+						"缺少 conversationId：请先确定是哪个会话。可用 list 查看最近 IM 会话" +
+							(known.length ? `（例如 ${known.slice(0, 3).map((c) => `${c.title ?? "未命名"}=${c.id}`).join("、")}）` : "") +
+							"；单聊里没有「当前群」这一语境，目标必须由对方明确给出或经你复述确认。",
+					);
+				}
+				const members = deps.listMembers?.(conv) ?? [];
+				if (members.length === 0) {
+					return {
+						content: [{
+							type: "text",
+							text:
+								`会话「${conv}」目前没有已记录成员：机器人只登记**给机器人发过消息的人**（平台未必授予列群成员权限），` +
+								`该群还没有人发言过，或会话 ID 不对。可用 list 核对会话 ID，或让对方在群里 @ 我 说一句话后重试。不要凭群名推测成员。`,
+						}],
+						details: { action, conversationId: conv, memberCount: 0 },
+					};
+				}
+				const rows = members.map((m) => {
+					const current = resolveRole(deps.config, m.staffId);
+					const when = new Date(m.lastSeenAt).toISOString().slice(0, 16).replace("T", " ");
+					return `  · ${m.name ? `${m.name} ` : ""}${m.staffId} → 当前 ${current}（${m.messageCount} 条消息，最近 ${when}）`;
+				});
+				return {
+					content: [{
+						type: "text",
+						text:
+							`会话「${conv}」已记录成员 ${members.length} 人（只含给机器人发过消息的人，人数可能少于群实际成员）：\n${rows.join("\n")}\n` +
+							`如需整体授权，用 set_conversation_roles 传同一 conversationId；按人授权用 set_role。执行前请把名单念给管理员确认。`,
+					}],
+					details: { action, conversationId: conv, memberCount: members.length, members: members.map((m) => ({ staffId: m.staffId, name: m.name })) },
+				};
+			}
+
 			const gate = requireConfirmedAdmin(deps, { needConfirmation: true });
 			if ("content" in gate) return gate;
 			const actor = gate.actor;
 			const sec = deps.config.all().security;
+
+			if (action === "set_conversation_roles") {
+				const conv = (conversationId ?? "").trim();
+				const parsed = parseRole(role);
+				if (!conv) return refuse("缺少 conversationId：按会话批量授权必须明确指定是哪个会话（可用 list 查看，或用 list_members 核对成员）。单聊里没有「当前群」的语境，不能凭对方一句「群里的人」就动手。");
+				if (!parsed) return refuse("role 必须是 viewer / operator / admin 之一。");
+				const members = deps.listMembers?.(conv) ?? [];
+				if (members.length === 0) {
+					return refuse(
+						`会话「${conv}」没有已记录成员，无法批量授权：机器人只登记给机器人发过消息的人。请先用 list 核对会话 ID，或让对方在群里 @ 我 发一条消息后重试；也可以改用 set_role 逐个指派。`,
+					);
+				}
+				const next = [...(sec.people ?? [])];
+				const changes: string[] = [];
+				const skipped: string[] = [];
+				for (const m of members) {
+					const idx = next.findIndex((p) => p.staffId === m.staffId);
+					const before = idx >= 0 ? next[idx].role : (sec.adminStaffIds.includes(m.staffId) ? "admin" : sec.defaultRole ?? "viewer");
+					if (before === parsed) {
+						skipped.push(`${m.name ?? m.staffId}（已是 ${parsed}）`);
+						continue;
+					}
+					// Same last-admin guard as set_role, applied per member: a bulk
+					// demotion must never leave the deployment without an admin.
+					if (parsed !== "admin" && !wouldKeepAnAdmin(sec, next, m.staffId, parsed)) {
+						skipped.push(`${m.name ?? m.staffId}（是最后一位管理员，未改动）`);
+						continue;
+					}
+					const entry = { staffId: m.staffId, role: parsed, ...(m.name ? { name: m.name } : idx >= 0 && next[idx].name ? { name: next[idx].name } : {}) };
+					if (idx >= 0) next[idx] = entry;
+					else next.push(entry);
+					changes.push(`${m.name ?? m.staffId}（${before} → ${parsed}）`);
+				}
+				if (changes.length === 0) {
+					return {
+						content: [{ type: "text", text: `会话「${conv}」的已记录成员无需改动。${skipped.length ? `跳过：${skipped.join("；")}` : ""}` }],
+						details: { action, conversationId: conv, changed: 0, skipped: skipped.length },
+					};
+				}
+				const updated = deps.config.update({ security: { people: next } });
+				deps.onConfigChanged();
+				console.log(`[access] set_conversation_roles ${conv} → ${parsed} by ${maskId(actor.senderId)}: ${changes.length} changed, ${skipped.length} skipped`);
+				return {
+					content: [{
+						type: "text",
+						text:
+							`✅ 会话「${conv}」已记录成员的角色已更新为 ${parsed}，共 ${changes.length} 人：${changes.join("；")}。` +
+							(skipped.length ? `\n跳过：${skipped.join("；")}。` : "") +
+							`\n注意名单只含发过消息的成员；其他人仍是默认角色（${updated.security.defaultRole ?? "viewer"}）。` +
+							(parsed === "admin" ? "\n⚠️ 这些成员现在是系统级管理员（含完整命令与系统设置权限），不只是在这个群里。" : ""),
+					}],
+					details: { action, conversationId: conv, role: parsed, changed: changes.length, skipped, peopleCount: updated.security.people?.length ?? 0 },
+				};
+			}
 
 			if (action === "set_role") {
 				const target = (staffId ?? "").trim();

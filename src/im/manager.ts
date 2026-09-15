@@ -205,6 +205,12 @@ export class IMAdapterManager {
 					if (this.draining) {
 						return "⏳ 系统正在安装应用更新，当前消息不会被执行；请稍后重新发送。";
 					}
+					// Record the sender in this conversation's roster BEFORE any gate:
+					// the roster is how an admin later says "给这个群的人设权限" without
+					// knowing staffIds, so it must include senders we refuse to serve
+					// (a viewer's refusal must not hide them from the roster). Rows are
+					// keyed on the platform-verified id, never on message text.
+					this.engine.recordConversationMember(msg.conversationId, msg.actor);
 					// IM slash commands (OpenClaw-style): /help /new /stop /restart /version /models /model <n|id>
 					const cmd = parseCommand(msg.text);
 					if (cmd) return this.runCommand(msg.conversationId, cmd, msg.actor, msg.text);
