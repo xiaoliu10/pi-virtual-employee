@@ -10,6 +10,7 @@
  * Alias / relay model ids (not in the pi-ai registry) are supported by cloning a
  * base model of the matching api type and overriding id + baseUrl.
  */
+import { randomUUID } from "node:crypto";
 import { Agent, convertToLlm, estimateContextTokens } from "@earendil-works/pi-agent-core";
 import type { AgentEvent, AgentMessage, Skill, StreamFn } from "@earendil-works/pi-agent-core";
 import { createModels } from "@earendil-works/pi-ai";
@@ -17,6 +18,8 @@ import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { Api, ImageContent, Model, MutableModels, TextContent } from "@earendil-works/pi-ai";
 import type { ConfigStore, Supplier } from "../db/config-store.js";
 import type { HistoryStore } from "../db/history-store.js";
+import { inferConversationOrigin } from "../db/history-store.js";
+import { looksLikeCorrection, type TelemetryStore, type TurnStatus } from "../db/telemetry-store.js";
 import type { InboundActor } from "../im/types.js";
 import type { KnowledgeService } from "../knowledge/knowledge-service.js";
 import type { BrowserService } from "../browser/browser-service.js";
@@ -166,6 +169,31 @@ export class EmployeeEngine implements EmployeeRuntime {
 		for (const provider of builtinProviders()) this.models.setProvider(provider);
 		this.skillLoader = new SkillLoader(paths.builtinSkillsDir, paths.userSkillsDir);
 		this.skillWriter = new SkillWriter(this.skillLoader, paths.userSkillsDir);
+	}
+
+	/**
+	 * Run telemetry (turn/tool outcomes). Optional so the engine still works in
+	 * headless tests and one-off scripts; every write is best-effort and must
+	 * never affect a turn's outcome.
+	 */
+	private telemetry?: TelemetryStore;
+	setTelemetryStore(store: TelemetryStore): void { this.telemetry = store; }
+
+	/** turnId per conversation for the in-flight turn, so tool events can link. */
+	private readonly turnIds = new Map<string, string>();
+	/** Abort reason noted mid-turn (watchdog / user stop) applied to the row. */
+	private readonly turnAborts = new Map<string, string>();
+	/** Tool calls made so far in the in-flight turn of each conversation. */
+	private readonly turnToolCalls = new Map<string, number>();
+
+	/**
+	 * Note why an in-flight turn was cut short, so its telemetry row says
+	 * "aborted:watchdog" instead of looking like an ordinary empty reply. Called
+	 * by the IM watchdog and by /stop; harmless when no turn is running.
+	 */
+	markTurnAbort(conversationId: string, reason: "watchdog" | "user" | "restart"): void {
+		if (!this.turnIds.has(conversationId)) return;
+		this.turnAborts.set(conversationId, reason);
 	}
 
 	/** Inject the platform updater after construction; new sessions see manage_update. */
@@ -459,7 +487,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 					isScheduledRun: conversationId.startsWith("sched:"),
 				}),
 				model: this.buildModel(supplier, modelId),
-				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })) }),
+				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry }),
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
 				messages: rehydrateMessages(this.history.listMessages(conversationId)),
@@ -717,6 +745,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// conversation serves many senders).
 		else if (!isLocalConversation(conversationId)) this.turnActor.delete(conversationId);
 
+		// Telemetry: one row per turn, written when the turn settles below. The id is
+		// minted here so tool calls made during this turn can be linked to it.
+		const turnId = this.telemetry ? randomUUID() : undefined;
+		const turnStartedAt = Date.now();
+		const turnCorrection = looksLikeCorrection(message);
+		if (turnId) this.turnIds.set(conversationId, turnId);
+
 		let reply = "";
 		const unsubscribe = agent.subscribe((event: AgentEvent) => {
 			if (event.type === "message_end" && (event.message as { role?: string }).role === "assistant") {
@@ -735,8 +770,14 @@ export class EmployeeEngine implements EmployeeRuntime {
 		});
 
 		let hardError: string | undefined;
+		let retried = false;
+		let capHit = false;
+		// Which last-resort path produced the reply, if any. Tracked explicitly
+		// rather than sniffed from the text: telemetry's job is to be accurate.
+		let askedForSummary = false;
+		let deterministic = false;
 		try {
-			await this.promptWithRetry(agent, message, ctx?.images);
+			retried = await this.promptWithRetry(agent, message, ctx?.images);
 		} catch (err) {
 			hardError = err instanceof Error ? err.message : String(err);
 			console.error(`[engine] prompt failed for ${conversationId}:`, err);
@@ -754,7 +795,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// was reached, the model was mid-task and likely left a narration ("正在登录...")
 		// rather than an outcome. Force a no-tools final summary so the user gets a
 		// clear status (what succeeded, what's left, what they need to provide).
-		if (this.toolStepCapHit(agent) && !hardError) {
+		capHit = this.toolStepCapHit(agent);
+		if (capHit && !hardError) {
+			askedForSummary = true;
 			const capSummary = await this.finalSummary(agent);
 			const max = this.config.all().general.maxToolSteps ?? 0;
 			reply = capSummary || `⚠️ 本轮已达到工具调用上限（${max} 步），系统已停止继续调用工具。当前任务可能尚未完成，请提高上限后重试，或把任务拆成更小的步骤。`;
@@ -765,6 +808,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// stream, model ended on a thinking-only message). In that case ask the model
 		// for a plain-language outcome summary first; it knows what it tried.
 		if (!reply.trim() && !hardError) {
+			askedForSummary = true;
 			const summary = await this.finalSummary(agent);
 			if (summary) reply = summary;
 		}
@@ -772,6 +816,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// Last resort: model/relay unreachable or still empty — emit a deterministic
 		// reply so the user is never left waiting in silence.
 		if (!reply.trim()) {
+			deterministic = true;
 			reply = this.deterministicFailure(hardError || errorMessage);
 			console.warn(`[engine] no reply produced for ${conversationId}; emitted deterministic failure (${hardError || errorMessage || "no error reported"})`);
 		}
@@ -789,7 +834,97 @@ export class EmployeeEngine implements EmployeeRuntime {
 			console.warn("[engine] compaction failed:", err);
 		}
 
+		this.recordTurnTelemetry({
+			conversationId,
+			turnId,
+			startedAt: turnStartedAt,
+			reply,
+			hardError,
+			agentError: errorMessage,
+			retried,
+			capHit,
+			askedForSummary,
+			deterministic,
+			correction: turnCorrection,
+			actor: ctx?.actor,
+		});
+
 		return { reply, error: hardError ?? (errorMessage || undefined) };
+	}
+
+	/** One tool call, linked to the turn that made it. Never throws. */
+	private recordToolTelemetry(
+		conversationId: string,
+		event: { name: string; durationMs: number; ok: boolean; refused?: boolean; error?: string },
+	): void {
+		if (!this.telemetry) return;
+		try {
+			this.turnToolCalls.set(conversationId, (this.turnToolCalls.get(conversationId) ?? 0) + 1);
+			this.telemetry.recordTool({ ...event, conversationId, turnId: this.turnIds.get(conversationId) });
+		} catch (err) {
+			console.warn("[engine] telemetry tool write failed:", err instanceof Error ? err.message : err);
+		}
+	}
+
+	/**
+	 * Write the turn's outcome row. Best-effort: a telemetry failure must never
+	 * turn a delivered reply into an error, so everything is swallowed.
+	 */
+	private recordTurnTelemetry(input: {
+		conversationId: string;
+		turnId?: string;
+		startedAt: number;
+		reply: string;
+		hardError?: string;
+		agentError?: string;
+		retried: boolean;
+		capHit: boolean;
+		askedForSummary: boolean;
+		deterministic: boolean;
+		correction: boolean;
+		actor?: InboundActor;
+	}): void {
+		const { conversationId, turnId } = input;
+		this.turnIds.delete(conversationId);
+		const toolCalls = this.turnToolCalls.get(conversationId) ?? 0;
+		this.turnToolCalls.delete(conversationId);
+		const abortReason = this.turnAborts.get(conversationId);
+		this.turnAborts.delete(conversationId);
+		if (!this.telemetry || !turnId) return;
+		try {
+			const errorText = input.hardError ?? input.agentError ?? undefined;
+			const emptyReply = !input.reply.trim();
+			// Status precedence: a hard error wins; then an explicitly aborted turn;
+			// then the two last-resort paths (deterministic failure, and "we had to
+			// ask for a summary because the turn produced no outcome text"); else ok.
+			let status: TurnStatus = "ok";
+			if (errorText) status = "error";
+			else if (abortReason) status = "aborted";
+			else if (input.deterministic) status = "deterministic_failure";
+			else if (input.askedForSummary || emptyReply) status = "empty_reply";
+			this.telemetry.recordTurn({
+				turnId,
+				conversationId,
+				origin: inferConversationOrigin(conversationId),
+				actorId: input.actor?.senderId,
+				channel: input.actor?.channel,
+				chatType: input.actor?.chatType,
+				startedAt: input.startedAt,
+				durationMs: Date.now() - input.startedAt,
+				status,
+				error: errorText,
+				toolCalls,
+				retries: input.retried ? 1 : 0,
+				stepCapHit: input.capHit,
+				emptyReply,
+				deterministic: input.deterministic,
+				abortReason,
+				correction: input.correction,
+				replyLen: input.reply.length,
+			});
+		} catch (err) {
+			console.warn("[engine] telemetry write failed:", err instanceof Error ? err.message : err);
+		}
 	}
 
 	/**
@@ -860,7 +995,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * stopReason="error" with no content, or a thinking-only "stop" — which would
 	 * otherwise surface to the user as a blank reply with no error.
 	 */
-	private async promptWithRetry(agent: Agent, message: string, images?: { data: string; mimeType: string }[]): Promise<void> {
+	private async promptWithRetry(agent: Agent, message: string, images?: { data: string; mimeType: string }[]): Promise<boolean> {
 		// Vision input: only pass images when the session's model actually accepts
 		// them — a non-vision model would reject the image block and fail the turn.
 		const visionImages: ImageContent[] | undefined =
@@ -877,7 +1012,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		}
 		const errorText = agent.state.errorMessage ?? "";
 		const endedEmpty = this.endedWithoutText(agent);
-		if (!threwTransient && !(errorText && TRANSIENT_STREAM_ERROR.test(errorText)) && !endedEmpty) return;
+		if (!threwTransient && !(errorText && TRANSIENT_STREAM_ERROR.test(errorText)) && !endedEmpty) return false;
 
 		const reason = endedEmpty && !threwTransient && !errorText
 			? "turn ended without visible text"
@@ -895,6 +1030,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			if (!text.startsWith("Cannot continue")) throw err;
 			await agent.prompt(message, visionImages);
 		}
+		return true;
 	}
 
 	/**

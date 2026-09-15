@@ -76,7 +76,7 @@ export function buildSystemPrompt(parts: PromptParts): string {
 	}
 	if (parts.isScheduledRun) {
 		sections.push(
-			"## 定时任务运行（内置，勿删）\n本次对话由定时任务自动触发、无人值守。涉及后台系统时：先检测登录态，已登录则直接执行任务、不要重复登录或索取验证码；未登录则停止浏览器操作并回复「后台登录态已过期，请在对话中重新登录」。\n本会话可能已携带任务创建者（管理员）的身份：若任务 prompt 要求执行 run_command 等受控操作，直接使用该工具即可（无需也无法要求「确认」）；若被拒绝（创建者已非管理员/任务无创建者身份），如实说明「该任务缺少管理员授权，无法执行受控命令」，不要反复重试。可建议管理员在单聊中使用 authorize_scheduled_task 为任务补授权（无需删除重建）。\nrun_command 用法：跑脚本直接给脚本文件路径（如 python scripts/gen_report.py），并通过 workingDir 参数传脚本所在目录的绝对路径（脚本按相对路径找数据文件时必填）；不要用 python -c / node -e 内联代码（括号会被安全过滤拦截），日期等计算放进脚本内部完成。",
+			"## 定时任务运行（内置，勿删）\n本次对话由定时任务自动触发、无人值守。涉及后台系统时：先检测登录态，已登录则直接执行任务、不要重复登录或索取验证码；未登录则停止浏览器操作并回复「后台登录态已过期，请在对话中重新登录」。\n本会话携带**任务创建人**的身份，按创建人当前角色授权：prompt 里要求执行的受控操作直接做即可（无人值守，无需也无法要求「确认」）。若工具被拒，如实说明是创建人角色不足（例如浏览器/文件需要 operator、完整命令需要 admin），不要反复重试，也不要改口说「群聊建的任务本来就没有权限」；只有当任务显示「执行身份：未记录」（控制台/旧版本创建的遗留任务）时，才建议管理员在单聊里用 authorize_scheduled_task 补授权（无需删除重建）。\nrun_command 用法：跑脚本直接给脚本文件路径（如 python scripts/gen_report.py），并通过 workingDir 参数传脚本所在目录的绝对路径（脚本按相对路径找数据文件时必填）；不要用 python -c / node -e 内联代码（括号会被安全过滤拦截），日期等计算放进脚本内部完成。",
 		);
 	}
 	return sections.join("\n\n");
@@ -130,6 +130,15 @@ function capabilityRules(c: RulesCtx): string {
 	lines.push(
 		"- **应用版本与更新必须使用 manage_update**：对方提到「当前版本、版本号、检查更新、升级到最新版、自我更新、开启/关闭自动更新」时，必须调用 manage_update，严禁回答「无法查看版本 / 没有升级权限 / 请去部署端查看」。status=查看版本和状态，check=检查更新，update=下载并在空闲时安装，set_auto=开关无人值守；涉及安装或开关时，必须让对方当前消息明确包含「确认」。",
 	);
+	// Self-inspection routing: the employee can read its own run telemetry, and it
+	// must use it rather than guessing when asked how it has been doing.
+	lines.push(
+		"- **自己的表现数据用 my_stats**：对方问「你最近表现怎么样 / 为什么老失败 / 哪类任务老出问题」，或你自己打算改流程/改写法之前，先调 my_stats（默认只看本会话，管理员可传 scope=all 看全部会话）。" +
+			"它返回的回合数、重试、工具步数封顶、被中断、用户当场纠错、失败最多的工具、最近错误样本都来自真实运行记录——**据实报告，不要估算，也不要补充记录之外的统计数字**。" +
+			"读法：工具失败要先分清「被权限拒绝」还是「参数/环境错误」（前者用 check_my_access 核对并如实转达需要什么权限，后者说明具体报错）；" +
+			"「用户当场纠错」偏多说明我的口径或答案有偏差，应把正确做法沉淀进知识库或技能，而不是重复解释。",
+	);
+
 	// Capability switches are always-on routing: the employee must not claim it
 	// "cannot enable tools" when manage_capabilities exists for exactly that.
 	lines.push(
@@ -209,7 +218,7 @@ function capabilityRules(c: RulesCtx): string {
 		);
 	if (c.schedulerEnabled)
 		lines.push(
-			'- 当对方需要"定时/周期性"执行某事（如每天早报、定期巡检、N 分钟后提醒、每周汇总）时，用 create_scheduled_task 创建定时任务：写清 title、到点要执行的 prompt（你会以自己身份自动执行它）、以及 5 字段 cron（本地时间，如 "0 9 * * *" 每天 9 点）。**任务若在钉钉群聊或单聊中创建，执行结果会自动主动推送回原会话**，无需对方手动查询；不要声称定时任务只能保存在后台、不能推送群聊。可用 list/delete/toggle 管理已有任务；未授权的任务（无执行身份、无人值守无法用受控工具）用 authorize_scheduled_task 授权，不必删除重建——管理员说自己建的任务都要能用时，直接传 all=true 一次授权全部，不要逐个来。仅创建对方明确要求的定时任务。',
+			'- 当对方需要"定时/周期性"执行某事（如每天早报、定期巡检、N 分钟后提醒、每周汇总）时，用 create_scheduled_task 创建定时任务：写清 title、到点要执行的 prompt（你会以自己身份自动执行它）、以及 5 字段 cron（本地时间，如 "0 9 * * *" 每天 9 点）。**任务若在钉钉群聊或单聊中创建，执行结果会自动主动推送回原会话**，无需对方手动查询；不要声称定时任务只能保存在后台、不能推送群聊。**任务跟随创建人权限**：不论在单聊还是群聊里创建，系统都记录创建人身份，到点以创建人**当前**的角色执行其可用工具——所以**不要**说「群聊里建的任务没有权限」「需要另外授权才能用浏览器/命令」，那是旧版本的行为，现在说错会让人白忙一场；也不要因为任务要在群里跑就要求对方先给权限。可用 list/delete/toggle/update 管理已有任务；只有显示「执行身份：未记录」的遗留任务（控制台或旧版本创建）才需要 authorize_scheduled_task 补授权，多个可传 all=true 一次补齐。仅创建对方明确要求的定时任务。',
 		);
 	if (c.documentsEnabled)
 		lines.push(

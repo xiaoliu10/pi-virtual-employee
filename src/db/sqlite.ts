@@ -110,6 +110,47 @@ function migrate(db: DB): void {
 			message_count   INTEGER NOT NULL DEFAULT 1,
 			PRIMARY KEY (conversation_id, staff_id)
 		);
+
+		-- 运行遥测：每条「回合」一行、每次「工具调用」一行。存在的唯一理由是让员工
+		-- 能看见自己的真实表现——在此之前，重试次数/步数封顶/看门狗中断/空回复只
+		-- 存在于日志和瞬间里，模型无从知道自己哪儿反复失败，任何「自我改进」都只能
+		-- 靠感觉。写入是本地的、短字段截断的；不发往任何外部服务。
+		CREATE TABLE IF NOT EXISTS turn_events (
+			id              TEXT PRIMARY KEY,
+			conversation_id TEXT NOT NULL,
+			origin          TEXT NOT NULL DEFAULT 'console',
+			actor_id        TEXT,
+			channel         TEXT,
+			chat_type       TEXT,
+			started_at      INTEGER NOT NULL,
+			duration_ms     INTEGER NOT NULL DEFAULT 0,
+			status          TEXT NOT NULL,
+			error           TEXT,
+			tool_calls      INTEGER NOT NULL DEFAULT 0,
+			retries         INTEGER NOT NULL DEFAULT 0,
+			step_cap_hit    INTEGER NOT NULL DEFAULT 0,
+			empty_reply     INTEGER NOT NULL DEFAULT 0,
+			deterministic   INTEGER NOT NULL DEFAULT 0,
+			abort_reason    TEXT,
+			correction      INTEGER NOT NULL DEFAULT 0,
+			reply_len       INTEGER NOT NULL DEFAULT 0
+		);
+		CREATE INDEX IF NOT EXISTS idx_turn_events_started ON turn_events(started_at);
+		CREATE INDEX IF NOT EXISTS idx_turn_events_conv ON turn_events(conversation_id, started_at);
+
+		CREATE TABLE IF NOT EXISTS tool_events (
+			id              TEXT PRIMARY KEY,
+			conversation_id TEXT NOT NULL,
+			turn_id         TEXT,
+			name            TEXT NOT NULL,
+			started_at      INTEGER NOT NULL,
+			duration_ms     INTEGER NOT NULL DEFAULT 0,
+			ok              INTEGER NOT NULL DEFAULT 1,
+			refused         INTEGER NOT NULL DEFAULT 0,
+			error           TEXT
+		);
+		CREATE INDEX IF NOT EXISTS idx_tool_events_started ON tool_events(started_at);
+		CREATE INDEX IF NOT EXISTS idx_tool_events_name ON tool_events(name, started_at);
 	`);
 	// Add per-conversation model columns to pre-existing tables.
 	const cols = new Set(

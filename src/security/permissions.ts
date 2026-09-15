@@ -38,6 +38,7 @@ export const CAPABILITY_LABEL: Record<string, string> = {
 	documents: "文档处理",
 	scheduler: "定时任务",
 	reports: "产物中心",
+	telemetry: "运行统计",
 	knowledge_manage: "知识库管理",
 	settings: "系统设置",
 	admin: "管理员操作",
@@ -49,6 +50,10 @@ const CAPABILITY_MIN: Record<string, Role> = {
 	knowledge: "viewer",
 	learn: "viewer",
 	reports: "operator",
+	// Running statistics expose how the employee has been performing (tool failure
+	// text, which chats failed). Operator-level: they may read files/browse anyway;
+	// the全量 view across every conversation is admin-only inside the tool.
+	telemetry: "operator",
 	browser: "operator",
 	computer: "operator",
 	filesystem: "operator",

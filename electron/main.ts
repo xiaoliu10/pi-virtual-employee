@@ -19,6 +19,7 @@ import { BrowserService } from "../src/browser/browser-service.js";
 import { ComputerService } from "../src/computer/computer-service.js";
 import { ScheduledTaskStore } from "../src/db/scheduled-task-store.js";
 import { SchedulerService } from "../src/scheduler/scheduler-service.js";
+import { TelemetryStore } from "../src/db/telemetry-store.js";
 import { DocumentService } from "../src/documents/document-service.js";
 import { FileSystemService } from "../src/filesystem/filesystem-service.js";
 import { ArtifactStore } from "../src/db/artifact-store.js";
@@ -419,6 +420,17 @@ async function main(): Promise<void> {
 		shellAuditLogPath: path.join(userData, "logs", "shell-audit.log"),
 	}, { timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000 });
 	engine.setComputerService(computer);
+	// Run telemetry: the employee's own record of how its turns went (my_stats tool;
+	// later, the input to a self-improvement proposal loop). Pruned at startup,
+	// alongside the other housekeeping sweeps.
+	const telemetry = new TelemetryStore(db);
+	engine.setTelemetryStore(telemetry);
+	try {
+		const pruned = telemetry.prune();
+		if (pruned > 0) console.log(`[main] telemetry pruned: ${pruned} turn rows past retention`);
+	} catch (err) {
+		console.warn("[main] telemetry prune failed:", (err as Error).message);
+	}
 	// The packaged playwright package sits under app.asar/node_modules; its CLI
 	// can install the Chromium kernel into the user's ms-playwright cache.
 	engine.setPlaywrightCliPath(path.join(__dirname, "../node_modules/playwright/cli.js"));

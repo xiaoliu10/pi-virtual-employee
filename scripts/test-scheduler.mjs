@@ -106,8 +106,8 @@ test("list shows which tasks carry an unattended identity", async (t) => {
 	const res = await tool(tools, "list_scheduled_tasks").execute("l1", {});
 	assert.equal(res.details.count, 2);
 	assert.equal(res.details.unauthorized, 1);
-	assert.match(res.content[0].text, /身份: 已授权（b\*\*\*）/, "ids are masked, even to an admin");
-	assert.match(res.content[0].text, /身份: 未授权——无人值守只能用对话与知识库/);
+	assert.match(res.content[0].text, /执行身份: 跟随创建人 b\*\*\*（当前 admin）/, "ids are masked, even to an admin");
+	assert.match(res.content[0].text, /执行身份: 未记录（控制台\/旧版本创建）/, "an identity-less row is named as such");
 	assert.match(res.content[0].text, /给所有定时任务授权/, "it tells the admin the one-line batch remedy");
 });
 
@@ -145,7 +145,7 @@ test("authorize without a target lists what needs it; single id still works", as
 	);
 	let res = await tool(tools, "authorize_scheduled_task").execute("a1", {});
 	assert.equal(res.details.ok, false);
-	assert.equal(res.details.unauthorized, 2);
+	assert.equal(res.details.unauthorized, 2, "two candidates → ask instead of guessing");
 	assert.match(res.content[0].text, /all=true/);
 	assert.match(res.content[0].text, /甲/);
 
@@ -215,7 +215,7 @@ test("the pending list names each task's origin, and flags nothing when all are 
 	const { tools } = build1(
 		t,
 		{ security: { adminStaffIds: ["boss"] } },
-		[{ title: "甲", conversation_id: "dt:boss" }],
+		[{ title: "甲", conversation_id: "dt:boss" }, { title: "乙", conversation_id: "dt:boss" }],
 		actor("boss"),
 		"dt:boss",
 	);
@@ -223,22 +223,65 @@ test("the pending list names each task's origin, and flags nothing when all are 
 	assert.match(res.content[0].text, /甲（id=t1，创建于本会话）/, "the origin is part of the pick list");
 
 	res = await tool(tools, "authorize_scheduled_task").execute("p2", { all: true });
-	assert.equal(res.details.authorized, 1);
+	assert.equal(res.details.authorized, 2);
 	assert.equal(res.details.authorizedElsewhere, 0);
-	assert.doesNotMatch(res.content[0].text, /不是在当前会话创建的/, "a task created here needs no warning");
+	assert.doesNotMatch(res.content[0].text, /不是在当前会话创建的/, "tasks created here need no warning");
 });
 
-test("creating a task without an identity says so, and how to fix it", async (t) => {
-	// Created in a group: allowed, but runs unattended with no identity.
-	const grouped = build1(t, { security: { adminStaffIds: ["boss"] } }, [], actor("boss", "group"), "dt:group:prod");
+test("a task created in a GROUP inherits its creator's role (no separate authorization)", async (t) => {
+	// The user rejected the previous model outright: 「群聊创建的任务默认跟随创建人
+	// 的权限，如果每个群聊定时任务都要单聊授权的话 那这个权限体系就是有问题」.
+	// So creation in a group must attach the platform-verified creator, and the
+	// task then runs at that person's CURRENT role.
+	const grouped = build1(t, { security: { adminStaffIds: ["boss"], people: [{ staffId: "op", role: "operator" }] } }, [], actor("op", "group"), "dt:group:prod");
 	let res = await tool(grouped.tools, "create_scheduled_task").execute("c1", { title: "巡检", prompt: "查一下", cron: "0 9 * * *" });
-	assert.equal(res.details.createdBy, null);
-	assert.match(res.content.map((c) => c.text).join("\n"), /未记录执行身份/);
-	assert.match(res.content.map((c) => c.text).join("\n"), /authorize_scheduled_task/, "the admin is told the remedy, not left stuck");
+	assert.equal(res.details.createdBy, "op", "the group sender's verified id is recorded");
+	const text = res.content.map((c) => c.text).join("\n");
+	assert.match(text, /跟随创建人的权限/);
+	assert.match(text, /当前 operator/, "the reply states the role the task will run at");
+	assert.doesNotMatch(text, /authorize_scheduled_task/, "no authorization detour is offered");
 
-	// Created in a 1:1 admin chat with 确认: identity captured.
-	const direct = build1(t, { security: { adminStaffIds: ["boss"] } }, [], actor("boss", "single", "建个任务，确认"));
+	// A 1:1 admin creating a task gets an admin-backed task, as before.
+	const direct = build1(t, { security: { adminStaffIds: ["boss"] } }, [], actor("boss", "single", "建个任务"));
 	res = await tool(direct.tools, "create_scheduled_task").execute("c2", { title: "巡检", prompt: "查一下", cron: "0 9 * * *" });
 	assert.equal(res.details.createdBy, "boss");
-	assert.doesNotMatch(res.content.map((c) => c.text).join("\n"), /未记录执行身份/);
+	assert.match(res.content.map((c) => c.text).join("\n"), /当前 admin/);
+});
+
+test("the task list reports the creator's CURRENT role and flags a demotion", async (t) => {
+	const { config, tools } = build1(
+		t,
+		{ security: { adminStaffIds: [], people: [{ staffId: "op", role: "operator" }, { staffId: "ex", role: "viewer" }] } },
+		[
+			{ title: "运维巡检", created_by: "op" },
+			{ title: "被降权的任务", created_by: "ex" },
+			{ title: "控制台遗留" },
+		],
+		actor("op"),
+	);
+	let res = await tool(tools, "list_scheduled_tasks").execute("l1", {});
+	assert.match(res.content[0].text, /跟随创建人 o\*\*\*（当前 operator）/, "the effective role is shown, resolved live");
+	assert.match(res.content[0].text, /⚠️ 创建人已被降为 viewer/, "a demoted creator is called out, not silently degraded");
+	assert.match(res.content[0].text, /控制台\/旧版本创建/, "legacy rows are distinguished from role-following ones");
+	assert.equal(res.details.unauthorized, 1, "only the identity-less legacy row needs repair");
+
+	// Demoting the creator immediately changes what the task may do.
+	config.update({ security: { people: [{ staffId: "op", role: "viewer" }] } });
+	res = await tool(tools, "list_scheduled_tasks").execute("l2", {});
+	assert.match(res.content[0].text, /跟随创建人 o\*\*\*（当前 viewer）/, "live re-check, no task rebuild needed");
+});
+
+test("an unaddressed authorization resolves the single pending task, and asks when ambiguous", async (t) => {
+	// 小派 told the admin to say 「给定时任务授权，确认」 — that phrasing must work
+	// when exactly one task needs repair, and must not guess when several do.
+	const one = build1(t, { security: { adminStaffIds: ["boss"] } }, [{ title: "控制台遗留" }], actor("boss", "single", "给定时任务授权，确认"));
+	let res = await tool(one.tools, "authorize_scheduled_task").execute("a1", {});
+	assert.equal(res.details.ok, true);
+	assert.equal(res.details.title, "控制台遗留", "the only candidate is unambiguous");
+
+	const many = build1(t, { security: { adminStaffIds: ["boss"] } }, [{ title: "甲" }, { title: "乙" }], actor("boss", "single", "给定时任务授权，确认"));
+	res = await tool(many.tools, "authorize_scheduled_task").execute("a2", {});
+	assert.equal(res.details.ok, false);
+	assert.equal(res.details.unauthorized, 2);
+	assert.match(res.content[0].text, /有 2 个任务没有执行身份/);
 });

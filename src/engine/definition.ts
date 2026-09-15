@@ -14,6 +14,8 @@ import type { ReportService } from "../reports/report-service.js";
 import type { DownloadService } from "../downloads/download-service.js";
 import type { SkillWriter } from "./skills/skill-writer.js";
 import type { ConfigStore } from "../db/config-store.js";
+import type { TelemetryStore } from "../db/telemetry-store.js";
+import { createMyStatsTool } from "./tools/telemetry.js";
 import type { InboundActor } from "../im/types.js";
 import { inferConversationOrigin } from "../db/history-store.js";
 import { buildSystemPrompt } from "./prompt.js";
@@ -123,6 +125,14 @@ export interface ToolSetOptions {
 	 * Resolves "给这个群的人设权限" to real staffIds instead of a guess.
 	 */
 	listMembers?: (conversationId: string) => { staffId: string; name: string | null; lastSeenAt: number; messageCount: number }[];
+	/**
+	 * Called after every tool call with its outcome. This is the only place that
+	 * sees each call exactly once, so the telemetry wrapper lives here rather than
+	 * inside each tool (a newly added tool is then covered by construction).
+	 */
+	onToolEvent?: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; error?: string }) => void;
+	/** Telemetry store for the self-inspection tool (my_stats). */
+	telemetry?: TelemetryStore;
 }
 
 /** Assemble the employee's tools; capability tools are conditional on their config flags. */
@@ -252,5 +262,40 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 		}));
 	}
 	tools.push(orderTool, escalateTool);
-	return tools;
+	if (options.telemetry) tools.push(guarded("telemetry", createMyStatsTool({ ...accessDeps, telemetry: options.telemetry })));
+	// Instrument LAST so the wrapper sits outside every other wrapper (including
+	// the RBAC guard): a refusal is recorded as a refusal, not as a silent pass.
+	return options.onToolEvent ? tools.map((tool) => withTelemetry(tool, options.onToolEvent!)) : tools;
+}
+
+/**
+ * Record one call per tool invocation. Behaviour-preserving by construction: the
+ * original result (or exception) is passed through untouched and a telemetry
+ * failure is swallowed, so instrumentation can never break a tool.
+ * A refusal counts as NOT ok — it is friction the agent should be able to see.
+ */
+function withTelemetry(
+	tool: AgentTool<any>,
+	onEvent: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; error?: string }) => void,
+): AgentTool<any> {
+	return {
+		...tool,
+		async execute(toolCallId, params, signal, onUpdate) {
+			const started = Date.now();
+			try {
+				const result = await tool.execute(toolCallId, params, signal, onUpdate);
+				const refused = Boolean((result as { details?: { refused?: boolean } } | undefined)?.details?.refused);
+				onEvent({ name: tool.name, durationMs: Date.now() - started, ok: !refused, refused });
+				return result;
+			} catch (err) {
+				onEvent({
+					name: tool.name,
+					durationMs: Date.now() - started,
+					ok: false,
+					error: err instanceof Error ? err.message : String(err),
+				});
+				throw err;
+			}
+		},
+	};
 }

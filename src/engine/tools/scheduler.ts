@@ -12,7 +12,8 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { SchedulerService } from "../../scheduler/scheduler-service.js";
 import type { ConfigStore } from "../../db/config-store.js";
-import { maskId, requireConfirmedAdmin, type ActorContext } from "./admin.js";
+import { maskId, isSchedulerActor, requireConfirmedAdmin, type ActorContext } from "./admin.js";
+import { resolveRole } from "../../security/permissions.js";
 
 function fmtTime(ms: number | null): string {
 	return ms ? new Date(ms).toLocaleString("zh-CN", { hour12: false }) : "—";
@@ -44,12 +45,28 @@ export function createSchedulerTools(
 	config?: ConfigStore,
 	resolveActor?: (conversationId: string) => ActorContext,
 ): AgentTool[] {
+	/**
+	 * How a task's unattended identity reads to an admin. The role is resolved
+	 * LIVE, because that is exactly how the task will run: with its creator's
+	 * *current* role. A demoted creator is therefore called out explicitly — that
+	 * is the silent case where a task quietly loses its abilities.
+	 */
+	const identityLabel = (task: { created_by: string | null }): string => {
+		if (!task.created_by) {
+			return "未记录（控制台/旧版本创建）——无人值守只能用对话与知识库；如需授权，管理员可在单聊里用 authorize_scheduled_task 补上";
+		}
+		const role = config ? resolveRole(config, task.created_by) : "unknown";
+		const tail = role === "viewer" ? "，⚠️ 创建人已被降为 viewer，该任务现在只能对话与知识库" : "";
+		return `跟随创建人 ${maskId(task.created_by)}（当前 ${role}）${tail}`;
+	};
+
 	const create: AgentTool = {
 		name: "create_scheduled_task",
 		label: "创建定时任务",
 		description:
-			"创建一个定时任务：到点后系统会自动以你的身份执行 prompt（可用全部工具）并保存结果；如果任务是在钉钉群聊或单聊中创建，执行结果会主动推送回创建任务的原会话，无需用户手动查询。cron 为标准 5 字段（分 时 日 月 周，本地时间），如 \"0 9 * * *\"=每天9点、\"*/30 * * * *\"=每30分钟、\"0 9 * * 1\"=每周一9点。prompt 写清到点要做什么。" +
-			"注意：定时任务无人值守执行，若其 prompt 需要执行命令（run_command）等管理员受控操作，则任务必须由管理员在 IM 单聊中明确「确认」创建——创建者身份会被记录并在每次执行时实时校验；由普通用户或群聊创建的任务，到点后无法使用这些管理员工具。来自普通用户的此类创建请求应先说明需管理员确认。",
+			"创建一个定时任务：到点后系统会自动执行 prompt 并保存结果；如果任务是在钉钉群聊或单聊中创建，执行结果会主动推送回创建任务的原会话，无需用户手动查询。cron 为标准 5 字段（分 时 日 月 周，本地时间），如 \"0 9 * * *\"=每天9点、\"*/30 * * * *\"=每30分钟、\"0 9 * * 1\"=每周一9点。prompt 写清到点要做什么。" +
+			"**任务默认跟随创建人的权限**：不论在单聊还是群聊里创建，系统都会记录创建人（平台验证的身份），到点执行时以创建人**当前**的角色判定——创建人能用什么工具，任务就能用什么（operator 可用浏览器/文件/白名单命令，admin 才有完整命令与系统设置）。创建人被降权或移出管理员后，任务立即跟着失去相应能力，不需要删任务重建。" +
+			"因此：不要向对方索要任何 ID；也不要声称群聊里创建的任务需要另外授权——那是不对的。任务创建本身需要 operator 及以上角色（会受会话门槛约束）。",
 		parameters: Type.Object({
 			title: Type.String({ description: "任务简短标题，如「每日订单早报」" }),
 			prompt: Type.String({ description: "到点要执行的指令，如「查询昨日所有订单状态并汇总异常」" }),
@@ -65,17 +82,15 @@ export function createSchedulerTools(
 					details: { ok: false },
 				};
 			}
-			// A task that may run admin-gated tools (run_command) unattended needs
-			// a creator identity to re-attach at fire time. Only capture it from a
-			// verified 1:1 admin chat WITH explicit confirmation — anyone else can
-			// still create the task, but it runs without admin-gated tools.
+			// Identity: the platform-verified sender of THIS request, whatever the chat
+			// type. A task may never exceed its creator's role, so attaching their own
+			// id is not an elevation — it is the definition of "任务跟随创建人权限".
+			// A scheduler actor is excluded so a task cannot spawn further tasks
+			// unattended (creation stays an interactive act).
 			let createdBy: string | null = null;
-			if (config && resolveActor) {
-				const gate = requireConfirmedAdmin(
-					{ config, resolveActor, conversationId },
-					{ needConfirmation: true, confirmationHint: "该定时任务将无人值守执行。请确认任务内容，并在当前消息中包含「确认」。" },
-				);
-				if ("actor" in gate) createdBy = gate.actor.senderId;
+			if (resolveActor) {
+				const actor = resolveActor(conversationId);
+				if (actor?.senderId && !isSchedulerActor(actor)) createdBy = actor.senderId;
 			}
 			const task = scheduler.create({
 				title: p.title,
@@ -85,6 +100,7 @@ export function createSchedulerTools(
 				origin,
 				createdBy,
 			});
+			const creatorRole = createdBy && config ? resolveRole(config, createdBy) : undefined;
 			return {
 				content: [
 					{
@@ -94,10 +110,21 @@ export function createSchedulerTools(
 								: `已创建定时任务「${task.title}」。下次执行：${fmtTime(task.next_run_at)}。到点后我会自动执行并把结果记入对话。`,
 					},
 					...(createdBy
-						? []
+						? [{
+								type: "text" as const,
+								text: (() => {
+									const role = creatorRole ?? "viewer";
+									const scope = role === "admin"
+										? "完整命令、系统设置与其它管理工具"
+										: role === "operator"
+											? "浏览器、文件系统、文档、定时任务、白名单内的命令"
+											: "仅对话与知识库";
+									return `该任务**跟随创建人的权限**：以 ${maskId(createdBy)}（当前 ${role}）的身份无人值守执行，可用范围是${scope}。你的角色被调整后它会立即跟着变，无需重建。`;
+								})(),
+							}]
 						: [{
 								type: "text" as const,
-								text: "⚠️ 该任务未记录执行身份（创建时不在管理员单聊并含「确认」）：到点后它只能对话与查知识库，无法使用命令/浏览器/文件等受控工具。若需要，请管理员在单聊里用 authorize_scheduled_task 补授权（传 all=true 可一次授权全部）。",
+								text: "⚠️ 本次创建没有平台验证的发送者身份（本机控制台/HTTP 调用）：任务到点只能对话与查知识库。如需受控能力，请管理员在单聊里用 authorize_scheduled_task 补授权。",
 							}]),
 				],
 				details: { ok: true, id: task.id, nextRunAt: task.next_run_at, createdBy },
@@ -109,8 +136,8 @@ export function createSchedulerTools(
 		name: "list_scheduled_tasks",
 		label: "查看定时任务",
 		description:
-			"列出当前所有定时任务及其启用状态、cron、上次与下次执行时间，以及**无人值守执行身份**是否已授权。" +
-			"「身份：未授权」的任务到点只能对话与查知识库，无法使用命令/浏览器/文件等受控工具，需要管理员在单聊中用 authorize_scheduled_task 补授权。",
+			"列出当前所有定时任务及其启用状态、cron、上次与下次执行时间、创建来源，以及**无人值守执行身份**。" +
+			"执行身份＝创建人当前的角色（任务跟随创建人权限）；显示「未记录」的只有控制台/旧版本创建的任务，那些才需要用 authorize_scheduled_task 补授权。创建人被降权时这里会警告。",
 		parameters: Type.Object({}),
 		async execute() {
 			const rows = scheduler.list();
@@ -120,7 +147,7 @@ export function createSchedulerTools(
 			const pending = rows.filter((r) => !r.created_by).length;
 			const lines = rows.map(
 				(r, i) =>
-					`${i + 1}. [${r.enabled ? "启用" : "停用"}] ${r.title}（id=${r.id}）\n   cron: ${r.cron}  下次: ${fmtTime(r.next_run_at)}  上次: ${fmtTime(r.last_run_at)}${r.last_status ? ` (${r.last_status})` : ""}\n   创建于: ${createdIn(r, conversationId).label}\n   身份: ${r.created_by ? `已授权（${maskId(r.created_by)}）` : "未授权——无人值守只能用对话与知识库"}`,
+					`${i + 1}. [${r.enabled ? "启用" : "停用"}] ${r.title}（id=${r.id}）\n   cron: ${r.cron}  下次: ${fmtTime(r.next_run_at)}  上次: ${fmtTime(r.last_run_at)}${r.last_status ? ` (${r.last_status})` : ""}\n   创建于: ${createdIn(r, conversationId).label}\n   执行身份: ${identityLabel(r)}`,
 			);
 			return {
 				content: [{
@@ -128,7 +155,7 @@ export function createSchedulerTools(
 					text:
 						`共 ${rows.length} 个定时任务：\n${lines.join("\n")}` +
 						(pending
-							? `\n其中 ${pending} 个未授权。若这些任务都是当前管理员创建的，可在单聊里说「给所有定时任务授权，确认」一次性补上（无需删除重建）。`
+							? `\n其中 ${pending} 个**没有执行身份**（控制台/旧版本创建的遗留任务）：它们到点只能用对话与知识库。若确认内容没问题，可让管理员在单聊里说「给所有定时任务授权，确认」一次性补上（无需删除重建）。`
 							: ""),
 				}],
 				details: { count: rows.length, unauthorized: pending },
@@ -152,8 +179,8 @@ export function createSchedulerTools(
 		label: "授权定时任务",
 		description:
 			"给已有定时任务补记创建者身份（仅限管理员在 IM 单聊中使用，且当前消息须明确包含「确认」）。" +
-			"**可以给任何位置创建的任务授权**——群里建的、控制台建的、旧版本建的都行：授权动作必须在管理员单聊里做，但被授权的任务不受这个限制，结果推送目标（原群/原单聊）也不变。" +
-			"适用于任务创建时未记录身份（群聊/旧版本/控制台创建）导致无人值守无法使用受控工具的情况——授权后**无需删除重建**，原 cron、prompt 与执行历史全部保留。" +
+			"**只用于修复没有执行身份的遗留任务**（控制台创建、旧版本创建的）。自本版本起，任务在单聊或群聊中创建都会自动记录创建人身份并跟随其权限，**不需要也不应该再单独授权**；如果别人说「群里的任务要授权」，先核对是不是遗留任务，不要把它当成常规流程。" +
+			"授权动作必须在管理员单聊里做（被授权的任务不受来源限制，群任务也能在此修好），结果推送目标（原群/原单聊）不变，且**无需删除重建**——原 cron、prompt 与执行历史全部保留。" +
 			"传 id 授权单个；传 all=true 一次授权**所有尚未授权的任务**（管理员自己建的任务批量补授权用这个，不必逐个来）。" +
 			"授权后任务以你（当前管理员）的身份执行，每次开跑前实时重新校验：你被移出管理员名单，任务立即失去受控权限。",
 		parameters: Type.Object({
@@ -162,18 +189,25 @@ export function createSchedulerTools(
 		}),
 		async execute(_id, params) {
 			const { id, all } = params as { id?: string; all?: boolean };
-			const taskId = (id ?? "").trim();
+			let taskId = (id ?? "").trim();
 			if (!all && !taskId) {
 				const pending = scheduler.list().filter((r) => !r.created_by);
-				return {
-					content: [{
-						type: "text",
-						text: pending.length
-							? `请给出要授权的任务 id，或传 all=true 一次授权全部 ${pending.length} 个未授权任务：\n${pending.map((r) => `  · ${r.title}（id=${r.id}，创建于${createdIn(r, conversationId).label}）`).join("\n")}`
-							: "没有需要授权的任务：所有定时任务都已带执行身份。",
-					}],
-					details: { ok: false, unauthorized: pending.length },
-				};
+				// Resolve-or-ask, same rule as people/group names: a single candidate is
+				// unambiguous, so "给定时任务授权" with exactly one pending task just
+				// works (the admin has already confirmed). Several candidates → ask.
+				if (pending.length === 1) {
+					taskId = pending[0].id;
+				} else {
+					return {
+						content: [{
+							type: "text",
+							text: pending.length
+								? `有 ${pending.length} 个任务没有执行身份，请说明要给哪一个授权（id），或传 all=true 一次授权全部：\n${pending.map((r) => `  · ${r.title}（id=${r.id}，创建于${createdIn(r, conversationId).label}）`).join("\n")}`
+								: "没有需要授权的任务：所有定时任务都已带执行身份。",
+						}],
+						details: { ok: false, unauthorized: pending.length },
+					};
+				}
 			}
 			if (!config || !resolveActor) {
 				return { content: [{ type: "text", text: "当前会话不支持授权操作（需要在 IM 单聊中进行）。" }], details: { ok: false } };

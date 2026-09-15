@@ -109,10 +109,15 @@ test("the admin-facing rules never ask for an unlookupable id, and don't nag", (
 	for (const marker of ["list_people", "list_members", "set_role person=<姓名>", "conversationName=<群名>"]) {
 		assert.ok(prompt.includes(marker), `the rules must name what does the resolving: ${marker}`);
 	}
-	// The batch remedy for identity-less scheduled tasks must be reachable by
-	// wording alone ("我建的任务都要能用"), not by the admin discovering an id.
-	assert.ok(prompt.includes("authorize_scheduled_task 授权"), "scheduled-task repair is routed");
-	assert.ok(prompt.includes("直接传 all=true 一次授权全部"), "…in one batch, not one by one");
+	// Scheduled tasks follow their creator's role — including tasks created in a
+	// GROUP. The old model (group tasks carry no identity, every one needs a 1:1
+	// authorization) was rejected by the user as a broken permission system, so the
+	// prompt must not keep asserting it.
+	assert.ok(prompt.includes("任务跟随创建人权限"), "the follow-the-creator rule is stated");
+	assert.ok(prompt.includes("不要**说「群聊里建的任务没有权限」"), "…and the old claim is explicitly forbidden");
+	// The repair path stays reachable for legacy console-created tasks.
+	assert.ok(prompt.includes("authorize_scheduled_task 补授权"), "legacy-task repair is routed");
+	assert.ok(prompt.includes("all=true 一次补齐"), "…in one batch, not one by one");
 	// The bot must not OFFER the id route either — it did twice, and it is a dead
 	// end for anyone who isn't an enterprise admin in the developer console.
 	assert.ok(prompt.includes("不要建议对方去「钉钉后台查 staffId」"), "the id route must not be offered as a fallback");
