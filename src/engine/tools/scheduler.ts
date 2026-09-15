@@ -18,6 +18,25 @@ function fmtTime(ms: number | null): string {
 	return ms ? new Date(ms).toLocaleString("zh-CN", { hour12: false }) : "—";
 }
 
+/**
+ * Where a task was created, relative to the conversation asking now.
+ * Authorization deliberately has no origin restriction — a group-created task is
+ * authorized from a 1:1 chat, that is the whole point. But creation is open to
+ * anyone, and authorizing attaches the ADMIN's identity, so "created elsewhere"
+ * (i.e. possibly someone else's wording) is worth showing before that happens.
+ */
+function createdIn(
+	task: { conversation_id: string | null },
+	currentConversationId: string,
+): { label: string; mine: boolean } {
+	const id = task.conversation_id;
+	if (!id) return { label: "控制台/旧版本", mine: false };
+	if (id === currentConversationId) return { label: "本会话", mine: true };
+	if (id.startsWith("dt:group:")) return { label: `群聊 ${maskId(id)}`, mine: false };
+	if (/^(dt|feishu|wecom|echo):/.test(id)) return { label: `IM 会话 ${maskId(id)}`, mine: false };
+	return { label: `其它会话 ${maskId(id)}`, mine: false };
+}
+
 export function createSchedulerTools(
 	scheduler: SchedulerService,
 	conversationId: string,
@@ -101,7 +120,7 @@ export function createSchedulerTools(
 			const pending = rows.filter((r) => !r.created_by).length;
 			const lines = rows.map(
 				(r, i) =>
-					`${i + 1}. [${r.enabled ? "启用" : "停用"}] ${r.title}（id=${r.id}）\n   cron: ${r.cron}  下次: ${fmtTime(r.next_run_at)}  上次: ${fmtTime(r.last_run_at)}${r.last_status ? ` (${r.last_status})` : ""}\n   身份: ${r.created_by ? `已授权（${maskId(r.created_by)}）` : "未授权——无人值守只能用对话与知识库"}`,
+					`${i + 1}. [${r.enabled ? "启用" : "停用"}] ${r.title}（id=${r.id}）\n   cron: ${r.cron}  下次: ${fmtTime(r.next_run_at)}  上次: ${fmtTime(r.last_run_at)}${r.last_status ? ` (${r.last_status})` : ""}\n   创建于: ${createdIn(r, conversationId).label}\n   身份: ${r.created_by ? `已授权（${maskId(r.created_by)}）` : "未授权——无人值守只能用对话与知识库"}`,
 			);
 			return {
 				content: [{
@@ -133,6 +152,7 @@ export function createSchedulerTools(
 		label: "授权定时任务",
 		description:
 			"给已有定时任务补记创建者身份（仅限管理员在 IM 单聊中使用，且当前消息须明确包含「确认」）。" +
+			"**可以给任何位置创建的任务授权**——群里建的、控制台建的、旧版本建的都行：授权动作必须在管理员单聊里做，但被授权的任务不受这个限制，结果推送目标（原群/原单聊）也不变。" +
 			"适用于任务创建时未记录身份（群聊/旧版本/控制台创建）导致无人值守无法使用受控工具的情况——授权后**无需删除重建**，原 cron、prompt 与执行历史全部保留。" +
 			"传 id 授权单个；传 all=true 一次授权**所有尚未授权的任务**（管理员自己建的任务批量补授权用这个，不必逐个来）。" +
 			"授权后任务以你（当前管理员）的身份执行，每次开跑前实时重新校验：你被移出管理员名单，任务立即失去受控权限。",
@@ -149,7 +169,7 @@ export function createSchedulerTools(
 					content: [{
 						type: "text",
 						text: pending.length
-							? `请给出要授权的任务 id，或传 all=true 一次授权全部 ${pending.length} 个未授权任务：\n${pending.map((r) => `  · ${r.title}（id=${r.id}）`).join("\n")}`
+							? `请给出要授权的任务 id，或传 all=true 一次授权全部 ${pending.length} 个未授权任务：\n${pending.map((r) => `  · ${r.title}（id=${r.id}，创建于${createdIn(r, conversationId).label}）`).join("\n")}`
 							: "没有需要授权的任务：所有定时任务都已带执行身份。",
 					}],
 					details: { ok: false, unauthorized: pending.length },
@@ -177,9 +197,12 @@ export function createSchedulerTools(
 			if (all) {
 				const pending = scheduler.list().filter((r) => !r.created_by);
 				const done: string[] = [];
+				const elsewhere: string[] = [];
 				for (const row of pending) {
 					const updated = scheduler.setCreatedBy(row.id, actorId);
-					if (updated) done.push(updated.title);
+					if (!updated) continue;
+					done.push(updated.title);
+					if (!createdIn(updated, conversationId).mine) elsewhere.push(`${updated.title}（${createdIn(updated, conversationId).label}）`);
 				}
 				if (done.length === 0) {
 					return { content: [{ type: "text", text: "没有需要授权的任务：所有定时任务都已带执行身份。" }], details: { ok: true, authorized: 0 } };
@@ -189,9 +212,12 @@ export function createSchedulerTools(
 						type: "text",
 						text:
 							`✅ 已授权全部 ${done.length} 个未授权的定时任务（以后以你的身份执行）：${done.join("、")}。` +
-							`cron、prompt 与执行历史均未改动；从现在起它们到点可用命令/浏览器/文件等受控工具。`,
+							`cron、prompt 与执行历史均未改动；从现在起它们到点可用命令/浏览器/文件等受控工具。` +
+							(elsewhere.length
+								? `\n\n⚠️ 其中 ${elsewhere.length} 个不是在当前会话创建的：${elsewhere.join("、")}。任何人在群里都能让机器人建任务，而授权等于把你的管理员身份交给该任务的 prompt —— 请确认这些任务的内容是你认可的；不认可的用 update_scheduled_task 改掉 prompt，或直接删掉。`
+								: ""),
 					}],
-					details: { ok: true, authorized: done.length, titles: done },
+					details: { ok: true, authorized: done.length, titles: done, authorizedElsewhere: elsewhere.length },
 				};
 			}
 

@@ -179,6 +179,55 @@ test("authorize is refused without a 1:1 admin and an explicit confirmation", as
 	assert.equal(unconfirmed.scheduler.list()[0].created_by, null);
 });
 
+test("a task created in a GROUP is authorized from the 1:1 chat, and keeps pushing to its group", async (t) => {
+	// The user's question: 「群里设置的定时任务呢？单聊可以授权吗？」 — yes. The
+	// authorization act must happen in a 1:1 admin chat, but the TASK being
+	// authorized is unrestricted: origin and push target are untouched.
+	const { tools } = build1(
+		t,
+		{ security: { adminStaffIds: ["boss"] } },
+		[
+			{ title: "群里建的日报", conversation_id: "dt:group:cidABC=", origin: "im" },
+			{ title: "本会话建的巡检", conversation_id: "dt:boss", origin: "im" },
+			{ title: "控制台遗留", conversation_id: null, origin: "console" },
+		],
+		actor("boss", "single", "给所有定时任务都授权，确认"),
+		"dt:boss",
+	);
+
+	const res = await tool(tools, "authorize_scheduled_task").execute("a1", { all: true });
+	assert.equal(res.details.authorized, 3, "group / console / own tasks are all eligible");
+	assert.equal(res.details.authorizedElsewhere, 2, "the two not created here are flagged");
+	// The warning is the safety half: creation is open to anyone, and authorizing
+	// hands the task the admin's identity.
+	assert.match(res.content[0].text, /不是在当前会话创建的/);
+	assert.match(res.content[0].text, /群里建的日报（群聊 dt\*\*\*C=/);
+	assert.match(res.content[0].text, /任何人在群里都能让机器人建任务/);
+
+	const listed = await tool(tools, "list_scheduled_tasks").execute("l1", {});
+	assert.match(listed.content[0].text, /创建于: 群聊 dt\*\*\*C=/, "list shows where each task came from");
+	assert.match(listed.content[0].text, /创建于: 本会话/);
+	assert.match(listed.content[0].text, /创建于: 控制台\/旧版本/);
+	assert.equal(listed.details.unauthorized, 0);
+});
+
+test("the pending list names each task's origin, and flags nothing when all are local", async (t) => {
+	const { tools } = build1(
+		t,
+		{ security: { adminStaffIds: ["boss"] } },
+		[{ title: "甲", conversation_id: "dt:boss" }],
+		actor("boss"),
+		"dt:boss",
+	);
+	let res = await tool(tools, "authorize_scheduled_task").execute("p1", {});
+	assert.match(res.content[0].text, /甲（id=t1，创建于本会话）/, "the origin is part of the pick list");
+
+	res = await tool(tools, "authorize_scheduled_task").execute("p2", { all: true });
+	assert.equal(res.details.authorized, 1);
+	assert.equal(res.details.authorizedElsewhere, 0);
+	assert.doesNotMatch(res.content[0].text, /不是在当前会话创建的/, "a task created here needs no warning");
+});
+
 test("creating a task without an identity says so, and how to fix it", async (t) => {
 	// Created in a group: allowed, but runs unattended with no identity.
 	const grouped = build1(t, { security: { adminStaffIds: ["boss"] } }, [], actor("boss", "group"), "dt:group:prod");
