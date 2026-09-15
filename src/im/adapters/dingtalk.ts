@@ -316,6 +316,9 @@ export class DingtalkAdapter implements IMAdapter {
 							conversationId,
 							text: promptText,
 							images,
+							// The group's own name — the only handle a human has for it (the
+							// client never shows openConversationId). Absent in 1:1 chats.
+							conversationName: (msg as { conversationTitle?: string }).conversationTitle?.trim() || undefined,
 							actor: {
 								senderId: msg.senderStaffId || msg.senderId || "",
 								senderName: (msg as { senderNick?: string }).senderNick?.trim() || undefined,

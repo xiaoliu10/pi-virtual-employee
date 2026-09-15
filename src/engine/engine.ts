@@ -58,6 +58,12 @@ export interface SendCtx {
 	images?: { data: string; mimeType: string }[];
 	/** Verified IM sender metadata for conversation-side admin authorization. */
 	actor?: InboundActor;
+	/**
+	 * The conversation's own name as the platform reports it (a DingTalk group
+	 * title). Recorded so an admin can refer to a group by name — the platform
+	 * never exposes the id a human could type.
+	 */
+	conversationName?: string;
 	/** Called right after a message is persisted, so the UI can reload this conversation live. */
 	onPersist?: (conversationId: string) => void;
 }
@@ -687,6 +693,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 		const existing = this.history.getConversation(conversationId);
 		this.history.ensureConversation(conversationId, existing?.title ?? deriveTitle(message));
+		// Adopt the channel's own name for the chat when it supplies one (group
+		// title), so the admin can name a group the only way they can — by name.
+		// Only for non-local chats: the console's own titles stay user-facing.
+		const channelName = ctx?.conversationName?.trim();
+		if (channelName && channelName !== existing?.title && !isLocalConversation(conversationId)) {
+			this.history.setConversationName(conversationId, channelName);
+		}
 		// Persist the user turn. Images ride along for THIS turn only (they go to the
 		// live model, not the text transcript), so mark them in the stored line.
 		const imageNote = ctx?.images?.length ? `\n[附带 ${ctx.images.length} 张图片]` : "";

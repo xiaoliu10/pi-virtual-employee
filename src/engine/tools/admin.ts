@@ -72,16 +72,19 @@ export function isSchedulerActor(actor: NonNullable<ActorContext>): boolean {
 /**
  * Platform-verified single-chat check shared by guarded tools. Group chats and
  * non-IM conversations have no reliable operation actor and are refused here.
+ * `opts.groupHint` lets a caller append the actionable "do it like this instead"
+ * line for its own operation (the plain refusal alone leaves the admin stuck).
  */
-export function requireSingleChatActor(deps: Pick<AdminToolDeps, "resolveActor" | "conversationId">):
-	| AdminRefusal
-	| { actor: NonNullable<ActorContext> } {
+export function requireSingleChatActor(
+	deps: Pick<AdminToolDeps, "resolveActor" | "conversationId">,
+	opts: { groupHint?: string } = {},
+): AdminRefusal | { actor: NonNullable<ActorContext> } {
 	const actor = deps.resolveActor(deps.conversationId);
 	if (!actor) {
 		return refuse("当前会话不是 IM 单聊（无经过验证的发送者身份），管理操作只能在 IM 单聊中进行。");
 	}
 	if (actor.chatType !== "single") {
-		return refuse("管理操作只允许在单聊中进行，群聊不开放（群内无法可靠鉴别操作者）。");
+		return refuse("管理操作只允许在单聊中进行，群聊不开放（群内无法可靠鉴别操作者）。" + (opts.groupHint ?? ""));
 	}
 	if (isSchedulerActor(actor)) {
 		// Unattended scheduled runs may only execute/supervise commands (via
@@ -103,9 +106,9 @@ export function requireSingleChatActor(deps: Pick<AdminToolDeps, "resolveActor" 
  */
 export function requireConfirmedAdmin(
 	deps: Pick<AdminToolDeps, "config" | "resolveActor" | "conversationId">,
-	opts: { needConfirmation: boolean; confirmationHint?: string },
+	opts: { needConfirmation: boolean; confirmationHint?: string; groupHint?: string },
 ): AdminRefusal | { actor: NonNullable<ActorContext> } {
-	const gate = requireSingleChatActor(deps);
+	const gate = requireSingleChatActor(deps, { groupHint: opts.groupHint });
 	if ("content" in gate) return gate;
 	const { actor } = gate;
 	if (!hasAnyAdmin(deps.config)) {

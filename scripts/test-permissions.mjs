@@ -224,10 +224,10 @@ test("manage_access writes roles, default role, and floors; validates input", as
 	assert.equal(res.details.refused, true);
 	assert.match(res.content[0].text, /viewer \/ operator \/ admin/);
 
-	res = await tool.execute("w4", { action: "set_conversation", conversationId: "dt:group:prod", floors: { knowledge: "admin", browser: "operator", nonsense: "admin" } });
+	res = await tool.execute("w4", { action: "set_conversation", conversationName: "dt:group:prod", floors: { knowledge: "admin", browser: "operator", nonsense: "admin" } });
 	assert.equal(res.details.refused, true, "unknown capability names are rejected");
 
-	res = await tool.execute("w5", { action: "set_conversation", conversationId: "dt:group:prod", floors: { knowledge: "admin", browser: "default" } });
+	res = await tool.execute("w5", { action: "set_conversation", conversationName: "dt:group:prod", floors: { knowledge: "admin", browser: "default" } });
 	assert.deepEqual(res.details.floors, { knowledge: "admin" }, "browser equal to its default is stored as no floor");
 
 	res = await tool.execute("w6", { action: "set_default_role", role: "operator" });
@@ -237,7 +237,7 @@ test("manage_access writes roles, default role, and floors; validates input", as
 	res = await tool.execute("w7", { action: "list" });
 	assert.match(res.content[0].text, /dt:group:prod/);
 
-	res = await tool.execute("w8", { action: "remove_conversation", conversationId: "dt:group:prod" });
+	res = await tool.execute("w8", { action: "remove_conversation", conversationName: "dt:group:prod" });
 	assert.deepEqual(config.all().security.conversations, []);
 });
 
@@ -358,7 +358,7 @@ test("the roster table in sqlite.ts matches the upsert's conflict target", async
 	assert.match(ddl, /PRIMARY KEY\s*\(\s*conversation_id\s*,\s*staff_id\s*\)/, "the upsert's ON CONFLICT target must exist");
 });
 
-test("list_members demands an explicit conversation and never guesses members", async (t) => {
+test("list_members resolves a group by NAME and never guesses members", async (t) => {
 	const { config } = store(t, { security: { adminStaffIds: ["boss"] } });
 	const store2 = roster(t);
 	store2.recordMember("dt:group:prod", "alice", "成员A");
@@ -371,36 +371,191 @@ test("list_members demands an explicit conversation and never guesses members", 
 		conversationId: "dt:boss",
 		listConversations: () => [
 			{ id: "dt:group:prod", title: "生产群", origin: "im" },
+			{ id: "dt:group:quiet", title: "安静群", origin: "im" },
 			{ id: "9f0c-console", title: "本地会话", origin: "console" },
 		],
 		listMembers: (cid) => asDep(store2.listMembers(cid)),
 	});
 
-	// No conversationId: the whole point of the group-identity fix — in a 1:1 chat
-	// there is no "current group", so the tool must ask instead of assuming one.
+	// No target at all: in a 1:1 chat there is no "current group", so the tool must
+	// ask — and it must ask for a NAME, never for an id nobody can look up.
 	let res = await tool.execute("m1", { action: "list_members" });
 	assert.equal(res.details.refused, true);
-	assert.match(res.content[0].text, /缺少 conversationId/);
-	assert.match(res.content[0].text, /生产群/, "it offers the known IM conversations to pick from");
+	assert.match(res.content[0].text, /缺少目标会话/);
+	assert.match(res.content[0].text, /群名/);
+	assert.doesNotMatch(res.content[0].text, /请提供.{0,6}(会话)?ID/, "never asks the human for an id");
 
-	res = await tool.execute("m2", { action: "list_members", conversationId: "dt:group:prod" });
+	res = await tool.execute("m2", { action: "list_members", conversationName: "生产群" });
 	assert.equal(res.details.memberCount, 2);
+	assert.equal(res.details.conversationId, "dt:group:prod", "the group name resolved to the platform id");
 	assert.match(res.content[0].text, /只含给机器人发过消息的人/, "the roster's incompleteness is stated, not hidden");
 	assert.match(res.content[0].text, /成员A/);
 	assert.deepEqual(res.details.members.map((m) => m.staffId), ["bob", "alice"], "most recently active first");
 
-	res = await tool.execute("m3", { action: "list_members", conversationId: "dt:group:quiet" });
+	// An id also works (the model may echo one from `list`).
+	res = await tool.execute("m2b", { action: "list_members", conversationId: "dt:group:prod" });
+	assert.equal(res.details.memberCount, 2);
+
+	res = await tool.execute("m3", { action: "list_members", conversationName: "安静群" });
 	assert.equal(res.details.memberCount, 0);
 	assert.match(res.content[0].text, /不要凭群名推测成员/);
+
+	res = await tool.execute("m3b", { action: "list_members", conversationName: "示例群" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /没有叫「示例群」的会话/);
+	assert.match(res.content[0].text, /生产群/, "it lists the groups it does know so the admin can correct the name");
 
 	// Non-admins cannot enumerate who is in which chat.
 	const member = createManageAccessTool({
 		config, resolveActor: () => actor("alice", "single", "名单"), onConfigChanged: () => {},
 		conversationId: "dt:alice", listMembers: (cid) => asDep(store2.listMembers(cid)),
 	});
-	res = await member.execute("m4", { action: "list_members", conversationId: "dt:group:prod" });
+	res = await member.execute("m4", { action: "list_members", conversationName: "生产群" });
 	assert.equal(res.details.refused, true);
 	assert.match(res.content[0].text, /不是本系统的管理员/);
+});
+
+test("a person is resolved by NAME from the bot's own roster, or refused with candidates", async (t) => {
+	const { config } = store(t, { security: { adminStaffIds: ["boss"], defaultRole: "viewer" } });
+	const store2 = roster(t);
+	store2.recordMember("dt:group:prod", "s_alice", "成员A");
+	store2.recordMember("dt:group:prod", "s_zhang1", "张工");
+	store2.recordMember("dt:group:ops", "s_zhang2", "张工");
+	store2.recordMember("dt:group:prod", "s_wang", "王小明");
+	const tool = createManageAccessTool({
+		config,
+		resolveActor: () => actor("boss", "single", "确认"),
+		onConfigChanged: () => {},
+		conversationId: "dt:boss",
+		listConversations: () => [
+			{ id: "dt:group:prod", title: "生产群", origin: "im" },
+			{ id: "dt:group:ops", title: "运维群", origin: "im" },
+		],
+		listMembers: (cid) => asDep(store2.listMembers(cid)),
+	});
+
+	// The point of the whole change: an admin who only knows a display name can act.
+	let res = await tool.execute("p1", { action: "set_role", person: "成员A", role: "operator" });
+	assert.equal(res.details.staffId, "s_alice");
+	assert.equal(res.details.matchedBy, "name");
+	assert.match(res.content[0].text, /成员A/);
+	assert.match(res.content[0].text, /s_alice/, "the reply shows which id it resolved to");
+	assert.deepEqual(config.all().security.people, [{ staffId: "s_alice", name: "成员A", role: "operator" }]);
+
+	// Two people share a name → refuse and show both, never pick one.
+	res = await tool.execute("p2", { action: "set_role", person: "张工", role: "operator" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /叫「张工」的有 2 个人/);
+	assert.match(res.content[0].text, /s_zhang1/);
+	assert.match(res.content[0].text, /s_zhang2/);
+	assert.match(res.content[0].text, /生产群|运维群/, "candidates say where each person was seen");
+	assert.equal(resolveRole(config, "s_zhang1"), "viewer", "nothing was written");
+
+	// A partial name offers near matches instead of guessing.
+	res = await tool.execute("p3", { action: "set_role", person: "王", role: "operator" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /名字接近的有/);
+	assert.match(res.content[0].text, /王小明/);
+
+	// Someone who never messaged the bot cannot be resolved — say what to do.
+	res = await tool.execute("p4", { action: "set_role", person: "李四", role: "operator" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /只登记\*\*给机器人发过消息的人\*\*/);
+	assert.match(res.content[0].text, /list_people/);
+
+	// The id path still works, and carries the roster name along.
+	res = await tool.execute("p5", { action: "set_role", person: "s_wang", role: "admin" });
+	assert.equal(res.details.matchedBy, "roster-id");
+	assert.deepEqual(config.all().security.people.find((p) => p.staffId === "s_wang"), { staffId: "s_wang", name: "王小明", role: "admin" });
+
+	// A name dropped into the id parameter must NOT be written as a staffId.
+	res = await tool.execute("p6", { action: "set_role", staffId: "成员A", role: "operator" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /看起来是姓名/);
+	assert.match(res.content[0].text, /person=<姓名>/);
+	assert.equal(config.all().security.people.some((p) => p.staffId === "成员A"), false, "no dead staffId entry was created");
+
+	// list_people is the directory the admin works from.
+	res = await tool.execute("p7", { action: "list_people" });
+	assert.equal(res.details.peopleCount, 4);
+	assert.match(res.content[0].text, /成员A/);
+	assert.match(res.content[0].text, /运维群/, "it says where each person was seen");
+});
+
+test("a group-wide grant resolves the group by name and refuses to guess it", async (t) => {
+	const { config } = store(t, { security: { adminStaffIds: ["boss"], defaultRole: "viewer" } });
+	const store2 = roster(t);
+	store2.recordMember("dt:group:prod", "s_a", "成员A");
+	store2.recordMember("dt:group:prod", "s_b", "成员B");
+	const tool = createManageAccessTool({
+		config,
+		resolveActor: () => actor("boss", "single", "确认"),
+		onConfigChanged: () => {},
+		conversationId: "dt:boss",
+		listConversations: () => [
+			{ id: "dt:group:prod", title: "内部群", origin: "im" },
+			{ id: "dt:group:other", title: "外部群", origin: "im" },
+		],
+		listMembers: (cid) => asDep(store2.listMembers(cid)),
+	});
+
+	let res = await tool.execute("g1", { action: "set_conversation_roles", conversationName: "内部群", role: "operator" });
+	assert.equal(res.details.changed, 2);
+	assert.equal(res.details.conversationId, "dt:group:prod");
+	assert.match(res.content[0].text, /内部群/);
+
+	res = await tool.execute("g2", { action: "set_conversation_roles", conversationName: "内部", role: "viewer" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /没有正好叫「内部」的会话/);
+	assert.match(res.content[0].text, /内部群/);
+
+	// Group-wide admin is the one case that must carry the scope warning.
+	res = await tool.execute("g3", { action: "set_conversation_roles", conversationName: "内部群", role: "admin" });
+	assert.match(res.content[0].text, /⚠️/);
+	assert.equal(isAdmin(config, "s_a"), true);
+
+	// Floors take a group name too.
+	res = await tool.execute("g4", { action: "set_conversation", conversationName: "内部群", floors: { knowledge: "admin" } });
+	assert.deepEqual(res.details.floors, { knowledge: "admin" });
+	res = await tool.execute("g5", { action: "remove_conversation", conversationName: "内部群" });
+	assert.deepEqual(config.all().security.conversations, []);
+});
+
+test("a permission request in a group is refused with instructions that need no id", async (t) => {
+	const { config } = store(t, { security: { adminStaffIds: ["boss"] } });
+	const tool = createManageAccessTool({
+		config,
+		resolveActor: () => actor("boss", "group", "给群里所有人设 operator"),
+		onConfigChanged: () => {},
+		conversationId: "dt:group:prod",
+	});
+	const res = await tool.execute("h1", { action: "set_conversation_roles", conversationName: "生产群", role: "operator" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /单聊/);
+	assert.match(res.content[0].text, /不用提供任何 ID/, "the way forward must not require an id");
+	assert.match(res.content[0].text, /有哪些群|这个群都有谁/, "it offers wording the admin can actually say");
+});
+
+test("the platform's group name is stored as the conversation title without touching recency", (t) => {
+	// A group name arrives with EVERY inbound message, so this write must not
+	// bump updated_at — otherwise the sidebar would reshuffle on each message.
+	const db = new DatabaseSync(":memory:");
+	db.exec(`
+		CREATE TABLE conversations (
+			id TEXT PRIMARY KEY, title TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+			model_supplier_id TEXT, model_model_id TEXT, origin TEXT NOT NULL DEFAULT 'console'
+		);
+	`);
+	t.after(() => db.close());
+	const store2 = new HistoryStore(db);
+	store2.ensureConversation("dt:group:prod", "帮我看看这个", "im");
+	const before = store2.getConversation("dt:group:prod");
+
+	store2.setConversationName("dt:group:prod", "示例群");
+	const after = store2.getConversation("dt:group:prod");
+	assert.equal(after.title, "示例群");
+	assert.equal(after.updated_at, before.updated_at, "recency is untouched");
+	assert.equal(after.origin, "im", "origin is preserved — the trust boundary keys off it");
 });
 
 test("set_conversation_roles grants the whole observed roster, but spares the last admin", async (t) => {
@@ -414,21 +569,25 @@ test("set_conversation_roles grants the whole observed roster, but spares the la
 		resolveActor: () => actor("solo", "single", "确认"),
 		onConfigChanged: () => {},
 		conversationId: "dt:solo",
+		listConversations: () => [
+			{ id: "dt:group:prod", title: "内部群", origin: "im" },
+			{ id: "dt:group:quiet", title: "安静群", origin: "im" },
+		],
 		listMembers: (cid) => asDep(store2.listMembers(cid)),
 	});
 
 	// No target conversation ⇒ refuse (this is what "给群内所有人加管理员" hits).
 	let res = await tool.execute("b1", { action: "set_conversation_roles", role: "admin" });
 	assert.equal(res.details.refused, true);
-	assert.match(res.content[0].text, /没有「当前群」的语境/);
+	assert.match(res.content[0].text, /缺少目标会话/);
 
-	// Unknown/quiet conversation ⇒ refuse rather than silently granting nobody.
-	res = await tool.execute("b2", { action: "set_conversation_roles", conversationId: "dt:group:quiet", role: "admin" });
+	// A known-but-empty conversation ⇒ refuse rather than silently granting nobody.
+	res = await tool.execute("b2", { action: "set_conversation_roles", conversationName: "安静群", role: "admin" });
 	assert.equal(res.details.refused, true);
 	assert.match(res.content[0].text, /没有已记录成员/);
 
 	// Bulk DEMOTION must skip the only admin and still apply to everyone else.
-	res = await tool.execute("b3", { action: "set_conversation_roles", conversationId: "dt:group:prod", role: "operator" });
+	res = await tool.execute("b3", { action: "set_conversation_roles", conversationName: "内部群", role: "operator" });
 	assert.equal(res.details.changed, 1);
 	assert.match(res.content[0].text, /成员A/);
 	assert.ok(res.details.skipped.some((s) => s.includes("最后一位管理员")));
@@ -436,7 +595,7 @@ test("set_conversation_roles grants the whole observed roster, but spares the la
 	assert.equal(resolveRole(config, "alice"), "operator");
 
 	// Promoting the roster to admin is applied per member, with the scope warning.
-	res = await tool.execute("b4", { action: "set_conversation_roles", conversationId: "dt:group:prod", role: "admin" });
+	res = await tool.execute("b4", { action: "set_conversation_roles", conversationName: "内部群", role: "admin" });
 	assert.equal(res.details.changed, 1, "solo already is admin — no redundant write");
 	assert.deepEqual(res.details.skipped, ["我（已是 admin）"]);
 	assert.match(res.content[0].text, /⚠️/, "it warns that these are system-wide admins, not group-local");
@@ -445,7 +604,7 @@ test("set_conversation_roles grants the whole observed roster, but spares the la
 
 	// A bulk demotion can never empty the admin seat, even when every member of
 	// the roster is currently admin: whoever gets processed last is skipped.
-	res = await tool.execute("b5", { action: "set_conversation_roles", conversationId: "dt:group:prod", role: "viewer" });
+	res = await tool.execute("b5", { action: "set_conversation_roles", conversationName: "内部群", role: "viewer" });
 	assert.equal(res.details.changed, 1);
 	assert.equal(res.details.skipped.length, 1);
 	assert.match(res.details.skipped[0], /最后一位管理员/);
@@ -457,7 +616,7 @@ test("set_conversation_roles grants the whole observed roster, but spares the la
 
 	// A refused call must not write anything.
 	const beforeRefused = config.all().security.people;
-	res = await tool.execute("b6", { action: "set_conversation_roles", conversationId: "dt:group:prod", role: "root" });
+	res = await tool.execute("b6", { action: "set_conversation_roles", conversationName: "内部群", role: "root" });
 	assert.equal(res.details.refused, true);
 	assert.deepEqual(config.all().security.people, beforeRefused);
 });

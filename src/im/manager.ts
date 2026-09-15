@@ -255,7 +255,7 @@ export class IMAdapterManager {
 						const result = await this.engine.send(
 							agent,
 							msg.text,
-							{ sendFile: ctx?.sendFile, sendImage: ctx?.sendImage, images: msg.images, actor: msg.actor, onPersist: (id) => this.onActivity?.(id) },
+							{ sendFile: ctx?.sendFile, sendImage: ctx?.sendImage, images: msg.images, actor: msg.actor, conversationName: msg.conversationName, onPersist: (id) => this.onActivity?.(id) },
 						);
 						// Final turn complete — signal the UI to refresh the task list.
 						this.onActivity?.(msg.conversationId);

@@ -84,6 +84,17 @@ export class HistoryStore {
 		);
 	}
 
+	/**
+	 * Store the conversation's PLATFORM name (a DingTalk group's title). Kept
+	 * separate from setTitle so it never touches updated_at: this is metadata
+	 * arriving with every inbound message, not user activity, and bumping it
+	 * would reshuffle the sidebar order on each message. The name is what lets an
+	 * admin refer to a group the only way they can — by name.
+	 */
+	setConversationName(id: string, name: string): void {
+		this.db.prepare("UPDATE conversations SET title = ? WHERE id = ?").run(name, id);
+	}
+
 	touch(id: string): void {
 		this.db.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?").run(Date.now(), id);
 	}

@@ -45,6 +45,12 @@ export interface InboundMessage {
 	text: string;
 	/** Verified sender metadata supplied by the adapter, never parsed from text. */
 	actor?: InboundActor;
+	/**
+	 * The conversation's own name as the platform reports it (a DingTalk group's
+	 * title). Display/resolution-only: it is how a human refers to the chat, since
+	 * they have no way to know its id.
+	 */
+	conversationName?: string;
 	/** Images the user sent with this message (vision models can see them). */
 	images?: InboundImage[];
 }
