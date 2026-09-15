@@ -16,6 +16,8 @@ import type { SkillWriter } from "./skills/skill-writer.js";
 import type { ConfigStore } from "../db/config-store.js";
 import type { TelemetryStore } from "../db/telemetry-store.js";
 import { createMyStatsTool } from "./tools/telemetry.js";
+import { createProposeImprovementTool } from "./tools/proposals.js";
+import type { ProposalStore } from "./proposals.js";
 import type { InboundActor } from "../im/types.js";
 import { inferConversationOrigin } from "../db/history-store.js";
 import { buildSystemPrompt } from "./prompt.js";
@@ -130,9 +132,13 @@ export interface ToolSetOptions {
 	 * sees each call exactly once, so the telemetry wrapper lives here rather than
 	 * inside each tool (a newly added tool is then covered by construction).
 	 */
-	onToolEvent?: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; error?: string }) => void;
+	onToolEvent?: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string }) => void;
 	/** Telemetry store for the self-inspection tool (my_stats). */
 	telemetry?: TelemetryStore;
+	/** Proposal store (self-improvement loop output: propose_improvement). */
+	proposals?: ProposalStore;
+	/** Where proposals live on disk (shown in the tool's output). */
+	proposalsDir?: string;
 }
 
 /** Assemble the employee's tools; capability tools are conditional on their config flags. */
@@ -150,7 +156,7 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 		...tool,
 		async execute(toolCallId, params, signal, onUpdate) {
 			const gate = checkPermission(options.config, options.resolveActor(options.conversationId), options.conversationId, capability);
-			if (!gate.ok) return permissionRefusal(gate);
+			if (!gate.ok) return permissionRefusal(gate, capability);
 			return tool.execute(toolCallId, params, signal, onUpdate);
 		},
 	});
@@ -263,6 +269,17 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 	}
 	tools.push(orderTool, escalateTool);
 	if (options.telemetry) tools.push(guarded("telemetry", createMyStatsTool({ ...accessDeps, telemetry: options.telemetry })));
+	// The proposal loop's output channel. Same capability as my_stats: a proposal
+	// is a review artifact, not an action — it changes nothing on its own.
+	if (options.proposals && options.telemetry) {
+		tools.push(
+			guarded("telemetry", createProposeImprovementTool({
+				proposals: options.proposals,
+				telemetry: options.telemetry,
+				proposalsDir: options.proposalsDir ?? "(未配置)",
+			})),
+		);
+	}
 	// Instrument LAST so the wrapper sits outside every other wrapper (including
 	// the RBAC guard): a refusal is recorded as a refusal, not as a silent pass.
 	return options.onToolEvent ? tools.map((tool) => withTelemetry(tool, options.onToolEvent!)) : tools;
@@ -276,7 +293,7 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
  */
 function withTelemetry(
 	tool: AgentTool<any>,
-	onEvent: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; error?: string }) => void,
+	onEvent: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string }) => void,
 ): AgentTool<any> {
 	return {
 		...tool,
@@ -284,8 +301,9 @@ function withTelemetry(
 			const started = Date.now();
 			try {
 				const result = await tool.execute(toolCallId, params, signal, onUpdate);
-				const refused = Boolean((result as { details?: { refused?: boolean } } | undefined)?.details?.refused);
-				onEvent({ name: tool.name, durationMs: Date.now() - started, ok: !refused, refused });
+				const details = (result as { details?: { refused?: boolean; capability?: string } } | undefined)?.details;
+				const refused = Boolean(details?.refused);
+				onEvent({ name: tool.name, durationMs: Date.now() - started, ok: !refused, refused, refusedCapability: details?.capability });
 				return result;
 			} catch (err) {
 				onEvent({

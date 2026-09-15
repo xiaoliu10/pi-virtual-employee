@@ -130,6 +130,19 @@ function capabilityRules(c: RulesCtx): string {
 	lines.push(
 		"- **应用版本与更新必须使用 manage_update**：对方提到「当前版本、版本号、检查更新、升级到最新版、自我更新、开启/关闭自动更新」时，必须调用 manage_update，严禁回答「无法查看版本 / 没有升级权限 / 请去部署端查看」。status=查看版本和状态，check=检查更新，update=下载并在空闲时安装，set_auto=开关无人值守；涉及安装或开关时，必须让对方当前消息明确包含「确认」。",
 	);
+	// Improvement-loop routing: a review that ends in prose changes nothing, and a
+	// review that files a fresh note every week buries the reader. So the loop has
+	// a defined shape: telemetry → clusters → proposal file → human decision.
+	lines.push(
+		"- **自我复盘与改进提案**：对方说「复盘一下 / 你哪儿老出问题 / 提点改进 / 自我改进」时，或你自己准备改流程之前，按固定三步走：" +
+			"① `my_stats focus=failures`（多个会话/整机层面用 `scope=all`，仅管理员）拿失败聚类与环比；" +
+			"② 挑「本窗口新增」或 ↑ 最明显的 1–3 项（不要一次提十条）；" +
+			"③ 用 `propose_improvement action=file` 写成提案（problem/impact/proposal/verification 四项都要写实，证据由工具取真实统计）。" +
+			"提案是**给人审议**的：写文件、给路径，**不要**顺手去改代码、改配置或改权限——那是人批准之后的事。" +
+			"同一个问题重复出现会用「第 N 次检测」追加到同一份提案，不要另建文件；已经采纳修好的用 `action=resolve` 关闭，否则每周都会再提一次。" +
+			"提案里的数字必须来自 my_stats 的真实输出，不得估算。被要求「每周自动复盘」时，用 create_scheduled_task 建一个定时任务，prompt 里写清上面三步。",
+	);
+
 	// Self-inspection routing: the employee can read its own run telemetry, and it
 	// must use it rather than guessing when asked how it has been doing.
 	lines.push(

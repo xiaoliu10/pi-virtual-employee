@@ -24,7 +24,7 @@ await build({
 		contents: `
 			export { ConfigStore } from "./src/db/config-store.ts";
 			export { TelemetryStore, looksLikeCorrection, MAX_ERROR_LEN } from "./src/db/telemetry-store.ts";
-			export { createMyStatsTool, formatSummary } from "./src/engine/tools/telemetry.ts";
+			export { createMyStatsTool, formatSummary, formatClusters, formatTrend } from "./src/engine/tools/telemetry.ts";
 		`,
 		resolveDir: root,
 		loader: "ts",
@@ -35,7 +35,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { ConfigStore, TelemetryStore, looksLikeCorrection, MAX_ERROR_LEN, createMyStatsTool, formatSummary } =
+const { ConfigStore, TelemetryStore, looksLikeCorrection, MAX_ERROR_LEN, createMyStatsTool, formatSummary, formatClusters } =
 	await import(pathToFileURL(bundle).href);
 
 /** In-memory DB with the two telemetry tables (schema mirrored from sqlite.ts). */
@@ -55,7 +55,8 @@ function stores(t, seed = {}) {
 		CREATE TABLE tool_events (
 			id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, turn_id TEXT, name TEXT NOT NULL,
 			started_at INTEGER NOT NULL, duration_ms INTEGER NOT NULL DEFAULT 0,
-			ok INTEGER NOT NULL DEFAULT 1, refused INTEGER NOT NULL DEFAULT 0, error TEXT
+			ok INTEGER NOT NULL DEFAULT 1, refused INTEGER NOT NULL DEFAULT 0,
+			refused_capability TEXT, error TEXT
 		);
 	`);
 	t.after(() => db.close());
@@ -107,7 +108,7 @@ test("counters reflect what actually happened in a turn", (t) => {
 test("tool failures and RBAC refusals are separated in the ranking", (t) => {
 	const { telemetry } = stores(t);
 	telemetry.recordTurn(turn("t1"));
-	for (let i = 0; i < 3; i += 1) telemetry.recordTool({ conversationId: "dt:group:prod", turnId: "t1", name: "run_command", durationMs: 10, ok: false, refused: true });
+	for (let i = 0; i < 3; i += 1) telemetry.recordTool({ conversationId: "dt:group:prod", turnId: "t1", name: "run_command", durationMs: 10, ok: false, refused: true, refusedCapability: "shell" });
 	telemetry.recordTool({ conversationId: "dt:group:prod", turnId: "t1", name: "browser_open", durationMs: 900, ok: false, error: "net::ERR_NAME_NOT_RESOLVED" });
 	telemetry.recordTool({ conversationId: "dt:group:prod", turnId: "t1", name: "search_knowledge_base", durationMs: 40, ok: true });
 
@@ -195,4 +196,105 @@ test("pruning bounds growth", (t) => {
 	const removed = telemetry.prune(90);
 	assert.equal(removed, 1, "only the row past retention goes");
 	assert.equal(telemetry.summary({ hours: 24 * 365 }).turns, 1);
+});
+
+test("errors cluster by signature: same failure, different ids/paths/ports = one group", (t) => {
+	const { telemetry } = stores(t);
+	telemetry.recordTurn(turn("t1"));
+	const variants = [
+		"fetch failed: https://internal.example.com/api/orders?page=3 timeout after 12000ms",
+		"fetch failed: https://internal.example.com/api/orders?page=9 timeout after 9000ms",
+		"fetch failed: https://internal.example.com/api/orders?page=11 timeout after 15000ms",
+	];
+	for (const error of variants) {
+		telemetry.recordTool({ conversationId: "dt:group:prod", turnId: "t1", name: "browser_open", durationMs: 100, ok: false, error });
+	}
+	telemetry.recordTool({ conversationId: "dt:group:prod", turnId: "t1", name: "run_command", durationMs: 5, ok: false, refused: true, refusedCapability: "shell" });
+	telemetry.recordTool({ conversationId: "dt:group:prod", turnId: "t1", name: "read_file", durationMs: 5, ok: false, refused: true, refusedCapability: "filesystem" });
+
+	const clusters = telemetry.failureClusters({ hours: 24 });
+	const byLabel = Object.fromEntries(clusters.map((c) => [c.label, c]));
+	const timeoutCluster = clusters.find((c) => c.kind === "tool_error");
+	assert.equal(timeoutCluster.count, 3, "three variants collapse into one cluster");
+	assert.match(timeoutCluster.label, /browser_open: fetch failed: <url> timeout after <n>ms/);
+	assert.ok(timeoutCluster.samples.length >= 2, "original texts are kept as samples");
+
+	// Refusals cluster by CAPABILITY, from the structured field — not by parsing prose.
+	assert.equal(byLabel.shell.count, 1);
+	assert.equal(byLabel.shell.kind, "refusal");
+	assert.deepEqual(byLabel.shell.samples, ["run_command"], "a refusal sample names the tool that was denied");
+	assert.equal(byLabel.filesystem.count, 1);
+	assert.equal(clusters.length, 3, "no phantom clusters");
+});
+
+test("clusters are ranked by what is NEW or growing, with the prior window as baseline", (t) => {
+	const { telemetry } = stores(t);
+	const now = Date.now();
+	const HOUR = 3_600_000;
+	// Previous window: one recurring failure, 4 times.
+	for (let i = 0; i < 4; i += 1) {
+		telemetry.recordTurn(turn(`p${i}`, { startedAt: now - 30 * HOUR }));
+		telemetry.recordTool({ conversationId: "dt:group:prod", turnId: `p${i}`, startedAt: now - 30 * HOUR, name: "search_knowledge_base", durationMs: 5, ok: false, error: "index locked" });
+	}
+	// Current window: that same one twice, plus a brand-new one 3 times.
+	for (let i = 0; i < 2; i += 1) {
+		telemetry.recordTurn(turn(`c${i}`, { startedAt: now - HOUR }));
+		telemetry.recordTool({ conversationId: "dt:group:prod", turnId: `c${i}`, name: "search_knowledge_base", durationMs: 5, ok: false, error: "index locked" });
+	}
+	for (let i = 0; i < 3; i += 1) {
+		telemetry.recordTurn(turn(`d${i}`, { startedAt: now - HOUR }));
+		telemetry.recordTool({ conversationId: "dt:group:prod", turnId: `d${i}`, name: "browser_click_at", durationMs: 5, ok: false, error: "element detached" });
+	}
+
+	const clusters = telemetry.failureClusters({ hours: 24 });
+	assert.equal(clusters[0].label, "browser_click_at: element detached", "the NEW problem is ranked first");
+	assert.equal(clusters[0].prior, 0);
+	assert.equal(clusters[0].delta, 3);
+	const recurring = clusters.find((c) => c.label.startsWith("search_knowledge_base"));
+	assert.equal(recurring.count, 2);
+	assert.equal(recurring.prior, 4, "the prior window anchors the comparison");
+	assert.equal(recurring.delta, -2, "an improving problem shows a negative delta");
+
+	const text = formatClusters(clusters);
+	assert.match(text, /本窗口新增，上窗口为 0/);
+	assert.match(text, /上窗口 4 次，↓2/);
+});
+
+test("trend reports direction, and an empty window is not mistaken for improvement", async (t) => {
+	const { telemetry } = stores(t);
+	const now = Date.now();
+	telemetry.recordTurn(turn("old1", { startedAt: now - 30 * 3_600_000, status: "error", error: "boom" }));
+	telemetry.recordTurn(turn("old2", { startedAt: now - 30 * 3_600_000 }));
+	telemetry.recordTurn(turn("new1", { startedAt: now - 3_600_000 }));
+	telemetry.recordTurn(turn("new2", { startedAt: now - 3_600_000, correction: true }));
+	telemetry.recordTurn(turn("new3", { startedAt: now - 3_600_000, retries: 1 }));
+
+	const trend = telemetry.trend({ hours: 24 });
+	assert.equal(trend.previous.turns, 2);
+	assert.equal(trend.previous.failed, 1);
+	assert.equal(trend.current.turns, 3);
+	assert.equal(trend.current.failed, 0, "no failures this window…");
+	assert.equal(trend.current.corrections, 1, "…but the user corrected twice as often, which the trend shows");
+	assert.equal(trend.current.retries, 1);
+	assert.equal(trend.current.avgDurationMs, 5_000, "durations still aggregate");
+
+	const { config, telemetry: fresh } = stores(t, { security: { adminStaffIds: ["boss"] } });
+	const tool2 = createMyStatsTool({ config, resolveActor: () => actor("boss"), conversationId: "dt:boss", telemetry: fresh });
+	const res = await tool2.execute("f1", { focus: "failures" });
+	assert.equal(res.details.clusters.length, 0);
+	assert.match(res.content[0].text, /没有失败聚类/);
+	assert.match(res.content[0].text, /全部由统计代码算出|不要另行估算/, "the interpretation duty is stated, not assumed");
+});
+
+test("my_stats focus=failures keeps the cross-chat rule: scope=all is admin-only", async (t) => {
+	const { config, telemetry } = stores(t, { security: { adminStaffIds: ["boss"], people: [{ staffId: "op", role: "operator" }] } });
+	telemetry.recordTurn(turn("t1"));
+	telemetry.recordTool({ conversationId: "dt:group:prod", turnId: "t1", name: "run_command", durationMs: 5, ok: false, refused: true, refusedCapability: "shell" });
+	const op = createMyStatsTool({ config, resolveActor: () => actor("op", "group"), conversationId: "dt:group:prod", telemetry });
+	const res = await op.execute("f1", { focus: "failures", scope: "all" });
+	assert.equal(res.details.refused, true);
+	const scoped = await op.execute("f2", { focus: "failures" });
+	assert.equal(scoped.details.turns, 1);
+	assert.match(scoped.content[0].text, /权限被拒/);
+	assert.match(scoped.content[0].text, /shell/);
 });

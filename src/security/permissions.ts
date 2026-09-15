@@ -187,10 +187,15 @@ export function checkPermission(
 // #endregion immutable:rbac-gate
 
 /** Uniform refusal content block for tool results. */
-export function permissionRefusal(refusal: PermissionRefusal): { content: { type: "text"; text: string }[]; details: { refused: true; reason: string } } {
+export function permissionRefusal(
+	refusal: PermissionRefusal,
+	capability?: string,
+): { content: { type: "text"; text: string }[]; details: { refused: true; reason: string; capability?: string } } {
 	return {
 		content: [{ type: "text", text: `⛔ 已拒绝：${refusal.reason}` }],
-		details: { refused: true, reason: refusal.reason },
+		// The capability rides along structurally so run telemetry can aggregate
+		// refusals by capability without parsing this sentence.
+		details: { refused: true, reason: refusal.reason, ...(capability ? { capability } : {}) },
 	};
 }
 

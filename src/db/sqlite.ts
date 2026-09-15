@@ -147,6 +147,7 @@ function migrate(db: DB): void {
 			duration_ms     INTEGER NOT NULL DEFAULT 0,
 			ok              INTEGER NOT NULL DEFAULT 1,
 			refused         INTEGER NOT NULL DEFAULT 0,
+			refused_capability TEXT,
 			error           TEXT
 		);
 		CREATE INDEX IF NOT EXISTS idx_tool_events_started ON tool_events(started_at);
@@ -177,6 +178,13 @@ function migrate(db: DB): void {
 	);
 	if (!kbCols.has("chunk_index")) db.exec("ALTER TABLE kb_chunks ADD COLUMN chunk_index INTEGER");
 	if (!kbCols.has("metadata")) db.exec("ALTER TABLE kb_chunks ADD COLUMN metadata TEXT");
+	// Which capability a refusal was about, as a structured field. Clustering
+	// "which kind of request keeps getting denied" must not depend on parsing the
+	// refusal sentence we happen to write today.
+	const toolCols = new Set(
+		(db.prepare("PRAGMA table_info(tool_events)").all() as { name: string }[]).map((r) => r.name),
+	);
+	if (!toolCols.has("refused_capability")) db.exec("ALTER TABLE tool_events ADD COLUMN refused_capability TEXT");
 	if (!kbCols.has("embed_status")) db.exec("ALTER TABLE kb_chunks ADD COLUMN embed_status TEXT DEFAULT 'pending'");
 	if (!kbCols.has("embedding_model")) db.exec("ALTER TABLE kb_chunks ADD COLUMN embedding_model TEXT");
 

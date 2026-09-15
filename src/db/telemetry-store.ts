@@ -31,6 +31,19 @@ export const RETENTION_DAYS = 90;
 
 export type TurnStatus = "ok" | "error" | "empty_reply" | "deterministic_failure" | "aborted";
 
+export interface ToolEventRow {
+	id: string;
+	conversation_id: string;
+	turn_id: string | null;
+	name: string;
+	started_at: number;
+	duration_ms: number;
+	ok: number;
+	refused: number;
+	refused_capability: string | null;
+	error: string | null;
+}
+
 export interface TurnEventRow {
 	id: string;
 	conversation_id: string;
@@ -78,10 +91,67 @@ export interface RecordToolInput {
 	conversationId: string;
 	turnId?: string;
 	name: string;
+	/** When the call happened; defaults to now. Stated explicitly by callers that
+	 *  record a call after the fact (tests, replays). */
+	startedAt?: number;
 	durationMs: number;
 	ok: boolean;
 	refused?: boolean;
+	/** Capability the refusal was about (structured, not parsed from text). */
+	refusedCapability?: string;
 	error?: string;
+}
+
+/** One group of similar failures in a review window. */
+export interface FailureCluster {
+	kind: "refusal" | "tool_error" | "turn_error" | "aborted" | "step_cap" | "empty_reply" | "correction";
+	/** Refusal ⇒ the capability; errors ⇒ "tool: signature"; others ⇒ a fixed label. */
+	label: string;
+	count: number;
+	/** Same cluster's count in the preceding equally-long window. */
+	prior: number;
+	/** count - prior: what is NEW or growing is what deserves attention. */
+	delta: number;
+	/** Up to 3 original texts (or tool names for refusals) for the reviewer. */
+	samples: string[];
+}
+
+export interface TrendWindow {
+	turns: number;
+	failed: number;
+	retries: number;
+	caps: number;
+	corrections: number;
+	aborted: number;
+	refusals: number;
+	avgDurationMs: number;
+}
+
+export interface Trend {
+	hours: number;
+	current: TrendWindow;
+	previous: TrendWindow;
+}
+
+/**
+ * Normalize a failure message into a cluster signature: the same error with a
+ * different order id, port, path or timing must land in ONE group, otherwise a
+ * weekly review sees ten "unique" problems that are one problem.
+ */
+export function errorSignature(text: string): string {
+	let t = text.toLowerCase();
+	t = t.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, "<uuid>");
+	t = t.replace(/\b(?:[a-z]:)?(?:[\/][\w.\-]+){2,}/g, "<path>");
+	t = t.replace(/\bhttps?:\/\/[^\s"']+/g, "<url>");
+	t = t.replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g, "<ip>");
+	t = t.replace(/\b[0-9a-f]{16,}\b/g, "<hex>");
+	t = t.replace(/\b\d{4}-\d{2}-\d{2}t[\d:.]+z?\b/g, "<time>");
+	// No word boundaries: "12000ms" and "HTTP429" must normalize too, and by this
+	// point every digit left belongs to a number (placeholders carry none).
+	t = t.replace(/\d+(?:\.\d+)?/g, "<n>");
+	t = t.replace(/"[^"]*"/g, "<str>");
+	t = t.replace(/\s+/g, " ").trim();
+	return t.length > 90 ? `${t.slice(0, 90)}…` : t;
 }
 
 /** Aggregate view returned to the agent (and only ever to an authorized one). */
@@ -167,17 +237,18 @@ export class TelemetryStore {
 	recordTool(input: RecordToolInput): void {
 		this.db
 			.prepare(
-				"INSERT INTO tool_events (id, conversation_id, turn_id, name, started_at, duration_ms, ok, refused, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				"INSERT INTO tool_events (id, conversation_id, turn_id, name, started_at, duration_ms, ok, refused, refused_capability, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				randomUUID(),
 				input.conversationId,
 				input.turnId ?? null,
 				input.name,
-				Date.now(),
+				input.startedAt ?? Date.now(),
 				Math.max(0, Math.round(input.durationMs)),
 				input.ok ? 1 : 0,
 				input.refused ? 1 : 0,
+				input.refusedCapability ?? null,
 				truncate(input.error) ?? null,
 			);
 	}
@@ -268,6 +339,148 @@ export class TelemetryStore {
 				.sort(([a], [b]) => a.localeCompare(b))
 				.map(([day, v]) => ({ day, ...v })),
 		};
+	}
+
+	/**
+	 * Cluster the window's failures so a review can act on them.
+	 *
+	 * Aggregation happens HERE, in code, not in the model: the counts are the
+	 * evidence, and evidence must not be produced by the thing being reviewed.
+	 * The model's job is to interpret the clusters, not to derive them.
+	 *
+	 *  - refusals cluster by the CAPABILITY they were about (a structured field),
+	 *    because "which kind of request keeps getting denied" is a policy signal.
+	 *  - errors cluster by a normalized signature, so the same failure with a
+	 *    different order id / path / port lands in one group instead of ten.
+	 *  - `prior` is the same signature's count in the equally-long window before
+	 *    this one, which is what turns a count into a direction (getting worse?).
+	 */
+	failureClusters(opts: { hours: number; conversationId?: string; limit?: number }): FailureCluster[] {
+		const hours = Math.max(1, opts.hours);
+		const now = Date.now();
+		const since = now - hours * 3_600_000;
+		const priorSince = since - hours * 3_600_000;
+		const conv = opts.conversationId;
+		const where = conv ? "started_at >= ? AND conversation_id = ?" : "started_at >= ?";
+		const args = conv ? [since, conv] : [since];
+		const priorArgs = conv ? [priorSince, conv] : [priorSince];
+
+		const tools = this.db
+			.prepare(`SELECT name, refused, refused_capability, error FROM tool_events WHERE ${where}`)
+			.all(...args) as Pick<ToolEventRow, "name" | "refused" | "refused_capability" | "error">[];
+		const priorTools = this.db
+			.prepare(`SELECT name, refused, refused_capability, error FROM tool_events WHERE ${where} AND started_at < ?`)
+			.all(...(conv ? [priorSince, conv!, since] : [priorSince, since])) as Pick<ToolEventRow, "name" | "refused" | "refused_capability" | "error">[];
+		const turns = this.db
+			.prepare(`SELECT status, error, abort_reason, step_cap_hit, empty_reply, correction FROM turn_events WHERE ${where}`)
+			.all(...args) as Pick<TurnEventRow, "status" | "error" | "abort_reason" | "step_cap_hit" | "empty_reply" | "correction">[];
+
+		const buckets = new Map<string, FailureCluster>();
+		const mine: FailureCluster[] = [];
+		const bump = (kind: FailureCluster["kind"], label: string): FailureCluster => {
+			const key = `${kind}|${label}`;
+			let cell = buckets.get(key);
+			if (!cell) {
+				cell = { kind, label, count: 0, prior: 0, samples: [], delta: 0 };
+				buckets.set(key, cell);
+				mine.push(cell);
+			}
+			return cell;
+		};
+
+		for (const t of tools) {
+			if (t.refused) {
+				const cell = bump("refusal", t.refused_capability ?? "unknown");
+				cell.count += 1;
+				if (!cell.samples.includes(t.name)) cell.samples.push(t.name);
+				continue;
+			}
+			if (t.error) {
+				const cell = bump("tool_error", `${t.name}: ${errorSignature(t.error)}`);
+				cell.count += 1;
+				if (!cell.samples.includes(t.error)) cell.samples.push(t.error);
+			}
+		}
+		// Prior window counts feed the same bucket map so labels line up exactly.
+		const priorCounts = new Map<string, number>();
+		for (const t of priorTools) {
+			const kind = t.refused ? "refusal" : "tool_error";
+			const label = t.refused ? (t.refused_capability ?? "unknown") : `${t.name}: ${errorSignature(t.error ?? "")}`;
+			const key = `${kind}|${label}`;
+			priorCounts.set(key, (priorCounts.get(key) ?? 0) + 1);
+		}
+		for (const t of turns) {
+			if (t.status === "error" && t.error) {
+				const cell = bump("turn_error", errorSignature(t.error));
+				cell.count += 1;
+				if (!cell.samples.includes(t.error)) cell.samples.push(t.error);
+			}
+			if (t.abort_reason) bump("aborted", t.abort_reason).count += 1;
+			if (t.step_cap_hit) bump("step_cap", "工具步数封顶").count += 1;
+			if (t.empty_reply) bump("empty_reply", "回合无正文（靠兜底总结收尾）").count += 1;
+			if (t.correction) bump("correction", "用户当场纠错").count += 1;
+		}
+
+		// Turn-level clusters get their prior from the previous window too, so a
+		// rising correction rate is visible and not just an absolute number.
+		const priorTurnRows = this.db
+			.prepare(`SELECT abort_reason, step_cap_hit, empty_reply, correction FROM turn_events WHERE ${where} AND started_at < ?`)
+			.all(...(conv ? [priorSince, conv, since] : [priorSince, since])) as Pick<TurnEventRow, "abort_reason" | "step_cap_hit" | "empty_reply" | "correction">[];
+		for (const t of priorTurnRows) {
+			if (t.abort_reason) priorCounts.set(`aborted|${t.abort_reason}`, (priorCounts.get(`aborted|${t.abort_reason}`) ?? 0) + 1);
+			if (t.step_cap_hit) priorCounts.set("step_cap|工具步数封顶", (priorCounts.get("step_cap|工具步数封顶") ?? 0) + 1);
+			if (t.empty_reply) priorCounts.set("empty_reply|回合无正文（靠兜底总结收尾）", (priorCounts.get("empty_reply|回合无正文（靠兜底总结收尾）") ?? 0) + 1);
+			if (t.correction) priorCounts.set("correction|用户当场纠错", (priorCounts.get("correction|用户当场纠错") ?? 0) + 1);
+		}
+
+		for (const c of mine) {
+			c.prior = priorCounts.get(`${c.kind}|${c.label}`) ?? 0;
+			c.delta = c.count - c.prior;
+			c.samples = c.samples.slice(0, 3);
+		}
+		// Worst first: what is NEW or growing outranks what is merely large.
+		return mine
+			.sort((a, b) => b.delta - a.delta || b.count - a.count)
+			.slice(0, Math.max(1, opts.limit ?? 12));
+	}
+
+	/** Window-over-window totals, so "did this get better?" has an answer. */
+	trend(opts: { hours: number; conversationId?: string }): Trend {
+		const hours = Math.max(1, opts.hours);
+		const now = Date.now();
+		const conv = opts.conversationId;
+		const cell = (from: number, to: number) => {
+			const where = conv
+				? "started_at >= ? AND started_at < ? AND conversation_id = ?"
+				: "started_at >= ? AND started_at < ?";
+			const args = conv ? [from, to, conv] : [from, to];
+			const row = this.db
+				.prepare(
+					`SELECT COUNT(*) AS turns,
+						SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END) AS failed,
+						SUM(retries) AS retries, SUM(step_cap_hit) AS caps, SUM(correction) AS corrections,
+						SUM(CASE WHEN abort_reason IS NOT NULL THEN 1 ELSE 0 END) AS aborted,
+						AVG(duration_ms) AS avg_ms
+					 FROM turn_events WHERE ${where}`,
+				)
+				.get(...args) as { turns: number; failed: number | null; retries: number | null; caps: number | null; corrections: number | null; aborted: number | null; avg_ms: number | null };
+			const refused = this.db
+				.prepare(`SELECT COUNT(*) AS n FROM tool_events WHERE ${where} AND refused = 1`)
+				.get(...args) as { n: number };
+			return {
+				turns: row.turns ?? 0,
+				failed: row.failed ?? 0,
+				retries: row.retries ?? 0,
+				caps: row.caps ?? 0,
+				corrections: row.corrections ?? 0,
+				aborted: row.aborted ?? 0,
+				refusals: refused.n ?? 0,
+				avgDurationMs: Math.round(row.avg_ms ?? 0),
+			};
+		};
+		const current = cell(now - hours * 3_600_000, now);
+		const previous = cell(now - 2 * hours * 3_600_000, now - hours * 3_600_000);
+		return { hours, current, previous };
 	}
 
 	/** Drop rows older than the retention window. Returns how many were removed. */

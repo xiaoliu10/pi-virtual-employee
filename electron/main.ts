@@ -20,6 +20,7 @@ import { ComputerService } from "../src/computer/computer-service.js";
 import { ScheduledTaskStore } from "../src/db/scheduled-task-store.js";
 import { SchedulerService } from "../src/scheduler/scheduler-service.js";
 import { TelemetryStore } from "../src/db/telemetry-store.js";
+import { ProposalStore } from "../src/engine/proposals.js";
 import { DocumentService } from "../src/documents/document-service.js";
 import { FileSystemService } from "../src/filesystem/filesystem-service.js";
 import { ArtifactStore } from "../src/db/artifact-store.js";
@@ -406,6 +407,9 @@ async function main(): Promise<void> {
 	// build script). User-imported skills live under userData/skills.
 	const builtinSkillsDir = path.join(__dirname, "resources", "skills");
 	const userSkillsDir = path.join(userData, "skills");
+	// Self-improvement proposals live next to the profile, as plain markdown the
+	// operator (or a developer) can read, diff and delete.
+	const proposalsDir = path.join(userData, "proposals");
 	await mkdir(userSkillsDir, { recursive: true }).catch(() => {});
 
 	// Clone path: if this profile was launched to absorb a pending employee
@@ -418,6 +422,7 @@ async function main(): Promise<void> {
 		builtinSkillsDir,
 		userSkillsDir,
 		shellAuditLogPath: path.join(userData, "logs", "shell-audit.log"),
+		proposalsDir,
 	}, { timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000 });
 	engine.setComputerService(computer);
 	// Run telemetry: the employee's own record of how its turns went (my_stats tool;
@@ -425,6 +430,7 @@ async function main(): Promise<void> {
 	// alongside the other housekeeping sweeps.
 	const telemetry = new TelemetryStore(db);
 	engine.setTelemetryStore(telemetry);
+	engine.setProposalStore(new ProposalStore(proposalsDir));
 	try {
 		const pruned = telemetry.prune();
 		if (pruned > 0) console.log(`[main] telemetry pruned: ${pruned} turn rows past retention`);

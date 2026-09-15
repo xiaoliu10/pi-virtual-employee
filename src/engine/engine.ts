@@ -20,6 +20,7 @@ import type { ConfigStore, Supplier } from "../db/config-store.js";
 import type { HistoryStore } from "../db/history-store.js";
 import { inferConversationOrigin } from "../db/history-store.js";
 import { looksLikeCorrection, type TelemetryStore, type TurnStatus } from "../db/telemetry-store.js";
+import type { ProposalStore } from "./proposals.js";
 import type { InboundActor } from "../im/types.js";
 import type { KnowledgeService } from "../knowledge/knowledge-service.js";
 import type { BrowserService } from "../browser/browser-service.js";
@@ -161,7 +162,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		private readonly filesystem: FileSystemService,
 		private readonly reportService: ReportService,
 		private readonly downloadService: DownloadService,
-		private readonly paths: { builtinSkillsDir: string; userSkillsDir: string; shellAuditLogPath?: string },
+		private readonly paths: { builtinSkillsDir: string; userSkillsDir: string; shellAuditLogPath?: string; proposalsDir?: string },
 		options: EngineOptions = {},
 	) {
 		this.opts = { timeoutMs: options.timeoutMs ?? 0, streamFn: options.streamFn };
@@ -178,6 +179,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 */
 	private telemetry?: TelemetryStore;
 	setTelemetryStore(store: TelemetryStore): void { this.telemetry = store; }
+
+	/** Improvement-proposal store (written by propose_improvement). */
+	private proposals?: ProposalStore;
+	setProposalStore(store: ProposalStore): void { this.proposals = store; }
 
 	/** turnId per conversation for the in-flight turn, so tool events can link. */
 	private readonly turnIds = new Map<string, string>();
@@ -487,7 +492,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 					isScheduledRun: conversationId.startsWith("sched:"),
 				}),
 				model: this.buildModel(supplier, modelId),
-				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry }),
+				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir }),
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
 				messages: rehydrateMessages(this.history.listMessages(conversationId)),
@@ -855,7 +860,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** One tool call, linked to the turn that made it. Never throws. */
 	private recordToolTelemetry(
 		conversationId: string,
-		event: { name: string; durationMs: number; ok: boolean; refused?: boolean; error?: string },
+		event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string },
 	): void {
 		if (!this.telemetry) return;
 		try {
