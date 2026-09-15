@@ -230,9 +230,12 @@ export function createBrowserTools(
 		name: "browser_press_key",
 		label: "浏览器：按键",
 		description:
-			"向当前页面发送一个键盘按键。用于：输入后按 Enter 提交日期/搜索框，Tab 切换到下一个输入框，Escape 关闭弹层/下拉面板，方向键翻日历。key 用标准键名，如 Enter、Tab、Escape、ArrowLeft、ArrowRight、Backspace。",
+			"向当前页面发送键盘按键或组合键。用于：输入后按 Enter 提交日期/搜索框，Tab 切换到下一个输入框，Escape 关闭弹层/下拉面板，方向键翻日历；" +
+			"远程桌面/终端场景还常用：PageUp/PageDown/Home/End（滚动与跳转）、Delete、F5（刷新远程画面）、ArrowUp/ArrowDown（终端历史命令）、" +
+			"以及组合键——用 + 连接修饰键，如 Control+c（中断终端当前命令）、Control+v（粘贴）、Alt+Tab（切换远程窗口）、Control+Shift+Escape。" +
+			"按键只送到当前焦点：先确认 browser_click_at 返回的 focus 已在远程会话内，否则组合键会打在页面本身上。",
 		parameters: Type.Object({
-			key: Type.String({ description: "键名，如 Enter、Tab、Escape、ArrowLeft、ArrowRight、Backspace" }),
+			key: Type.String({ description: "键名或组合键，如 Enter、Tab、Escape、ArrowUp、PageDown、F5、Delete、Control+c、Alt+Tab、Control+Shift+Escape" }),
 		}),
 		async execute(_id, params) {
 			try {
@@ -271,7 +274,9 @@ export function createBrowserTools(
 		label: "浏览器：坐标点击",
 		description:
 			"按屏幕坐标点击（原始鼠标输入），用于 Canvas 画布类页面——堡垒机/H5 远程桌面把远程屏幕画在 canvas 里，Navicat 等远程程序的按钮不是 DOM 元素，browser_click 点不到。" +
-			"用法：先 browser_screenshot 看清画面（截图与视口 1:1，1280x800），把目标按钮的像素坐标传进来；点击后目标（如远程会话）获得焦点。" +
+			"用法：先 browser_screenshot 看清画面（截图与视口 1:1，1280x800），把目标按钮的像素坐标传进来。" +
+			"返回里的 focus 告诉你键盘现在会打到谁：拿到焦点的是远程会话的隐藏 textarea/div 才算点中；是 body 说明没点中，键盘输入到不了远程，应重新截图定位再点。" +
+			"tabSwitched=true 表示这次点击打开了新标签页/窗口（堡垒机常把 SSH 终端开在新窗口），已自动跟随，后续工具作用于新页。" +
 			"需要双击传 double=true，右键传 button=right。普通网页仍优先用 browser_click（按元素点更稳）。",
 		parameters: Type.Object({
 			x: Type.Number({ description: "像素 X 坐标（以 browser_screenshot 画面为准）" }),
@@ -286,7 +291,95 @@ export function createBrowserTools(
 					double: p.double,
 					button: p.button === "right" ? "right" : "left",
 				});
-				return textResult(`已在坐标 (${r.x}, ${r.y}) 点击。目标若获得焦点，可用 browser_type_text / browser_press_key 键入，或再 screenshot 看结果。`, { x: r.x, y: r.y, double: !!p.double, button: p.button === "right" ? "right" : "left" });
+				const focus = r.focus ? `${r.focus.tag}${r.focus.id ? `#${r.focus.id}` : ""}${r.focus.cls ? `.${r.focus.cls.split(/\s+/)[0]}` : ""}` : "未知";
+				const hint = !r.focus || r.focus.tag === "body"
+					? "焦点仍在 body：键盘输入到不了远程会话，请重新截图确认坐标是否落在远程画面内。"
+					: "焦点已进入目标，可用 browser_type_text（英文/短文本）或 browser_paste_text（中文/长文本）输入，再 browser_press_key 提交。";
+				return textResult(
+					`已在坐标 (${r.x}, ${r.y}) 点击。当前焦点：${focus}。${r.tabSwitched ? "（本次点击打开了新标签页，已自动跟随到新页）" : ""}${hint}`,
+					{ x: r.x, y: r.y, double: !!p.double, button: p.button === "right" ? "right" : "left", tabSwitched: r.tabSwitched, url: r.url, focus: r.focus },
+				);
+			} catch (err) {
+				return errorResult(err);
+			}
+		},
+	};
+
+	const scroll: AgentTool = {
+		name: "browser_scroll",
+		label: "浏览器：滚动",
+		description:
+			"在画布/页面上滚动（原始滚轮输入）。Canvas 远程会话里滚动条属于远程程序（如 Navicat 的结果网格、SSH 终端回滚缓冲），DOM 滚动无效，必须发真实滚轮事件。" +
+			"deltaY 正数向下、负数向上；deltaX 处理横向滚动。默认在视口中心滚动，可用 x/y 指定在某个区域滚（如把指针放到结果网格内再滚）。" +
+			"远程客户端灵敏度不一，一次不够就把 times 调大（最多 20）。滚动后建议再 screenshot 确认到达位置。",
+		parameters: Type.Object({
+			deltaY: Type.Optional(Type.Number({ description: "垂直滚动量，正数向下、负数向上（如 300 / -300）" })),
+			deltaX: Type.Optional(Type.Number({ description: "水平滚动量，正数向右、负数向左" })),
+			x: Type.Optional(Type.Number({ description: "可选：滚轮所在像素 X（默认视口中心）" })),
+			y: Type.Optional(Type.Number({ description: "可选：滚轮所在像素 Y（默认视口中心）" })),
+			times: Type.Optional(Type.Number({ description: "重复次数，默认 1，最多 20（远程客户端灵敏度低时用）" })),
+		}),
+		async execute(_id, params) {
+			try {
+				const p = params as { deltaY?: number; deltaX?: number; x?: number; y?: number; times?: number };
+				const r = await browser.mouseWheel(resolveOwnerId(), p);
+				return textResult(`已在 (${r.x}, ${r.y}) 滚动 deltaX=${r.deltaX} deltaY=${r.deltaY} ×${r.times}。建议 screenshot 确认位置。`, { ...r });
+			} catch (err) {
+				return errorResult(err);
+			}
+		},
+	};
+
+	const drag: AgentTool = {
+		name: "browser_drag",
+		label: "浏览器：拖拽",
+		description:
+			"按住鼠标从一点拖到另一点（原始鼠标输入），用于 Canvas 远程会话：拖动滚动条、移动/缩放远程窗口、拖动表格列宽、在远程程序里框选文本——这些都不是 DOM 元素，没有选择器可用。" +
+			"坐标以 browser_screenshot 画面为准（1:1）。拖拽前不要先 browser_click_at（那会先松一次鼠标）；本工具自己完成按下-移动-抬起。",
+		parameters: Type.Object({
+			fromX: Type.Number({ description: "起点像素 X" }),
+			fromY: Type.Number({ description: "起点像素 Y" }),
+			toX: Type.Number({ description: "终点像素 X" }),
+			toY: Type.Number({ description: "终点像素 Y" }),
+			button: Type.Optional(Type.String({ description: "left（默认）| right" })),
+			steps: Type.Optional(Type.Number({ description: "移动步数，默认 12，范围 2-40（远程客户端需要足够中间事件才认拖拽时调大）" })),
+		}),
+		async execute(_id, params) {
+			try {
+				const p = params as { fromX: number; fromY: number; toX: number; toY: number; button?: string; steps?: number };
+				const r = await browser.mouseDrag(
+					resolveOwnerId(),
+					{ x: p.fromX, y: p.fromY },
+					{ x: p.toX, y: p.toY },
+					{ button: p.button === "right" ? "right" : "left", steps: p.steps },
+				);
+				return textResult(`已从 (${r.from.x}, ${r.from.y}) 拖到 (${r.to.x}, ${r.to.y})。建议 screenshot 确认结果。`, { ...r });
+			} catch (err) {
+				return errorResult(err);
+			}
+		},
+	};
+
+	const pasteText: AgentTool = {
+		name: "browser_paste_text",
+		label: "浏览器：剪贴板粘贴",
+		description:
+			"把文本写入剪贴板再按 Ctrl+V 粘贴（Windows/Linux 为 Ctrl+V，macOS 为 Cmd+V）——远程桌面/终端输入中文的唯一可靠通路：" +
+			"RDP/SSH 客户端把按键翻译成远程扫描码，中文没有对应扫描码，用 browser_type_text 逐键输入会丢字；粘贴走客户端自己的剪贴板通道，中文和长文本都能完整送进去。" +
+			"用法：先 browser_click_at 点中远程会话里的输入位置（focus 不在远程会话时粘贴同样到不了），再调用本工具，最后 browser_press_key 提交。" +
+			"英文短文本仍可直接用 browser_type_text；中文、长 SQL、含特殊符号的字符串一律走本工具。",
+		parameters: Type.Object({
+			text: Type.String({ description: "要粘贴的文本（中文/长文本均可，先写入剪贴板再发送粘贴键）" }),
+		}),
+		async execute(_id, params) {
+			try {
+				const r = await browser.pasteText(resolveOwnerId(), (params as { text: string }).text);
+				const focus = r.focus ? `${r.focus.tag}${r.focus.id ? `#${r.focus.id}` : ""}` : "未知";
+				return textResult(
+					`已通过 ${r.chord} 粘贴 ${r.length} 个字符（剪贴板来源：${r.clipboard === "both" ? "系统+页面" : r.clipboard === "os" ? "系统" : "页面"}）。当前焦点：${focus}。` +
+						"若远处没有任何字符出现，说明焦点不在远程会话内——重新 browser_screenshot 定位输入位置后再点一次。",
+					{ ok: true, length: r.length, chord: r.chord, clipboard: r.clipboard, focus: r.focus },
+				);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -297,19 +390,29 @@ export function createBrowserTools(
 		name: "browser_type_text",
 		label: "浏览器：逐键输入文本",
 		description:
-			"把文本逐键敲进当前焦点（原始键盘输入）。主要用于 Canvas/远程桌面场景：先用 browser_click_at 点中远程会话里的输入框，再用本工具输入文本——远程程序不是 DOM，browser_type 填不进去。普通网页输入框仍优先 browser_type（有回读校验）。输入后通常接 browser_press_key Enter 提交。",
+			"把文本逐键敲进当前焦点（原始键盘输入）。主要用于 Canvas/远程桌面场景：先用 browser_click_at 点中远程会话里的输入框，再用本工具输入文本——远程程序不是 DOM，browser_type 填不进去。" +
+			"适合英文、数字、短命令；中文或长文本请改用 browser_paste_text（逐键发送没有中文扫描码，会丢字）。" +
+			"可直接传 x/y：本工具会先在该坐标点一下再输入，省去「焦点没落在输入位置」的来回。" +
+			"普通网页输入框仍优先 browser_type（有回读校验）。输入后通常接 browser_press_key Enter 提交。",
 		parameters: Type.Object({
 			text: Type.String({ description: "要键入的文本（逐键发送，约每键 30ms）" }),
+			x: Type.Optional(Type.Number({ description: "可选：先在该像素 X 点一下再输入（截图为 1:1 视口）" })),
+			y: Type.Optional(Type.Number({ description: "可选：先在该像素 Y 点一下再输入" })),
 		}),
 		async execute(_id, params) {
 			try {
-				const r = await browser.keyboardType(resolveOwnerId(), (params as { text: string }).text);
-				return textResult(`已逐键输入 ${r.length} 个字符到当前焦点。`, { ok: true, length: r.length });
+				const p = params as { text: string; x?: number; y?: number };
+				const r = await browser.keyboardType(resolveOwnerId(), p.text, { x: p.x, y: p.y });
+				const focus = r.focus ? `${r.focus.tag}${r.focus.id ? `#${r.focus.id}` : ""}` : "未知";
+				const warn = !r.focus || r.focus.tag === "body"
+					? "注意：当前焦点是 body，字符不会进入远程会话——请先 browser_screenshot 定位输入位置并用 browser_click_at 点中。"
+					: "";
+				return textResult(`已逐键输入 ${r.length} 个字符。当前焦点：${focus}。${warn}`, { ok: true, length: r.length, focus: r.focus });
 			} catch (err) {
 				return errorResult(err);
 			}
 		},
 	};
 
-	return [navigate, read, screenshot, click, clickAt, type, typeText, pressKey, evaluate, tabs];
+	return [navigate, read, screenshot, click, clickAt, scroll, drag, type, typeText, pasteText, pressKey, evaluate, tabs];
 }

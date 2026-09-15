@@ -6,7 +6,7 @@
  * streams chat through it), the IM adapter manager, and autostart. All
  * GUI-facing state (config, tasks, autostart) flows over IPC.
  */
-import { app, BrowserWindow, dialog, ipcMain } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain } from "electron";
 import { mkdir, readFile, writeFile, copyFile, readdir, rm } from "node:fs/promises";
 import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -396,6 +396,10 @@ async function main(): Promise<void> {
 	browser.setDownloadHandler((dl, page) => {
 		void downloadService.handleDownload(dl, page);
 	});
+	// OS clipboard access for browser_paste_text: RDP/SSH canvas sessions only
+	// accept CJK through a paste (keydown → remote scan code loses it), and the
+	// client syncs the OS clipboard, not the page one.
+	browser.setClipboardWriter((text) => clipboard.writeText(text));
 
 	// Built-in skills ship under dist-electron/resources/skills (copied by the
 	// build script). User-imported skills live under userData/skills.

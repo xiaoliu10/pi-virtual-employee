@@ -59,6 +59,18 @@ export interface BrowserScreenshot {
 	viewport: { width: number; height: number };
 }
 
+/**
+ * What currently holds keyboard focus, so a canvas task can tell whether the
+ * remote session actually received the click: an H5 RDP/SSH client usually
+ * focuses a hidden <textarea>/<div tabindex> that swallows key events. `body`
+ * means nothing focusable took it — typing would go nowhere.
+ */
+export interface FocusInfo {
+	tag: string;
+	id: string;
+	cls: string;
+}
+
 export class BrowserService {
 	private context: BrowserContext | null = null;
 	/** One page per owner (IM 会话 / 定时任务会话 / 控制台会话)，共享同一个 context，
@@ -67,6 +79,10 @@ export class BrowserService {
 	/** 共享的 context 启动 promise：并发首次访问时只 launch 一次。 */
 	private launching: Promise<void> | null = null;
 	private downloadHandler: DownloadHandler | null = null;
+	/** OS 剪贴板写入器（由主进程注入 Electron 的 clipboard.writeText）。远程
+	 * 桌面/终端靠 Ctrl+V 从本地剪贴板吸入文本——中文没有对应的键盘扫描码，
+	 * 逐键发送到不了远程，粘贴是唯一可靠通路。未注入时退回页面剪贴板 API。 */
+	private clipboardWriter: ((text: string) => void | Promise<void>) | null = null;
 	/**
 	 * One in-flight handling promise per `Download` object, so a download that is
 	 * both captured by a passive `page.on("download")` listener AND awaited via
@@ -86,6 +102,11 @@ export class BrowserService {
 	/** Inject the download funnel (DownloadService.handleDownload). */
 	setDownloadHandler(handler: DownloadHandler): void {
 		this.downloadHandler = handler;
+	}
+
+	/** Inject the OS-clipboard writer (Electron clipboard.writeText in the app). */
+	setClipboardWriter(writer: (text: string) => void | Promise<void>): void {
+		this.clipboardWriter = writer;
 	}
 
 	/**
@@ -191,6 +212,12 @@ export class BrowserService {
 			headless,
 			viewport: VIEWPORT,
 			acceptDownloads: true,
+			// 远程桌面/终端靠 Ctrl+V 从剪贴板吸入文本（中文没有键盘扫描码，逐键发送
+			// 到不了远程）。页面剪贴板 API 必须显式授权，否则 writeText 抛
+			// NotAllowedError——已用对照实验验证：不授权必然失败，授权后写入/读回正常。
+			// （弹窗拦截无需处理：Playwright 默认已带 --disable-popup-blocking，
+			// 堡垒机新窗口会话本来就不会被拦，见 adoptPopup。）
+			permissions: ["clipboard-read", "clipboard-write"],
 		});
 		// Attach the passive download funnel to every page — owner pages created via
 		// getPage() plus popups (target=_blank) and JS-opened windows, so a download
@@ -317,31 +344,179 @@ export class BrowserService {
 	 * so selector-based click can't reach it. `page.mouse` operates at the
 	 * browser input level, exactly like a real user's mouse. Pair with
 	 * screenshot (viewport 1:1) for the model to pick coordinates.
+	 *
+	 * Also reports whether the click opened/switched a tab and which element now
+	 * holds focus — the two facts a canvas task needs to distinguish "the click
+	 * missed", "a new tab took over", and "the remote session got focus, so
+	 * keystrokes will reach it".
 	 */
 	async mouseClick(
 		ownerId: string,
 		x: number,
 		y: number,
 		opts: { button?: "left" | "right"; double?: boolean } = {},
-	): Promise<{ ok: boolean; x: number; y: number }> {
+	): Promise<{ ok: boolean; x: number; y: number; tabSwitched: boolean; url: string; focus: FocusInfo | null }> {
 		const page = await this.getPage(ownerId);
 		if (x < 0 || y < 0 || x > VIEWPORT.width || y > VIEWPORT.height) {
 			throw new Error(`坐标 (${x}, ${y}) 超出视口 ${VIEWPORT.width}x${VIEWPORT.height}——请以 browser_screenshot 的画面为准（1:1 对应）`);
 		}
+		const tabsBefore = this.openPages().length;
 		await page.mouse.move(x, y);
 		await page.mouse.click(x, y, { button: opts.button ?? "left", clickCount: opts.double ? 2 : 1 });
-		return { ok: true, x, y };
+		// 留一拍给异步 window.open 的弹窗事件，以及画面重绘（远程会话建立）。
+		await page.waitForTimeout(250);
+		const now = await this.getPage(ownerId);
+		return {
+			ok: true,
+			x,
+			y,
+			tabSwitched: now !== page || this.openPages().length > tabsBefore,
+			url: now.url(),
+			focus: await this.focusInfo(now),
+		};
+	}
+
+	/**
+	 * Raw wheel scroll at an optional point. Needed inside canvas remote sessions
+	 * (long SQL result grids, terminal scrollback, log panes) where the remote
+	 * app owns the scrollbar and DOM scrolling does nothing. `times` repeats the
+	 * wheel event because canvas clients often apply an own sensitivity curve.
+	 */
+	async mouseWheel(
+		ownerId: string,
+		opts: { x?: number; y?: number; deltaX?: number; deltaY?: number; times?: number } = {},
+	): Promise<{ ok: boolean; x: number; y: number; deltaX: number; deltaY: number; times: number; focus: FocusInfo | null }> {
+		const page = await this.getPage(ownerId);
+		const x = Math.round(opts.x ?? VIEWPORT.width / 2);
+		const y = Math.round(opts.y ?? VIEWPORT.height / 2);
+		if (x < 0 || y < 0 || x > VIEWPORT.width || y > VIEWPORT.height) {
+			throw new Error(`坐标 (${x}, ${y}) 超出视口 ${VIEWPORT.width}x${VIEWPORT.height}——请以 browser_screenshot 的画面为准（1:1 对应）`);
+		}
+		const deltaX = Math.round(opts.deltaX ?? 0);
+		const deltaY = Math.round(opts.deltaY ?? 0);
+		if (deltaX === 0 && deltaY === 0) throw new Error("deltaX 与 deltaY 不能同时为 0（正值向下/向右滚动）。");
+		const times = Math.min(Math.max(Math.round(opts.times ?? 1), 1), 20);
+		await page.mouse.move(x, y);
+		for (let i = 0; i < times; i += 1) {
+			await page.mouse.wheel(deltaX, deltaY);
+			if (i < times - 1) await page.waitForTimeout(40);
+		}
+		await page.waitForTimeout(120);
+		return { ok: true, x, y, deltaX, deltaY, times, focus: await this.focusInfo(await this.getPage(ownerId)) };
+	}
+
+	/**
+	 * Press-drag-release between two viewport points (real mouse input). Needed
+	 * for canvas remote sessions: dragging a scrollbar, moving a window, resizing
+	 * a grid column, or selecting text inside the remote app — none of which are
+	 * DOM elements, so no selector-based drag exists.
+	 */
+	async mouseDrag(
+		ownerId: string,
+		from: { x: number; y: number },
+		to: { x: number; y: number },
+		opts: { button?: "left" | "right"; steps?: number } = {},
+	): Promise<{ ok: boolean; from: { x: number; y: number }; to: { x: number; y: number }; focus: FocusInfo | null }> {
+		const page = await this.getPage(ownerId);
+		for (const p of [from, to]) {
+			if (p.x < 0 || p.y < 0 || p.x > VIEWPORT.width || p.y > VIEWPORT.height) {
+				throw new Error(`坐标 (${p.x}, ${p.y}) 超出视口 ${VIEWPORT.width}x${VIEWPORT.height}——请以 browser_screenshot 的画面为准（1:1 对应）`);
+			}
+		}
+		const steps = Math.min(Math.max(Math.round(opts.steps ?? 12), 2), 40);
+		const button = opts.button ?? "left";
+		await page.mouse.move(from.x, from.y);
+		await page.mouse.down({ button });
+		for (let i = 1; i <= steps; i += 1) {
+			await page.mouse.move(from.x + ((to.x - from.x) * i) / steps, from.y + ((to.y - from.y) * i) / steps);
+			await page.waitForTimeout(15);
+		}
+		await page.mouse.up({ button });
+		await page.waitForTimeout(150);
+		return { ok: true, from, to, focus: await this.focusInfo(await this.getPage(ownerId)) };
 	}
 
 	/**
 	 * Type text key-by-key into whatever has focus (raw keyboard input). After
 	 * mouseClick lands focus inside a canvas remote session, this is how text
 	 * reaches the remote machine — browser_type (DOM fill) can't see it.
+	 *
+	 * `focusAt` clicks that point first (same turn), so the caller never has to
+	 * guess whether focus is where the keystrokes should go.
 	 */
-	async keyboardType(ownerId: string, text: string): Promise<{ ok: boolean; length: number }> {
+	async keyboardType(
+		ownerId: string,
+		text: string,
+		opts: { x?: number; y?: number } = {},
+	): Promise<{ ok: boolean; length: number; focus: FocusInfo | null }> {
 		const page = await this.getPage(ownerId);
+		if (opts.x !== undefined && opts.y !== undefined) {
+			if (opts.x < 0 || opts.y < 0 || opts.x > VIEWPORT.width || opts.y > VIEWPORT.height) {
+				throw new Error(`坐标 (${opts.x}, ${opts.y}) 超出视口 ${VIEWPORT.width}x${VIEWPORT.height}——请以 browser_screenshot 的画面为准（1:1 对应）`);
+			}
+			await page.mouse.click(opts.x, opts.y);
+			await page.waitForTimeout(150);
+		}
 		await page.keyboard.type(text, { delay: 30 });
-		return { ok: true, length: text.length };
+		await page.waitForTimeout(80);
+		return { ok: true, length: text.length, focus: await this.focusInfo(await this.getPage(ownerId)) };
+	}
+
+	/**
+	 * Put text on the clipboard and paste it with the platform paste chord — the
+	 * only reliable way to get CJK (or long) text into an RDP/SSH canvas session:
+	 * those clients translate keydown into remote scan codes, and Chinese has no
+	 * scan code, so key-by-key typing silently loses it while a paste (which the
+	 * client syncs through its own clipboard channel) survives.
+	 *
+	 * Writes the OS clipboard (injected by the app) and the page clipboard (when
+	 * the API is available) because clients differ in which one they read.
+	 */
+	async pasteText(
+		ownerId: string,
+		text: string,
+	): Promise<{ ok: boolean; length: number; clipboard: "both" | "os" | "page"; chord: string; focus: FocusInfo | null }> {
+		const page = await this.getPage(ownerId);
+		let os = false;
+		if (this.clipboardWriter) {
+			try {
+				await this.clipboardWriter(text);
+				os = true;
+			} catch (err) {
+				console.warn("[browser] OS clipboard write failed:", (err as Error).message);
+			}
+		}
+		const pageClip = await page
+			.evaluate<boolean>(
+				// String expression (not a callback): this file compiles against the
+				// Node lib, so it has no DOM types. The text goes in as a JSON literal
+				// (correctly escaped for any quotes/newlines).
+				`(async () => { try { await navigator.clipboard.writeText(${JSON.stringify(text)}); return true; } catch { return false; } })()`,
+			)
+			.catch(() => false);
+		if (!os && !pageClip) {
+			throw new Error("剪贴板不可用（OS 剪贴板写入器未注入且页面剪贴板被拒绝）。请改用 browser_type_text 逐键输入，或先 browser_click_at 点中远程会话再试。");
+		}
+		const chord = process.platform === "darwin" ? "Meta+v" : "Control+v";
+		await page.keyboard.press(chord);
+		await page.waitForTimeout(200);
+		return {
+			ok: true,
+			length: text.length,
+			clipboard: os && pageClip ? "both" : os ? "os" : "page",
+			chord,
+			focus: await this.focusInfo(await this.getPage(ownerId)),
+		};
+	}
+
+	/** 当前焦点元素摘要（不含任何输入内容），用于判断键盘事件会打到谁。 */
+	private async focusInfo(page: Page): Promise<FocusInfo | null> {
+		return page
+			.evaluate<FocusInfo | null>(
+				// String expression: no DOM lib in this compile target (see getText).
+				"(() => { const el = document.activeElement; if (!el) return null; return { tag: el.tagName.toLowerCase(), id: el.id || '', cls: (typeof el.className === 'string' ? el.className : '').slice(0, 60) }; })()",
+			)
+			.catch(() => null);
 	}
 
 	/**
