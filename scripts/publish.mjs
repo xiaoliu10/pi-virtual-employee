@@ -275,9 +275,13 @@ async function retainVersionRelease() {
 			console.log(`[publish] retained rollback release ${tag} (id=${release.id})`);
 		}
 		// Sweep older version releases, keeping the newest KEEP.
+		// The list above was fetched BEFORE this version's release was created, so the
+		// current tag must be included explicitly — otherwise each publish keeps
+		// KEEP+1 (measured: v0.2.65–68 were all still present while KEEP=3).
 		const versioned = all
 			.map((r) => ({ id: r.id, tag: r.tag_name }))
 			.filter((r) => /^v\d+\.\d+\.\d+$/.test(r.tag))
+			.concat([{ id: -1, tag }])
 			.sort((a, b) => a.tag.localeCompare(b.tag, undefined, { numeric: true }));
 		const doomed = versioned.slice(0, Math.max(0, versioned.length - KEEP_VERSION_RELEASES));
 		for (const r of doomed) {
