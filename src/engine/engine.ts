@@ -21,6 +21,7 @@ import type { HistoryStore } from "../db/history-store.js";
 import { inferConversationOrigin } from "../db/history-store.js";
 import { looksLikeCorrection, type TelemetryStore, type TurnStatus } from "../db/telemetry-store.js";
 import type { ProposalStore } from "./proposals.js";
+import type { PromptLab } from "../db/prompt-lab.js";
 import type { InboundActor } from "../im/types.js";
 import type { KnowledgeService } from "../knowledge/knowledge-service.js";
 import type { BrowserService } from "../browser/browser-service.js";
@@ -70,6 +71,12 @@ export interface SendCtx {
 	conversationName?: string;
 	/** Called right after a message is persisted, so the UI can reload this conversation live. */
 	onPersist?: (conversationId: string) => void;
+	/**
+	 * Evaluation run: the turn is answered but NOT persisted and NOT recorded in
+	 * telemetry. Keeps prompt experiments out of the transcript, the sidebar and —
+	 * importantly — out of the very statistics the improvement loop reads.
+	 */
+	ephemeral?: boolean;
 }
 
 export interface ModelOption {
@@ -179,6 +186,17 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 */
 	private telemetry?: TelemetryStore;
 	setTelemetryStore(store: TelemetryStore): void { this.telemetry = store; }
+
+	/**
+	 * Per-session rules override, used ONLY by the prompt lab's evaluation runs.
+	 * Deliberately not a config write: a candidate must never be served to a real
+	 * chat, and a crash mid-evaluation must not leave an experiment applied.
+	 */
+	private readonly promptOverrides = new Map<string, string>();
+
+	/** Prompt lab (evaluation cases / variants / history for prompt.rules). */
+	private promptLab?: PromptLab;
+	setPromptLab(lab: PromptLab): void { this.promptLab = lab; }
 
 	/** Improvement-proposal store (written by propose_improvement). */
 	private proposals?: ProposalStore;
@@ -457,42 +475,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 		const { supplier, modelId } = this.resolveForConversation(conversationId);
 		const cfg = this.config.all();
-		const skills = this.getCachedSkills();
-		const disabled = new Set(cfg.skills?.disabled ?? []);
-		const activeSkills = pickActiveSkills(skills, disabled);
 			const agent = new Agent({
 				initialState: {
-					systemPrompt: buildSystemPrompt({
-						name: cfg.identity.name,
-						appVersion: this.updates?.getStatus().currentVersion,
-						role: cfg.identity.role,
-						duty: cfg.identity.duty,
-						serviceHours: cfg.identity.serviceHours,
-						kbEnabled: cfg.kb.enabled,
-						learnEnabled: cfg.kb.learn.enabled,
-						manageEnabled: cfg.kb.manage.enabled,
-						researchEnabled: cfg.kb.research.enabled,
-						browserEnabled: cfg.browser.enabled,
-						schedulerEnabled: cfg.scheduler.enabled,
-						documentsEnabled: cfg.documents.enabled,
-						filesystemEnabled: cfg.filesystem.enabled,
-						reportsEnabled: cfg.reports.enabled,
-						skillsBlock: formatInlineSkills(activeSkills),
-						// Always-on memory index: user-specific facts (preferences,
-						// corrections, standing context) visible WITHOUT a KB query.
-						memoryLines: this.knowledge
-							.listMemoryIndex()
-							.map((m) => `${m.title} — ${m.snippet}`),
-					rules: cfg.prompt.rules,
-					extra: cfg.prompt.extra,
-					language: cfg.general.language,
-					// Unattended context for scheduler-owned conversations: tells the
-					// model to detect login state instead of re-logging-in / asking for
-					// OTP codes, and to stop and ask for re-login when expired.
-					isScheduledRun: conversationId.startsWith("sched:"),
-				}),
+					systemPrompt: buildSystemPrompt(this.promptPartsFor(conversationId)),
 				model: this.buildModel(supplier, modelId),
-				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir }),
+				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules) }),
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
 				messages: rehydrateMessages(this.history.listMessages(conversationId)),
@@ -736,8 +723,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// Persist the user turn. Images ride along for THIS turn only (they go to the
 		// live model, not the text transcript), so mark them in the stored line.
 		const imageNote = ctx?.images?.length ? `\n[附带 ${ctx.images.length} 张图片]` : "";
-		this.history.appendMessage(conversationId, "user", message + imageNote);
-		ctx?.onPersist?.(conversationId); // user turn now persisted → refresh this conversation live
+		if (!ctx?.ephemeral) {
+			this.history.appendMessage(conversationId, "user", message + imageNote);
+			ctx?.onPersist?.(conversationId); // user turn now persisted → refresh this conversation live
+		}
 
 		// Expose the channel's file-sender to the provide_document tool for this
 		// turn only (cleared in the finally below). Tools resolve it live via the
@@ -827,8 +816,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 		}
 
 		reply = reply.trim();
-		this.history.appendMessage(conversationId, "assistant", reply);
-		ctx?.onPersist?.(conversationId); // assistant reply now persisted → refresh this conversation live
+		if (!ctx?.ephemeral) {
+			this.history.appendMessage(conversationId, "assistant", reply);
+			ctx?.onPersist?.(conversationId); // assistant reply now persisted → refresh this conversation live
+		}
 
 		// Context management: summarize old turns once the transcript approaches
 		// the model's context window (IM chats run indefinitely). Best-effort —
@@ -895,7 +886,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.turnToolCalls.delete(conversationId);
 		const abortReason = this.turnAborts.get(conversationId);
 		this.turnAborts.delete(conversationId);
-		if (!this.telemetry || !turnId) return;
+		// Evaluation runs are excluded from telemetry on purpose: the improvement
+		// loop reads these numbers, and measuring its own experiments would corrupt
+		// the very signal it is trying to improve.
+		if (!this.telemetry || !turnId || inferConversationOrigin(conversationId) === "eval") return;
 		try {
 			const errorText = input.hardError ?? input.agentError ?? undefined;
 			const emptyReply = !input.reply.trim();
@@ -929,6 +923,80 @@ export class EmployeeEngine implements EmployeeRuntime {
 			});
 		} catch (err) {
 			console.warn("[engine] telemetry write failed:", err instanceof Error ? err.message : err);
+		}
+	}
+
+	/**
+	 * Assemble the system prompt as it WOULD be with `rules` — same inputs as the
+	 * live session build, so a `prompt_includes` case measures the real article and
+	 * not a hand-made approximation of it.
+	 */
+	buildPromptWithRules(conversationId: string, rules: string): string {
+		return buildSystemPrompt(this.promptPartsFor(conversationId, rules));
+	}
+
+	/**
+	 * The prompt parts for a conversation — the SINGLE assembly path, shared by the
+	 * live session build and by prompt-lab evaluation. Sharing it is not tidiness:
+	 * an evaluator that assembles a slightly different prompt than production
+	 * measures the wrong article, and every score it produces is a lie.
+	 *
+	 * `rulesOverride` (used only by the lab) replaces prompt.rules for this call.
+	 */
+	private promptPartsFor(conversationId: string, rulesOverride?: string) {
+		const cfg = this.config.all();
+		const disabled = new Set(cfg.skills?.disabled ?? []);
+		return {
+			name: cfg.identity.name,
+			appVersion: this.updates?.getStatus().currentVersion,
+			role: cfg.identity.role,
+			duty: cfg.identity.duty,
+			serviceHours: cfg.identity.serviceHours,
+			kbEnabled: cfg.kb.enabled,
+			learnEnabled: cfg.kb.learn.enabled,
+			manageEnabled: cfg.kb.manage.enabled,
+			researchEnabled: cfg.kb.research.enabled,
+			browserEnabled: cfg.browser.enabled,
+			schedulerEnabled: cfg.scheduler.enabled,
+			documentsEnabled: cfg.documents.enabled,
+			filesystemEnabled: cfg.filesystem.enabled,
+			reportsEnabled: cfg.reports.enabled,
+			downloadsEnabled: cfg.downloads.enabled,
+			skillsBlock: formatInlineSkills(pickActiveSkills(this.getCachedSkills(), disabled)),
+			// Always-on memory index: user-specific facts (preferences, corrections,
+			// standing context) visible WITHOUT a KB query.
+			memoryLines: this.knowledge.listMemoryIndex().map((m) => `${m.title} — ${m.snippet}`),
+			rules: rulesOverride ?? this.promptOverrides.get(conversationId) ?? cfg.prompt.rules,
+			extra: cfg.prompt.extra,
+			language: cfg.general.language,
+			// Unattended context for scheduler-owned conversations: tells the model to
+			// detect login state instead of re-logging-in / asking for OTP codes, and
+			// to stop and ask for re-login when expired.
+			isScheduledRun: conversationId.startsWith("sched:"),
+		};
+	}
+
+	/**
+	 * Run ONE isolated turn with `rulesOverride` as the rules, for prompt-lab
+	 * evaluation. Returns the reply. Never persists, never records telemetry, never
+	 * mutates config: the override lives in a per-conversation map that is cleared
+	 * in `finally`, and the session is dropped on both ends so no cached agent
+	 * keeps the candidate prompt.
+	 *
+	 * Evaluation runs act WITHOUT an IM actor, so guarded tools resolve to the
+	 * default (viewer) role. That is intentional: behavioural cases should assert
+	 * on wording, honesty and refusal behaviour — not on privileged execution.
+	 */
+	async runEvalTurn(conversationId: string, rulesOverride: string, input: string): Promise<string> {
+		this.promptOverrides.set(conversationId, rulesOverride);
+		try {
+			this.dropSession(conversationId);
+			const agent = this.getOrCreateSession(conversationId);
+			const result = await this.send(agent, input, { ephemeral: true });
+			return result.reply ?? "";
+		} finally {
+			this.promptOverrides.delete(conversationId);
+			this.dropSession(conversationId);
 		}
 	}
 

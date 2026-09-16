@@ -182,5 +182,8 @@ export class HistoryStore {
 export function inferConversationOrigin(id: string): string {
 	if (/^(dt|feishu|wecom|echo):/.test(id)) return "im";
 	if (id.startsWith("sched:")) return "scheduled";
+	// Prompt-lab evaluation runs: isolated, never persisted, excluded from telemetry
+	// so the improvement loop does not measure its own experiments.
+	if (id.startsWith("eval:")) return "eval";
 	return "console";
 }

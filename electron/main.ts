@@ -21,6 +21,7 @@ import { ScheduledTaskStore } from "../src/db/scheduled-task-store.js";
 import { SchedulerService } from "../src/scheduler/scheduler-service.js";
 import { TelemetryStore } from "../src/db/telemetry-store.js";
 import { ProposalStore } from "../src/engine/proposals.js";
+import { PromptLab } from "../src/db/prompt-lab.js";
 import { DocumentService } from "../src/documents/document-service.js";
 import { FileSystemService } from "../src/filesystem/filesystem-service.js";
 import { ArtifactStore } from "../src/db/artifact-store.js";
@@ -431,6 +432,14 @@ async function main(): Promise<void> {
 	const telemetry = new TelemetryStore(db);
 	engine.setTelemetryStore(telemetry);
 	engine.setProposalStore(new ProposalStore(proposalsDir));
+	// Prompt lab: evaluation cases + variants + history for prompt.rules. The
+	// red-line cases are seeded once so a fresh box can evaluate a candidate
+	// without having to invent an evaluation set first. Evaluation runs go through
+	// the engine's isolated, non-persisted, telemetry-excluded path.
+	const promptLab = new PromptLab(db);
+	const seededCases = promptLab.seedCases();
+	if (seededCases > 0) console.log(`[main] prompt-lab: seeded ${seededCases} evaluation cases`);
+	engine.setPromptLab(promptLab);
 	try {
 		const pruned = telemetry.prune();
 		if (pruned > 0) console.log(`[main] telemetry pruned: ${pruned} turn rows past retention`);

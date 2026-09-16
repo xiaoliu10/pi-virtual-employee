@@ -179,7 +179,11 @@ function personLine(p: PersonHit, config: ConfigStore): string {
 /** One candidate line for a conversation refusal. */
 function conversationLine(deps: AccessToolDeps, c: { id: string; title: string | null; origin: string }): string {
 	const n = deps.listMembers?.(c.id)?.length ?? 0;
-	const label = c.origin === "im" ? "IM 会话" : c.origin === "scheduled" ? "定时任务会话" : "本机控制台会话";
+	const label =
+		c.origin === "im" ? "IM 会话"
+		: c.origin === "scheduled" ? "定时任务会话"
+		: c.origin === "eval" ? "提示词评测会话（可忽略）"
+		: "本机控制台会话";
 	return `  · ${c.title?.trim() || "（未命名）"}${c.origin === "im" ? "" : `【${label}】`} → ${c.id}${n ? `（已记录 ${n} 人）` : ""}`;
 }
 

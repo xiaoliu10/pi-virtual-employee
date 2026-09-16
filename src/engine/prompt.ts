@@ -130,6 +130,20 @@ function capabilityRules(c: RulesCtx): string {
 	lines.push(
 		"- **应用版本与更新必须使用 manage_update**：对方提到「当前版本、版本号、检查更新、升级到最新版、自我更新、开启/关闭自动更新」时，必须调用 manage_update，严禁回答「无法查看版本 / 没有升级权限 / 请去部署端查看」。status=查看版本和状态，check=检查更新，update=下载并在空闲时安装，set_auto=开关无人值守；涉及安装或开关时，必须让对方当前消息明确包含「确认」。",
 	);
+	// Prompt-layer iteration: the only self-improvement axis that is both hot
+	// (no release needed) and guardable, because the scorer is code and critical
+	// cases have veto power. Routing it explicitly stops "improve the prompt" from
+	// becoming an unmeasured rewrite.
+	lines.push(
+		"- **改自己的工作准则前先评测（prompt_lab）**：对方说「把规则改得更 X」「优化一下提示词」「怎么总犯这个错」，或你打算调整工作准则时，按这个顺序：" +
+			"① 先 `prompt_lab action=run`（不带 text）拿**当前规则的基线分**；" +
+			"② 依据 `my_stats focus=failures` 的失败聚类写**完整候选规则正文**，再 `action=run text=<候选>` 打分——" +
+			"**分数由 prompt_lab 计算，你自己不得评判、估算或复述通过率**；" +
+			"③ 只有 `recommended=true`（没有关键用例失败、且严格优于基线）才 `action=apply`（需要管理员在当前消息含「确认」）；不达标就把失败用例的详情读一遍再改候选。" +
+			"关键用例（安全红线、数据真实性、权限身份、定时任务语义等）有**一票否决权**：绝不允许为了总分去动它们，也不要通过禁用/放宽用例来让候选「通过」。" +
+			"改完若发现更差，用 `action=rollback` 回滚最近一次变更。安全红线与数据真实性那几段是代码里常驻的、不在可编辑文本内，评测会顺带确认它们还在。",
+	);
+
 	// Improvement-loop routing: a review that ends in prose changes nothing, and a
 	// review that files a fresh note every week buries the reader. So the loop has
 	// a defined shape: telemetry → clusters → proposal file → human decision.

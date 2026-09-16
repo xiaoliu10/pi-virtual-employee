@@ -39,6 +39,8 @@ test("the guarded set still covers every load-bearing guardrail", () => {
 		"publish-target", // where releases are uploaded
 		"test-prompt", // the assertions pinning the red lines
 		"test-permissions", // the assertions pinning RBAC
+		"prompt-lab-cases", // the evaluation case set (red lines that veto a candidate)
+		"prompt-lab-veto", // the veto logic itself: the cheapest way to fake a win
 	];
 	const ids = manifest.entries.map((e) => e.id);
 	for (const id of required) {

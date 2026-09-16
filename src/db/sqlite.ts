@@ -152,6 +152,53 @@ function migrate(db: DB): void {
 		);
 		CREATE INDEX IF NOT EXISTS idx_tool_events_started ON tool_events(started_at);
 		CREATE INDEX IF NOT EXISTS idx_tool_events_name ON tool_events(name, started_at);
+
+		-- 提示词/规则的自评测：评测用例、候选变体与变更历史。
+		-- 为什么需要这三张表：改 prompt.rules 是「热改行为」——不用发版就生效，
+		-- 因此它既能被快速改进，也能被快速改坏。没有固定用例与历史，所谓
+		-- 「优化提示词」就是凭手感；没有历史就没法回滚。
+		CREATE TABLE IF NOT EXISTS eval_cases (
+			id            TEXT PRIMARY KEY,
+			name          TEXT NOT NULL,
+			-- prompt_includes / prompt_excludes: 断言装配后的系统提示词里有没有
+			-- 某段文字（纯本地、零模型调用）。
+			-- reply_matches / reply_excludes: 断言真实回合的回复（要有模型调用）。
+			check_kind    TEXT NOT NULL,
+			check_value   TEXT NOT NULL,
+			-- 真实输入：reply_* 用例会用它跑一个隔离回合。
+			input         TEXT,
+			-- 关键用例：只要失败，变体一律不采纳——不允许用总分换掉安全断言。
+			critical      INTEGER NOT NULL DEFAULT 0,
+			enabled       INTEGER NOT NULL DEFAULT 1,
+			notes         TEXT,
+			created_at    INTEGER NOT NULL
+		);
+
+		CREATE TABLE IF NOT EXISTS prompt_variants (
+			id            TEXT PRIMARY KEY,
+			-- 面向的配置路径，目前只有 prompt.rules（可扩展 prompt.extra 等）。
+			target        TEXT NOT NULL,
+			text          TEXT NOT NULL,
+			author        TEXT NOT NULL DEFAULT 'model',
+			rationale     TEXT,
+			score         REAL,
+			results       TEXT,
+			status        TEXT NOT NULL DEFAULT 'candidate',
+			created_at    INTEGER NOT NULL
+		);
+
+		CREATE TABLE IF NOT EXISTS prompt_history (
+			id            TEXT PRIMARY KEY,
+			target        TEXT NOT NULL,
+			previous_text TEXT,
+			new_text      TEXT NOT NULL,
+			variant_id    TEXT,
+			reason        TEXT,
+			score_before  REAL,
+			score_after   REAL,
+			applied_at    INTEGER NOT NULL,
+			rolled_back_at INTEGER
+		);
 	`);
 	// Add per-conversation model columns to pre-existing tables.
 	const cols = new Set(

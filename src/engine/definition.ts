@@ -17,6 +17,8 @@ import type { ConfigStore } from "../db/config-store.js";
 import type { TelemetryStore } from "../db/telemetry-store.js";
 import { createMyStatsTool } from "./tools/telemetry.js";
 import { createProposeImprovementTool } from "./tools/proposals.js";
+import { createPromptLabTool } from "./tools/prompt-lab.js";
+import type { PromptLab } from "../db/prompt-lab.js";
 import type { ProposalStore } from "./proposals.js";
 import type { InboundActor } from "../im/types.js";
 import { inferConversationOrigin } from "../db/history-store.js";
@@ -139,6 +141,12 @@ export interface ToolSetOptions {
 	proposals?: ProposalStore;
 	/** Where proposals live on disk (shown in the tool's output). */
 	proposalsDir?: string;
+	/** Prompt lab (evaluation cases + variants + history for prompt.rules). */
+	promptLab?: PromptLab;
+	/** Isolated evaluation turn runner, provided by the engine. */
+	runEvalTurn?: (input: string, variantText: string) => Promise<string>;
+	/** Assembles the system prompt as it would be with a candidate rules text. */
+	buildPromptWithRules?: (rules: string) => string;
 }
 
 /** Assemble the employee's tools; capability tools are conditional on their config flags. */
