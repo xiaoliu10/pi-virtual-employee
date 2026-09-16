@@ -11,7 +11,7 @@
  * base model of the matching api type and overriding id + baseUrl.
  */
 import { randomUUID } from "node:crypto";
-import { Agent, convertToLlm, estimateContextTokens } from "@earendil-works/pi-agent-core";
+import { Agent, convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens } from "@earendil-works/pi-agent-core";
 import type { AgentEvent, AgentMessage, Skill, StreamFn } from "@earendil-works/pi-agent-core";
 import { createModels } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
@@ -35,7 +35,7 @@ import { buildSystemPrompt, buildTools } from "./definition.js";
 import type { UpdateOperations } from "./tools/update.js";
 import { hasActiveShellCommands } from "./tools/shell.js";
 import { isLocalConversation } from "../security/permissions.js";
-import { maybeCompact, rehydrateMessages } from "./context.js";
+import { estimateTokensSafe, isContextOverflowError, maybeCompact, rehydrateMessages, truncateToFit } from "./context.js";
 import { SkillLoader, pickActiveSkills } from "./skills/skill-loader.js";
 import { SkillWriter } from "./skills/skill-writer.js";
 import { formatInlineSkills } from "./skills/skills-prompt.js";
@@ -603,6 +603,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			prompt: Agent["prompt"];
 			createLoopConfig: (opts?: unknown) => Record<string, unknown>;
 			__toolStepCapHit?: boolean;
+			__contextBudgetHit?: boolean;
 		};
 		// `createLoopConfig` is private in the SDK's declaration but exists on the
 		// runtime instance. Use a narrow structural view so the workaround stays
@@ -619,6 +620,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		target.prompt = ((...args: Parameters<typeof agent.prompt>) => {
 			steps = 0;
 			target.__toolStepCapHit = false;
+			target.__contextBudgetHit = false;
 			return originalPrompt(...args);
 		}) as typeof agent.prompt;
 
@@ -629,6 +631,25 @@ export class EmployeeEngine implements EmployeeRuntime {
 				// normal text-only final answer. Only responses that actually executed
 				// tools count as tool-loop steps.
 				if (!context.toolResults?.length) return false;
+
+				// CONTEXT BUDGET — checked here because this is the last moment before
+				// the next request is built. A single huge tool result (a browser dump,
+				// a big file, a log) can push the transcript past the provider's hard
+				// limit mid-turn, where compaction-after-the-turn cannot help; the turn
+				// then dies with ContextWindowExceededError and the user gets nothing
+				// (field report: qwen 204800 → whole turn lost). Ending the loop early
+				// instead lets the existing "cap hit → final summary" path produce a
+				// real answer, and says so.
+				const window = agent.state.model.contextWindow || 128_000;
+				const budget = window - this.compactionReserve();
+				if (estimateTokensSafe(agent.state.messages) >= budget) {
+					target.__contextBudgetHit = true;
+					console.warn(
+						`[engine] context budget reached (~${estimateTokensSafe(agent.state.messages)} ≥ ${budget} of ${window}); ending turn for final summary`,
+					);
+					return true;
+				}
+
 				const max = this.config.all().general.maxToolSteps ?? 0;
 				if (max <= 0) return false; // unlimited
 				steps += 1;
@@ -644,6 +665,16 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** True when the agent's last run ended because the tool-step cap fired. */
 	private toolStepCapHit(agent: Agent): boolean {
 		return Boolean((agent as Agent & { __toolStepCapHit?: boolean }).__toolStepCapHit);
+	}
+
+	/** True when the turn loop was ended early because the context budget ran out. */
+	private contextBudgetHit(agent: Agent): boolean {
+		return Boolean((agent as Agent & { __contextBudgetHit?: boolean }).__contextBudgetHit);
+	}
+
+	/** Tokens held back for the summary + the model's own answer. */
+	private compactionReserve(): number {
+		return Math.max(DEFAULT_COMPACTION_SETTINGS.reserveTokens, 16_384);
 	}
 
 	private getCachedSkills(): Skill[] {
@@ -766,6 +797,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		let hardError: string | undefined;
 		let retried = false;
 		let capHit = false;
+		let contextBudgetHit = false;
 		// Which last-resort path produced the reply, if any. Tracked explicitly
 		// rather than sniffed from the text: telemetry's job is to be accurate.
 		let askedForSummary = false;
@@ -790,11 +822,16 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// rather than an outcome. Force a no-tools final summary so the user gets a
 		// clear status (what succeeded, what's left, what they need to provide).
 		capHit = this.toolStepCapHit(agent);
-		if (capHit && !hardError) {
+		contextBudgetHit = this.contextBudgetHit(agent);
+		if ((capHit || contextBudgetHit) && !hardError) {
 			askedForSummary = true;
 			const capSummary = await this.finalSummary(agent);
 			const max = this.config.all().general.maxToolSteps ?? 0;
-			reply = capSummary || `⚠️ 本轮已达到工具调用上限（${max} 步），系统已停止继续调用工具。当前任务可能尚未完成，请提高上限后重试，或把任务拆成更小的步骤。`;
+			reply =
+				capSummary ||
+				(contextBudgetHit
+					? "⚠️ 本轮读取的内容太多、已接近模型上下文上限，系统先停下来汇总，以免整轮请求被模型拒绝。已完成的结论见上；如果要继续，请把任务拆成更小的步骤，或让我换一种更省上下文的方式取数。"
+					: `⚠️ 本轮已达到工具调用上限（${max} 步），系统已停止继续调用工具。当前任务可能尚未完成，请提高上限后重试，或把任务拆成更小的步骤。`);
 		}
 
 		// GUARANTEED FINAL REPLY — a virtual employee must always answer, success or
@@ -1029,6 +1066,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 	/** Deterministic reply of last resort — always non-empty, in Chinese. */
 	private deterministicFailure(cause?: string): string {
+		if (cause && isContextOverflowError(cause)) {
+			return (
+				"⚠️ 这次没能完成：本会话累计的内容超出了模型能一次处理的长度上限（已尝试自动压缩与裁剪仍未通过）。\n\n" +
+				"建议：① 用 /new 开一个新会话再发这个任务（最快）；② 把任务拆成更小的步骤；③ 让我少读一点（例如只读需要的字段/时间段，而不是整页或整表）。"
+			);
+		}
 		if (cause) {
 			return `⚠️ 抱歉，这次没能完成你的请求：${cause}。\n\n我已经尽力尝试，但没有成功。可以稍后重试，或把任务拆成更小的步骤再发给我。`;
 		}
@@ -1080,10 +1123,32 @@ export class EmployeeEngine implements EmployeeRuntime {
 			await agent.prompt(message, visionImages);
 		} catch (err) {
 			const text = err instanceof Error ? err.message : String(err);
+			// Provider says the prompt is too long (our estimate was low, or one
+			// enormous tool result dominated the transcript). Shrink the transcript
+			// and retry ONCE instead of losing the turn — the whole turn used to die
+			// here with nothing to show the user.
+			if (isContextOverflowError(text)) {
+				const recovered = await this.recoverFromContextOverflow(agent);
+				if (recovered) {
+					console.warn("[engine] context overflow: retrying the request on a compacted transcript");
+					await agent.prompt(message, visionImages);
+					return false;
+				}
+				throw err;
+			}
 			if (!TRANSIENT_STREAM_ERROR.test(text)) throw err;
 			threwTransient = true;
 		}
-		const errorText = agent.state.errorMessage ?? "";
+		let errorText = agent.state.errorMessage ?? "";
+		// The relay may report the overflow as an in-turn error rather than throwing.
+		// Same recovery: shrink the transcript, then continue the same turn.
+		if (errorText && isContextOverflowError(errorText)) {
+			if (await this.recoverFromContextOverflow(agent)) {
+				console.warn("[engine] context overflow reported in-turn: retrying on a compacted transcript");
+				await agent.continue();
+				return true;
+			}
+		}
 		const endedEmpty = this.endedWithoutText(agent);
 		if (!threwTransient && !(errorText && TRANSIENT_STREAM_ERROR.test(errorText)) && !endedEmpty) return false;
 
@@ -1102,6 +1167,28 @@ export class EmployeeEngine implements EmployeeRuntime {
 			const text = err instanceof Error ? err.message : String(err);
 			if (!text.startsWith("Cannot continue")) throw err;
 			await agent.prompt(message, visionImages);
+		}
+		return true;
+	}
+
+	/**
+	 * Shrink the transcript so the next request fits: summarize the old head first
+	 * (keeps meaning), and if that cannot help — one huge tool result, or too short
+	 * to split — drop the oldest messages outright. Returns false when nothing could
+	 * be freed, so the caller can fail honestly instead of retrying forever.
+	 */
+	private async recoverFromContextOverflow(agent: Agent): Promise<boolean> {
+		try {
+			if (await maybeCompact(agent, this.models, true)) return true;
+		} catch (err) {
+			console.warn("[engine] overflow compaction failed:", err instanceof Error ? err.message : err);
+		}
+		const window = agent.state.model.contextWindow || 128_000;
+		const target = Math.max(4_000, Math.floor((window - this.compactionReserve()) / 2));
+		const dropped = truncateToFit(agent, target);
+		if (dropped === null) {
+			console.warn("[engine] context overflow: nothing left to drop (transcript already minimal)");
+			return false;
 		}
 		return true;
 	}

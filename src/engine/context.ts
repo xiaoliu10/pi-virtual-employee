@@ -97,6 +97,125 @@ function contentText(content: string | { type: string; text?: string }[]): strin
 		.join("");
 }
 
+
+/**
+ * Token estimate that does NOT assume English.
+ *
+ * pi's `estimateTokens` divides characters by 4 — a decent heuristic for English
+ * and badly wrong for Chinese, where a character costs about one token
+ * (Qwen/GPT-class tokenizers). A Chinese deployment therefore UNDER-counts by
+ * 3–5×, `shouldCompact` never fires, and the request only fails at the
+ * provider's hard limit. Field report:
+ *   `ContextWindowExceededError … maximum context length is 204800 tokens`
+ *   on a qwen relay, after which the whole turn was lost — a conversation that
+ *   the app believed was ~50k tokens was really over 200k.
+ *
+ * So: count CJK (and Hangul/Kana) at 1 token per character, everything else at
+ * the English rate of 4 chars/token, and take the LARGER of that and pi's own
+ * estimate — under-counting is what causes the outage; over-counting only makes
+ * compaction run a little earlier, which is cheap.
+ */
+export function estimateTokensSafe(messages: AgentMessage[]): number {
+	let tokens = 0;
+	for (const m of messages) tokens += estimateMessageTokens(m);
+	return Math.max(tokens, estimateContextTokens(messages).tokens);
+}
+
+/** Same rule as estimateTokensSafe, for a single message. */
+export function estimateMessageTokens(message: AgentMessage): number {
+	const text = messageText(message);
+	let cjk = 0;
+	for (const ch of text) {
+		const code = ch.codePointAt(0) ?? 0;
+		// CJK Unified Ideographs + extensions, CJK punctuation, Kana, Hangul.
+		if (
+			(code >= 0x3000 && code <= 0x30ff) ||
+			(code >= 0x3400 && code <= 0x4dbf) ||
+			(code >= 0x4e00 && code <= 0x9fff) ||
+			(code >= 0xf900 && code <= 0xfaff) ||
+			(code >= 0xac00 && code <= 0xd7af) ||
+			(code >= 0x20000 && code <= 0x2ebef)
+		) {
+			cjk += 1;
+		}
+	}
+	const other = text.length - cjk;
+	return Math.max(cjk + Math.ceil(other / 4), estimateTokens(message));
+}
+
+/** Flatten any message shape to its text (tool args/results included). */
+function messageText(message: AgentMessage): string {
+	const parts: string[] = [];
+	const push = (v: unknown) => {
+		if (typeof v === "string") parts.push(v);
+		else if (v !== null && v !== undefined) {
+			try {
+				parts.push(JSON.stringify(v));
+			} catch {
+				/* circular — ignore */
+			}
+		}
+	};
+	const any = message as unknown as { content?: unknown; summary?: unknown; output?: unknown; result?: unknown };
+	if (typeof any.content === "string") push(any.content);
+	else if (Array.isArray(any.content)) {
+		for (const block of any.content as { type?: string; text?: unknown; thinking?: unknown; name?: unknown; arguments?: unknown; content?: unknown }[]) {
+			push(block.text ?? block.thinking ?? "");
+			push(block.name ?? "");
+			push(block.arguments ?? "");
+			push(block.content ?? "");
+		}
+	}
+	push(any.summary ?? "");
+	push(any.output ?? "");
+	push(any.result ?? "");
+	return parts.join("");
+}
+
+/**
+ * True for the provider's "input too long" rejection, however it is phrased by
+ * the relay in front of the model (litellm, OpenAI-compatible gateways and the
+ * vendors all word it differently).
+ */
+export function isContextOverflowError(text: string): boolean {
+	return /contextwindowexceeded|context length|context_length_exceeded|maximum context|too many tokens|input tokens.*exceed|reduce the length of the input|prompt is too long/i.test(text);
+}
+
+/**
+ * Last-resort shrink for when compaction cannot help (a single enormous tool
+ * result, or a transcript too short to split). Keeps a recent tail starting on a
+ * user turn and replaces the dropped head with an explicit note, so the model
+ * knows history was cut instead of silently losing it.
+ *
+ * Returns how many messages were dropped, or null when nothing could be dropped
+ * (already minimal) — the caller then gives up honestly rather than looping.
+ */
+export function truncateToFit(agent: Agent, targetTokens: number, now = new Date().toISOString()): number | null {
+	const messages = agent.state.messages;
+	if (messages.length <= 2) return null;
+	let cut = messages.length;
+	let kept = 0;
+	while (cut > 0 && kept < targetTokens) {
+		cut--;
+		kept += estimateMessageTokens(messages[cut]);
+	}
+	// Start the kept tail on a user turn so the provider sees a clean turn order.
+	while (cut < messages.length && messages[cut].role !== "user") cut++;
+	if (cut === 0 || cut >= messages.length) return null;
+	const dropped = cut;
+	const before = estimateTokensSafe(messages);
+	agent.state.messages = [
+		createCompactionSummaryMessage(
+			`（上下文超出模型上限，本次请求已丢弃更早的 ${dropped} 条消息以继续；完整历史仍可在会话记录中查看。）`,
+			before,
+			now,
+		),
+		...messages.slice(cut),
+	];
+	console.log(`[engine] context overflow: dropped ${dropped} older messages (~${before} tokens before)`);
+	return dropped;
+}
+
 /**
  * Summarize old turns when the transcript approaches the context window.
  *
@@ -114,7 +233,10 @@ export async function maybeCompact(agent: Agent, models: Models, force = false):
 	const messages = agent.state.messages;
 	const model = agent.state.model;
 	const contextWindow = model.contextWindow || FALLBACK_CONTEXT_WINDOW;
-	if (!force && !shouldCompact(estimateContextTokens(messages).tokens, contextWindow, settings)) {
+	// CJK-aware: pi's own estimate divides characters by 4, which under-counts a
+	// Chinese transcript badly enough that compaction never fires (see
+	// estimateTokensSafe). Overshooting only compacts a bit sooner.
+	if (!force && !shouldCompact(estimateTokensSafe(messages), contextWindow, settings)) {
 		return false;
 	}
 
@@ -124,7 +246,7 @@ export async function maybeCompact(agent: Agent, models: Models, force = false):
 	let kept = 0;
 	while (cut > 0 && kept < settings.keepRecentTokens) {
 		cut--;
-		kept += estimateTokens(messages[cut]);
+		kept += estimateMessageTokens(messages[cut]);
 	}
 	while (cut < messages.length && messages[cut].role !== "user") cut++;
 	if (cut === 0 || cut === messages.length) return false;
@@ -141,7 +263,7 @@ export async function maybeCompact(agent: Agent, models: Models, force = false):
 	}
 	if (old.length === 0) return false;
 
-	const tokensBefore = estimateContextTokens(messages).tokens;
+	const tokensBefore = estimateTokensSafe(messages);
 	const result = await generateSummary(
 		old,
 		models,
