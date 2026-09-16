@@ -14,6 +14,8 @@ import type { ReportService } from "../reports/report-service.js";
 import { EchoAdapter } from "./adapters/echo.js";
 import { DingtalkAdapter } from "./adapters/dingtalk.js";
 import type { IMAdapter, IMIO, InboundActor } from "./types.js";
+import { looksLikeCommandAttempt, parseCommand, type ParsedCommand } from "./commands.js";
+import { diag } from "./diag.js";
 import { CAPABILITY_LABEL, checkPermission, describeAccess, isAdmin } from "../security/permissions.js";
 import { maskId } from "../engine/tools/admin.js";
 
@@ -176,7 +178,8 @@ export class IMAdapterManager {
 				// /stop aborts the in-flight turn WITHOUT wiping context — also
 				// outside the queue, same reason as /new (a wedged turn must not
 				// block its own escape hatch).
-				if (msg.text.trim() === "/stop") {
+				const inbound = parseCommand(msg.text);
+				if (inbound?.name === "stop") {
 					const aborted = this.engine.abortSession(msg.conversationId);
 					return Promise.resolve(
 						aborted
@@ -189,7 +192,7 @@ export class IMAdapterManager {
 				// Abort the live agent FIRST (unblocks the queue), then run the
 				// wipe enqueued at the BACK of the chain so it lands after the
 				// dead turn's final persistence.
-				if (msg.text.trim() === "/new") {
+				if (inbound?.name === "new") {
 					if (this.draining) {
 						return Promise.resolve("⏳ 系统正在安装应用更新，当前消息不会被执行；请稍后重新发送。");
 					}
@@ -212,8 +215,17 @@ export class IMAdapterManager {
 					// keyed on the platform-verified id, never on message text.
 					this.engine.recordConversationMember(msg.conversationId, msg.actor);
 					// IM slash commands (OpenClaw-style): /help /new /stop /restart /version /models /model <n|id>
-					const cmd = parseCommand(msg.text);
-					if (cmd) return this.runCommand(msg.conversationId, cmd, msg.actor, msg.text);
+					if (inbound) {
+						// /new and /stop were already handled above (they must not queue).
+						return this.runCommand(msg.conversationId, inbound, msg.actor, msg.text);
+					}
+					// A slash word we do not recognise: log the raw text once. The point
+					// is that the NEXT "命令不生效" report can be answered from the log
+					// instead of guessed at — the client's exact serialization of a
+					// mention is not something we control.
+					if (looksLikeCommandAttempt(msg.text)) {
+						void diag("commands", `unrecognised command attempt conv=${msg.conversationId} raw=${JSON.stringify(msg.text.slice(0, 120))}`, "warn");
+					}
 
 					// Conversation admission floor (RBAC): a conversation may RAISE the
 					// minimum role needed to be served at all (security.conversations
@@ -281,14 +293,21 @@ export class IMAdapterManager {
 	/** Handle deterministic slash commands, returning a text reply for the channel. */
 	private runCommand(
 		conversationId: string,
-		cmd: { name: "version" } | { name: "models" } | { name: "model"; arg: string } | { name: "compact" } | { name: "help" } | { name: "perm" } | { name: "restart" },
+		cmd: ParsedCommand,
 		actor?: InboundActor,
 		userText?: string,
 	): string | Promise<string> {
+		if (cmd.name === "new" || cmd.name === "stop") {
+			// Intercepted in makeIO (they must bypass the queue). Reaching here would
+			// mean the interception was bypassed — say so instead of silently doing
+			// nothing, which is exactly the failure this module was written for.
+			console.error(`[im] ${cmd.name} reached runCommand — interception bypassed`);
+			return `⚠️ 命令 /${cmd.name} 未能生效（内部路由异常）。请重发一次；若仍无效请反馈这条消息。`;
+		}
 		if (cmd.name === "help") {
 			return [
 				"可用命令：",
-				"/new — 中断当前回合并清空上下文，开启新会话",
+				"/new — 中断当前回合并清空上下文，开启新会话（群聊里 @ 我 /new 同样有效）",
 				"/compact — 压缩上下文（较早对话汇总为摘要，近期对话保留）",
 				"/stop — 中断当前回合（上下文保留）",
 				"/perm — 查看我在当前会话的权限（角色 + 各项能力是否放行）",
@@ -348,8 +367,8 @@ export class IMAdapterManager {
 			].join("\n");
 		}
 
-		// /model <arg>
-		const arg = cmd.arg.trim();
+		// /model <arg> — parseCommand only yields {name:"model"} when an arg exists.
+		const arg = (cmd.arg ?? "").trim();
 		let target: ModelOption | undefined = options[parseInt(arg, 10) - 1];
 		if (!target) {
 			// match by modelId, or "supplierId/modelId"
@@ -401,17 +420,5 @@ function credChanged(prev: ImChannelConfig | undefined, next: ImChannelConfig): 
 	);
 }
 
-/** The deterministic IM slash commands. /new and /stop are intercepted in
- * makeIO (they must bypass the queue); the rest run through runCommand. */
-function parseCommand(text: string): { name: "version" } | { name: "models" } | { name: "model"; arg: string } | { name: "compact" } | { name: "help" } | { name: "perm" } | { name: "restart" } | null {
-	const t = text.trim();
-	if (t === "/version" || t === "/ver") return { name: "version" };
-	if (t === "/models" || t === "/model") return { name: "models" };
-	const m = /^\/model\s+(.+)$/.exec(t);
-	if (m) return { name: "model", arg: m[1] };
-	if (t === "/compact") return { name: "compact" };
-	if (t === "/perm" || t === "/whoami" || t === "/me") return { name: "perm" };
-	if (t === "/restart") return { name: "restart" };
-	if (t === "/help" || t === "/?" ) return { name: "help" };
-	return null;
-}
+/* Command recognition lives in ./commands.js — one tolerant parser shared with the
+ * adapters, so "@机器人/new", "／new" and multi-line mentions all work. */

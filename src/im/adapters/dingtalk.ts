@@ -24,6 +24,7 @@ import { randomUUID } from "node:crypto";
 import { DWClient, TOPIC_ROBOT } from "dingtalk-stream";
 import type { DWClientDownStream, RobotMessage } from "dingtalk-stream";
 import type { IMAdapter, IMConfig, IMIO, InboundImage } from "../types.js";
+import { normalizeInboundText } from "../commands.js";
 import { diag } from "../diag.js";
 import { extractText } from "../../knowledge/file-parser.js";
 import type { ReportService } from "../../reports/report-service.js";
@@ -252,11 +253,14 @@ export class DingtalkAdapter implements IMAdapter {
 				return;
 			}
 
-			// Group @-mentions ride INSIDE the text content ("@小派 /help"), which
-			// breaks slash-command detection (startsWith "/") and feeds a stray
-			// "@小派" into prompts. Strip leading mention tokens; 1:1 chats have
-			// no mention so this is a no-op there.
-			const text = (msg.text?.content ?? "").replace(/^(?:@[^\s@]+\s+)+/, "").trim();
+			// Group @-mentions ride INSIDE the text content ("@小派 /help"), which would
+			// otherwise break slash-command detection and feed a stray "@小派" into
+			// prompts. normalizeInboundText handles every serialization we have seen —
+			// "@小派 /new", "@小派/new", "@小派　/new", "／new" (full-width slash from a
+			// Chinese IME) — and is shared with the manager's own command parsing, so
+			// the two can never disagree. 1:1 chats have no mention: a no-op there.
+			const rawContent = msg.text?.content ?? "";
+			const text = normalizeInboundText(rawContent);
 			// Inbound images arrive as msgtype "picture" with a downloadCode; fetch
 			// the bytes so a vision model can see them. Image-only messages carry no
 			// text — supply a short prompt so the model knows a photo arrived.
