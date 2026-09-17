@@ -19,6 +19,7 @@ import { diag } from "./diag.js";
 import { CAPABILITY_LABEL, checkPermission, describeAccess, isAdmin } from "../security/permissions.js";
 import { maskId } from "../engine/tools/admin.js";
 import { isAuthorizationPhrase } from "../engine/authorization.js";
+import { startStallWatchdog } from "./watchdog.js";
 
 /** Shared deps handed to adapter factories that need them (e.g. image hosting). */
 export interface AdapterDeps {
@@ -268,19 +269,30 @@ export class IMAdapterManager {
 								});
 						}, progressMin * 60_000)
 						: undefined;
-					// Turn watchdog: the per-conversation queue is strict, so ONE wedged
-					// turn (hung LLM call / tool) would block that chat forever — field
-					// incident: a group went silent while single chats kept working, and
-					// only an app restart cleared it. Abort the turn after the cap; the
-					// queue then drains on its own.
+					// Turn watchdog — STALL-based (0.2.73): the per-conversation queue is
+					// strict, so ONE wedged turn (hung LLM call / hung socket / hung
+					// remote session) would block that chat forever — field incident: a
+					// group went silent while single chats kept working, and only an app
+					// restart cleared it. The old fixed timer measured TOTAL turn time
+					// and killed healthy long tasks (field feedback 2026-09-17); this one
+					// fires only after `turnTimeoutMin` of ZERO activity — a live task
+					// never trips it no matter how long it runs. True wedges (hung
+					// sockets, hung remote sessions) can't be unstuck in-process — abort
+					// is the release; context-size trouble never gets here because the
+					// in-turn budget gate compacts and continues.
 					const turnTimeoutMin = this.config.all().general.turnTimeoutMin ?? 0;
 					let turnTimedOut = false;
 					const watchdog = turnTimeoutMin > 0
-						? setTimeout(() => {
-							turnTimedOut = true;
-							console.warn(`[im] turn exceeded ${turnTimeoutMin}min — aborting: ${msg.conversationId}`);
-							this.engine.abortSession(msg.conversationId);
-						}, turnTimeoutMin * 60_000)
+						? startStallWatchdog({
+							thresholdMs: turnTimeoutMin * 60_000,
+							activityAgeMs: () => this.engine.turnIdleMs(msg.conversationId),
+							onStall: () => {
+								turnTimedOut = true;
+								console.warn(`[im] turn silent for ${turnTimeoutMin}min — aborting: ${msg.conversationId}`);
+								this.engine.markTurnAbort(msg.conversationId, "watchdog");
+								this.engine.abortSession(msg.conversationId);
+							},
+						})
 						: undefined;
 
 					try {
@@ -292,7 +304,7 @@ export class IMAdapterManager {
 						// Final turn complete — signal the UI to refresh the task list.
 						this.onActivity?.(msg.conversationId);
 						if (turnTimedOut) {
-							return `⏱️ 本回合超过 ${turnTimeoutMin} 分钟未完成，已自动中断以防会话卡死。请重新发送指令重试；若反复出现，请把任务拆小或分步执行。`;
+							return `⏱️ 本回合已连续 ${turnTimeoutMin} 分钟无任何进展（疑似卡死），已自动中断以解除会话阻塞。请重新发送指令重试；若反复出现，请把任务拆小或分步执行，并联系管理员查看日志定位卡点。`;
 						}
 						if (!result.reply) {
 							console.error(`[im] no reply for ${msg.conversationId}:`, result.error ?? "(no error reported)");
@@ -303,7 +315,7 @@ export class IMAdapterManager {
 						return result.reply;
 					} finally {
 						if (heartbeat) clearInterval(heartbeat);
-						if (watchdog) clearTimeout(watchdog);
+						if (watchdog) watchdog.stop();
 					}
 				});
 			},

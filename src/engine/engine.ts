@@ -165,6 +165,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 	private readonly turnUserMessage = new Map<string, string>();
 	/** One-shot admin delegation: pending 「确认授权」 requests per conversation. */
 	private readonly authorizations = new AuthorizationStore();
+	/** Last observed sign of life per conversation's current turn (LLM stream
+	 * events, tool calls). Feeds the stall watchdog: it measures SILENCE, not
+	 * total turn time, so long-but-live tasks are never killed. */
+	private readonly turnActivity = new Map<string, number>();
 
 	constructor(
 		private readonly config: ConfigStore,
@@ -539,6 +543,16 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.sessions.delete(conversationId);
 	}
 
+	/** Ms since the conversation's current turn last showed life; huge when unknown. */
+	turnIdleMs(conversationId: string): number {
+		const at = this.turnActivity.get(conversationId);
+		return at === undefined ? Number.MAX_SAFE_INTEGER : Date.now() - at;
+	}
+
+	private touchActivity(conversationId: string): void {
+		this.turnActivity.set(conversationId, Date.now());
+	}
+
 	/**
 	 * A guarded tool refused the current turn because the requester's role is
 	 * below the capability floor. Record a pending one-shot admin authorization
@@ -858,6 +872,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// flow: a role-refusal registers it as the pending request to replay.
 		// Cleared in the finally like the other per-turn state.
 		this.turnUserMessage.set(conversationId, message);
+		// First sign of life for the stall watchdog — every event below refreshes it.
+		this.touchActivity(conversationId);
 
 		// Telemetry: one row per turn, written when the turn settles below. The id is
 		// minted here so tool calls made during this turn can be linked to it.
@@ -868,6 +884,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 		let reply = "";
 		const unsubscribe = agent.subscribe((event: AgentEvent) => {
+			// Any SDK event (stream deltas, message ends, tool calls) is life.
+			this.touchActivity(conversationId);
 			if (event.type === "message_end" && (event.message as { role?: string }).role === "assistant") {
 				const msg = event.message as { content?: unknown; stopReason?: string };
 				const parts = Array.isArray(msg.content) ? (msg.content as { type?: string }[]) : [];
@@ -902,6 +920,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			this.turnSendImage.delete(conversationId);
 			this.turnActor.delete(conversationId);
 			this.turnUserMessage.delete(conversationId);
+			this.turnActivity.delete(conversationId);
 			await this.computer?.release(conversationId);
 		}
 
@@ -991,6 +1010,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		conversationId: string,
 		event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string },
 	): void {
+		this.touchActivity(conversationId); // tool start/end — life, even without telemetry
 		if (!this.telemetry) return;
 		try {
 			this.turnToolCalls.set(conversationId, (this.turnToolCalls.get(conversationId) ?? 0) + 1);
