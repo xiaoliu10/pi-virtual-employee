@@ -162,6 +162,13 @@ export const SEED_CASES: { name: string; kind: CaseKind; value: string; input?: 
 		kind: "prompt_includes",
 		value: "my_stats focus=failures",
 	},
+	{
+		name: "登录态结论必须当轮实测",
+		kind: "prompt_includes",
+		value: "登录态结论必须当轮实测",
+		critical: true,
+		notes: "字段事故：凭会话旧印象断言「已登录」误导用户；只认服务端证据（跳登录页/401/真实取数）",
+	},
 ];
 // #endregion immutable:prompt-lab-cases
 

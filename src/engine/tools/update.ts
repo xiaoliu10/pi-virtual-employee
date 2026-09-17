@@ -24,6 +24,11 @@ export interface UpdateToolStatus {
 	targetVersion?: string;
 	percent?: number;
 	error?: string;
+	/** Epoch ms of the last COMPLETED update check (server-confirmed available
+	 * or not-available). Undefined = never checked since this launch. "none" is
+	 * only trustworthy relative to this: a 6h-scheduled check can be hours old
+	 * while a release just shipped (field incident 2026-09-17). */
+	lastCheckAt?: number;
 }
 
 export type UpdateRequestResult =
@@ -53,7 +58,7 @@ const MODE_TEXT: Record<AutoUpdateMode, string> = {
 };
 
 /** Compact textual status used by both tool responses and the model's context. */
-function describeStatus(status: UpdateToolStatus, mode: AutoUpdateMode): string {
+export function describeStatus(status: UpdateToolStatus, mode: AutoUpdateMode): string {
 	const lines = [`当前版本：v${status.currentVersion}`];
 	switch (status.phase) {
 		case "idle":
@@ -66,7 +71,9 @@ function describeStatus(status: UpdateToolStatus, mode: AutoUpdateMode): string 
 			lines.push(`更新状态：发现新版本 v${status.targetVersion ?? "未知"}，尚未下载`);
 			break;
 		case "none":
-			lines.push("更新状态：已是最新版本");
+			// "已是最新" is a CONCLUSION FROM A POINT IN TIME, not a live fact —
+			// always state its age so the model can't pass it off as current.
+			lines.push("更新状态：上次检查（" + freshness(status.lastCheckAt) + "）未发现新版本");
 			break;
 		case "downloading":
 			lines.push(`更新状态：正在下载 v${status.targetVersion ?? "未知"}${typeof status.percent === "number" ? `（${status.percent}%）` : ""}`);
@@ -82,8 +89,31 @@ function describeStatus(status: UpdateToolStatus, mode: AutoUpdateMode): string 
 			lines.push(`更新状态：失败（${status.error ?? "未知错误"}）`);
 			break;
 	}
+	// Stale-conclusion guard: scheduled checks run every 6h, so "没有新版本" can
+	// be hours old while a release just shipped (v0.2.66 boxes kept reporting
+	// "已是最新" after 0.2.67/68 landed). Surface the age whenever the cached
+	// conclusion would be used as if it were current.
+	const STALE_CHECK_MS = 30 * 60_000;
+	const stale = (status.phase === "none" || status.phase === "idle") && (!status.lastCheckAt || Date.now() - status.lastCheckAt > STALE_CHECK_MS);
+	if (stale) {
+		lines.push(
+			status.lastCheckAt
+				? `注意：这是 ${freshness(status.lastCheckAt)}的结论，之后可能已发布新版本；要确认是否最新，需用 action=check 实时检查，不要用 status 的缓存下结论`
+				: "注意：本次启动以来尚未完成过更新检查，无法确定是否最新；要确认需用 action=check 实时检查，不要用 status 的缓存下结论",
+		);
+	}
 	lines.push(`自动更新模式：${MODE_TEXT[mode]}`);
 	return lines.join("；");
+}
+
+/** Human phrase for how long ago the last completed check was. */
+function freshness(lastCheckAt?: number, now = Date.now()): string {
+	if (!lastCheckAt) return "本次启动以来尚未完成过检查";
+	const min = Math.max(1, Math.floor((now - lastCheckAt) / 60_000));
+	if (min < 60) return `${min} 分钟前`;
+	const h = Math.floor(min / 60);
+	if (h < 24) return `${h} 小时前`;
+	return `${Math.floor(h / 24)} 天前`;
 }
 
 /**

@@ -32,7 +32,7 @@ import { EmployeeEngine } from "../src/engine/engine.js";
 import { disposeShellCommands } from "../src/engine/tools/shell.js";
 import { buildSystemPrompt, defaultCoreRules } from "../src/engine/prompt.js";
 import { startHttpTransport } from "../src/transport/http.js";
-import { setupAutoUpdater, getUpdateState, checkNow, downloadNow, quitAndInstall, stopUpdater, setupUnattended, updateCapability, requestUpdateAndInstall, type UpdateState } from "./updater.js";
+import { setupAutoUpdater, getUpdateState, lastCheckTime, checkNow, downloadNow, quitAndInstall, stopUpdater, setupUnattended, updateCapability, requestUpdateAndInstall, type UpdateState } from "./updater.js";
 import type { UpdateToolStatus } from "../src/engine/tools/update.js";
 import { IMAdapterManager, availableChannels } from "../src/im/manager.js";
 import { setDiagFile } from "../src/im/diag.js";
@@ -66,6 +66,7 @@ function toUpdateToolStatus(state: UpdateState): UpdateToolStatus {
 		targetVersion: "version" in state ? state.version : undefined,
 		percent: state.phase === "downloading" ? state.percent : undefined,
 		error: state.phase === "error" ? state.message : undefined,
+		lastCheckAt: lastCheckTime(),
 	};
 }
 

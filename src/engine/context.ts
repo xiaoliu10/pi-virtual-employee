@@ -26,8 +26,12 @@ import type { MessageRow } from "../db/history-store.js";
  * visible in the UI; the transcript re-grows (and re-compacts) naturally. */
 const REHYDRATE_MAX_MESSAGES = 40;
 
-/** Fallback when a model reports no context window. */
-const FALLBACK_CONTEXT_WINDOW = 128_000;
+/** Fallback when a model reports no context window. 200k: modern mainstream
+ * models are 128k–200k+, and the 0.2.68-era 128k guess mislabeled real-200k
+ * relay models (litellm qwen), tripping the budget gate ~40k tokens too early
+ * and then never compacting (field incident 2026-09-17). Relay/alias models
+ * should now also set the per-model override in the settings UI. */
+export const FALLBACK_CONTEXT_WINDOW = 200_000;
 
 const ZERO_USAGE: Usage = {
 	input: 0,
@@ -228,6 +232,33 @@ export function truncateToFit(agent: Agent, targetTokens: number, now = new Date
  * the transcript is too short to split); failures leave the transcript
  * untouched.
  */
+/**
+ * Walk back until the kept tail is roughly `keepRecentTokens`, then advance to
+ * the next user turn so the tail starts on a turn boundary. Returns 0 when there
+ * is nothing summarizable (transcript shorter than the tail, no user boundary
+ * before it).
+ */
+export function findCompactionCut(messages: AgentMessage[], keepRecentTokens: number): number {
+	let cut = messages.length;
+	let kept = 0;
+	while (cut > 0 && kept < keepRecentTokens) {
+		cut--;
+		kept += estimateMessageTokens(messages[cut]);
+	}
+	while (cut < messages.length && messages[cut].role !== "user") cut++;
+	if (cut === messages.length && messages.length > 0) {
+		// The keep-recent walk landed inside the FINAL turn — its own tool results
+		// fill the 20k tail, so there is no user boundary left in the tail (field
+		// deadlock 2026-09-17: a 112k conversation whose every turn tripped the
+		// budget gate while compaction returned "nothing to do", forever). Rewind
+		// to the last user message and keep just that turn verbatim instead of
+		// giving up — summarizing the past always makes forward progress.
+		const lastUserIdx = messages.findLastIndex((m) => m.role === "user");
+		cut = Math.max(lastUserIdx, 0);
+	}
+	return cut;
+}
+
 export async function maybeCompact(agent: Agent, models: Models, force = false): Promise<boolean> {
 	const settings = DEFAULT_COMPACTION_SETTINGS;
 	const messages = agent.state.messages;
@@ -240,15 +271,8 @@ export async function maybeCompact(agent: Agent, models: Models, force = false):
 		return false;
 	}
 
-	// Cut point: walk back until the kept tail is roughly keepRecentTokens,
-	// then advance to the next user turn so the tail starts on a turn boundary.
-	let cut = messages.length;
-	let kept = 0;
-	while (cut > 0 && kept < settings.keepRecentTokens) {
-		cut--;
-		kept += estimateMessageTokens(messages[cut]);
-	}
-	while (cut < messages.length && messages[cut].role !== "user") cut++;
+	// Cut point: compaction never splits within a turn — see findCompactionCut.
+	const cut = findCompactionCut(messages, settings.keepRecentTokens);
 	if (cut === 0 || cut === messages.length) return false;
 
 	let old = messages.slice(0, cut);

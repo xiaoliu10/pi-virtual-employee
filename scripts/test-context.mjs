@@ -25,7 +25,7 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 		contents: `
-			export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit } from "./src/engine/context.ts";
+			export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, FALLBACK_CONTEXT_WINDOW } from "./src/engine/context.ts";
 			export { estimateTokens } from "@earendil-works/pi-agent-core";
 		`,
 		resolveDir: root,
@@ -37,7 +37,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, estimateTokens } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, FALLBACK_CONTEXT_WINDOW, estimateTokens } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -110,4 +110,42 @@ test("last-resort truncation frees room and keeps a usable tail on a turn bounda
 	const tiny = { state: { messages: [user("你好"), assistant("你好，有什么可以帮你？")] } };
 	assert.equal(truncateToFit(tiny, 1), null);
 	assert.equal(tiny.state.messages.length, 2, "nothing was destroyed");
+});
+
+// Field incident 2026-09-17: the fallback window was 128k while a litellm-relayed
+// qwen really has 204800 — the budget gate drew its line on the fake figure and
+// never let the conversation breathe. The default is now 200k (relay models can
+// set the per-model override higher still).
+test("fallback context window is 200k, not the old English-heuristic-era 128k", () => {
+	assert.equal(FALLBACK_CONTEXT_WINDOW, 200_000);
+});
+
+// Field incident 2026-09-17: a 112k conversation whose final turn's own tool
+// results filled the keep-recent tail had NO user boundary in the tail, so
+// compaction returned "nothing to do" forever while the budget gate kept
+// tripping every turn — every task ended as a forced mid-task summary.
+test("cut point falls back to the last user turn when the tail is inside the final turn", () => {
+	const messages = [user("旧任务")];
+	for (let i = 0; i < 20; i += 1) messages.push(assistant("历史内容。" + "案".repeat(2200))); // past 20k tail
+	messages.push(user("本轮请求"));
+	// Final turn's tool result — huge, and followed only by assistant text, so
+	// the naive forward scan for a user boundary runs off the transcript end.
+	messages.push(assistant("正在查询…"));
+	messages.push({ role: "toolResult", content: "结果" + "账".repeat(30_000), timestamp: Date.now() });
+	messages.push(assistant("汇总：查询到很多数据。"));
+
+	const cut = findCompactionCut(messages, 20_000);
+	assert.ok(cut > 0, "must find a cut point, not give up");
+	assert.equal(messages[cut].role, "user", "tail must start on a user turn");
+	assert.equal(cut, messages.length - 4, "cut must rewind to the LAST user message");
+	assert.ok(estimateTokensSafe(messages.slice(0, cut)) > 20_000, "the summarizable head is not empty");
+
+	// Ordinary case unchanged: short final turn keeps the naive behaviour —
+	// everything fits in the tail ⇒ nothing to summarize (cut 0).
+	const small = [user("hi"), assistant("同样是回答，内容很短"), user("好"), assistant("好")];
+	assert.equal(findCompactionCut(small, 20_000), 0);
+
+	// No user message at all anywhere → 0 (nothing summarizable before a boundary).
+	const roleless = [assistant("只有一条助手消息，且很长。" + "长".repeat(30_000))];
+	assert.equal(findCompactionCut(roleless, 20_000), 0);
 });

@@ -35,7 +35,7 @@ import { buildSystemPrompt, buildTools } from "./definition.js";
 import type { UpdateOperations } from "./tools/update.js";
 import { hasActiveShellCommands } from "./tools/shell.js";
 import { isLocalConversation } from "../security/permissions.js";
-import { estimateTokensSafe, isContextOverflowError, maybeCompact, rehydrateMessages, truncateToFit } from "./context.js";
+import { estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, isContextOverflowError, maybeCompact, rehydrateMessages, truncateToFit } from "./context.js";
 import { SkillLoader, pickActiveSkills } from "./skills/skill-loader.js";
 import { SkillWriter } from "./skills/skill-writer.js";
 import { formatInlineSkills } from "./skills/skills-prompt.js";
@@ -546,7 +546,16 @@ export class EmployeeEngine implements EmployeeRuntime {
 		const before = estimateContextTokens(agent.state.messages).tokens;
 		const done = await maybeCompact(agent, this.models, true);
 		if (!done) {
-			return `上下文很短（约 ${before} tokens），无需压缩。`;
+			// Honest verdict, not boilerplate: one branch is genuinely "no need",
+			// the other is "over budget but structurally incompressible this pass"
+			// — they must not sound the same (the old wording called an 88%-full
+			// transcript "很短", see field incident 2026-09-17).
+			const window = agent.state.model.contextWindow || FALLBACK_CONTEXT_WINDOW;
+			const pct = Math.max(1, Math.round((before / window) * 100));
+			if (before < window - this.compactionReserve()) {
+				return `上下文约 ${before.toLocaleString()} tokens（约占窗口 ${pct}%），离压缩阈值还很远，无需压缩。`;
+			}
+			return `⚠️ 会话约 ${before.toLocaleString()} tokens，已占窗口 ${pct}%，但这次压缩没有执行成（通常是最近一轮的工具返回太大、或摘要生成失败）。最快的恢复方式是直接 /new 开新会话。`;
 		}
 		const after = estimateContextTokens(agent.state.messages).tokens;
 		return `🧹 上下文已压缩：约 ${before} → ${after} tokens（较早的对话已汇总为摘要，近期对话原样保留）。`;
@@ -626,7 +635,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 		target.createLoopConfig = (opts?: unknown) => {
 			const config = originalCreateLoopConfig(opts) as Record<string, unknown>;
-			config.shouldStopAfterTurn = (context: { toolResults?: unknown[] }) => {
+			config.shouldStopAfterTurn = async (context: { toolResults?: unknown[] }) => {
 				// The SDK invokes this hook after every assistant response, including a
 				// normal text-only final answer. Only responses that actually executed
 				// tools count as tool-loop steps.
@@ -637,15 +646,30 @@ export class EmployeeEngine implements EmployeeRuntime {
 				// a big file, a log) can push the transcript past the provider's hard
 				// limit mid-turn, where compaction-after-the-turn cannot help; the turn
 				// then dies with ContextWindowExceededError and the user gets nothing
-				// (field report: qwen 204800 → whole turn lost). Ending the loop early
-				// instead lets the existing "cap hit → final summary" path produce a
-				// real answer, and says so.
-				const window = agent.state.model.contextWindow || 128_000;
+				// (field report: qwen 204800 → whole turn lost).
+				//
+				// But stopping is the LAST resort, not the protocol: the user ruled
+				// (2026-09-17) that a near-full context must never chop the task — the
+				// automatic compaction machinery IS the plan, so run its recovery here,
+				// mid-turn, and continue. Only a transcript that genuinely cannot shrink
+				// (e.g. recovery itself failed) ends the turn for the summary path.
+				const window = agent.state.model.contextWindow || FALLBACK_CONTEXT_WINDOW;
 				const budget = window - this.compactionReserve();
 				if (estimateTokensSafe(agent.state.messages) >= budget) {
+					try {
+						const recovered = await this.recoverFromContextOverflow(agent);
+						if (recovered && estimateTokensSafe(agent.state.messages) < budget) {
+							console.warn(
+								`[engine] context budget reached mid-task (~${estimateTokensSafe(agent.state.messages)} ≥ ${budget}); compacted in-turn and continuing the task`,
+							);
+							return false;
+						}
+					} catch (err) {
+						console.warn("[engine] in-turn context recovery failed:", err instanceof Error ? err.message : err);
+					}
 					target.__contextBudgetHit = true;
 					console.warn(
-						`[engine] context budget reached (~${estimateTokensSafe(agent.state.messages)} ≥ ${budget} of ${window}); ending turn for final summary`,
+						`[engine] context budget reached and recovery could not free room (~${estimateTokensSafe(agent.state.messages)} ≥ ${budget} of ${window}); ending turn for final summary`,
 					);
 					return true;
 				}
@@ -830,7 +854,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			reply =
 				capSummary ||
 				(contextBudgetHit
-					? "⚠️ 本轮读取的内容太多、已接近模型上下文上限，系统先停下来汇总，以免整轮请求被模型拒绝。已完成的结论见上；如果要继续，请把任务拆成更小的步骤，或让我换一种更省上下文的方式取数。"
+					? "⚠️ 本轮读取的内容太多，已接近模型上下文上限，自动压缩也没能腾出空间，系统先停下来汇总，以免整轮请求被模型拒绝。已完成的结论见上；如果要继续，请把任务拆成更小的步骤，或让我换一种更省上下文的方式取数。"
 					: `⚠️ 本轮已达到工具调用上限（${max} 步），系统已停止继续调用工具。当前任务可能尚未完成，请提高上限后重试，或把任务拆成更小的步骤。`);
 		}
 
@@ -1183,7 +1207,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		} catch (err) {
 			console.warn("[engine] overflow compaction failed:", err instanceof Error ? err.message : err);
 		}
-		const window = agent.state.model.contextWindow || 128_000;
+		const window = agent.state.model.contextWindow || FALLBACK_CONTEXT_WINDOW;
 		const target = Math.max(4_000, Math.floor((window - this.compactionReserve()) / 2));
 		const dropped = truncateToFit(agent, target);
 		if (dropped === null) {

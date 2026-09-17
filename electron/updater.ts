@@ -280,6 +280,14 @@ export type UpdateState =
 	| { phase: "error"; currentVersion: string; message: string };
 
 let lastState: UpdateState = { phase: "idle", currentVersion: app.getVersion() };
+/** Timestamp of the last COMPLETED update check (available / not-available).
+ * Has to live outside UpdateState itself: the state union changes on every
+ * download tick, and restarts must not treat "never checked" as stale. Used by
+ * the manage_update status tool to flag stale "已是最新" conclusions. */
+let lastCheckAt: number | undefined;
+export function lastCheckTime(): number | undefined {
+	return lastCheckAt;
+}
 let window: BrowserWindow | null = null;
 let recheckTimer: NodeJS.Timeout | undefined;
 let idlePollTimer: NodeJS.Timeout | undefined;
@@ -463,6 +471,7 @@ function wireEvents(): void {
 	});
 	autoUpdater.on("update-available", (info: { version?: string; releaseNotes?: unknown } = {}) => {
 		checking = false;
+		lastCheckAt = Date.now();
 		pendingVersion = info.version;
 		pendingReleaseNotes = coerceNotes(info.releaseNotes);
 		setState({
@@ -477,6 +486,7 @@ function wireEvents(): void {
 	});
 	autoUpdater.on("update-not-available", () => {
 		checking = false;
+		lastCheckAt = Date.now();
 		requestedInstall = false;
 		setState({ phase: "none", currentVersion: app.getVersion() });
 	});
