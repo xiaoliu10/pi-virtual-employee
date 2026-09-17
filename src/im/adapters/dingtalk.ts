@@ -563,6 +563,10 @@ export class DingtalkAdapter implements IMAdapter {
 			await this.sendFileMessage(downloadCode, msg);
 			return { ok: true };
 		} catch (err) {
+			// The tool result paraphrases this for the user; the raw provider error
+			// (status + response body) must also reach main.log or channel-side
+			// failures are undiagnosable after the fact (field gap 2026-09-17).
+			console.warn(`[dingtalk] 文件投递失败 conv=${msg.conversationId ?? "?"} file=${fileName}: ${(err as Error).message}`);
 			return { ok: false, error: (err as Error).message };
 		}
 	}
