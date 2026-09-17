@@ -805,12 +805,19 @@ export class DingtalkAdapter implements IMAdapter {
 		const url = opts.isSingle
 			? "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
 			: "https://api.dingtalk.com/v1.0/robot/groupMessages/send";
+		// DingTalk's new API is unreliable with raw non-ASCII inside msgParam
+		// (group file sends failed while identical 1:1 sends passed — field
+		// incident 2026-09-17). LobsterAI's stringifyAsciiJson: escape to \uXXXX,
+		// which is lossless JSON and accepted everywhere.
+		const msgParam = opts.msgParam.replace(/[\u0080-\uFFFF]/g, (ch) =>
+			`\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
+		);
 		const body = opts.isSingle
-			? { msgParam: opts.msgParam, msgKey: opts.msgKey, userIds: opts.userIds ?? [], robotCode }
-			: { msgParam: opts.msgParam, msgKey: opts.msgKey, openConversationId: opts.openConversationId, robotCode };
+			? { msgParam, msgKey: opts.msgKey, userIds: opts.userIds ?? [], robotCode }
+			: { msgParam, msgKey: opts.msgKey, openConversationId: opts.openConversationId, robotCode };
 		const res = await fetch(url, {
 			method: "POST",
-			headers: { "Content-Type": "application/json", "x-acs-dingtalk-access-token": token },
+			headers: { "Content-Type": "application/json; charset=utf-8", "x-acs-dingtalk-access-token": token },
 			body: JSON.stringify(body),
 		});
 		if (!res.ok) {
