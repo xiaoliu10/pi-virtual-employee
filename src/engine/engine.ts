@@ -34,7 +34,9 @@ import type { DownloadService } from "../downloads/download-service.js";
 import { buildSystemPrompt, buildTools } from "./definition.js";
 import type { UpdateOperations } from "./tools/update.js";
 import { hasActiveShellCommands } from "./tools/shell.js";
-import { isLocalConversation } from "../security/permissions.js";
+import { isLocalConversation, resolveRole } from "../security/permissions.js";
+import { maskId } from "./tools/admin.js";
+import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, isContextOverflowError, maybeCompact, rehydrateMessages, truncateToFit } from "./context.js";
 import { SkillLoader, pickActiveSkills } from "./skills/skill-loader.js";
 import { SkillWriter } from "./skills/skill-writer.js";
@@ -158,6 +160,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 	private readonly turnSendImage = new Map<string, ImageSender>();
 	/** Verified IM actor + raw text for the turn in flight (admin/identity tools). */
 	private readonly turnActor = new Map<string, InboundActor & { text: string }>();
+	/** Original requester text per in-flight turn — the payload a pending admin
+	 * authorization replays. Set in send(), cleared in its finally. */
+	private readonly turnUserMessage = new Map<string, string>();
+	/** One-shot admin delegation: pending 「确认授权」 requests per conversation. */
+	private readonly authorizations = new AuthorizationStore();
 
 	constructor(
 		private readonly config: ConfigStore,
@@ -479,7 +486,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				initialState: {
 					systemPrompt: buildSystemPrompt(this.promptPartsFor(conversationId)),
 				model: this.buildModel(supplier, modelId),
-				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules) }),
+				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onRoleRefusal: (cid, info) => this.noteAuthorizationNeeded(cid, info), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules) }),
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
 				messages: rehydrateMessages(this.history.listMessages(conversationId)),
@@ -530,6 +537,60 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.history.ensureConversation(conversationId, null);
 		if (override) this.history.setModelOverride(conversationId, override.supplierId, override.modelId);
 		this.sessions.delete(conversationId);
+	}
+
+	/**
+	 * A guarded tool refused the current turn because the requester's role is
+	 * below the capability floor. Record a pending one-shot admin authorization
+	 * carrying the requester's original message — an admin's 「确认授权」 replays
+	 * exactly that, once, as themselves.
+	 */
+	noteAuthorizationNeeded(conversationId: string, info: { capability: string; need: string }): void {
+		const message = this.turnUserMessage.get(conversationId);
+		if (!message) return; // no requester text → nothing to replay; the refusal text already explained
+		const requester = this.turnActor.get(conversationId);
+		this.authorizations.note({
+			conversationId,
+			message,
+			requesterId: requester?.senderId || undefined,
+			capability: info.capability,
+			need: info.need,
+			requestedAt: Date.now(),
+		});
+	}
+
+	/**
+	 * Admin one-shot delegation: the deterministic 「确认授权」 handler. Only a
+	 * platform-verified ADMIN's confirmation counts — anyone else gets told and
+	 * the pending request survives for a real admin (never consumed by a bad
+	 * guess). A valid confirmation consumes the pending request and replays the
+	 * requester's original message with the admin as this turn's actor, so the
+	 * capability gates resolve to admin for that one task and nothing more.
+	 */
+	async confirmAuthorization(conversationId: string, actor: InboundActor | undefined, conversationName?: string): Promise<string> {
+		const pending = this.authorizations.peek(conversationId);
+		if (!pending) {
+			return "当前没有待授权的操作，无需回复「确认授权」。若刚才的权限拒绝已过期（超过 10 分钟），请让对方重新发起一次请求。";
+		}
+		const role = resolveRole(this.config, actor?.senderId ?? null);
+		if (role !== "admin") {
+			return `只有管理员可以授权这个操作（你当前是 ${role}）。「确认授权」未生效，任务保持待授权状态（10 分钟内有效），请管理员回复。`;
+		}
+		const grant = this.authorizations.consume(conversationId);
+		if (!grant) return "待授权刚刚过期了，请让对方重新发起一次请求。";
+		console.log(`[engine] one-shot authorization granted in ${conversationId} by ${maskId(actor?.senderId ?? "?")} for capability "${grant.capability}" (requester ${grant.requesterId ? maskId(grant.requesterId) : "?"})`);
+		try {
+			const agent = this.getOrCreateSession(conversationId);
+			const result = await this.send(agent, grant.message, { actor, conversationName });
+			return `✅ 管理员已授权，本次操作按管理员权限执行。\n\n${result.reply || "（任务已受理，但没有产生可见回复）"}`;
+		} catch (err) {
+			return `⚠️ 授权已通过，但重放执行失败了：${err instanceof Error ? err.message : err}。请让对方重新发起一次请求。`;
+		}
+	}
+
+	/** True when an inbound message is the exact authorization confirmation. */
+	isAuthorizationPhrase(raw: string): boolean {
+		return isAuthorizationPhrase(raw);
 	}
 
 	/**
@@ -793,6 +854,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// the previous sender's identity (roles are per-person, and one group
 		// conversation serves many senders).
 		else if (!isLocalConversation(conversationId)) this.turnActor.delete(conversationId);
+		// The requester's original text, for the admin one-shot authorization
+		// flow: a role-refusal registers it as the pending request to replay.
+		// Cleared in the finally like the other per-turn state.
+		this.turnUserMessage.set(conversationId, message);
 
 		// Telemetry: one row per turn, written when the turn settles below. The id is
 		// minted here so tool calls made during this turn can be linked to it.
@@ -836,6 +901,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			this.turnSendFile.delete(conversationId);
 			this.turnSendImage.delete(conversationId);
 			this.turnActor.delete(conversationId);
+			this.turnUserMessage.delete(conversationId);
 			await this.computer?.release(conversationId);
 		}
 

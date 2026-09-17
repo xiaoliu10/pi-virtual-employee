@@ -70,6 +70,14 @@ const CAPABILITY_MIN: Record<string, Role> = {
 export interface PermissionRefusal {
 	ok: false;
 	reason: string;
+	/**
+	 * Why access was denied, for callers that react differently per cause.
+	 * "role" = the sender's role is below the capability floor — the one case
+	 * the admin one-shot delegation flow (「确认授权」) may remedy. Set inside
+	 * checkPermission; the guard wrapper keys off it to register the pending
+	 * authorization, never to widen access.
+	 */
+	kind?: "role" | "misconfig";
 }
 
 export interface PermissionGrant {
@@ -171,7 +179,7 @@ export function checkPermission(
 	// rather than silently falling back to the capability's default: a typo in a
 	// security setting must not hand out access.
 	if (raw !== undefined && floor === undefined) {
-		return { ok: false, reason: `会话门槛配置有误（能力「${capability}」的门槛值「${raw}」不是有效角色），为安全起见按管理员级别限制。请管理员在单聊中修正 security.conversations。` };
+		return { ok: false, kind: "misconfig", reason: `会话门槛配置有误（能力「${capability}」的门槛值「${raw}」不是有效角色），为安全起见按管理员级别限制。请管理员在单聊中修正 security.conversations。` };
 	}
 	const minRole = floor && ROLE_RANK[floor] > ROLE_RANK[CAPABILITY_MIN[capability] ?? "viewer"] ? floor : (CAPABILITY_MIN[capability] ?? "viewer");
 	if (ROLE_RANK[role] < ROLE_RANK[minRole]) {
@@ -179,6 +187,7 @@ export function checkPermission(
 		const need = minRole === "admin" ? "管理员" : minRole === "operator" ? "操作员（operator）" : "viewer";
 		return {
 			ok: false,
+			kind: "role",
 			reason: `当前用户没有「${label}」权限（需要 ${need} 或更高，你当前是 ${role}）。如需开通请联系管理员调整 security.people 中的角色指派。`,
 		};
 	}

@@ -18,6 +18,7 @@ import { looksLikeCommandAttempt, parseCommand, type ParsedCommand } from "./com
 import { diag } from "./diag.js";
 import { CAPABILITY_LABEL, checkPermission, describeAccess, isAdmin } from "../security/permissions.js";
 import { maskId } from "../engine/tools/admin.js";
+import { isAuthorizationPhrase } from "../engine/authorization.js";
 
 /** Shared deps handed to adapter factories that need them (e.g. image hosting). */
 export interface AdapterDeps {
@@ -233,6 +234,13 @@ export class IMAdapterManager {
 					// message text can never influence it.
 					const admission = checkPermission(this.config, msg.actor, msg.conversationId, "chat");
 					if (!admission.ok) return admission.reason;
+
+					// Admin one-shot authorization — deterministic, no model turn:
+					// exactly 「确认授权」 answers a pending role-refusal request.
+					// Only a platform-verified admin counts; the engine checks.
+					if (isAuthorizationPhrase(msg.text)) {
+						return await this.engine.confirmAuthorization(msg.conversationId, msg.actor, msg.conversationName);
+					}
 
 					const agent = this.engine.getOrCreateSession(msg.conversationId);
 

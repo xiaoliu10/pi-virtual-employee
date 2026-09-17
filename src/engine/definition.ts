@@ -44,7 +44,7 @@ import { createRunCommandTool, createManageProcessTool, type ShellToolDeps } fro
 import { createManageSettingsTool } from "./tools/settings.js";
 import { orderTool } from "./tools/orders.js";
 import { escalateTool } from "./tools/escalate.js";
-import { checkPermission, permissionRefusal } from "../security/permissions.js";
+import { CAPABILITY_LABEL, checkPermission, permissionRefusal } from "../security/permissions.js";
 import { createCheckMyAccessTool, createManageAccessTool, type AccessToolDeps } from "./tools/access.js";
 
 export { buildSystemPrompt, BASE_RULES_SUMMARY } from "./prompt.js";
@@ -78,6 +78,11 @@ export interface ToolSetOptions {
 	userSkillsDir: string;
 	/** Persistent config store used by guarded admin/identity tools. */
 	config: ConfigStore;
+	/** Fired when a guarded tool refused because the turn actor's role is below
+	 * the capability floor. The engine registers a pending one-shot admin
+	 * authorization (「确认授权」) for the conversation; refusing to fire it for
+	 * confirmation-gated or misconfig refusals is deliberate. */
+	onRoleRefusal?: (conversationId: string, info: { capability: string; need: string }) => void;
 	/** Resolve the verified IM actor + raw inbound text for the turn in flight. */
 	resolveActor: (conversationId: string) => (InboundActor & { text: string }) | undefined;
 	/** Called after a skill is written/updated, so the engine can refresh its
@@ -164,7 +169,28 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 		...tool,
 		async execute(toolCallId, params, signal, onUpdate) {
 			const gate = checkPermission(options.config, options.resolveActor(options.conversationId), options.conversationId, capability);
-			if (!gate.ok) return permissionRefusal(gate, capability);
+			if (!gate.ok) {
+				if (gate.kind === "role") {
+					// Role-shortfall in a live IM turn → register a pending one-shot
+					// admin authorization and tell the requester the path. Only this
+					// refusal kind arms the flow: misconfigurations must be fixed, and
+					// confirmation-gated tools keep their own gate.
+					const label = CAPABILITY_LABEL[capability] ?? capability;
+					options.onRoleRefusal?.(options.conversationId, { capability, need: label });
+					const base = permissionRefusal(gate, capability);
+					return {
+						...base,
+						content: [{
+							type: "text",
+							text:
+								`${base.content[0].text}\n\n（可选路径）如果对接方坚持要执行这个操作，可以回复对方：` +
+								`「该操作需要${label}权限。请管理员在本会话回复：确认授权 ——管理员回复后本次请求会自动执行（单次有效，10 分钟内）。」` +
+								`不要反复重试同一个被拒操作，也不要在管理员未回复时自行降级执行。`,
+						}],
+					};
+				}
+				return permissionRefusal(gate, capability);
+			}
 			return tool.execute(toolCallId, params, signal, onUpdate);
 		},
 	});
