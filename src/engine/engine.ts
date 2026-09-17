@@ -851,11 +851,22 @@ export class EmployeeEngine implements EmployeeRuntime {
 			askedForSummary = true;
 			const capSummary = await this.finalSummary(agent);
 			const max = this.config.all().general.maxToolSteps ?? 0;
-			reply =
-				capSummary ||
-				(contextBudgetHit
-					? "⚠️ 本轮读取的内容太多，已接近模型上下文上限，自动压缩也没能腾出空间，系统先停下来汇总，以免整轮请求被模型拒绝。已完成的结论见上；如果要继续，请把任务拆成更小的步骤，或让我换一种更省上下文的方式取数。"
-					: `⚠️ 本轮已达到工具调用上限（${max} 步），系统已停止继续调用工具。当前任务可能尚未完成，请提高上限后重试，或把任务拆成更小的步骤。`);
+			if (contextBudgetHit) {
+				// The budget gate already tried in-turn compaction and could not free
+				// room. Surface that plainly — the user must know WHY the task ended
+				// (context nearly full, auto-compact failed) and what to do next
+				// (manual /compact or /new), not just see a bare summary that looks
+				// like a normal "task done" (field feedback 2026-09-17).
+				const notice =
+					"⚠️ 上下文已接近模型上限，自动压缩也没能腾出足够空间——本次任务在此结束。\n\n" +
+					"建议：① 发 `/compact` 手动压缩本会话，或 `/new` 开新会话后重发任务；② 把任务拆成更小的步骤，或让我换一种更省上下文的方式取数。\n\n" +
+					"以下为本轮已完成的进展：";
+				reply = capSummary?.trim() ? `${notice}\n\n${capSummary}` : notice;
+			} else {
+				reply =
+					capSummary ||
+					`⚠️ 本轮已达到工具调用上限（${max} 步），系统已停止继续调用工具。当前任务可能尚未完成，请提高上限后重试，或把任务拆成更小的步骤。`;
+			}
 		}
 
 		// GUARANTEED FINAL REPLY — a virtual employee must always answer, success or
