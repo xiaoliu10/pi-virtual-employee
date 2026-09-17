@@ -377,7 +377,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// budget clamped to 1 token once the transcript passes the fake limit.
 		const ctxOverride = supplier.modelContextWindow?.[modelId];
 		const contextWindow = typeof ctxOverride === "number" && ctxOverride > 0 ? Math.floor(ctxOverride) : base.contextWindow;
-		return { ...base, id: modelId, name: modelId, input, contextWindow, ...(baseUrl ? { baseUrl } : {}) };
+		// Max output tokens: same inherit-vs-override story (base caps can silently
+		// truncate a relay model's long answers/reports).
+		const maxTokOverride = supplier.modelMaxTokens?.[modelId];
+		const maxTokens = typeof maxTokOverride === "number" && maxTokOverride > 0 ? Math.floor(maxTokOverride) : base.maxTokens;
+		return { ...base, id: modelId, name: modelId, input, contextWindow, ...(maxTokens !== undefined ? { maxTokens } : {}), ...(baseUrl ? { baseUrl } : {}) };
 	}
 
 	/** Effective image-input capability for a configured model (override else base). For the settings UI. */

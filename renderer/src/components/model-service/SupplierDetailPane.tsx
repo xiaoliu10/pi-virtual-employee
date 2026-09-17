@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type { ModelConfig, Supplier } from "../../lib/types";
 import { api } from "../../lib/ipc";
 import { Toggle } from "./Toggle";
+import { EditModelDialog, contextBadge, type ModelOverridePatch } from "./EditModelDialog";
 
 interface SupplierDetailPaneProps {
 	supplier: Supplier | null;
@@ -24,6 +25,8 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 	const [newModel, setNewModel] = useState("");
 	/** Effective image-input capability per modelId (from the engine, via IPC). */
 	const [capabilities, setCapabilities] = useState<Record<string, boolean>>({});
+	/** Model id currently open in the edit dialog, if any. */
+	const [editingModel, setEditingModel] = useState<string | null>(null);
 	const supplier = props.supplier;
 
 	// Re-fetch effective capabilities when the supplier's identity / api type /
@@ -63,24 +66,33 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 		setNewModel("");
 	};
 
-	/** Set the per-model image-input override; "inherit" removes the key. */
-	const setImageOverride = (modelId: string, value: "inherit" | boolean) => {
-		const prev = supplier.modelImage ?? {};
-		const next = { ...prev };
-		if (value === "inherit") delete next[modelId];
-		else next[modelId] = value;
-		props.onUpdate({ modelImage: Object.keys(next).length ? next : undefined });
+	/** Apply a per-model override patch from the edit dialog: merges each map and
+	 * drops keys that the dialog cleared (empty string = remove the override). */
+	const applyModelPatch = (modelId: string, patch: ModelOverridePatch) => {
+		const mergeTokens = (map: Record<string, number> | undefined, raw?: string) => {
+			if (raw === undefined) return map;
+			const next = { ...(map ?? {}) };
+			const n = Math.floor(Number(raw));
+			if (!raw.trim() || !Number.isFinite(n) || n <= 0) delete next[modelId];
+			else next[modelId] = n;
+			return Object.keys(next).length ? next : undefined;
+		};
+		let imageMap = supplier.modelImage;
+		if (patch.image !== undefined) {
+			const next = { ...(supplier.modelImage ?? {}) };
+			if (patch.image === "inherit") delete next[modelId];
+			else next[modelId] = patch.image;
+			imageMap = Object.keys(next).length ? next : undefined;
+		}
+		props.onUpdate({
+			modelContextWindow: mergeTokens(supplier.modelContextWindow, patch.contextWindow),
+			modelMaxTokens: mergeTokens(supplier.modelMaxTokens, patch.maxTokens),
+			modelImage: imageMap,
+		});
 	};
 
-	/** Set the per-model context-window override (tokens); empty removes the key. */
-	const setContextWindow = (modelId: string, raw: string) => {
-		const prev = supplier.modelContextWindow ?? {};
-		const next = { ...prev };
-		const n = Math.floor(Number(raw));
-		if (!raw.trim() || !Number.isFinite(n) || n <= 0) delete next[modelId];
-		else next[modelId] = n;
-		props.onUpdate({ modelContextWindow: Object.keys(next).length ? next : undefined });
-	};
+	/** Effective context window for the chip badge: override else nothing (inherit is invisible). */
+	const editing = supplier && editingModel && supplier.models.includes(editingModel) ? editingModel : null;
 
 	return (
 		<section className="flex min-w-0 flex-1 flex-col bg-white">
@@ -158,39 +170,37 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 							</div>
 						</div>
 
-						<div className="space-y-2.5">
+						<div className="flex flex-wrap gap-2.5">
 							{supplier.models.map((modelId) => {
 								const isDefault = supplier.id === props.model.defaultSupplierId && modelId === props.model.defaultModelId;
+								const badge = contextBadge(supplier.modelContextWindow?.[modelId]);
+								const supportsImage = capabilities[modelId] ?? false;
 								return (
-									<div key={modelId} className={`group flex items-center gap-3 rounded-xl border px-4 py-3 ${isDefault ? "border-blue-300 bg-blue-50/50" : "border-slate-200 bg-white"}`}>
-										<span className={`h-2.5 w-2.5 rounded-full ${supplier.enabled ? "bg-emerald-400" : "bg-slate-300"}`} />
-										<div className="min-w-0 flex-1">
-											<div className="truncate text-sm font-medium text-slate-800">{modelId}</div>
-											<div className="mt-0.5 truncate font-mono text-[11px] text-slate-400">{modelId}</div>
-										</div>
-										<ImageToggle
-											explicit={supplier.modelImage?.[modelId]}
-											effective={capabilities[modelId] ?? false}
-											onChange={(val) => setImageOverride(modelId, val)}
-										/>
-										<input
-											type="number"
-											min={0}
-											value={supplier.modelContextWindow?.[modelId] ?? ""}
-											onChange={(event) => setContextWindow(modelId, event.target.value)}
-											placeholder="上下文"
-											title="真实上下文窗口（tokens）。中转/别名模型务必按网关实际值填写，否则长对话会被错误压缩甚至空回复；留空 = 继承默认。"
-											className="h-8 w-24 rounded-lg border border-slate-200 bg-[#f7f8fa] px-2 text-xs text-slate-700 outline-none focus:border-blue-400 focus:bg-white"
-										/>
-										{isDefault ? <span className="rounded-md bg-blue-100 px-2 py-1 text-[11px] font-medium text-blue-600">默认</span> : (
-											<button type="button" disabled={!supplier.enabled} onClick={() => props.onSetDefault(modelId)} className="hidden rounded-lg px-2 py-1 text-xs text-blue-500 hover:bg-blue-50 disabled:text-slate-300 group-hover:block">设为默认</button>
+									<div
+										key={modelId}
+										className={`group flex items-center gap-2 rounded-full border py-1.5 pl-3 pr-1.5 transition ${isDefault ? "border-blue-300 bg-blue-50/60" : "border-slate-200 bg-white hover:border-slate-300"}`}
+									>
+										<button
+											type="button"
+											onClick={() => setEditingModel(modelId)}
+											title="编辑模型配置（上下文窗口 / 最大输出 / 输入类型）"
+											className="flex items-center gap-2 text-sm font-medium text-slate-800"
+										>
+											{modelId}
+											{badge && <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-[11px] font-semibold text-slate-500">{badge}</span>}
+											{supportsImage && <span title="支持图片输入" className="text-[11px]">🖼️</span>}
+											{isDefault && <span className="rounded-md bg-blue-100 px-1.5 py-0.5 text-[11px] font-medium text-blue-600">默认</span>}
+										</button>
+										{!isDefault && supplier.enabled && (
+											<button type="button" onClick={() => props.onSetDefault(modelId)} title="设为默认模型" className="hidden rounded-full px-1.5 py-0.5 text-[11px] text-blue-500 hover:bg-blue-50 group-hover:block">★</button>
 										)}
-										<button type="button" onClick={() => props.onRemoveModel(modelId)} className="rounded-lg px-2 py-1 text-xs text-slate-300 hover:bg-rose-50 hover:text-rose-500">删除</button>
+										<button type="button" onClick={() => props.onRemoveModel(modelId)} title="删除模型" className="rounded-full px-1.5 py-0.5 text-xs text-slate-300 hover:bg-rose-50 hover:text-rose-500">✕</button>
 									</div>
 								);
 							})}
-							{supplier.models.length === 0 && <div className="rounded-xl border border-dashed border-slate-200 px-4 py-7 text-center text-sm text-slate-400">还没有模型，请在下方添加模型 ID。</div>}
+							{supplier.models.length === 0 && <div className="w-full rounded-xl border border-dashed border-slate-200 px-4 py-7 text-center text-sm text-slate-400">还没有模型，请在下方添加模型 ID。</div>}
 						</div>
+						<p className="mt-2 text-xs text-slate-400">点击模型可编辑上下文窗口、最大输出与输入类型；徽标为该模型的上下文窗口（未设置则继承默认，不显示）。</p>
 
 						<div className="mt-3 flex gap-2">
 							<input value={newModel} onChange={(event) => setNewModel(event.target.value)} onKeyDown={(event) => event.key === "Enter" && submitModel()} className={inputCls} placeholder="模型 ID，例如 claude-sonnet-4-5 / gpt-4o" />
@@ -199,46 +209,15 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 					</div>
 				</div>
 			</div>
+			{editing && (
+				<EditModelDialog
+					supplier={supplier}
+					modelId={editing}
+					effectiveImage={capabilities[editing] ?? false}
+					onApply={applyModelPatch}
+					onClose={() => setEditingModel(null)}
+				/>
+			)}
 		</section>
-	);
-}
-
-/** Tri-state image-input control for a model: 继承 (inherit base) / 支持 / 关闭. */
-function ImageToggle(props: {
-	explicit: boolean | undefined;
-	effective: boolean;
-	onChange: (value: "inherit" | boolean) => void;
-}) {
-	const opts = [
-		{ key: "inherit", label: "继承", value: "inherit" as const },
-		{ key: "on", label: "支持", value: true as const },
-		{ key: "off", label: "关闭", value: false as const },
-	];
-	const isActive = (v: "inherit" | boolean) =>
-		props.explicit === undefined ? v === "inherit" : v === props.explicit;
-	const tone = (v: "inherit" | boolean) =>
-		isActive(v)
-			? v === false
-				? "bg-rose-50 text-rose-600"
-				: v === true
-					? "bg-blue-50 text-blue-600"
-					: "bg-slate-100 text-slate-600"
-			: "text-slate-400 hover:bg-slate-50";
-	return (
-		<div
-			className="flex items-center gap-0.5 rounded-lg border border-slate-200 p-0.5"
-			title={`图像识别 · 当前生效：${props.effective ? "支持" : "不支持"}${props.explicit === undefined ? "（继承默认）" : ""}`}
-		>
-			{opts.map((o) => (
-				<button
-					key={o.key}
-					type="button"
-					onClick={() => props.onChange(o.value)}
-					className={`rounded-md px-2 py-0.5 text-[11px] font-medium ${tone(o.value)}`}
-				>
-					{o.label}
-				</button>
-			))}
-		</div>
 	);
 }

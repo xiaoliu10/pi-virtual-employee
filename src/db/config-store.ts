@@ -72,6 +72,12 @@ export interface Supplier {
 	 * empty text — the "模型连续多次未返回内容" failure mode.
 	 */
 	modelContextWindow?: Record<string, number>;
+	/**
+	 * Per-model max output tokens override. Key = modelId. Absent → inherit the
+	 * base registry model's maxTokens. Relay/alias models inherit an unrelated
+	 * base model's cap, which can silently truncate long answers/reports.
+	 */
+	modelMaxTokens?: Record<string, number>;
 }
 
 export interface ModelConfig {
@@ -564,6 +570,7 @@ export function newSupplier(partial: Partial<Supplier> = {}): Supplier {
 		models: normalizedModels(partial.models),
 		modelImage: normalizedModelImage(partial.modelImage),
 		modelContextWindow: normalizedModelContextWindow(partial.modelContextWindow),
+		modelMaxTokens: normalizedModelContextWindow(partial.modelMaxTokens),
 	};
 }
 
@@ -603,6 +610,7 @@ export function normalizeModelConfig(value: unknown): ModelConfig {
 				models: normalizedModels(entry.models),
 				modelImage: normalizedModelImage(entry.modelImage),
 				modelContextWindow: normalizedModelContextWindow(entry.modelContextWindow),
+				modelMaxTokens: normalizedModelContextWindow(entry.modelMaxTokens),
 			}))
 		: [];
 

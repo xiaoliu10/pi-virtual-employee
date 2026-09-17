@@ -28,6 +28,8 @@ export interface Supplier {
 	/** Per-model context window override in tokens (absent → inherit base). Set
 	 * this for relay/alias models whose real window differs, e.g. qwen-200k. */
 	modelContextWindow?: Record<string, number>;
+	/** Per-model max output tokens override (absent → inherit base). */
+	modelMaxTokens?: Record<string, number>;
 }
 
 export interface ModelOption {
