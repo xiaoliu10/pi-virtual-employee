@@ -214,6 +214,8 @@ export class DingtalkAdapter implements IMAdapter {
 	private client?: DWClient;
 	private appId = "";
 	private appSecret = "";
+	/** Cached OLD-oapi token (separate lifetime from the new-API token). */
+	private oapiToken?: { value: string; expiresAt: number };
 	/**
 	 * Optional custom interactive-card template id. When empty, the official AI
 	 * card template (AI_CARD_TEMPLATE_ID) is used — card-first is the default.
@@ -559,8 +561,8 @@ export class DingtalkAdapter implements IMAdapter {
 	private async sendFileFor(msg: AnyRobotMsg, filePath: string, fileName: string): Promise<{ ok: boolean; error?: string }> {
 		try {
 			if (!msg.robotCode) return { ok: false, error: "缺少 robotCode" };
-			const downloadCode = await this.uploadFile(msg.robotCode, filePath, fileName);
-			await this.sendFileMessage(downloadCode, msg);
+			const uploaded = await this.uploadFile(msg.robotCode, filePath, fileName);
+			await this.sendFileMessage(uploaded, msg);
 			return { ok: true };
 		} catch (err) {
 			// The tool result paraphrases this for the user; the raw provider error
@@ -571,8 +573,65 @@ export class DingtalkAdapter implements IMAdapter {
 		}
 	}
 
-	/** Upload a file via the robot messageFiles API and return its downloadCode. */
-	private async uploadFile(robotCode: string, filePath: string, fileName: string): Promise<string> {
+	/**
+	 * Upload a file for robot delivery. Two upload APIs exist and they use
+	 * DIFFERENT token systems; field incident 2026-09-17 showed the new robot
+	 * messageFiles API answering 404 for an app whose old-oapi path works
+	 * (reference: LobsterAI's dingtalkMedia.ts). Strategy: prefer the old oapi
+	 * /media/upload (mature, org-wide) and fall back to the new messageFiles
+	 * API for deployments where only that is enabled. The return discriminates
+	 * which send-message payload the caller must build.
+	 */
+	private async uploadFile(
+		robotCode: string,
+		filePath: string,
+		fileName: string,
+	): Promise<{ kind: "mediaId" | "downloadCode"; value: string; fileName: string }> {
+		try {
+			const mediaId = await this.uploadFileOapi(filePath, fileName);
+			return { kind: "mediaId", value: mediaId, fileName };
+		} catch (err) {
+			console.warn(`[dingtalk] oapi media/upload failed (${(err as Error).message}); falling back to robot messageFiles/upload`);
+		}
+		const downloadCode = await this.uploadFileNewApi(robotCode, filePath, fileName);
+		return { kind: "downloadCode", value: downloadCode, fileName };
+	}
+
+	/** Old-oapi path: GET gettoken (separate token system!) then media/upload?type=file → media_id. */
+	private async uploadFileOapi(filePath: string, fileName: string): Promise<string> {
+		const oapiToken = await this.oapiAccessToken();
+		const buffer = await readFile(filePath);
+		const form = new FormData();
+		form.append("media", new Blob([buffer], { type: mimeFor(fileName) }), fileName);
+		const res = await fetch(`https://oapi.dingtalk.com/media/upload?access_token=${encodeURIComponent(oapiToken)}&type=file`, {
+			method: "POST",
+			body: form,
+		});
+		const text = await res.text().catch(() => "");
+		if (!res.ok) throw new Error(`oapi media/upload HTTP ${res.status}: ${text.slice(0, 200)}`);
+		const data = JSON.parse(text || "{}") as { errcode?: number; errmsg?: string; media_id?: string };
+		if (data.errcode && data.errcode !== 0) throw new Error(`oapi media/upload errcode ${data.errcode}: ${data.errmsg ?? text.slice(0, 200)}`);
+		if (!data.media_id) throw new Error("oapi media/upload 未返回 media_id");
+		return data.media_id;
+	}
+
+	/** Cached OLD-oapi token — NOT interchangeable with the new api.dingtalk.com token. */
+	private async oapiAccessToken(): Promise<string> {
+		const now = Date.now();
+		if (this.oapiToken && this.oapiToken.expiresAt - now > 60_000) return this.oapiToken.value;
+		const res = await fetch(
+			`https://oapi.dingtalk.com/gettoken?appkey=${encodeURIComponent(this.appId)}&appsecret=${encodeURIComponent(this.appSecret)}`,
+		);
+		const text = await res.text().catch(() => "");
+		if (!res.ok) throw new Error(`oapi gettoken HTTP ${res.status}: ${text.slice(0, 200)}`);
+		const data = JSON.parse(text || "{}") as { errcode?: number; errmsg?: string; access_token?: string; expires_in?: number };
+		if (!data.access_token) throw new Error(`oapi gettoken 失败: ${data.errmsg ?? text.slice(0, 200)}`);
+		this.oapiToken = { value: data.access_token, expiresAt: now + (data.expires_in ?? 7200) * 1000 };
+		return this.oapiToken.value;
+	}
+
+	/** New-API path (kept as fallback): robot messageFiles/upload → downloadCode. */
+	private async uploadFileNewApi(robotCode: string, filePath: string, fileName: string): Promise<string> {
 		const token = await this.accessToken();
 		const buffer = await readFile(filePath);
 		const form = new FormData();
@@ -709,12 +768,17 @@ export class DingtalkAdapter implements IMAdapter {
 	}
 
 	/** Send a sampleFile message to the conversation the inbound message came from. */
-	private async sendFileMessage(downloadCode: string, msg: AnyRobotMsg): Promise<void> {
+	private async sendFileMessage(uploaded: { kind: "mediaId" | "downloadCode"; value: string; fileName: string }, msg: AnyRobotMsg): Promise<void> {
 		const isSingle = msg.conversationType === "1";
+		// Old-oapi media_id and new-API downloadCode ride DIFFERENT sampleFile payloads.
+		const msgParam =
+			uploaded.kind === "mediaId"
+				? JSON.stringify({ mediaId: uploaded.value, fileName: uploaded.fileName })
+				: JSON.stringify({ downloadCode: uploaded.value });
 		await this.sendProactive({
 			isSingle,
 			msgKey: "sampleFile",
-			msgParam: JSON.stringify({ downloadCode }),
+			msgParam,
 			robotCode: msg.robotCode,
 			userIds: isSingle ? [msg.senderStaffId || msg.senderId || ""] : undefined,
 			openConversationId: isSingle ? undefined : msg.conversationId,
@@ -859,4 +923,31 @@ export class DingtalkAdapter implements IMAdapter {
 			await this.callEmotion("recall", target);
 		}
 	}
+}
+
+/** MIME by extension for old-oapi media uploads (octet-stream is accepted). */
+function mimeFor(fileName: string): string {
+	const ext = extname(fileName).toLowerCase();
+	const map: Record<string, string> = {
+		".jpg": "image/jpeg",
+		".jpeg": "image/jpeg",
+		".png": "image/png",
+		".gif": "image/gif",
+		".webp": "image/webp",
+		".bmp": "image/bmp",
+		".pdf": "application/pdf",
+		".doc": "application/msword",
+		".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		".xls": "application/vnd.ms-excel",
+		".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+		".ppt": "application/vnd.ms-powerpoint",
+		".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+		".zip": "application/zip",
+		".txt": "text/plain",
+		".csv": "text/csv",
+		".mp4": "video/mp4",
+		".mp3": "audio/mpeg",
+		".wav": "audio/wav",
+	};
+	return map[ext] || "application/octet-stream";
 }
