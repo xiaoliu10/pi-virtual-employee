@@ -248,12 +248,24 @@ export class IMAdapterManager {
 					// turn is still running, push a brief progress note to the channel.
 					// IM only — real adapters provide ctx.onProgress; the console/HTTP
 					// path does not. Repeats until the turn finishes (cleared in finally).
+					// The note comes from a side-channel LLM pass (progressBrief) for a
+					// concrete ≤100-char progress report; if the turn settles while the
+					// summary is in flight, the stale "仍在进行中" is dropped.
 					const onProgress = ctx?.onProgress;
 					const progressMin = this.config.all().general.longTaskProgressMin;
+					let progressInFlight = false;
 					const heartbeat = progressMin > 0 && onProgress
 						? setInterval(() => {
-							const note = this.engine.briefProgress(agent);
-							void onProgress(note).catch((err) => console.warn("[im] progress push failed:", (err as Error).message));
+							if (progressInFlight) return;
+							progressInFlight = true;
+							void this.engine.progressBrief(agent)
+								.then((note) => {
+									if (agent.state.isStreaming) return onProgress(note);
+								})
+								.catch((err) => console.warn("[im] progress push failed:", (err as Error).message))
+								.finally(() => {
+									progressInFlight = false;
+								});
 						}, progressMin * 60_000)
 						: undefined;
 					// Turn watchdog: the per-conversation queue is strict, so ONE wedged

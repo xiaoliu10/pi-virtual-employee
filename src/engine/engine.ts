@@ -11,7 +11,7 @@
  * base model of the matching api type and overriding id + baseUrl.
  */
 import { randomUUID } from "node:crypto";
-import { Agent, convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens } from "@earendil-works/pi-agent-core";
+import { Agent, convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "@earendil-works/pi-agent-core";
 import type { AgentEvent, AgentMessage, Skill, StreamFn } from "@earendil-works/pi-agent-core";
 import { createModels } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
@@ -37,7 +37,7 @@ import { hasActiveShellCommands } from "./tools/shell.js";
 import { isLocalConversation, resolveRole } from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
-import { estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, isContextOverflowError, maybeCompact, rehydrateMessages, truncateToFit } from "./context.js";
+import { estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, truncateToFit } from "./context.js";
 import { SkillLoader, pickActiveSkills } from "./skills/skill-loader.js";
 import { SkillWriter } from "./skills/skill-writer.js";
 import { formatInlineSkills } from "./skills/skills-prompt.js";
@@ -1197,6 +1197,40 @@ export class EmployeeEngine implements EmployeeRuntime {
 			}
 		}
 		return "⏳ 任务仍在进行中（已耗时较长），请稍候，完成后会立即回复结果。";
+	}
+
+	/**
+	 * Long-task heartbeat, upgraded (field request 2026-09-17): the raw
+	 * latest-narration snippet ("检查表格当前行状态") gives the user no sense of
+	 * WHERE the task is. This runs a side-channel LLM pass over the task
+	 * statement + recent tail (see progressContextSlice) for a concrete ≤100-char
+	 * progress report. Never mutates agent state, never competes with the live
+	 * turn's request beyond one extra call; falls back to the raw snippet when
+	 * the side call fails or the transcript is too small to be worth it.
+	 */
+	async progressBrief(agent: Agent): Promise<string> {
+		const fallback = () => this.briefProgress(agent);
+		try {
+			const msgs = agent.state.messages;
+			if (estimateTokensSafe(msgs) < 2_000) return fallback();
+			const context = progressContextSlice(msgs);
+			const model = agent.state.model;
+			const result = await generateSummary(
+				context,
+				this.models,
+				model,
+				512, // ~0.8×512 tokens of output budget — plenty for 100 Chinese chars
+				undefined,
+				"这是正在执行中的任务的对话记录节选（开头是任务目标，后面是最近的进展）。请用不超过100字的中文，向用户报告任务当前进展：进行到哪一步、刚完成了什么、接下来要做什么。只依据记录中真实发生的事与工具真实返回，绝不编造未发生的进度；判断不了整体位置时，如实说明当前正在做的具体一步。",
+				undefined,
+			);
+			if (!result.ok || !result.value?.trim()) return fallback();
+			const text = result.value.replace(/\s+/g, " ").trim().slice(0, 140);
+			return `⏳ 任务仍在进行中。${text}`;
+		} catch (err) {
+			console.warn("[engine] progress summary failed:", err instanceof Error ? err.message : err);
+			return fallback();
+		}
 	}
 
 	/**

@@ -259,6 +259,28 @@ export function findCompactionCut(messages: AgentMessage[], keepRecentTokens: nu
 	return cut;
 }
 
+/**
+ * Context for the heartbeat progress summary (field request 2026-09-17: the
+ * raw latest-narration snippet read like "检查表格当前行状态" — no sense of
+ * where the task actually is). The side-channel LLM call gets the TASK
+ * statement (first user message, so the goal is always in view) plus a recent
+ * tail of roughly `keepRecentTokens`, deduped when the tail already covers it.
+ * Pure slicing — never touches agent state.
+ */
+export function progressContextSlice(messages: AgentMessage[], keepRecentTokens = 24_000): AgentMessage[] {
+	if (messages.length === 0) return [];
+	let cut = messages.length;
+	let kept = 0;
+	while (cut > 0 && kept < keepRecentTokens) {
+		cut--;
+		kept += estimateMessageTokens(messages[cut]);
+	}
+	const tail = messages.slice(cut);
+	const first = messages.find((m) => m.role === "user");
+	if (first && !tail.includes(first)) return [first, ...tail];
+	return tail;
+}
+
 export async function maybeCompact(agent: Agent, models: Models, force = false): Promise<boolean> {
 	const settings = DEFAULT_COMPACTION_SETTINGS;
 	const messages = agent.state.messages;

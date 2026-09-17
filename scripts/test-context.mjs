@@ -25,7 +25,7 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 		contents: `
-			export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, FALLBACK_CONTEXT_WINDOW } from "./src/engine/context.ts";
+			export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, progressContextSlice, FALLBACK_CONTEXT_WINDOW } from "./src/engine/context.ts";
 			export { estimateTokens } from "@earendil-works/pi-agent-core";
 		`,
 		resolveDir: root,
@@ -37,7 +37,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, FALLBACK_CONTEXT_WINDOW, estimateTokens } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -148,4 +148,28 @@ test("cut point falls back to the last user turn when the tail is inside the fin
 	// No user message at all anywhere → 0 (nothing summarizable before a boundary).
 	const roleless = [assistant("只有一条助手消息，且很长。" + "长".repeat(30_000))];
 	assert.equal(findCompactionCut(roleless, 20_000), 0);
+});
+
+// Field request 2026-09-17: the heartbeat's raw snippet ("检查表格当前行状态")
+// gave no sense of task position, so the heartbeat now summarizes a side-channel
+// slice: the TASK statement plus a recent tail.
+test("progress context keeps the task goal in view alongside the recent tail", () => {
+	const goal = user("任务：对账 7 月渠道账单，核对每笔退款");
+	const filler = [];
+	for (let i = 0; i < 30; i += 1) filler.push(assistant("中间步骤。" + "步".repeat(2400)));
+	const recent = [user("继续"), assistant("正在核对第 3 批退款明细。")];
+	const messages = [goal, ...filler, ...recent];
+
+	const slice = progressContextSlice(messages, 20_000);
+	assert.equal(slice[0], goal, "the task statement must always be in view");
+	assert.ok(slice.includes(recent[0]) && slice.includes(recent[1]), "the recent tail must be included");
+	assert.ok(slice.length < messages.length, "the middle bulk is not needed for a progress report");
+
+	// Short transcript where the tail already covers the goal — no duplicate.
+	const small = [user("任务 A"), assistant("做了一半")];
+	const sliceSmall = progressContextSlice(small, 20_000);
+	assert.equal(sliceSmall.length, small.length);
+	assert.equal(sliceSmall[0], small[0]);
+
+	assert.deepEqual(progressContextSlice([], 20_000), []);
 });
