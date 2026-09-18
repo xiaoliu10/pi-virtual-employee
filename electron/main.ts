@@ -30,6 +30,7 @@ import { DownloadStore } from "../src/downloads/download-store.js";
 import { DownloadService } from "../src/downloads/download-service.js";
 import { EmployeeEngine } from "../src/engine/engine.js";
 import { disposeShellCommands } from "../src/engine/tools/shell.js";
+import { scheduledTimePrefix } from "../src/engine/tools/time.js";
 import { buildSystemPrompt, defaultCoreRules } from "../src/engine/prompt.js";
 import { startHttpTransport } from "../src/transport/http.js";
 import { setupAutoUpdater, getUpdateState, lastCheckTime, checkNow, downloadNow, quitAndInstall, stopUpdater, setupUnattended, updateCapability, requestUpdateAndInstall, type UpdateState } from "./updater.js";
@@ -519,7 +520,7 @@ async function main(): Promise<void> {
 			});
 			let sendResult: Awaited<ReturnType<typeof engine.send>>;
 			try {
-				sendResult = await engine.send(agent, task.prompt, {
+				sendResult = await engine.send(agent, scheduledTimePrefix() + task.prompt, {
 					// Re-attach the task creator's identity for guarded tools
 					// (run_command). Captured at creation in a verified 1:1 admin
 					// chat; requireAdminForCommand re-checks the live whitelist on

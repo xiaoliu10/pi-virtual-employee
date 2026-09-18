@@ -13,7 +13,7 @@
 			"path": "src/engine/prompt.ts",
 			"kind": "region",
 			"why": "数据真实性（禁止编造业务数据）——用户红线，见 no-fabricated-data-rule",
-			"sha256": "39641a1dc66c4907e4ec28793ceac3a192b21e7cd203fd76a5f794583c54e575"
+			"sha256": "9fb19adeae6abe3522e1565ebb3943ead2bf8b43633ed09507a4670e6951f297"
 		},
 		{
 			"id": "rbac-gate",
