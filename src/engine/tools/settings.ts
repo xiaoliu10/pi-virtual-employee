@@ -44,7 +44,7 @@ const MAX_VALUE_CHARS = 20_000;
 
 /** Root-block catalog for the list action (also the discovery surface for the model). */
 const ROOT_CATALOG: Record<string, string> = {
-	model: "模型供应商与默认模型（suppliers/defaultSupplierId/defaultModelId；改动错误会导致员工失联）",
+	model: "模型供应商与默认模型（suppliers/defaultSupplierId/defaultModelId；每个 supplier 条目内还有 per-model 覆盖：modelImage/modelContextWindow/modelMaxTokens，按 modelId 键值写入，如 model.suppliers.0.modelContextWindow = {\"模型ID\": 204800}；改动错误会导致员工失联）",
 	identity: "员工身份（name/role/duty/serviceHours）",
 	im: "IM 渠道（im.enabled/channels[].appId/appSecret 等）",
 	general: "通用（autostart/language/requestTimeoutMin/longTaskProgressMin/maxToolSteps/autoUpdate）",

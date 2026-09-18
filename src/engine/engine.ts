@@ -657,18 +657,22 @@ export class EmployeeEngine implements EmployeeRuntime {
 			return "⏳ 当前有回合正在进行，等它结束后再试 /compact。";
 		}
 		const before = estimateContextTokens(agent.state.messages).tokens;
-		const done = await maybeCompact(agent, this.models, true);
-		if (!done) {
-			// Honest verdict, not boilerplate: one branch is genuinely "no need",
-			// the other is "over budget but structurally incompressible this pass"
-			// — they must not sound the same (the old wording called an 88%-full
-			// transcript "很短", see field incident 2026-09-17).
+		const { compacted, skipReason } = await maybeCompact(agent, this.models, true);
+		if (!compacted) {
+			// An EXPLICIT /compact must be executed or honestly reported — never
+			// second-guessed with "无需压缩" when the real cause was a summarizer
+			// failure (field bug 2026-09-18: below-threshold forced passes always
+			// printed 无需压缩 because the reason was folded into the size check).
 			const window = agent.state.model.contextWindow || FALLBACK_CONTEXT_WINDOW;
 			const pct = Math.max(1, Math.round((before / window) * 100));
-			if (before < window - this.compactionReserve()) {
-				return `上下文约 ${before.toLocaleString()} tokens（约占窗口 ${pct}%），离压缩阈值还很远，无需压缩。`;
+			const size = `上下文约 ${before.toLocaleString()} tokens（约占窗口 ${pct}%）`;
+			if (skipReason === "summary_failed") {
+				return `⚠️ ${size}，但这次压缩没有执行成：摘要生成失败（具体原因已记录在 main.log 的「compaction summary failed」行）。可以直接 /new 开新会话恢复。`;
 			}
-			return `⚠️ 会话约 ${before.toLocaleString()} tokens，已占窗口 ${pct}%，但这次压缩没有执行成（通常是最近一轮的工具返回太大、或摘要生成失败）。最快的恢复方式是直接 /new 开新会话。`;
+			if (skipReason === "nothing_to_cut" || skipReason === "empty_head") {
+				return `${size}，目前没有可压缩的早期对话（早期内容太少或已摘要过），无需压缩。`;
+			}
+			return `⚠️ ${size}，但这次压缩没有执行成（原因：${skipReason ?? "未知"}）。可以直接 /new 开新会话恢复。`;
 		}
 		const after = estimateContextTokens(agent.state.messages).tokens;
 		return `🧹 上下文已压缩：约 ${before} → ${after} tokens（较早的对话已汇总为摘要，近期对话原样保留）。`;
@@ -1020,7 +1024,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// the model's context window (IM chats run indefinitely). Best-effort —
 		// compaction must never break message delivery.
 		try {
-			await maybeCompact(agent, this.models);
+			await maybeCompact(agent, this.models).then((r) => r.compacted);
 		} catch (err) {
 			console.warn("[engine] compaction failed:", err);
 		}
@@ -1372,7 +1376,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 */
 	private async recoverFromContextOverflow(agent: Agent): Promise<boolean> {
 		try {
-			if (await maybeCompact(agent, this.models, true)) return true;
+			if ((await maybeCompact(agent, this.models, true)).compacted) return true;
 		} catch (err) {
 			console.warn("[engine] overflow compaction failed:", err instanceof Error ? err.message : err);
 		}

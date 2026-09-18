@@ -281,7 +281,18 @@ export function progressContextSlice(messages: AgentMessage[], keepRecentTokens 
 	return tail;
 }
 
-export async function maybeCompact(agent: Agent, models: Models, force = false): Promise<boolean> {
+/** Why a compaction pass did not run — /compact must report the REAL reason,
+ * not fold "summary generation failed" into "no need" (field bug 2026-09-18:
+ * a forced /compact below the threshold always printed 无需压缩 even when the
+ * summarizer itself had failed). */
+export type CompactSkipReason = "below_threshold" | "nothing_to_cut" | "empty_head" | "summary_failed";
+
+export interface CompactOutcome {
+	compacted: boolean;
+	skipReason?: CompactSkipReason;
+}
+
+export async function maybeCompact(agent: Agent, models: Models, force = false): Promise<CompactOutcome> {
 	const settings = DEFAULT_COMPACTION_SETTINGS;
 	const messages = agent.state.messages;
 	const model = agent.state.model;
@@ -290,12 +301,12 @@ export async function maybeCompact(agent: Agent, models: Models, force = false):
 	// Chinese transcript badly enough that compaction never fires (see
 	// estimateTokensSafe). Overshooting only compacts a bit sooner.
 	if (!force && !shouldCompact(estimateTokensSafe(messages), contextWindow, settings)) {
-		return false;
+		return { compacted: false, skipReason: "below_threshold" };
 	}
 
 	// Cut point: compaction never splits within a turn — see findCompactionCut.
 	const cut = findCompactionCut(messages, settings.keepRecentTokens);
-	if (cut === 0 || cut === messages.length) return false;
+	if (cut === 0 || cut === messages.length) return { compacted: false, skipReason: "nothing_to_cut" };
 
 	let old = messages.slice(0, cut);
 	const recent = messages.slice(cut);
@@ -307,7 +318,7 @@ export async function maybeCompact(agent: Agent, models: Models, force = false):
 		previousSummary = head.summary;
 		old = old.slice(1);
 	}
-	if (old.length === 0) return false;
+	if (old.length === 0) return { compacted: false, skipReason: "empty_head" };
 
 	const tokensBefore = estimateTokensSafe(messages);
 	const result = await generateSummary(
@@ -321,7 +332,7 @@ export async function maybeCompact(agent: Agent, models: Models, force = false):
 	);
 	if (!result.ok) {
 		console.warn("[engine] compaction summary failed:", result.error);
-		return false;
+		return { compacted: false, skipReason: "summary_failed" };
 	}
 	agent.state.messages = [
 		createCompactionSummaryMessage(result.value, tokensBefore, new Date().toISOString()),
@@ -330,5 +341,5 @@ export async function maybeCompact(agent: Agent, models: Models, force = false):
 	console.log(
 		`[engine] compacted ${agent.sessionId ?? "?"}: ${old.length} turns → summary (~${tokensBefore} tokens before)`,
 	);
-	return true;
+	return { compacted: true };
 }
