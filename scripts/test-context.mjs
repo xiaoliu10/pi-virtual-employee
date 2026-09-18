@@ -25,7 +25,7 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 		contents: `
-			export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, progressContextSlice, FALLBACK_CONTEXT_WINDOW } from "./src/engine/context.ts";
+			export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, progressContextSlice, FALLBACK_CONTEXT_WINDOW } from "./src/engine/context.ts";
 			export { estimateTokens } from "@earendil-works/pi-agent-core";
 		`,
 		resolveDir: root,
@@ -37,7 +37,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -200,4 +200,32 @@ test("forced cut handles single-turn transcripts: keep the task, summarize the m
 	// Tiny sessions still refuse: nothing outside the keep window.
 	const tiny = [user("hi"), assistant("hello")];
 	assert.equal(findForcedCompactionCut(tiny, 20_000), null);
+});
+
+// Field incident 2026-09-18: "Cannot continue from message role: assistant".
+// An aborted/interrupted request leaves a trailing assistant message (empty, or
+// carrying toolCalls whose results never arrived); continuing from it throws.
+test("stripDanglingAssistant removes the un-resumable tail but keeps completed replies", () => {
+	const toolCall = (id) => ({ role: "assistant", content: [{ type: "text", text: "查一下" }, { type: "toolCall", id, name: "x", arguments: {} }], timestamp: Date.now() });
+
+	// Empty assistant tail (stream died before any text) → removed.
+	let msgs = [user("任务"), assistant("")];
+	assert.equal(stripDanglingAssistant(msgs), 1);
+	assert.equal(msgs.length, 1);
+
+	// Assistant with toolCalls but no toolResult (watchdog aborted the loop) → removed.
+	msgs = [user("任务"), toolCall("c1")];
+	assert.equal(stripDanglingAssistant(msgs), 1);
+	assert.equal(msgs.length, 1);
+
+	// Completed final reply (text, no tool calls) → preserved.
+	msgs = [user("任务"), assistant("已完成：结果是 42。")];
+	assert.equal(stripDanglingAssistant(msgs), 0);
+	assert.equal(msgs.length, 2);
+
+	// Trailing toolResult or user → nothing to strip.
+	msgs = [user("任务"), toolCall("c2"), { role: "toolResult", content: "ok", timestamp: Date.now() }];
+	assert.equal(stripDanglingAssistant(msgs), 0);
+	msgs = [user("任务")];
+	assert.equal(stripDanglingAssistant(msgs), 0);
 });

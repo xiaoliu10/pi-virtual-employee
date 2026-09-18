@@ -37,7 +37,7 @@ import { hasActiveShellCommands } from "./tools/shell.js";
 import { isLocalConversation, resolveRole } from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
-import { estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, truncateToFit } from "./context.js";
+import { estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, truncateToFit } from "./context.js";
 import { SkillLoader, pickActiveSkills } from "./skills/skill-loader.js";
 import { SkillWriter } from "./skills/skill-writer.js";
 import { formatInlineSkills } from "./skills/skills-prompt.js";
@@ -1390,6 +1390,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		if (errorText && isContextOverflowError(errorText)) {
 			if (await this.recoverFromContextOverflow(agent)) {
 				console.warn("[engine] context overflow reported in-turn: retrying on a compacted transcript");
+				this.stripDanglingAssistant(agent);
 				await agent.continue();
 				return true;
 			}
@@ -1402,15 +1403,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 			: `transient stream error (${errorText || "stream aborted"})`;
 		console.warn(`[engine] ${reason} — retrying once`);
 		await sleep(1000);
-		// Drop a trailing empty/error assistant message so continue() can resume from
-		// the preceding user/tool message instead of throwing "Cannot continue from
-		// message role: assistant".
-		if (this.endedWithoutText(agent)) agent.state.messages.pop();
 		try {
-			await agent.continue();
+			await this.safeContinue(agent);
 		} catch (err) {
 			const text = err instanceof Error ? err.message : String(err);
 			if (!text.startsWith("Cannot continue")) throw err;
+			// Last-resort: a transcript whose only resumable anchor is gone —
+			// replay the user message as a fresh turn instead of failing the request.
 			await agent.prompt(message, visionImages);
 		}
 		return true;
@@ -1443,6 +1442,26 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * text and no pending tool calls — i.e. the turn "finished" but the user would
 	 * see nothing. Tool-call messages are excluded (the loop would keep running).
 	 */
+	/**
+	 * Resume a turn after a stream interruption (transient error, watchdog
+	 * abort, in-turn overflow). A half-finished request leaves a trailing
+	 * assistant message that must never be continued from: it is either empty or
+	 * carries toolCalls whose toolResults never arrived (the tool execution was
+	 * aborted mid-loop), and the SDK hard-throws "Cannot continue from message
+	 * role: assistant" in both cases (field incident 2026-09-18). Pop such a
+	 * dangling tail so the transcript resumes from the preceding user/tool
+	 * message; keep a completed final assistant reply untouched.
+	 */
+	private stripDanglingAssistant(agent: Agent): void {
+		stripDanglingAssistant(agent.state.messages);
+	}
+
+	/** Continue the loop after making the tail continuation-safe. */
+	private safeContinue(agent: Agent): Promise<void> {
+		this.stripDanglingAssistant(agent);
+		return agent.continue();
+	}
+
 	private endedWithoutText(agent: Agent): boolean {
 		const msgs = agent.state.messages;
 		const last = msgs[msgs.length - 1];

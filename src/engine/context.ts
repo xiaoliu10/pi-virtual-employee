@@ -54,7 +54,6 @@ export function rehydrateMessages(rows: MessageRow[]): AgentMessage[] {
 	const tail = rows.slice(-REHYDRATE_MAX_MESSAGES);
 	let start = 0;
 	while (start < tail.length && tail[start].role !== "user") start++;
-
 	const out: AgentMessage[] = [];
 	for (const row of tail.slice(start)) {
 		if (row.role === "user") {
@@ -238,6 +237,31 @@ export function truncateToFit(agent: Agent, targetTokens: number, now = new Date
  * is nothing summarizable (transcript shorter than the tail, no user boundary
  * before it).
  */
+/**
+ * Remove a trailing assistant message that must not be continued from. A
+ * half-finished request (stream interrupted by a watchdog abort, transient
+ * error, in-turn overflow) leaves the tail as either an empty assistant message
+ * or an assistant message carrying toolCalls whose toolResults never arrived.
+ * The SDK hard-throws "Cannot continue from message role: assistant" and
+ * providers reject orphaned tool calls. A COMPLETED reply (non-empty text, no
+ * pending tool calls) is preserved. Returns how many messages were removed.
+ */
+export function stripDanglingAssistant(messages: AgentMessage[]): number {
+	let removed = 0;
+	const last = messages[messages.length - 1];
+	if (last && last.role === "assistant") {
+		const text = messageText(last).trim();
+		const content = (last as { content?: unknown }).content;
+		const parts = Array.isArray(content) ? (content as { type?: string }[]) : [];
+		const hasToolCalls = parts.some((p) => p.type === "toolCall");
+		if (!text || hasToolCalls) {
+			messages.pop();
+			removed += 1;
+		}
+	}
+	return removed;
+}
+
 export function findCompactionCut(messages: AgentMessage[], keepRecentTokens: number): number {
 	let cut = messages.length;
 	let kept = 0;
