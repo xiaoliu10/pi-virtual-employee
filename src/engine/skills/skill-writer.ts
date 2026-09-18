@@ -151,8 +151,12 @@ export class SkillWriter {
 			const base = resolve(this.userSkillsDir);
 			const dest = resolve(targetPath);
 			// Reject symlinks/`..` escapes. `resolve` normalizes `..`, so a path
-			// outside `base` no longer has `base` as a real prefix.
-			if (dest !== base && !dest.startsWith(base + "/")) return false;
+			// outside `base` no longer has `base` as a real prefix. Use the
+			// PLATFORM separator — a hardcoded "/" rejected every target on
+			// Windows (paths use "\\"), so no skill could ever be written there
+			// (field 2026-09-18: all four save_to_skill attempts rejected).
+			const s = sepFromPath(base);
+			if (dest !== base && !dest.startsWith(base + s)) return false;
 			// If an ancestor is a symlink, lstat won't follow it; resolve+startsWith
 			// on a symlinked user dir would still be fine (base is the symlink root),
 			// but block a target whose own path is a symlink pointing outside.
@@ -186,6 +190,12 @@ function validateName(name: string): string | null {
 
 function reject(name: string, message: string): SkillWriteResult {
 	return { outcome: "rejected", name, message };
+}
+
+/** Separator actually used in a resolved path: "\\" for Windows-style paths
+ * (C:\\…), "/" otherwise — the check must not hardcode "/" on win32. */
+function sepFromPath(p: string): string {
+	return p.includes("\\") && !p.includes("/") ? "\\" : "/";
 }
 
 /** True when an existing file is a top-level `<name>.md` (vs the directory form). */
