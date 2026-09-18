@@ -25,7 +25,7 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 		contents: `
-			export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, progressContextSlice, FALLBACK_CONTEXT_WINDOW } from "./src/engine/context.ts";
+			export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, progressContextSlice, FALLBACK_CONTEXT_WINDOW } from "./src/engine/context.ts";
 			export { estimateTokens } from "@earendil-works/pi-agent-core";
 		`,
 		resolveDir: root,
@@ -37,7 +37,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -172,4 +172,32 @@ test("progress context keeps the task goal in view alongside the recent tail", (
 	assert.equal(sliceSmall[0], small[0]);
 
 	assert.deepEqual(progressContextSlice([], 20_000), []);
+});
+
+// Field request 2026-09-18: an explicit /compact must EXECUTE, not refuse.
+// Single-turn sessions (one task statement + a huge execution trace) had no
+// user boundary to cut on — now the forced path keeps the task statement and
+// summarizes the middle.
+test("forced cut handles single-turn transcripts: keep the task, summarize the middle", () => {
+	const task = user("任务：对账 7 月渠道账单，逐商户下载对账文件");
+	const messages = [task];
+	// One long turn: alternating assistant narration and tool results.
+	for (let i = 0; i < 30; i += 1) {
+		messages.push(assistant(`执行第 ${i} 步。` + "执".repeat(2000)));
+		messages.push({ role: "toolResult", content: "结果" + "果".repeat(600), timestamp: Date.now() });
+	}
+
+	const forced = findForcedCompactionCut(messages, 20_000);
+	assert.ok(forced, "a 40k+ single-turn session must yield a forced cut");
+	assert.equal(forced.keepIndex, 0, "the task statement is the kept anchor");
+	assert.ok(forced.cut > 1 && forced.cut < messages.length, "middle content exists on both sides");
+	assert.equal(messages[forced.cut].role, "assistant", "tail must not open on an orphaned toolResult");
+
+	// Summarizable middle is substantial.
+	const middle = messages.slice(1, forced.cut);
+	assert.ok(estimateTokensSafe(middle) > 10_000, "the summarized middle must actually free room");
+
+	// Tiny sessions still refuse: nothing outside the keep window.
+	const tiny = [user("hi"), assistant("hello")];
+	assert.equal(findForcedCompactionCut(tiny, 20_000), null);
 });

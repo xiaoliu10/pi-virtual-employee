@@ -259,6 +259,36 @@ export function findCompactionCut(messages: AgentMessage[], keepRecentTokens: nu
 	return cut;
 }
 
+export interface ForcedCut {
+	/** First kept message index (the task statement). */
+	keepIndex: number;
+	/** Tail starts here (first message of the kept recent window). */
+	cut: number;
+}
+
+/**
+ * Forced-compaction cut for SINGLE-TURN transcripts (one task statement followed
+ * by a huge execution trace): the normal user-boundary rule has nothing to cut,
+ * but these are exactly the sessions worth compacting. Keep the task statement
+ * verbatim (summarizing away the goal would corrupt the session), summarize the
+ * middle, keep the recent tail. Returns null when nothing can be freed at all.
+ */
+export function findForcedCompactionCut(messages: AgentMessage[], keepRecentTokens: number): ForcedCut | null {
+	const keepIndex = messages.findIndex((m) => m.role === "user");
+	if (keepIndex < 0) return null;
+	let cut = messages.length;
+	let kept = 0;
+	while (cut > keepIndex + 1 && kept < keepRecentTokens) {
+		cut--;
+		kept += estimateMessageTokens(messages[cut]);
+	}
+	// The kept tail must not open on an orphaned toolResult (its toolCall would
+	// be summarized away — providers reject that sequence).
+	while (cut < messages.length && messages[cut].role === "toolResult") cut++;
+	if (cut <= keepIndex + 1) return null;
+	return { cut, keepIndex };
+}
+
 /**
  * Context for the heartbeat progress summary (field request 2026-09-17: the
  * raw latest-narration snippet read like "检查表格当前行状态" — no sense of
@@ -305,11 +335,26 @@ export async function maybeCompact(agent: Agent, models: Models, force = false):
 	}
 
 	// Cut point: compaction never splits within a turn — see findCompactionCut.
-	const cut = findCompactionCut(messages, settings.keepRecentTokens);
+	let cut = findCompactionCut(messages, settings.keepRecentTokens);
+	// Forced passes (explicit /compact, overflow recovery) relax the rule for
+	// single-turn transcripts: the user ORDERED a compaction, so make a genuine
+	// best effort — keep the task statement, summarize the middle (2026-09-18).
+	let keepIndex = -1;
+	if (force && (cut === 0 || cut === messages.length)) {
+		const forced = findForcedCompactionCut(messages, settings.keepRecentTokens);
+		if (forced) {
+			cut = forced.cut;
+			keepIndex = forced.keepIndex;
+		}
+	}
 	if (cut === 0 || cut === messages.length) return { compacted: false, skipReason: "nothing_to_cut" };
 
 	let old = messages.slice(0, cut);
-	const recent = messages.slice(cut);
+	let recent = messages.slice(cut);
+	if (keepIndex >= 0) {
+		old = messages.slice(0, cut).filter((_, i) => i !== keepIndex);
+		recent = [messages[keepIndex], ...recent];
+	}
 
 	// Chain onto a prior summary instead of re-summarizing it.
 	let previousSummary: string | undefined;

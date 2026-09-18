@@ -674,7 +674,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				return `⚠️ ${size}，但这次压缩没有执行成：摘要生成失败（具体原因已记录在 main.log 的「compaction summary failed」行）。可以直接 /new 开新会话恢复。`;
 			}
 			if (skipReason === "nothing_to_cut" || skipReason === "empty_head") {
-				return `${size}，目前没有可压缩的早期对话（早期内容太少或已摘要过），无需压缩。`;
+				return `已尝试压缩：会话约 ${before.toLocaleString()} tokens，全部内容都在近期保留窗口内，没有可归档的早期内容，因此没有产生变更。`;
 			}
 			return `⚠️ ${size}，但这次压缩没有执行成（原因：${skipReason ?? "未知"}）。可以直接 /new 开新会话恢复。`;
 		}
