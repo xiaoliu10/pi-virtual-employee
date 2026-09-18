@@ -169,6 +169,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * events, tool calls). Feeds the stall watchdog: it measures SILENCE, not
 	 * total turn time, so long-but-live tasks are never killed. */
 	private readonly turnActivity = new Map<string, number>();
+	/** Per-conversation in-flight LLM request count + last call start — an
+	 * in-flight request counts as life even before its first event arrives. */
+	private readonly llmInFlight = new Map<string, number>();
+	private readonly lastLlmCallAt = new Map<string, number>();
 
 	constructor(
 		private readonly config: ConfigStore,
@@ -298,7 +302,29 @@ export class EmployeeEngine implements EmployeeRuntime {
 		return c.model.defaultModelId || this.availableModels()[0]?.modelId || "unknown";
 	}
 
-	private readonly streamFn: StreamFn = async (model, context, options) => {
+	/**
+	 * Per-conversation streamFn: the IM session's Agent gets one bound to its
+	 * conversation so model interaction (call start + in-flight) can be credited
+	 * to the right stall-watchdog clock. Field rule 2026-09-18: a model request
+	 * in flight IS progress — long-context requests can stay silent (slow
+	 * time-to-first-token through a relay) far past the watchdog threshold while
+	 * perfectly alive. Bounded by the per-request timeout, so a truly hung
+	 * request still self-terminates and unblocks the queue.
+	 */
+	private makeStreamFn(conversationId: string): StreamFn {
+		return async (model, context, options) => {
+			this.llmInFlight.set(conversationId, (this.llmInFlight.get(conversationId) ?? 0) + 1);
+			this.lastLlmCallAt.set(conversationId, Date.now());
+			this.touchActivity(conversationId);
+			try {
+				return await this.rawStreamFn(model, context, options);
+			} finally {
+				this.llmInFlight.set(conversationId, Math.max(0, (this.llmInFlight.get(conversationId) ?? 1) - 1));
+			}
+		};
+	}
+
+	private readonly rawStreamFn: StreamFn = async (model, context, options) => {
 		// Log the exact model id + endpoint each LLM call uses, so it's auditable
 		// what name is actually sent upstream (vs. what a relay re-routes it to).
 		const incomingTimeout = (options as { timeoutMs?: number }).timeoutMs;
@@ -428,7 +454,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		const { supplier, modelId } = this.resolveDefaultModel();
 		const agent = new Agent({
 			initialState: { systemPrompt, model: this.buildModel(supplier, modelId), tools: [] },
-			streamFn: this.streamFn,
+			streamFn: this.rawStreamFn,
 			getApiKey: () => supplier.apiKey || undefined,
 		});
 		let reply = "";
@@ -503,7 +529,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// messages to the model — the Agent default would drop them.
 			convertToLlm,
 			sessionId: conversationId,
-			streamFn: this.streamFn,
+			streamFn: this.makeStreamFn(conversationId),
 			getApiKey: () => supplier.apiKey || undefined,
 		});
 
@@ -547,10 +573,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.sessions.delete(conversationId);
 	}
 
-	/** Ms since the conversation's current turn last showed life; huge when unknown. */
+	/** Ms since the conversation's current turn last showed life; huge when unknown.
+	 * An in-flight LLM request counts as life (see makeStreamFn) — its idle clock
+	 * is the time since that request STARTED, so slow first-token silence is alive
+	 * while a request that has been hung past its own timeout is not credited. */
 	turnIdleMs(conversationId: string): number {
 		const at = this.turnActivity.get(conversationId);
-		return at === undefined ? Number.MAX_SAFE_INTEGER : Date.now() - at;
+		const activityIdle = at === undefined ? Number.MAX_SAFE_INTEGER : Date.now() - at;
+		if ((this.llmInFlight.get(conversationId) ?? 0) > 0) {
+			const last = this.lastLlmCallAt.get(conversationId) ?? Date.now();
+			return Math.min(activityIdle, Date.now() - last);
+		}
+		return activityIdle;
 	}
 
 	private touchActivity(conversationId: string): void {
