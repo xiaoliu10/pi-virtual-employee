@@ -362,6 +362,11 @@ function briefSummary(markdown: string, max = 1200): string {
 
 async function main(): Promise<void> {
 	const userData = app.getPath("userData");
+	// Files received over IM live inside the profile (not OS Temp) and are
+	// allowlisted automatically — the employee must read what was just sent to
+	// it without a settings round-trip (field 2026-09-18).
+	const inboundDir = path.join(userData, "inbound");
+	void mkdir(inboundDir, { recursive: true }).catch(() => {});
 	// From here on, everything printed with console.* also lands in
 	// logs/main.log — the headless box's only window into main-process errors.
 	teeConsoleToDisk(path.join(userData, "logs", "main.log"));
@@ -390,6 +395,7 @@ async function main(): Promise<void> {
 	// two-step authorized delete tool). No directory is pre-created here — the
 	// service just resolves the configured whitelist at call time.
 	const filesystem = new FileSystemService(config);
+	filesystem.addAllowedDir(inboundDir);
 
 	// Browser downloads: capture into a managed workspace so the employee can
 	// list/read/analyze downloaded files (Excel exports, etc.) without touching
@@ -472,7 +478,7 @@ async function main(): Promise<void> {
 	// dedicated conversation (results show in the sidebar), then refreshes the UI.
 	// If the task was created in an IM conversation, the result is proactively
 	// pushed back to that group/1:1 through the active IM adapter.
-	const im = new IMAdapterManager(engine, config, { reportService });
+	const im = new IMAdapterManager(engine, config, { reportService, inboundDir });
 	// /restart command hook: relaunch the same binary with the same args.
 	im.setOnRestart(() => {
 		app.relaunch();

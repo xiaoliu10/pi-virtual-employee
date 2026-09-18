@@ -24,12 +24,14 @@ import { startStallWatchdog } from "./watchdog.js";
 /** Shared deps handed to adapter factories that need them (e.g. image hosting). */
 export interface AdapterDeps {
 	reportService?: ReportService;
+	/** Where inbound files received from channels are stored. */
+	inboundDir?: string;
 }
 
 /** channel type → factory. Add more real channels (feishu/wecom/…) here. */
 const REGISTRY = new Map<string, (deps: AdapterDeps) => IMAdapter>([
 	["echo", () => new EchoAdapter()],
-	["dingtalk", (deps) => new DingtalkAdapter(deps.reportService)],
+	["dingtalk", (deps) => new DingtalkAdapter(deps.reportService, deps.inboundDir)],
 ]);
 
 export function availableChannels(): string[] {

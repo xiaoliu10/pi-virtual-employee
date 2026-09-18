@@ -36,14 +36,28 @@ const LIST_LIMIT = 300;
 const RECURSIVE_DEPTH = 2;
 
 export class FileSystemService {
+	/** App-level dirs always allowlisted IN ADDITION to the configured
+	 * filesystem.allowedDirs — received files must be readable without the user
+	 * first editing settings (field 2026-09-18: inbound files sat in OS Temp,
+	 * outside the allowlist, so structured reads were refused). */
+	private extraAllowed: string[] = [];
+
 	constructor(private readonly config: ConfigStore) {}
+
+	/** Register an app-managed dir (e.g. <userData>/inbound) as accessible. */
+	addAllowedDir(dir: string | undefined): void {
+		if (dir && !this.extraAllowed.includes(dir)) this.extraAllowed.push(dir);
+	}
 
 	/** Allowed directories as absolute paths (`~` expanded, blanks dropped). */
 	allowedDirs(): string[] {
-		return this.config
-			.all()
-			.filesystem.allowedDirs.map((d) => this.expand(d.trim()))
-			.filter(Boolean);
+		return [
+			...this.config
+				.all()
+				.filesystem.allowedDirs.map((d) => this.expand(d.trim()))
+				.filter(Boolean),
+			...this.extraAllowed,
+		];
 	}
 
 	/** Expand a leading `~` to the home dir and resolve to an absolute path. */

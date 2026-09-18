@@ -225,7 +225,13 @@ export class DingtalkAdapter implements IMAdapter {
 	private cardTemplateId = "";
 	private token: { value: string; expiresAt: number } | null = null;
 
-	constructor(private readonly reportService?: ReportService) {}
+	constructor(
+		private readonly reportService?: ReportService,
+		/** Directory inbound files are stored in. Defaults to the OS temp
+		 * dir for tests; the app injects <userData>/inbound so received files
+		 * live inside the profile and can be put on the filesystem allowlist. */
+		private readonly inboundDir?: string,
+	) {}
 
 	async start(io: IMIO, config: IMConfig): Promise<void> {
 		if (!config.appId || !config.appSecret) {
@@ -706,7 +712,9 @@ export class DingtalkAdapter implements IMAdapter {
 		const rawName = fileNameHint || (dispositionName ? decodeURIComponent(dispositionName) : "") || `file-${Date.now()}`;
 		const safeName = rawName.replace(/[\\/:*?"<>|\r\n]+/g, "_").slice(0, 120) || "file";
 
-		const dir = join(tmpdir(), "pi-ve-inbound");
+		// App-injected profile dir by preference (persistent, allowlisted);
+		// OS temp is only the test/non-packaged fallback.
+		const dir = this.inboundDir ?? join(tmpdir(), "pi-ve-inbound");
 		await mkdir(dir, { recursive: true });
 		const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
 		const savedPath = join(dir, `${stamp}-${randomUUID().slice(0, 6)}-${safeName}`);
