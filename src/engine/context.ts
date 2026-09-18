@@ -262,6 +262,22 @@ export function stripDanglingAssistant(messages: AgentMessage[]): number {
 	return removed;
 }
 
+/**
+ * Drop a kept message's provider usage record. A usage record describes the
+ * transcript AS THAT REQUEST SAW IT; kept verbatim past a compaction cut, the
+ * newest one pins estimateContextTokens to the PRE-compaction size, so the
+ * budget gate reads a successfully compacted transcript as still over budget
+ * (field 2026-09-18: "compacted 434 turns → summary" yet "~188760 ≥ 188416" —
+ * the turn died on a stale floor). Char-based estimation takes over until the
+ * next real response writes a fresh record.
+ */
+export function stripStaleUsage(message: AgentMessage): AgentMessage {
+	if (message.role !== "assistant") return message;
+	if (!(message as { usage?: unknown }).usage) return message;
+	const { usage: _stale, ...rest } = message as AgentMessage & { usage?: unknown };
+	return rest as AgentMessage;
+}
+
 export function findCompactionCut(messages: AgentMessage[], keepRecentTokens: number): number {
 	let cut = messages.length;
 	let kept = 0;
@@ -405,7 +421,7 @@ export async function maybeCompact(agent: Agent, models: Models, force = false):
 	}
 	agent.state.messages = [
 		createCompactionSummaryMessage(result.value, tokensBefore, new Date().toISOString()),
-		...recent,
+		...recent.map(stripStaleUsage),
 	];
 	console.log(
 		`[engine] compacted ${agent.sessionId ?? "?"}: ${old.length} turns → summary (~${tokensBefore} tokens before)`,

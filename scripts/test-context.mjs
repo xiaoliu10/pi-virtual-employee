@@ -25,7 +25,7 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 		contents: `
-			export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, progressContextSlice, FALLBACK_CONTEXT_WINDOW } from "./src/engine/context.ts";
+			export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW } from "./src/engine/context.ts";
 			export { estimateTokens } from "@earendil-works/pi-agent-core";
 		`,
 		resolveDir: root,
@@ -37,7 +37,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -228,4 +228,36 @@ test("stripDanglingAssistant removes the un-resumable tail but keeps completed r
 	assert.equal(stripDanglingAssistant(msgs), 0);
 	msgs = [user("任务")];
 	assert.equal(stripDanglingAssistant(msgs), 0);
+});
+
+// Field incident 2026-09-18 (16:26 北京时间): the budget gate ran a compaction
+// that SUCCEEDED ("compacted 434 turns → summary") yet immediately ruled
+// "~188760 ≥ 188416 — could not free room" and killed the turn. Cause: the
+// kept tail's last usage record described the PRE-compaction request, and
+// estimateTokensSafe trusts that floor — so a freshly compacted transcript
+// still estimated at its old size. Stripping the stale record must drop the
+// estimate back to char counting.
+test("stale usage floor must not survive a compaction cut", () => {
+	const withUsage = (text, total) => ({
+		role: "assistant",
+		content: [{ type: "text", text }],
+		usage: { totalTokens: total },
+		stopReason: "stop",
+		timestamp: Date.now(),
+	});
+
+	// Floor active: a usage record pins the estimate at the provider's number.
+	const floored = [withUsage("hello world", 188760)];
+	assert.equal(estimateTokensSafe(floored), 188760);
+
+	// After stripping: falls back to char-based estimation (tiny here).
+	const stripped = floored.map(stripStaleUsage);
+	assert.ok(estimateTokensSafe(stripped) < 1000, `expected char-based estimate, got ${estimateTokensSafe(stripped)}`);
+	assert.equal(stripped[0].usage, undefined);
+
+	// Non-assistant and usage-less messages pass through untouched.
+	const u = user("任务");
+	const plain = assistant("回答");
+	assert.equal(stripStaleUsage(u), u);
+	assert.equal(stripStaleUsage(plain), plain);
 });
