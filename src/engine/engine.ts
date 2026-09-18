@@ -13,7 +13,7 @@
 import { randomUUID } from "node:crypto";
 import { Agent, convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "@earendil-works/pi-agent-core";
 import type { AgentEvent, AgentMessage, Skill, StreamFn } from "@earendil-works/pi-agent-core";
-import { createModels } from "@earendil-works/pi-ai";
+import { createModels, InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { Api, ImageContent, Model, MutableModels, TextContent } from "@earendil-works/pi-ai";
 import type { ConfigStore, Supplier } from "../db/config-store.js";
@@ -136,6 +136,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 	readonly profileId = "customer-service";
 	private readonly sessions = new Map<string, Agent>();
 	private readonly models: MutableModels;
+	/** Engine-owned credential store handed to the Models registry — lets us
+	 * write supplier keys for providers the SDK resolves auth against. */
+	private readonly credentialStore = new InMemoryCredentialStore();
 	private readonly opts: Required<Omit<EngineOptions, "streamFn">> & { streamFn?: StreamFn };
 	private readonly skillLoader: SkillLoader;
 	/** Authoring surface for declarative skills (save_to_skill). */
@@ -188,8 +191,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 		options: EngineOptions = {},
 	) {
 		this.opts = { timeoutMs: options.timeoutMs ?? 0, streamFn: options.streamFn };
-		this.models = createModels();
+		this.models = createModels({ credentials: this.credentialStore });
 		for (const provider of builtinProviders()) this.models.setProvider(provider);
+		this.syncProviderCredentials();
 		this.skillLoader = new SkillLoader(paths.builtinSkillsDir, paths.userSkillsDir);
 		this.skillWriter = new SkillWriter(this.skillLoader, paths.userSkillsDir);
 	}
@@ -703,7 +707,51 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * Agent from the newly-persisted config. */
 	markConfigChanged(): void {
 		void this.computer?.syncConfig();
+		this.syncProviderCredentials();
 		this.skillsRevision += 1;
+	}
+
+	/**
+	 * Write each enabled supplier's API key into the Models credential store for
+	 * the BUILTIN provider its relay models borrow (openai-type suppliers borrow
+	 * groq first — see providerSearchOrder). Root-cause fix for "every compaction
+	 * summary failed" (field, 2026-09-18): the main loop passes the supplier key
+	 * per call (agent-loop getApiKey → options.apiKey, which overrides stored
+	 * credentials), but SDK-internal calls — compaction summaries, heartbeat
+	 * progress briefs, knowledge consolidation — go through
+	 * models.completeSimple WITHOUT a key and fall back to the provider's STORED
+	 * credential. Nothing had written one, so auth resolution failed
+	 * ("Provider is not configured: groq") and summary generation failed every
+	 * time even though chat worked.
+	 *
+	 * Collision note: two openai-type suppliers borrowing the same builtin
+	 * provider share one stored credential (last write wins). That is safe for
+	 * the main loop (explicit key always wins) and only affects keyless internal
+	 * calls on non-default suppliers — acceptable; this deployment has one.
+	 */
+	private syncProviderCredentials(): void {
+		try {
+			const cfg = this.config.all().model;
+			const byProvider = new Map<string, string>();
+			for (const supplier of cfg.suppliers) {
+				if (!supplier.enabled || !supplier.apiKey.trim()) continue;
+				for (const modelId of supplier.models) {
+					try {
+						const m = this.buildModel(supplier, modelId);
+						if (m.provider) byProvider.set(m.provider, supplier.apiKey);
+					} catch {
+						/* unresolvable supplier/model — skip */
+					}
+				}
+			}
+			for (const [providerId, key] of byProvider) {
+				this.credentialStore
+					.modify(providerId, async () => ({ type: "api_key" as const, key }))
+					.catch((err: unknown) => console.warn(`[engine] credential sync failed for ${providerId}:`, err instanceof Error ? err.message : err));
+			}
+		} catch (err) {
+			console.warn("[engine] provider credential sync failed:", err instanceof Error ? err.message : err);
+		}
 	}
 
 	/**
