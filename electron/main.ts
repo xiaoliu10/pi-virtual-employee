@@ -349,18 +349,6 @@ function relaunchInto(profile: string): void {
 	app.exit(0);
 }
 
-/**
- * First part of a report for the IM push when a link exists. Keeps markdown
- * structure (line breaks/headings/lists all render in DingTalk); the adapter
- * flattens any pipe tables at send time. Capped at a line boundary.
- */
-function briefSummary(markdown: string, max = 1200): string {
-	const text = markdown.trim();
-	if (text.length <= max) return text;
-	const cut = text.lastIndexOf("\n", max);
-	return (cut > 0 ? text.slice(0, cut) : text.slice(0, max)).trimEnd() + "\n…（完整内容见报告链接）";
-}
-
 async function main(): Promise<void> {
 	const userData = app.getPath("userData");
 	// Files received over IM live inside the profile (not OS Temp) and are
@@ -554,12 +542,13 @@ async function main(): Promise<void> {
 				const pub = await reportService.publish(reportRun.runId, task.title, reply);
 				reportUrl = pub?.url ?? null;
 			}
-			// Push the result back to the originating IM chat. When a report link is
-			// available, send a short summary + link (the full report lives at the
-			// link); otherwise fall back to the full reply. Non-IM tasks skip push.
+			// Push the FULL result back to the originating IM chat — the manager
+			// chunks anything past the platform's per-message cap into ordered
+			// parts, so the report arrives whole. The link stays appended for the
+			// rendered/original copy. Non-IM tasks skip push.
 			let pushError: string | undefined;
 			if (task.conversation_id && reply) {
-				const body = reportUrl ? `${briefSummary(reply)}\n\n📎 查看报告：${reportUrl}` : reply;
+				const body = reportUrl ? `${reply}\n\n📎 查看报告：${reportUrl}` : reply;
 				const pushText = `⏰ **定时任务完成：${task.title}**\n\n${body}`;
 				const pushed = await im.pushToConversation(task.conversation_id, pushText);
 				if (!pushed.ok) {

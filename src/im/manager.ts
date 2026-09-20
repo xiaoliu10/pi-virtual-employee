@@ -20,6 +20,7 @@ import { CAPABILITY_LABEL, checkPermission, describeAccess, isAdmin } from "../s
 import { maskId } from "../engine/tools/admin.js";
 import { isAuthorizationPhrase } from "../engine/authorization.js";
 import { startStallWatchdog } from "./watchdog.js";
+import { splitForPush } from "./chunks.js";
 
 /** Shared deps handed to adapter factories that need them (e.g. image hosting). */
 export interface AdapterDeps {
@@ -144,7 +145,16 @@ export class IMAdapterManager {
 	async pushToConversation(conversationId: string, text: string): Promise<{ ok: boolean; error?: string }> {
 		const adapter = this.adapterFor(conversationId);
 		if (!adapter?.push) return { ok: false, error: `没有可推送到 ${conversationId} 的在线渠道` };
-		return adapter.push(conversationId, text);
+		// Platform message caps (~4000 chars on DingTalk) mean a long report must
+		// ride as several messages — split at paragraph boundaries and deliver the
+		// full text in order (field 2026-09-20: daily reports hard-cut at 1200).
+		const parts = splitForPush(text);
+		for (let i = 0; i < parts.length; i += 1) {
+			const piece = parts.length > 1 ? `【${i + 1}/${parts.length}】\n${parts[i]}` : parts[i];
+			const pushed = await adapter.push(conversationId, piece);
+			if (!pushed.ok) return pushed;
+		}
+		return { ok: true };
 	}
 
 	/** Map an app-internal conversation id to the active adapter that owns it. */
