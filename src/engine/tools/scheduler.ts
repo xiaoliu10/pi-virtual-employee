@@ -137,7 +137,8 @@ export function createSchedulerTools(
 		label: "查看定时任务",
 		description:
 			"列出当前所有定时任务及其启用状态、cron、上次与下次执行时间、创建来源，以及**无人值守执行身份**。" +
-			"执行身份＝创建人当前的角色（任务跟随创建人权限）；显示「未记录」的只有控制台/旧版本创建的任务，那些才需要用 authorize_scheduled_task 补授权。创建人被降权时这里会警告。",
+			"执行身份＝创建人当前的角色（任务跟随创建人权限）；显示「未记录」的只有控制台/旧版本创建的任务，那些才需要用 authorize_scheduled_task 补授权。创建人被降权时这里会警告。" +
+			"本列表不含 prompt 正文；要看某个任务的执行指令原文用 get_scheduled_task（id 从本列表取）。",
 		parameters: Type.Object({}),
 		async execute() {
 			const rows = scheduler.list();
@@ -154,11 +155,47 @@ export function createSchedulerTools(
 					type: "text",
 					text:
 						`共 ${rows.length} 个定时任务：\n${lines.join("\n")}` +
+						`\n要看某个任务的 prompt 执行指令原文，用 get_scheduled_task（传 id）。` +
 						(pending
 							? `\n其中 ${pending} 个**没有执行身份**（控制台/旧版本创建的遗留任务）：它们到点只能用对话与知识库。若确认内容没问题，可让管理员在单聊里说「给所有定时任务授权，确认」一次性补上（无需删除重建）。`
 							: ""),
 				}],
 				details: { count: rows.length, unauthorized: pending },
+			};
+		},
+	};
+
+	const detail: AgentTool = {
+		name: "get_scheduled_task",
+		label: "查看定时任务详情",
+		description:
+			"按 id 查看一个定时任务的完整详情，包括 **prompt 执行指令原文**（list_scheduled_tasks 只有标题/cron/时间等元数据，不含 prompt）。" +
+			"修改 prompt（update_scheduled_task）之前必须先看原文，禁止盲改。",
+		parameters: Type.Object({ id: Type.String({ description: "任务 id（来自 list_scheduled_tasks）" }) }),
+		async execute(_toolCallId, params) {
+			const id = (params as { id: string }).id;
+			const task = scheduler.get(id);
+			if (!task) {
+				return {
+					content: [{ type: "text", text: `未找到 id 为 ${id} 的定时任务，请先用 list_scheduled_tasks 确认。` }],
+					details: { ok: false },
+				};
+			}
+			const text = [
+				`定时任务「${task.title}」（id=${task.id}）`,
+				`状态: ${task.enabled ? "启用" : "停用"}  cron: ${task.cron}`,
+				`下次: ${fmtTime(task.next_run_at)}  上次: ${fmtTime(task.last_run_at)}${task.last_status ? ` (${task.last_status})` : ""}`,
+				`创建于: ${createdIn(task, conversationId).label}`,
+				`执行身份: ${identityLabel(task)}`,
+				`结果推送: ${task.conversation_id ? maskId(task.conversation_id) : "无（仅存控制台）"}`,
+				"",
+				"【prompt 原文开始】",
+				task.prompt,
+				"【prompt 原文结束】",
+			].join("\n");
+			return {
+				content: [{ type: "text", text }],
+				details: { ok: true, task: { ...task } },
 			};
 		},
 	};
@@ -293,7 +330,8 @@ export function createSchedulerTools(
 		description:
 			"修改已有定时任务的标题 / 执行指令 / cron / 推送目标，无需删除重建（执行历史保留）。" +
 			"改推送目标最常用的方式是 bindCurrent=true：在正确的群聊/单聊里调用，把任务的结果推送改绑到当前会话——" +
-			"例如任务当初建错了群，现在在正确的群里改绑即可。只传想改的字段。",
+			"例如任务当初建错了群，现在在正确的群里改绑即可。只传想改的字段。" +
+			"改 prompt 前必须先用 get_scheduled_task 读原文（本工具不返回旧值），禁止凭记忆盲改。",
 		parameters: Type.Object({
 			id: Type.String({ description: "任务 id（来自 list_scheduled_tasks）" }),
 			title: Type.Optional(Type.String({ description: "新的任务标题" })),
@@ -332,5 +370,5 @@ export function createSchedulerTools(
 		},
 	};
 
-	return [create, list, remove, toggle, authorize, updateTask];
+	return [create, list, detail, remove, toggle, authorize, updateTask];
 }

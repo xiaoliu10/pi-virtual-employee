@@ -57,6 +57,10 @@ export class SchedulerService {
 		return this.store.list();
 	}
 
+	get(id: string): ScheduledTaskRow | undefined {
+		return this.store.get(id);
+	}
+
 	delete(id: string): void {
 		this.store.delete(id);
 	}
