@@ -23,19 +23,19 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const workDir = await mkdtemp(join(root, "node_modules/.watchdog-test-"));
 process.on("exit", () => { void rm(workDir, { recursive: true, force: true }); });
 const bundle = join(workDir, "watchdog.mjs");
-await build({
-	stdin: {
-		contents: `export { startStallWatchdog } from "./src/im/watchdog.ts";`,
-		resolveDir: root,
-		loader: "ts",
-	},
-	outfile: bundle,
-	bundle: true,
-	platform: "node",
-	format: "esm",
-	packages: "external",
-});
-const { startStallWatchdog } = await import(pathToFileURL(bundle).href);
+	await build({
+		stdin: {
+			contents: `export { startStallWatchdog, computeStallIdleMs } from "./src/im/watchdog.ts";`,
+			resolveDir: root,
+			loader: "ts",
+		},
+		outfile: bundle,
+		bundle: true,
+		platform: "node",
+		format: "esm",
+		packages: "external",
+	});
+const { startStallWatchdog, computeStallIdleMs } = await import(pathToFileURL(bundle).href);
 
 function harness(t) {
 	t.mock.timers.enable({ apis: ["setInterval"] });
@@ -95,4 +95,24 @@ test("stop() disarms without firing, even in deep silence", (t) => {
 	h.watchdog.stop();
 	h.advance(31_000);
 	assert.equal(h.state.aborts, 0, "a stopped watchdog never fires");
+});
+
+// Field incident 2026-09-18: "有模型调用为什么还判断成卡死？" — v2 credited an
+// in-flight LLM request only up to the request's OWN AGE (min(activityIdle,
+// callAge)), so a healthy-but-silent long request (box raised
+// requestTimeoutMin above the 20min watchdog threshold; slow relay, no stream
+// deltas until the end) crossed the threshold mid-request and was killed.
+// v3 semantics: in-flight = life, unconditionally — the request's own timeout
+// is what bounds a dead call, never the watchdog.
+test("computeStallIdleMs: an in-flight LLM request is life regardless of its age", () => {
+	const now = 1_000_000_000;
+	const activityAt = now - 40 * 60_000; // silent 40min by events
+	assert.equal(computeStallIdleMs({ lastActivityAt: activityAt, llmInFlight: 1 }, now), 0,
+		"in-flight request ⇒ alive, even when its age exceeds the threshold");
+	assert.equal(computeStallIdleMs({ lastActivityAt: activityAt, llmInFlight: 3 }, now), 0,
+		"several in-flight requests ⇒ alive");
+	assert.equal(computeStallIdleMs({ lastActivityAt: activityAt, llmInFlight: 0 }, now), 40 * 60_000,
+		"no in-flight request ⇒ silence is measured from real activity");
+	assert.equal(computeStallIdleMs({ lastActivityAt: undefined, llmInFlight: 0 }, now), Number.MAX_SAFE_INTEGER,
+		"never any activity ⇒ huge idle (fires on next poll)");
 });

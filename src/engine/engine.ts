@@ -37,6 +37,7 @@ import { hasActiveShellCommands } from "./tools/shell.js";
 import { isLocalConversation, resolveRole } from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
+import { computeStallIdleMs } from "../im/watchdog.js";
 import { estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, truncateToFit } from "./context.js";
 import { SkillLoader, pickActiveSkills } from "./skills/skill-loader.js";
 import { SkillWriter } from "./skills/skill-writer.js";
@@ -578,17 +579,26 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/** Ms since the conversation's current turn last showed life; huge when unknown.
-	 * An in-flight LLM request counts as life (see makeStreamFn) — its idle clock
-	 * is the time since that request STARTED, so slow first-token silence is alive
-	 * while a request that has been hung past its own timeout is not credited. */
+	 * An in-flight LLM request counts as life unconditionally (computeStallIdleMs) —
+	 * its own request timeout is what bounds a dead call, not the watchdog. */
 	turnIdleMs(conversationId: string): number {
+		return computeStallIdleMs(
+			{
+				lastActivityAt: this.turnActivity.get(conversationId),
+				llmInFlight: this.llmInFlight.get(conversationId) ?? 0,
+			},
+			Date.now(),
+		);
+	}
+
+	/** Why the watchdog is (or is not) about to fire — logged at stall time so
+	 * main.log explains the kill without code archaeology. */
+	turnStallSnapshot(conversationId: string): string {
 		const at = this.turnActivity.get(conversationId);
-		const activityIdle = at === undefined ? Number.MAX_SAFE_INTEGER : Date.now() - at;
-		if ((this.llmInFlight.get(conversationId) ?? 0) > 0) {
-			const last = this.lastLlmCallAt.get(conversationId) ?? Date.now();
-			return Math.min(activityIdle, Date.now() - last);
-		}
-		return activityIdle;
+		const inFlight = this.llmInFlight.get(conversationId) ?? 0;
+		const lastCall = this.lastLlmCallAt.get(conversationId);
+		const ago = (t: number | undefined) => (t === undefined ? "∅" : `${Math.round((Date.now() - t) / 1000)}s前`);
+		return `idleMs=${this.turnIdleMs(conversationId)} llmInFlight=${inFlight} 最近活动=${ago(at)} 最近LLM调用开始=${ago(lastCall)}`;
 	}
 
 	private touchActivity(conversationId: string): void {
@@ -1318,13 +1328,16 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * turn's request beyond one extra call; falls back to the raw snippet when
 	 * the side call fails or the transcript is too small to be worth it.
 	 */
-	async progressBrief(agent: Agent): Promise<string> {
+	async progressBrief(agent: Agent, conversationId?: string): Promise<string> {
 		const fallback = () => this.briefProgress(agent);
 		try {
 			const msgs = agent.state.messages;
 			if (estimateTokensSafe(msgs) < 2_000) return fallback();
 			const context = progressContextSlice(msgs);
 			const model = agent.state.model;
+			// The side pass is real work on the turn's behalf — count it as life so
+			// the stall watchdog sees the servicing, not just the main loop.
+			if (conversationId) this.touchActivity(conversationId);
 			const result = await generateSummary(
 				context,
 				this.models,

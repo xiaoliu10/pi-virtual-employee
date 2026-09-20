@@ -28,6 +28,30 @@ export interface StallWatchdog {
 	fired(): boolean;
 }
 
+/** Inputs to the stall verdict, from the engine's per-conversation maps. */
+export interface StallSignals {
+	/** Timestamp of the last observed activity; undefined = never any. */
+	lastActivityAt?: number;
+	/** Number of LLM requests currently in flight for the turn. */
+	llmInFlight: number;
+}
+
+/**
+ * Ms since the turn last showed life — the single definition of "silent" for
+ * the watchdog. An in-flight LLM request counts as life UNCONDITIONALLY (v3,
+ * field 2026-09-18: a box that raised requestTimeoutMin above the watchdog
+ * threshold got healthy-but-silent long requests killed at 20min, because the
+ * old credit expired once the request's own age crossed the threshold). A
+ * truly dead request is bounded by its per-request timeout (client default
+ * ≈10min, or general.requestTimeoutMin): when it errors, in-flight drops and
+ * the silence clock resumes from real activity.
+ */
+export function computeStallIdleMs(signals: StallSignals, now: number): number {
+	if (signals.llmInFlight > 0) return 0;
+	if (signals.lastActivityAt === undefined) return Number.MAX_SAFE_INTEGER;
+	return now - signals.lastActivityAt;
+}
+
 export function startStallWatchdog(opts: StallWatchdogOptions): StallWatchdog {
 	const pollMs = opts.pollMs ?? 30_000;
 	let fired = false;

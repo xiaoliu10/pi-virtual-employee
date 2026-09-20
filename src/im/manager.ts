@@ -261,7 +261,7 @@ export class IMAdapterManager {
 						? setInterval(() => {
 							if (progressInFlight) return;
 							progressInFlight = true;
-							void this.engine.progressBrief(agent)
+							void this.engine.progressBrief(agent, msg.conversationId)
 								.then((note) => {
 									if (agent.state.isStreaming) return onProgress(note);
 								})
@@ -277,23 +277,28 @@ export class IMAdapterManager {
 					// group went silent while single chats kept working, and only an app
 					// restart cleared it. The old fixed timer measured TOTAL turn time
 					// and killed healthy long tasks (field feedback 2026-09-17); this one
-					// fires only after `turnTimeoutMin` of ZERO activity — a live task
-					// never trips it no matter how long it runs. True wedges (hung
-					// sockets, hung remote sessions) can't be unstuck in-process — abort
-					// is the release; context-size trouble never gets here because the
-					// in-turn budget gate compacts and continues.
+						// fires only after `turnTimeoutMin` of ZERO activity — a live task
+						// never trips it no matter how long it runs. An in-flight LLM
+						// request IS life (v3, 0.2.86): its own request timeout bounds a
+						// dead call, so the watchdog must not second-guess it. True wedges
+						// (hung tools, hung remote sessions) can't be unstuck in-process —
+						// abort is the release; context-size trouble never gets here
+						// because the in-turn budget gate compacts and continues.
 					const turnTimeoutMin = this.config.all().general.turnTimeoutMin ?? 0;
 					let turnTimedOut = false;
 					const watchdog = turnTimeoutMin > 0
 						? startStallWatchdog({
 							thresholdMs: turnTimeoutMin * 60_000,
 							activityAgeMs: () => this.engine.turnIdleMs(msg.conversationId),
-							onStall: () => {
-								turnTimedOut = true;
-								console.warn(`[im] turn silent for ${turnTimeoutMin}min — aborting: ${msg.conversationId}`);
-								this.engine.markTurnAbort(msg.conversationId, "watchdog");
-								this.engine.abortSession(msg.conversationId);
-							},
+						onStall: () => {
+							turnTimedOut = true;
+							// Snapshot BEFORE abort: the numbers must explain the kill in
+							// main.log (field 2026-09-18 — with in-flight LLM = life, a fire
+							// here means genuinely zero requests and zero events).
+							console.warn(`[im] turn silent for ${turnTimeoutMin}min — aborting: ${msg.conversationId} | ${this.engine.turnStallSnapshot(msg.conversationId)}`);
+							this.engine.markTurnAbort(msg.conversationId, "watchdog");
+							this.engine.abortSession(msg.conversationId);
+						},
 						})
 						: undefined;
 
