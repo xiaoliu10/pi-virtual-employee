@@ -90,3 +90,18 @@ test("existing wording contracts keep their shape", () => {
 	assert.match(describeStatus(base("ready", { targetVersion: "0.2.69" }), "download_only"), /回复「确认更新到最新版」/);
 	assert.match(describeStatus(base("error", { error: "boom" }), "off"), /失败（boom）/);
 });
+
+// Field incident 2026-09-20: 「确认更新到最新版」 was promised in the ready
+// status text and the admin notification, but NO code path implemented it —
+// download_only mode had no install route at all, and even auto mode had no
+// way to install now instead of waiting for the idle poll. The status text
+// must now map the phrase to action=install_now explicitly.
+test("ready status text maps the confirmation phrase to install_now", () => {
+	const now = Date.now();
+	const dl = describeStatus(base("ready", { targetVersion: "0.2.88", lastCheckAt: now }), "download_only");
+	assert.match(dl, /确认更新到最新版/);
+	assert.match(dl, /install_now/, "download_only ready text must point at the install_now action");
+
+	const auto = describeStatus(base("ready", { targetVersion: "0.2.88", lastCheckAt: now }), "full");
+	assert.match(auto, /install_now/, "auto-mode ready text must offer install_now for 立刻安装 requests");
+});

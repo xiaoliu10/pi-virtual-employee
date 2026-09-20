@@ -33,7 +33,7 @@ import { disposeShellCommands } from "../src/engine/tools/shell.js";
 import { scheduledTimePrefix } from "../src/engine/tools/time.js";
 import { buildSystemPrompt, defaultCoreRules } from "../src/engine/prompt.js";
 import { startHttpTransport } from "../src/transport/http.js";
-import { setupAutoUpdater, getUpdateState, lastCheckTime, checkNow, downloadNow, quitAndInstall, stopUpdater, setupUnattended, updateCapability, requestUpdateAndInstall, type UpdateState } from "./updater.js";
+import { setupAutoUpdater, getUpdateState, lastCheckTime, checkNow, downloadNow, quitAndInstall, installNow as installNowUpdate, stopUpdater, setupUnattended, updateCapability, requestUpdateAndInstall, type UpdateState } from "./updater.js";
 import type { UpdateToolStatus } from "../src/engine/tools/update.js";
 import { IMAdapterManager, availableChannels } from "../src/im/manager.js";
 import { setDiagFile } from "../src/im/diag.js";
@@ -452,6 +452,12 @@ async function main(): Promise<void> {
 		requestUpdateAndInstall: () => {
 			const result = requestUpdateAndInstall();
 			return { ...result, status: toUpdateToolStatus(result.state) };
+		},
+		installNow: () => {
+			const result = installNowUpdate(() => engine.abortAllTurns("install_now"));
+			return result.ok
+				? { started: true as const, mode: "installing" as const, status: toUpdateToolStatus(getUpdateState()) }
+				: { started: false as const, reason: result.error ?? "未知原因", status: toUpdateToolStatus(getUpdateState()) };
 		},
 	});
 	knowledge.setLlm((system, user) => engine.complete(system, user));

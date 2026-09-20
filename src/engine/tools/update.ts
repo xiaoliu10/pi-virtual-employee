@@ -16,6 +16,10 @@ export interface UpdateOperations {
 	checkNow(): Promise<UpdateToolStatus>;
 	/** Fire-and-forget check → download → install after the current reply drains. */
 	requestUpdateAndInstall(): UpdateRequestResult;
+	/** Install an already-downloaded update NOW: abort in-flight turns, stop
+	 * accepting new work, and restart into the installer. The admin's explicit
+	 * command IS the confirmation in download_only mode. */
+	installNow(): UpdateRequestResult;
 }
 
 export interface UpdateToolStatus {
@@ -81,8 +85,8 @@ export function describeStatus(status: UpdateToolStatus, mode: AutoUpdateMode): 
 		case "ready":
 			lines.push(
 				mode === "download_only"
-					? `更新状态：新版本 v${status.targetVersion ?? "未知"} 已下载完成，本机为仅下载模式，回复「确认更新到最新版」即可安装`
-					: `更新状态：新版本 v${status.targetVersion ?? "未知"} 已下载完成，等待空闲后安装`,
+					? `更新状态：新版本 v${status.targetVersion ?? "未知"} 已下载完成，本机为仅下载模式；用户回复「确认更新到最新版」即等于要求立即安装，应立刻调用 action=install_now 执行`
+					: `更新状态：新版本 v${status.targetVersion ?? "未知"} 已下载完成，等待空闲后安装；用户若要求立即安装，调用 action=install_now`,
 			);
 			break;
 		case "error":
@@ -129,13 +133,15 @@ export function createManageUpdateTool(deps: UpdateToolDeps): AgentTool {
 		label: "应用更新管理",
 		description:
 			"管理本应用自身版本（仅限 IM 单聊）。action=status 查看当前版本/更新状态；action=check 立即检查新版本；" +
-			"action=update 下载并安排空闲时重启安装最新版；action=set_auto 开启或关闭无人值守自动更新（传 enabled=true/false）。" +
-			"安全规则：status 仅单聊可查看；check 需管理员单聊；update 和 set_auto 必须由管理员在当前消息中明确包含「确认」（或同义明确肯定语），群聊一律拒绝。" +
-			"update 是异步操作：收到工具结果后先正常回复「已安排更新」，不要声称已经重启完成。",
+			"action=update 下载并安排空闲时重启安装最新版；action=install_now 立即安装已下载的新版本（不等空闲，会结束进行中的任务并重启）；" +
+			"action=set_auto 开启或关闭无人值守自动更新（传 enabled=true/false）。" +
+			"安全规则：status 仅单聊可查看；check 需管理员单聊；update、install_now 和 set_auto 必须由管理员在当前消息中明确包含「确认」（或同义明确肯定语），群聊一律拒绝。" +
+			"用户说「立刻安装/马上装」而新版本已下载时用 install_now；用户回复「确认更新到最新版」（download_only 模式提示语）也映射为 install_now。" +
+			"update 是异步操作：收到工具结果后先正常回复「已安排更新」，不要声称已经重启完成；install_now 同理，回复后应用随时会重启。",
 		parameters: Type.Object({
 			action: Type.Union(
-				[Type.Literal("status"), Type.Literal("check"), Type.Literal("update"), Type.Literal("set_auto")],
-				{ description: "status=查看；check=检查；update=下载并空闲时安装；set_auto=开关无人值守自动更新" },
+				[Type.Literal("status"), Type.Literal("check"), Type.Literal("update"), Type.Literal("install_now"), Type.Literal("set_auto")],
+				{ description: "status=查看；check=检查；update=下载并空闲时安装；install_now=立即安装已下载版本；set_auto=开关无人值守自动更新" },
 			),
 			enabled: Type.Optional(Type.Union([Type.Boolean(), Type.Literal("full"), Type.Literal("download_only"), Type.Literal("off")], {
 				description: "仅 set_auto 必填：true/false 或 \"full\"（完全自动）/ \"download_only\"（仅下载不自动装）/ \"off\"",
@@ -143,7 +149,7 @@ export function createManageUpdateTool(deps: UpdateToolDeps): AgentTool {
 		}),
 		async execute(_toolCallId, params) {
 			const { action, enabled } = params as {
-				action: "status" | "check" | "update" | "set_auto";
+				action: "status" | "check" | "update" | "install_now" | "set_auto";
 				enabled?: boolean | "full" | "download_only" | "off";
 			};
 
@@ -181,7 +187,9 @@ export function createManageUpdateTool(deps: UpdateToolDeps): AgentTool {
 				confirmationHint:
 					action === "update"
 						? "更新会下载安装包并在系统空闲时重启应用。请明确说出要更新，并在当前消息中包含「确认」。"
-						: "变更无人值守自动更新会影响后续版本是否自动安装。请明确说出要开启或关闭，并在当前消息中包含「确认」。",
+						: action === "install_now"
+							? "立即安装会马上重启应用：进行中的任务会被结束、新消息停收，直到安装完成。请明确说出要立即安装，并在当前消息中包含「确认」。"
+							: "变更无人值守自动更新会影响后续版本是否自动安装。请明确说出要开启或关闭，并在当前消息中包含「确认」。",
 			});
 			if ("content" in gate) return gate;
 			console.log(`[update] action=${action} authorized by ${maskId(gate.actor.senderId)}`);
@@ -200,6 +208,37 @@ export function createManageUpdateTool(deps: UpdateToolDeps): AgentTool {
 						text: `✅ 自动更新模式已设为：${MODE_TEXT[mode]}。`,
 					}],
 					details: { action, autoUpdate: updated.general.autoUpdate },
+				};
+			}
+
+			// action === "install_now": the version is already downloaded; install it
+			// NOW instead of waiting for the idle poll (field 2026-09-20: an admin's
+			// 「立刻安装」 had no code path — only "schedule for idle", and a chatty
+			// test task kept the engine busy, so the update never applied).
+			if (action === "install_now") {
+				const status = deps.updates.getStatus();
+				if (status.phase !== "ready") {
+					return {
+						content: [{
+							type: "text",
+							text: `⛔ 没有已下载待安装的新版本，无法立即安装。${describeStatus(status, normalizeAutoUpdate(deps.config.all().general.autoUpdate))}；要下载最新版请用 action=update。`,
+						}],
+						details: { action, started: false, status },
+					};
+				}
+				const result = deps.updates.installNow();
+				if (!result.started) {
+					return {
+						content: [{ type: "text", text: `⛔ 无法立即安装：${result.reason}。${describeStatus(result.status, normalizeAutoUpdate(deps.config.all().general.autoUpdate))}` }],
+						details: { action, started: false, status: result.status },
+					};
+				}
+				return {
+					content: [{
+						type: "text",
+						text: `✅ 已开始立即安装 v${result.status.targetVersion ?? "?"}：正在结束进行中的任务并停收新消息，几秒内重启进入安装（约 20-40 秒）。完成后新版本即生效，之后请重新核对「你的版本是多少」。`,
+					}],
+					details: { action, started: true, status: result.status },
 				};
 			}
 

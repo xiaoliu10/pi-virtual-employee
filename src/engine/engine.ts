@@ -232,9 +232,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/**
 	 * Note why an in-flight turn was cut short, so its telemetry row says
 	 * "aborted:watchdog" instead of looking like an ordinary empty reply. Called
-	 * by the IM watchdog and by /stop; harmless when no turn is running.
+	 * by the IM watchdog, /stop, and install_now; harmless when no turn is running.
 	 */
-	markTurnAbort(conversationId: string, reason: "watchdog" | "user" | "restart"): void {
+	markTurnAbort(conversationId: string, reason: "watchdog" | "user" | "restart" | "install_now"): void {
 		if (!this.turnIds.has(conversationId)) return;
 		this.turnAborts.set(conversationId, reason);
 	}
@@ -1503,6 +1503,20 @@ export class EmployeeEngine implements EmployeeRuntime {
 			if (agent.state.isStreaming) return false;
 		}
 		return true;
+	}
+
+	/** Abort every in-flight agent turn — the install_now shutdown path (an
+	 * admin's explicit 立刻安装 outranks the tasks it interrupts). Returns how
+	 * many turns were aborted. */
+	abortAllTurns(reason: "watchdog" | "user" | "restart" | "install_now"): number {
+		let aborted = 0;
+		for (const [conversationId, agent] of this.sessions) {
+			if (!agent.state.isStreaming) continue;
+			this.markTurnAbort(conversationId, reason);
+			this.abortSession(conversationId);
+			aborted += 1;
+		}
+		return aborted;
 	}
 
 	isReadOnlyConversation(conversationId: string): boolean {

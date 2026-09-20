@@ -1032,8 +1032,34 @@ function scheduleRecheck(): void {
  * 15s (Playwright/DingTalk child process holding the loop), force-exit so the
  * NSIS installer isn't left waiting forever.
  */
-export function quitAndInstall(): void {
-	if (!enabled() || installing) return;
+/**
+ * Install an already-downloaded update IMMEDIATELY — the admin's explicit
+ * 「立刻安装」/「确认更新到最新版」. Skips the idle wait: forceAbort takes down
+ * in-flight agent turns first, then the standard guarded quit runs (drain →
+ * watchdog arm → NSIS). Bypasses unattendedInstallBlocked: an explicit admin
+ * command IS the confirmation download_only mode asks for. The machine-level
+ * failure breaker is still enforced (quitAndInstall refuses and leaves
+ * `installing` false, which we surface as an error).
+ */
+export function installNow(forceAbort?: () => void): { ok: boolean; error?: string } {
+	if (!enabled()) return { ok: false, error: "当前环境不支持自动更新" };
+	if (installing) return { ok: false, error: "安装已在进行中" };
+	if (!pendingVersion) return { ok: false, error: "没有已下载待安装的新版本（先用 action=update 下载）" };
+	log("INFO", `install-now requested: current=${app.getVersion()} target=${pendingVersion}`);
+	try {
+		forceAbort?.();
+	} catch (err) {
+		log("WARN", `install-now force-abort failed: ${err instanceof Error ? err.message : err}`);
+	}
+	beginDrain?.();
+	quitAndInstall();
+	if (!installing) {
+		return { ok: false, error: "安装被拒绝：本机连续安装失败熔断中——请手动下载安装包修复一次" };
+	}
+	return { ok: true };
+}
+
+export function quitAndInstall(): void {	if (!enabled() || installing) return;
 	// Machine-level breaker: repeated cross-version install failures (usually a
 	// broken old uninstaller) — refuse to take the app down again; a manual
 	// repair install is the documented exit.
