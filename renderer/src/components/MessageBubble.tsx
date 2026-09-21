@@ -11,7 +11,7 @@ const MARKDOWN_CLASSES =
 	"[&_ul]:list-disc [&_ul]:pl-5 [&_ul]:space-y-1 [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:space-y-1 " +
 	"[&_code]:rounded [&_code]:bg-slate-100 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:text-[13px] [&_code]:font-mono " +
 	"[&_pre]:my-2 [&_pre]:overflow-x-auto [&_pre]:rounded-lg [&_pre]:bg-ink-900 [&_pre]:p-3 [&_pre]:text-[13px] " +
-	"[&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-slate-100 " +
+	"[&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-[#dde2ea] " +
 	"[&_p]:leading-relaxed [&_strong]:font-semibold [&_a]:text-accent [&_a]:underline";
 
 export function MessageBubble({ role, content, streaming }: MessageBubbleProps) {
@@ -19,14 +19,14 @@ export function MessageBubble({ role, content, streaming }: MessageBubbleProps) 
 	return (
 		<div className={`flex animate-fade-in ${isUser ? "justify-end" : "justify-start"}`}>
 			{!isUser && (
-				<div className="mr-3 mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-ink-900 text-sm font-bold text-accent">
+				<div className="mr-3 mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[#20242c] text-sm font-bold text-[#a8c9ff]">
 					π
 				</div>
 			)}
 			<div
 				className={`max-w-[78%] rounded-2xl px-4 py-3 text-[15px] leading-relaxed ${
 					isUser
-						? "rounded-br-md bg-ink-900 text-slate-100"
+						? "rounded-br-md bg-[#202630] text-[#edf0f4]"
 						: "rounded-tl-md border border-slate-200 bg-white text-slate-800 shadow-sm"
 				}`}
 			>

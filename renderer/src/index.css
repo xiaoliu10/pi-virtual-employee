@@ -3,7 +3,7 @@
 @tailwind utilities;
 
 :root {
-	color-scheme: light;
+	color-scheme: dark;
 }
 
 html,
@@ -14,11 +14,20 @@ body,
 }
 
 body {
+	/* pi-desktop dark slate system (#11141a app / #191c22 panel / #20242c surface) */
 	font-family: ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI",
 		sans-serif;
-	background: #f5f4f0;
-	color: #1b2738;
+	background: #11141a;
+	color: #edf0f4;
 	-webkit-font-smoothing: antialiased;
+}
+
+/* Light-theme leftover: `bg-white` marked card surfaces in the old palette.
+ * In the pi-desktop dark system a "card" is a slightly raised panel. Elements
+ * that need true white (toggle knobs via after:bg-white) use different
+ * generated classes and are unaffected. */
+.bg-white {
+	background-color: #1a1e26;
 }
 
 /* macOS hiddenInset title bar drag region */
@@ -54,7 +63,7 @@ body {
 .streaming-caret::after {
 	content: "▍";
 	animation: caret-blink 1s steps(1) infinite;
-	color: #e0a458;
+	color: #98b7f0;
 	margin-left: 1px;
 }
 

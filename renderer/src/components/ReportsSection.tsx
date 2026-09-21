@@ -235,7 +235,7 @@ export function ReportsSection({ reports, onUpdate, onBeforeTest }: ReportsSecti
 					<button
 						onClick={runTest}
 						disabled={testing}
-						className="rounded-lg bg-blue-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-blue-600 disabled:opacity-50"
+						className="rounded-lg bg-[#e1e7ef] px-4 py-2 text-sm font-medium text-[#171c24] transition hover:bg-white disabled:opacity-50"
 					>
 						{testing ? "测试中…" : "测试连接"}
 					</button>

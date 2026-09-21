@@ -769,13 +769,13 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 																		<a href={u.manualUrl} target="_blank" rel="noreferrer" className="rounded-xl border border-slate-200 px-4 py-2 text-xs text-slate-500 transition hover:bg-slate-50" title="自动下载失败时的手动下载链接">
 																			手动下载
 																		</a>
-																		<button type="button" onClick={() => updater.download()} className="rounded-xl bg-blue-500 px-5 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-blue-600">
+																		<button type="button" onClick={() => updater.download()} className="rounded-xl bg-[#e1e7ef] px-5 py-2 text-sm font-medium text-[#171c24] shadow-sm transition hover:bg-white">
 																			下载更新
 																		</button>
 																	</>
 																)}
 																{u?.phase === "downloading" && (
-																	<button type="button" disabled className="rounded-xl bg-blue-500/60 px-5 py-2 text-sm font-medium text-white shadow-sm">
+																	<button type="button" disabled className="rounded-xl bg-[#e1e7ef]/60 px-5 py-2 text-sm font-medium text-[#171c24] shadow-sm">
 																		下载中 {u.percent}%
 																	</button>
 																)}
@@ -804,7 +804,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 					<footer className="flex h-[76px] shrink-0 items-center justify-end gap-3 border-t border-slate-200 bg-white px-8">
 						{error && <span className="mr-auto max-w-lg truncate text-xs text-rose-500">{error}</span>}
 						<button type="button" onClick={cancel} disabled={saving} className="rounded-xl border border-slate-200 bg-white px-6 py-2.5 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-50">取消</button>
-						<button type="button" onClick={() => void save()} disabled={saving || !draft} className="rounded-xl bg-blue-500 px-7 py-2.5 text-sm font-medium text-white shadow-sm hover:bg-blue-600 disabled:opacity-50">{saving ? "保存中..." : "保存"}</button>
+						<button type="button" onClick={() => void save()} disabled={saving || !draft} className="rounded-xl bg-[#e1e7ef] px-7 py-2.5 text-sm font-medium text-[#171c24] shadow-sm hover:bg-white disabled:opacity-50">{saving ? "保存中..." : "保存"}</button>
 					</footer>
 				</div>
 			</div>

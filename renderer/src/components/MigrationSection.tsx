@@ -100,7 +100,7 @@ export function MigrationSection() {
 							type="button"
 							onClick={onExport}
 							disabled={exporting}
-							className="rounded-xl bg-blue-500 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:bg-blue-600 disabled:opacity-50"
+							className="rounded-xl bg-[#e1e7ef] px-4 py-2.5 text-sm font-medium text-[#171c24] shadow-sm hover:bg-white disabled:opacity-50"
 						>
 							{exporting ? "打包中…" : "选择位置并导出"}
 						</button>

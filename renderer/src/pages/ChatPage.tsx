@@ -199,7 +199,7 @@ export function ChatPage({
 		<div className="flex min-h-0 flex-1 flex-col">
 			<header className="titlebar-drag flex h-14 items-center justify-between border-b border-slate-200 px-6">
 				<div className="titlebar-nodrag flex items-center gap-2 pt-3 text-sm text-slate-500">
-					<span className="font-semibold text-ink-900">{agentName}</span>
+					<span className="font-semibold text-[#edf0f4]">{agentName}</span>
 					<span>·</span>
 					<span>{readOnly ? "IM 会话 · 只读" : "多轮对话"}</span>
 				</div>
@@ -227,7 +227,7 @@ export function ChatPage({
 				<div className="mx-auto max-w-3xl space-y-5 px-6 py-8">
 					{messages.length === 0 && !streaming && (
 						<div className="flex flex-col items-center gap-3 py-24 text-center text-slate-400">
-							<div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-ink-900 text-2xl font-bold text-accent">
+							<div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-[#20242c] text-2xl font-bold text-[#a8c9ff]">
 								π
 							</div>
 							<p className="text-base text-slate-500">你好,我是 {agentName} 👋</p>

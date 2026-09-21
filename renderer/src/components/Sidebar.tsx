@@ -53,12 +53,10 @@ export function Sidebar(props: SidebarProps) {
 			: undefined;
 
 	return (
-		<aside className="titlebar-drag flex w-72 shrink-0 flex-col bg-ink-900 text-slate-200">
-			{/* Brand */}
+		<aside className="titlebar-drag flex w-72 shrink-0 flex-col bg-[#191c22] text-[#c3cad6] border-r border-[#30343c]">
+			{/* Brand — pi-desktop style: serif π mark + name stack */}
 			<div className="flex items-center gap-3 px-5 pb-4 pt-6">
-				<div className="flex h-10 w-10 items-center justify-center rounded-xl bg-accent text-xl font-bold text-ink-900 shadow-lg">
-					π
-				</div>
+				<div className="select-none font-serif text-[30px] leading-none text-slate-100">π</div>
 				<div>
 					<div className="text-[15px] font-semibold leading-tight text-white">虚拟员工</div>
 					<div className="text-xs text-slate-400">Virtual Employee</div>
@@ -98,7 +96,7 @@ export function Sidebar(props: SidebarProps) {
 							>
 								<div className="min-w-0 flex-1">
 									<div className="flex items-center gap-1.5">
-										<span className="truncate text-sm text-slate-100">{c.title ?? "新对话"}</span>
+										<span className="truncate text-sm text-[#dde2ea]">{c.title ?? "新对话"}</span>
 										{c.origin === "im" && (
 											<span className="shrink-0 rounded bg-ink-700 px-1 py-px text-[9px] font-medium text-sky-300" title="来自 IM 渠道，只读">
 												IM
@@ -150,7 +148,7 @@ export function Sidebar(props: SidebarProps) {
 					className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm transition-colors ${
 						settingsActive
 							? "bg-ink-700 text-white"
-							: "text-slate-300 hover:bg-ink-800 hover:text-white"
+							: "text-[#8b93a1] hover:bg-ink-800 hover:text-white"
 					}`}
 				>
 					<GearIcon className="h-[18px] w-[18px]" />

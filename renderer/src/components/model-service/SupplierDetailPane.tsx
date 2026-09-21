@@ -194,7 +194,7 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 										{!isDefault && supplier.enabled && (
 											<button type="button" onClick={() => props.onSetDefault(modelId)} title="设为默认模型" className="hidden rounded-full px-1.5 py-0.5 text-[11px] text-blue-500 hover:bg-blue-50 group-hover:block">★</button>
 										)}
-										<button type="button" onClick={() => props.onRemoveModel(modelId)} title="删除模型" className="rounded-full px-1.5 py-0.5 text-xs text-slate-300 hover:bg-rose-50 hover:text-rose-500">✕</button>
+										<button type="button" onClick={() => props.onRemoveModel(modelId)} title="删除模型" className="rounded-full px-1.5 py-0.5 text-xs text-[#8b93a1] hover:bg-rose-50 hover:text-rose-500">✕</button>
 									</div>
 								);
 							})}
@@ -204,7 +204,7 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 
 						<div className="mt-3 flex gap-2">
 							<input value={newModel} onChange={(event) => setNewModel(event.target.value)} onKeyDown={(event) => event.key === "Enter" && submitModel()} className={inputCls} placeholder="模型 ID，例如 claude-sonnet-4-5 / gpt-4o" />
-							<button type="button" onClick={submitModel} className="shrink-0 rounded-xl bg-blue-500 px-4 text-sm font-medium text-white hover:bg-blue-600">＋ 添加模型</button>
+							<button type="button" onClick={submitModel} className="shrink-0 rounded-xl bg-[#e1e7ef] px-4 text-sm font-medium text-[#171c24] hover:bg-white">＋ 添加模型</button>
 						</div>
 					</div>
 				</div>

@@ -85,7 +85,7 @@ export function SkillsSection(): ReactNode {
 						type="button"
 						disabled={busy}
 						onClick={onImport}
-						className="rounded-xl bg-blue-500 px-4 py-2 text-sm text-white transition hover:bg-blue-600 disabled:opacity-50"
+						className="rounded-xl bg-[#e1e7ef] px-4 py-2 text-sm text-[#171c24] transition hover:bg-white disabled:opacity-50"
 					>
 						{busy ? "处理中…" : "导入 Skill…"}
 					</button>
