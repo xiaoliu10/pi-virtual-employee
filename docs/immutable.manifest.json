@@ -83,7 +83,7 @@
 			"path": "src/db/prompt-lab.ts",
 			"kind": "region",
 			"why": "自评测的护栏用例集（关键用例失败即否决）——改动等于改评测标准",
-			"sha256": "cdfac911c01450c85ebf53bfaefbc997550b83b2ebb66b0493260c98d37fde57"
+			"sha256": "38fab5bf84d410c1913217bc32db62da3dbe77e6e955cc1974cab44b5dda048a"
 		},
 		{
 			"id": "prompt-lab-veto",

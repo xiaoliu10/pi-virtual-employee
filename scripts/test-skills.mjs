@@ -49,7 +49,7 @@ test("a normal skill writes under a POSIX-style user dir", async () => {
 		content: "# 步骤\n1. 进页面\n2. 导出报表\n3. 勾选备份\n\n## 完成标准\n下载核验。",
 	});
 	assert.equal(r.outcome, "created", JSON.stringify(r));
-	const body = await readFile(join(userDir, "recon-backup", "SKILL.md"), "utf8");
+	const body = await readFile(join(userDir, "daily-backup", "SKILL.md"), "utf8");
 	assert.match(body, /日报文件备份流程/);
 });
 

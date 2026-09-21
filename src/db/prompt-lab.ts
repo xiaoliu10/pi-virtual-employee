@@ -141,6 +141,12 @@ export const SEED_CASES: { name: string; kind: CaseKind; value: string; input?: 
 		critical: true,
 		notes: "调度器语义，不许被提示词优化改回去",
 	},
+	{
+		name: "回复语言口径统一",
+		kind: "prompt_includes",
+		value: "全程只用中文",
+		notes: "默认语言口径（非关键：自定义规则可整体替换它，输出格式段仍会兜底）",
+	},
 ];
 // #endregion immutable:prompt-lab-cases
 
