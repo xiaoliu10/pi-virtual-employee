@@ -87,6 +87,7 @@
 	"build": {
 		"appId": "com.pi.virtualemployee",
 		"productName": "Pi Virtual Employee",
+		"icon": "build/icon.png",
 		"artifactName": "Pi-Virtual-Employee-Setup-${version}-${arch}.${ext}",
 		"directories": {
 			"output": "release"
@@ -127,6 +128,17 @@
 				}
 			],
 			"artifactName": "Pi-Virtual-Employee-Setup-${version}-${arch}.${ext}"
+		},
+		"mac": {
+			"target": [
+				{
+					"target": "dir",
+					"arch": [
+						"arm64"
+					]
+				}
+			],
+			"icon": "build/icon.png"
 		},
 		"nsis": {
 			"oneClick": true,

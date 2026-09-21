@@ -141,7 +141,11 @@ function createWindow(): void {
 		minWidth: 1060,
 		minHeight: 680,
 		titleBarStyle: "hiddenInset",
-		backgroundColor: "#0f1724",
+		backgroundColor: "#ffffff",
+		// Window/taskbar icon in DEV (Linux/Win). Packaged apps take their
+		// dock/exe icon from the bundle (mac) / NSIS config (win), so we don't
+		// set it there.
+		...(app.isPackaged ? {} : { icon: path.join(__dirname, "../../build/icon.png") }),
 		webPreferences: {
 			preload: path.join(__dirname, "preload.cjs"),
 			contextIsolation: true,

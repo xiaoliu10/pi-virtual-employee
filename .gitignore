@@ -14,3 +14,4 @@ data/
 *.sqlite-shm
 *.sqlite-wal
 renderer/dist-renderer/
+.zcode/
