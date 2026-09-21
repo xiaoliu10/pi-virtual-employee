@@ -30,6 +30,7 @@ import { DownloadStore } from "../src/downloads/download-store.js";
 import { DownloadService } from "../src/downloads/download-service.js";
 import { EmployeeEngine } from "../src/engine/engine.js";
 import { disposeShellCommands } from "../src/engine/tools/shell.js";
+import { replyHasReportLink } from "../src/engine/tools/reports.js";
 import { scheduledTimePrefix } from "../src/engine/tools/time.js";
 import { buildSystemPrompt, defaultCoreRules } from "../src/engine/prompt.js";
 import { startHttpTransport } from "../src/transport/http.js";
@@ -544,7 +545,11 @@ async function main(): Promise<void> {
 				error: error ?? null,
 			});
 			let reportUrl: string | null = null;
-			if (reply) {
+			// Skip the scheduler's own publish when the reply already cites a
+			// report link (save_report ran mid-task and 小派 embedded its URL).
+			// Re-publishing would mint a SECOND artifact+URL → two links in one
+			// push (field 2026-09-21). The reply's own link is the one to deliver.
+			if (reply && !replyHasReportLink(reply)) {
 				const pub = await reportService.publish(reportRun.runId, task.title, reply);
 				reportUrl = pub?.url ?? null;
 			}

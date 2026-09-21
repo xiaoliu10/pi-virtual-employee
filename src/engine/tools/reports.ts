@@ -3,6 +3,20 @@ import { Type } from "@earendil-works/pi-ai";
 import type { ReportService } from "../../reports/report-service.js";
 
 /**
+ * True when `text` already carries a report link — either the save_report
+ * tool's "查看报告" line, or a bare report-host URL. The scheduled-task push
+ * uses this to AVOID publishing + appending a SECOND link to a reply that
+ * already cites one (field 2026-09-21: two different reportIds in one push —
+ * save_report published, then the scheduler published again and appended).
+ */
+export function replyHasReportLink(text: string): boolean {
+	// "查看报告" (the push layer's own marker) OR any "/reports/<id>/" path
+	// (covers OSS and Gitee publish targets — save_report's "访问链接" line
+	// carries the same path segment).
+	return /查看报告[:：]|\/reports\/[a-f0-9-]{8,}\//i.test(text);
+}
+
+/**
  * Build the in-conversation report tool. Lets the employee save an arbitrary
  * artifact (a poem, a summary, an analysis, a generated doc) to the report
  * center and get back a shareable link — without waiting for a scheduled task.

@@ -66,14 +66,14 @@ export function EditModelDialog(props: EditModelDialogProps) {
 
 					<label className="block">
 						<span className="mb-2 block text-sm font-medium text-slate-800">
-							上下文窗口 <span className="ml-1 cursor-help text-[#8b93a1]" title="真实上下文窗口（tokens）。中转/别名模型务必按网关实际值填写，否则长对话会被错误压缩甚至空回复；留空 = 继承默认。">?</span>
+							上下文窗口 <span className="ml-1 cursor-help text-[#a1a1a6]" title="真实上下文窗口（tokens）。中转/别名模型务必按网关实际值填写，否则长对话会被错误压缩甚至空回复；留空 = 继承默认。">?</span>
 						</span>
 						<input type="number" min={0} value={contextWindow} onChange={(e) => setContextWindow(e.target.value)} className={inputCls} placeholder="继承默认（200000）" />
 					</label>
 
 					<label className="block">
 						<span className="mb-2 block text-sm font-medium text-slate-800">
-							最大输出 Token <span className="ml-1 cursor-help text-[#8b93a1]" title="单次回复的最大输出长度（tokens）。中转模型继承到不合适的基础值时会截断长回复；留空 = 继承默认。">?</span>
+							最大输出 Token <span className="ml-1 cursor-help text-[#a1a1a6]" title="单次回复的最大输出长度（tokens）。中转模型继承到不合适的基础值时会截断长回复；留空 = 继承默认。">?</span>
 						</span>
 						<input type="number" min={0} value={maxTokens} onChange={(e) => setMaxTokens(e.target.value)} className={inputCls} placeholder="继承默认" />
 					</label>
@@ -118,7 +118,7 @@ export function EditModelDialog(props: EditModelDialogProps) {
 					</button>
 					<div className="flex gap-3">
 						<button type="button" onClick={props.onClose} className="rounded-xl border border-slate-200 bg-white px-5 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50">取消</button>
-						<button type="button" onClick={save} className="rounded-xl bg-[#e1e7ef] px-5 py-2.5 text-sm font-medium text-[#171c24] hover:bg-white">保存</button>
+						<button type="button" onClick={save} className="rounded-xl bg-[#1d1d1f] px-5 py-2.5 text-sm font-medium text-white hover:bg-[#3f3f43]">保存</button>
 					</div>
 				</div>
 			</div>

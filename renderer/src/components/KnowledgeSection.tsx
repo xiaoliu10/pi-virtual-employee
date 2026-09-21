@@ -576,7 +576,7 @@ export function KnowledgeSection({ kb, suppliers, onUpdate }: Props) {
 									<input value={editing.tags} onChange={(e) => setEditing({ ...editing, tags: e.target.value })} placeholder="标签（逗号分隔）" className={inputCls} />
 									<textarea value={editing.content} onChange={(e) => setEditing({ ...editing, content: e.target.value })} placeholder="正文" rows={4} className={inputCls + " h-auto py-2"} />
 									<div className="flex gap-2">
-										<button type="button" onClick={() => void saveEntry()} className="rounded-xl bg-[#e1e7ef] px-4 py-2 text-sm font-medium text-[#171c24] hover:bg-white">保存</button>
+										<button type="button" onClick={() => void saveEntry()} className="rounded-xl bg-[#1d1d1f] px-4 py-2 text-sm font-medium text-white hover:bg-[#3f3f43]">保存</button>
 										<button type="button" onClick={() => setEditing(null)} className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50">取消</button>
 									</div>
 								</div>
@@ -763,7 +763,7 @@ export function KnowledgeSection({ kb, suppliers, onUpdate }: Props) {
 				<Card title="检索测试" desc="按当前配置查询，验证召回效果（保存后生效）。">
 					<div className="flex gap-2">
 						<input value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => e.key === "Enter" && runSearch()} placeholder="输入查询，例如：退货流程" className={inputCls} />
-						<button type="button" onClick={() => void runSearch()} className="shrink-0 rounded-xl bg-[#e1e7ef] px-5 text-sm font-medium text-[#171c24] hover:bg-white">搜索</button>
+						<button type="button" onClick={() => void runSearch()} className="shrink-0 rounded-xl bg-[#1d1d1f] px-5 text-sm font-medium text-white hover:bg-[#3f3f43]">搜索</button>
 					</div>
 					{hits.length > 0 && (
 						<div className="mt-3 space-y-2">

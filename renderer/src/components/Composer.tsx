@@ -5,6 +5,9 @@ interface ComposerProps {
 	disabled?: boolean;
 }
 
+/** pi-desktop composer: a floating white card (radius 20, border-strong, no
+ * outer strip), borderless tall input, and a toolbar row ending in a 30px
+ * near-black square send button. */
 export function Composer({ onSend, disabled }: ComposerProps) {
 	const [value, setValue] = useState("");
 
@@ -16,10 +19,8 @@ export function Composer({ onSend, disabled }: ComposerProps) {
 	};
 
 	return (
-		<div className="border-t border-slate-200 bg-[#14171d] px-6 py-4">
-			{/* pi-desktop composer: one rounded panel holding a borderless input
-			 * and a light primary action — no separate boxed field. */}
-			<div className="mx-auto flex max-w-3xl items-end gap-3 rounded-2xl border border-[#414854] bg-ink-800 p-3">
+		<div className="bg-white px-6 pb-5 pt-1">
+			<div className="mx-auto w-[min(980px,calc(100%-48px))] rounded-[20px] border border-black/[0.14] bg-white px-3.5 py-3">
 				<textarea
 					value={value}
 					onChange={(e) => setValue(e.target.value)}
@@ -29,17 +30,21 @@ export function Composer({ onSend, disabled }: ComposerProps) {
 							submit();
 						}
 					}}
-					rows={1}
+					rows={2}
 					placeholder="描述任务，或输入消息…"
-					className="max-h-[180px] min-h-[46px] flex-1 resize-none border-0 bg-transparent px-2 py-2 text-[15px] outline-none placeholder:text-slate-500"
+					className="block max-h-[180px] min-h-[76px] w-full resize-none border-0 bg-transparent px-0.5 pb-3 pt-2.5 text-[15px] leading-normal outline-none placeholder:text-[#a1a1a6] focus:shadow-none focus:outline-none"
 				/>
-				<button
-					onClick={submit}
-					disabled={disabled || !value.trim()}
-					className="flex h-[42px] shrink-0 items-center rounded-xl bg-[#e1e7ef] px-5 text-sm font-medium text-[#171c24] transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
-				>
-					{disabled ? "应答中…" : "发送 ↑"}
-				</button>
+				<div className="flex items-center justify-end gap-1.5 pt-1">
+					<button
+						onClick={submit}
+						disabled={disabled || !value.trim()}
+						className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[9px] bg-[#1d1d1f] text-sm font-medium text-white transition hover:opacity-[0.82] disabled:bg-[#f2f2f3] disabled:text-[#a1a1a6] disabled:opacity-100"
+						aria-label="发送"
+						title="发送（Enter）"
+					>
+						↑
+					</button>
+				</div>
 			</div>
 		</div>
 	);

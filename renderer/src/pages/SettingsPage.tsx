@@ -258,9 +258,9 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 
 	return (
 		<div className="titlebar-nodrag fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-8 backdrop-blur-[3px]">
-			<div className="animate-settings-in flex h-[min(780px,calc(100vh-64px))] w-[min(1180px,calc(100vw-64px))] min-w-[900px] overflow-hidden rounded-[24px] border border-white/70 bg-[#f6f7f9] shadow-[0_28px_80px_rgba(15,23,42,0.34)]">
-				<aside className="flex w-[230px] shrink-0 flex-col border-r border-slate-200 bg-[#f1f3f7] px-5 pb-5 pt-8">
-					<div className="px-3 text-2xl font-semibold tracking-tight text-slate-950">设置</div>
+			<div className="animate-settings-in flex h-[min(780px,calc(100vh-64px))] w-[min(1180px,calc(100vw-64px))] min-w-[900px] overflow-hidden rounded-2xl border border-black/[0.08] bg-white shadow-[0_10px_38px_rgba(0,0,0,0.14),0_2px_8px_rgba(0,0,0,0.08)]">
+				<aside className="flex w-[230px] shrink-0 flex-col border-r border-black/[0.08] bg-[#f6f6f7] px-5 pb-5 pt-8">
+					<div className="px-3 text-2xl font-semibold tracking-tight text-[#1d1d1f]">设置</div>
 					<nav className="mt-7 space-y-1.5">
 						{TABS.map((item) => (
 							<button
@@ -268,7 +268,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 								key={item.id}
 								onClick={() => setTab(item.id)}
 								className={`flex w-full items-center gap-3 rounded-xl px-3.5 py-3 text-[15px] font-medium transition ${
-									tab === item.id ? "bg-blue-100/80 text-blue-600" : "text-slate-500 hover:bg-white/70 hover:text-slate-800"
+									tab === item.id ? "bg-black/[0.075] text-[#1d1d1f]" : "text-[#6e6e73] hover:bg-black/[0.045] hover:text-[#1d1d1f]"
 								}`}
 							>
 								{item.icon}
@@ -282,10 +282,10 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 				<div className="flex min-w-0 flex-1 flex-col bg-white">
 					<header className="flex h-[82px] shrink-0 items-center justify-between border-b border-slate-100 px-8">
 						<div>
-							<h1 className="text-2xl font-semibold tracking-tight text-slate-950">{tab === "model" ? "自定义模型" : tab === "knowledge" ? "知识库" : tab === "content" ? "内容中心" : tab === "skills" ? "技能" : tab === "im" ? "IM 机器人" : tab === "prompt" ? "提示词" : tab === "tasks" ? "定时任务" : tab === "migrate" ? "迁移与复制" : "通用"}</h1>
-							{tab !== "model" && <p className="mt-1 text-xs text-slate-400">{tab === "knowledge" ? "可配置、可插拔的知识库：内置混合检索 + 外接 RAG。" : tab === "content" ? "交付资料库（既有可复用资料）与任务产物（生成的带版本输出）统一在此管理。" : tab === "skills" ? "管理内置与导入的技能（SKILL.md），启停、导入、删除。技能以声明式指令注入提示词。" : tab === "im" ? "连接即时通讯渠道，让虚拟员工随时响应。" : tab === "prompt" ? "自定义员工的内置行为规则与追加指令，保存后新对话生效。" : tab === "tasks" ? "在对话中创建定时任务，系统到点自动执行；此处可查看与管理。" : tab === "migrate" ? "把当前员工打包导出（.pve），或导入员工包：克隆为新员工 / 覆盖当前员工，支持跨机器迁移。" : "管理员工身份与系统行为。"}</p>}
+							<h1 className="text-2xl font-semibold tracking-tight text-[#1d1d1f]">{tab === "model" ? "自定义模型" : tab === "knowledge" ? "知识库" : tab === "content" ? "内容中心" : tab === "skills" ? "技能" : tab === "im" ? "IM 机器人" : tab === "prompt" ? "提示词" : tab === "tasks" ? "定时任务" : tab === "migrate" ? "迁移与复制" : "通用"}</h1>
+							{tab !== "model" && <p className="mt-1 text-xs text-[#a1a1a6]">{tab === "knowledge" ? "可配置、可插拔的知识库：内置混合检索 + 外接 RAG。" : tab === "content" ? "交付资料库（既有可复用资料）与任务产物（生成的带版本输出）统一在此管理。" : tab === "skills" ? "管理内置与导入的技能（SKILL.md），启停、导入、删除。技能以声明式指令注入提示词。" : tab === "im" ? "连接即时通讯渠道，让虚拟员工随时响应。" : tab === "prompt" ? "自定义员工的内置行为规则与追加指令，保存后新对话生效。" : tab === "tasks" ? "在对话中创建定时任务，系统到点自动执行；此处可查看与管理。" : tab === "migrate" ? "把当前员工打包导出（.pve），或导入员工包：克隆为新员工 / 覆盖当前员工，支持跨机器迁移。" : "管理员工身份与系统行为。"}</p>}
 						</div>
-						<button type="button" onClick={cancel} className="rounded-xl p-2 text-2xl leading-none text-slate-400 transition hover:bg-slate-100 hover:text-slate-700" aria-label="关闭设置">×</button>
+						<button type="button" onClick={cancel} className="rounded-xl p-2 text-2xl leading-none text-[#a1a1a6] transition hover:bg-black/[0.045] hover:text-[#1d1d1f]" aria-label="关闭设置">×</button>
 					</header>
 
 					<div className="flex min-h-0 flex-1">
@@ -301,7 +301,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 							<div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-[#fafbfc] px-10 py-8">
 								<div className="mx-auto w-full max-w-3xl">
 									<div className="mb-4 inline-flex rounded-xl border border-slate-200 bg-white p-1">
-										<button type="button" onClick={() => setContentTab("resources")} className={`rounded-lg px-4 py-1.5 text-sm font-medium transition ${contentTab === "resources" ? "bg-blue-100/80 text-blue-600" : "text-slate-500 hover:text-slate-800"}`}>交付资料库</button>
+										<button type="button" onClick={() => setContentTab("resources")} className={`rounded-lg px-4 py-1.5 text-sm font-medium transition ${contentTab === "resources" ? "bg-black/[0.075] text-[#1d1d1f]" : "text-[#6e6e73] hover:text-[#1d1d1f]"}`}>交付资料库</button>
 										<button type="button" onClick={() => setContentTab("artifacts")} className={`rounded-lg px-4 py-1.5 text-sm font-medium transition ${contentTab === "artifacts" ? "bg-blue-100/80 text-blue-600" : "text-slate-500 hover:text-slate-800"}`}>任务产物</button>
 									</div>
 									<div className="space-y-5">
@@ -769,13 +769,13 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 																		<a href={u.manualUrl} target="_blank" rel="noreferrer" className="rounded-xl border border-slate-200 px-4 py-2 text-xs text-slate-500 transition hover:bg-slate-50" title="自动下载失败时的手动下载链接">
 																			手动下载
 																		</a>
-																		<button type="button" onClick={() => updater.download()} className="rounded-xl bg-[#e1e7ef] px-5 py-2 text-sm font-medium text-[#171c24] shadow-sm transition hover:bg-white">
+																		<button type="button" onClick={() => updater.download()} className="rounded-xl bg-[#1d1d1f] px-5 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-[#3f3f43]">
 																			下载更新
 																		</button>
 																	</>
 																)}
 																{u?.phase === "downloading" && (
-																	<button type="button" disabled className="rounded-xl bg-[#e1e7ef]/60 px-5 py-2 text-sm font-medium text-[#171c24] shadow-sm">
+																	<button type="button" disabled className="rounded-xl bg-[#1d1d1f]/60 px-5 py-2 text-sm font-medium text-white shadow-sm">
 																		下载中 {u.percent}%
 																	</button>
 																)}
@@ -803,8 +803,8 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 
 					<footer className="flex h-[76px] shrink-0 items-center justify-end gap-3 border-t border-slate-200 bg-white px-8">
 						{error && <span className="mr-auto max-w-lg truncate text-xs text-rose-500">{error}</span>}
-						<button type="button" onClick={cancel} disabled={saving} className="rounded-xl border border-slate-200 bg-white px-6 py-2.5 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-50">取消</button>
-						<button type="button" onClick={() => void save()} disabled={saving || !draft} className="rounded-xl bg-[#e1e7ef] px-7 py-2.5 text-sm font-medium text-[#171c24] shadow-sm hover:bg-white disabled:opacity-50">{saving ? "保存中..." : "保存"}</button>
+						<button type="button" onClick={cancel} disabled={saving} className="rounded-xl border border-black/[0.08] bg-white px-6 py-2.5 text-sm font-medium text-[#1d1d1f] shadow-sm hover:bg-black/[0.045] disabled:opacity-50">取消</button>
+						<button type="button" onClick={() => void save()} disabled={saving || !draft} className="rounded-xl bg-[#1d1d1f] px-7 py-2.5 text-sm font-medium text-white shadow-sm hover:bg-[#3f3f43] disabled:opacity-50">{saving ? "保存中..." : "保存"}</button>
 					</footer>
 				</div>
 			</div>

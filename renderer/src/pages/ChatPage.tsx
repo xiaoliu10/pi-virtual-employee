@@ -197,14 +197,14 @@ export function ChatPage({
 
 	return (
 		<div className="flex min-h-0 flex-1 flex-col">
-			<header className="titlebar-drag flex h-14 items-center justify-between border-b border-slate-200 px-6">
-				<div className="titlebar-nodrag flex items-center gap-2 pt-3 text-sm text-slate-500">
-					<span className="font-semibold text-[#edf0f4]">{agentName}</span>
+			<header className="titlebar-drag flex h-[60px] shrink-0 items-center justify-between gap-4 pl-[22px] pr-[18px]">
+				<div className="titlebar-nodrag flex min-w-0 items-center gap-2 text-sm text-[#6e6e73]">
+					<span className="truncate text-[15px] font-semibold text-[#1d1d1f]">{agentName}</span>
 					<span>·</span>
-					<span>{readOnly ? "IM 会话 · 只读" : "多轮对话"}</span>
+					<span className="shrink-0">{readOnly ? "IM 会话 · 只读" : "多轮对话"}</span>
 				</div>
 				<select
-					className="titlebar-nodrag mr-1 mt-3 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs text-slate-600 outline-none focus:border-accent disabled:opacity-50"
+					className="titlebar-nodrag h-[30px] max-w-[240px] shrink-0 cursor-pointer rounded-full border-0 bg-transparent px-2.5 text-[12.5px] text-[#6e6e73] outline-none transition-colors hover:bg-black/[0.045] hover:text-[#1d1d1f] disabled:opacity-50"
 					value={selectedValue}
 					disabled={!conversationId || modelOptions.length === 0 || readOnly}
 					onChange={(e) => {
@@ -224,35 +224,36 @@ export function ChatPage({
 			</header>
 
 			<div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
-				<div className="mx-auto max-w-3xl space-y-5 px-6 py-8">
+				<div className="mx-auto w-full max-w-[860px] space-y-8 py-7 pl-14 pr-12">
 					{messages.length === 0 && !streaming && (
-						<div className="flex flex-col items-center gap-3 py-24 text-center text-slate-400">
-							<div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-[#20242c] text-2xl font-bold text-[#a8c9ff]">
-								π
-							</div>
-							<p className="text-base text-slate-500">你好,我是 {agentName} 👋</p>
-							<p className="text-sm">可以问我售后政策、订单进度,或让我转人工。</p>
+						<div className="flex flex-col items-center gap-3 py-24 text-center">
+							<div className="select-none font-serif text-[70px] leading-none text-[#c9c9ce]">π</div>
+							<p className="text-[22px] font-semibold text-[#1d1d1f]">你好，我是 {agentName}</p>
+							<p className="text-sm text-[#6e6e73]">把任务交给我——查询、整理、推送，到点自动执行。</p>
+							<p className="mt-2 text-xs text-[#a1a1a6]">支持钉钉 / 飞书 / 企微 IM 触达与定时任务</p>
 						</div>
 					)}
 					{messages.map((m) => (
 						<MessageBubble key={m.id} role={m.role} content={m.content} streaming={m.streaming} />
 					))}
 					{tools.length > 0 && (
-						<div className="flex flex-wrap gap-2 pl-11">
+						<div className="flex flex-wrap gap-2">
 							{tools.map((t, i) => (
 								<ToolCallChip key={t.id ?? i} name={t.name} done={t.done} isError={t.isError} />
 							))}
 						</div>
 					)}
 					{error && (
-						<div className="pl-11 text-sm text-rose-600">出错:{error}</div>
+						<div className="text-sm text-rose-600">出错:{error}</div>
 					)}
 				</div>
 			</div>
 
 			{readOnly ? (
-				<div className="border-t border-slate-200 bg-slate-50 px-6 py-4 text-center text-sm text-slate-500">
-					这是来自 IM 渠道的会话，仅可查看记录。继续对话请回到对应的 IM（钉钉 / 飞书等）。
+				<div className="px-6 pb-5">
+					<div className="mx-auto w-[min(980px,calc(100%-48px))] rounded-2xl border border-black/[0.08] bg-[#f6f6f7] px-5 py-3 text-center text-[13px] text-[#6e6e73]">
+						这是来自 IM 渠道的会话，仅可查看记录。继续对话请回到对应的 IM（钉钉 / 飞书等）。
+					</div>
 				</div>
 			) : (
 				<Composer onSend={send} disabled={streaming || port === 0} />

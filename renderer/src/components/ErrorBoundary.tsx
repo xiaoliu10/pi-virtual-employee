@@ -22,7 +22,7 @@ export class ErrorBoundary extends Component<Props, State> {
 	render() {
 		if (this.state.error) {
 			return (
-				<div className="flex h-full flex-col items-center justify-center gap-3 bg-[#11141a] p-8 text-center">
+				<div className="flex h-full flex-col items-center justify-center gap-3 bg-[#f6f6f7] p-8 text-center">
 					<div className="text-2xl">⚠️</div>
 					<h2 className="text-lg font-semibold text-ink-900">界面渲染出错</h2>
 					<pre className="max-w-xl overflow-auto rounded-lg bg-white p-3 text-left text-xs text-rose-600">

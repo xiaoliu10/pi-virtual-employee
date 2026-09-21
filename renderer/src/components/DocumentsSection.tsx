@@ -195,7 +195,7 @@ export function DocumentsSection({ documents, onUpdate }: Props) {
 					<div className="mt-5 flex flex-wrap items-center gap-3">
 						{editing ? (
 							<>
-								<button type="button" disabled={busy} onClick={updateResource} className="rounded-xl bg-[#e1e7ef] px-4 py-2 text-sm font-medium text-[#171c24] transition hover:bg-white disabled:opacity-50">
+								<button type="button" disabled={busy} onClick={updateResource} className="rounded-xl bg-[#1d1d1f] px-4 py-2 text-sm font-medium text-white transition hover:bg-white disabled:opacity-50">
 									保存修改
 								</button>
 								<button type="button" onClick={resetForm} className="rounded-xl border border-slate-200 px-4 py-2 text-sm text-slate-600 transition hover:bg-slate-50">
@@ -204,7 +204,7 @@ export function DocumentsSection({ documents, onUpdate }: Props) {
 							</>
 						) : (
 							<>
-								<button type="button" disabled={busy} onClick={saveLink} className="rounded-xl bg-[#e1e7ef] px-4 py-2 text-sm font-medium text-[#171c24] transition hover:bg-white disabled:opacity-50">
+								<button type="button" disabled={busy} onClick={saveLink} className="rounded-xl bg-[#1d1d1f] px-4 py-2 text-sm font-medium text-white transition hover:bg-white disabled:opacity-50">
 									保存为在线链接
 								</button>
 								<button type="button" disabled={busy} onClick={uploadFile} className="rounded-xl border border-blue-300 bg-blue-50 px-4 py-2 text-sm font-medium text-blue-600 transition hover:bg-blue-100 disabled:opacity-50">
