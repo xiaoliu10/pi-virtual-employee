@@ -37,7 +37,7 @@ export function createDocumentTools(
 		description:
 			"检索文档资源库，找出要提供给对接方的文档（接口文档、规格说明、在线文档等）。可按关键词（匹配名称/描述/场景/标签）和/或对接方名称过滤。返回每条资源的 id、名称、类型(在线文档/文件)、适用对接方、场景。回答「把某文档发给某对接方」类需求前先调用此工具定位资源，再用 provide_document 投递。",
 		parameters: Type.Object({
-			query: Type.Optional(Type.String({ description: "关键词，如「对账接口」「退款规则」" })),
+			query: Type.Optional(Type.String({ description: "关键词，如「接口文档」「退款规则」" })),
 			partner: Type.Optional(Type.String({ description: "对接方/接收方名称过滤，如「支付宝」「微信」" })),
 		}),
 		async execute(_toolCallId, params) {
@@ -94,7 +94,7 @@ export function createDocumentTools(
 		description:
 			"把一个可复用的文档资源存进资源库（通常是你在任务中发现的在线文档链接，填好名称、URL、适用对接方、场景）。文件类资源一般由管理员在设置界面上传，除非你已确知文件在本机的绝对路径。名称必填；链接类必须给 url。",
 		parameters: Type.Object({
-			name: Type.String({ description: "资源名称，如「支付宝对账接口文档 v2」" }),
+			name: Type.String({ description: "资源名称，如「XX系统接口文档 v2」" }),
 			kind: Type.Union([Type.Literal("link"), Type.Literal("file")], {
 				description: "link=在线文档(需填 url)；file=本地文件(需填 filePath)",
 			}),

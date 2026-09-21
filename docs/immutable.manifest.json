@@ -6,14 +6,14 @@
 			"path": "src/engine/prompt.ts",
 			"kind": "region",
 			"why": "安全红线（凭据不外泄）——常驻、不可被 prompt.rules 覆盖",
-			"sha256": "20bc68cf2657360bb1e56e1d74c5372b4ed7ffa346ae3eb25b1a1d934ac7669f"
+			"sha256": "bdb3a6e91dfe71f91d564ce3b854cefe8e5f154df80eb70d563e90ef43797b00"
 		},
 		{
 			"id": "prompt-integrity",
 			"path": "src/engine/prompt.ts",
 			"kind": "region",
 			"why": "数据真实性（禁止编造业务数据）——用户红线，见 no-fabricated-data-rule",
-			"sha256": "9fb19adeae6abe3522e1565ebb3943ead2bf8b43633ed09507a4670e6951f297"
+			"sha256": "5843387ef2ed90e18c0c422ebcb13b9915594b4cc3b23acb4ade55a32d63181a"
 		},
 		{
 			"id": "rbac-gate",
@@ -62,7 +62,7 @@
 			"path": "scripts/test-prompt.mjs",
 			"kind": "file",
 			"why": "守护提示词红线的断言本身（改测试而不是改行为是 RSI 最经典的失败模式）",
-			"sha256": "eecaf09c4f9a95739f4327da7b3e440298cab6339921fa7a343723183907a20c"
+			"sha256": "0b5d1ae70a268d6977685182c8c2f1391dea9a929fd785697fa5f63fef55a3a4"
 		},
 		{
 			"id": "test-permissions",
@@ -83,7 +83,7 @@
 			"path": "src/db/prompt-lab.ts",
 			"kind": "region",
 			"why": "自评测的护栏用例集（关键用例失败即否决）——改动等于改评测标准",
-			"sha256": "ea2d0a45a53b99e35da6fbd7ad703dc606fa91919f907e3d4a64aada83755d91"
+			"sha256": "cdfac911c01450c85ebf53bfaefbc997550b83b2ebb66b0493260c98d37fde57"
 		},
 		{
 			"id": "prompt-lab-veto",

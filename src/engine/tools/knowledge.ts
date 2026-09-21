@@ -10,7 +10,7 @@ export function createKnowledgeTool(knowledge: KnowledgeService): AgentTool {
 		description:
 			"查询业务知识库，获取完成各类任务所需的依据：官方规则与政策、业务/操作流程与步骤、系统地址与入口、账号凭据、产品或业务规格、常见问题等。回答任何事实性或流程性问题（含'怎么做''地址是什么''账号密码''规定是什么'）前，必须先调用此工具核实，不要凭记忆编造。",
 		parameters: Type.Object({
-			query: Type.String({ description: "查询关键词或问题，例如：对账操作流程、XX系统登录地址、退款规则、产品参数" }),
+			query: Type.String({ description: "查询关键词或问题，例如：业务操作流程、XX系统登录地址、退款规则、产品参数" }),
 		}),
 		async execute(_toolCallId, params) {
 			const { query } = params as { query: string };

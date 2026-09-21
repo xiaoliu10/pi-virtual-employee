@@ -382,7 +382,7 @@ function manualUrl(version: string): string {
 
 /**
  * Best-effort sweep of stale partial downloads in electron-updater's shared
- * cache. 小派 failed its download twice (6h apart) with EPERM on the same
+ * cache. One deployment failed its download twice (6h apart) with EPERM on the same
  * temp file — a leftover from an interrupted download that every later
  * attempt collides with. Two profiles share this user-level cache dir, so
  * the sweep only removes .tmp/.blocked partials older than an hour (never a
@@ -543,7 +543,7 @@ function wireEvents(): void {
 		endDrain?.();
 		const message = err.message || String(err);
 		setState({ phase: "error", currentVersion: app.getVersion(), message });
-		// 小派 pattern: two profiles share the user-level updater cache and
+		// Multi-profile pattern: two profiles share the user-level updater cache and
 		// collided on the same temp file → EPERM/sharing violation. Sweep stale
 		// partials and retry the download ONCE after the other instance has
 		// finished; never loop on repeated failures.
@@ -648,7 +648,7 @@ function snapshotRunningProfiles(): string[] {
 			// Electron child processes (renderer/GPU/utility) embed the exe path
 			// plus --type=... and carry no --profile — counting them fabricated
 			// an empty default-profile entry and LaunchApp started a bare extra
-			// instance (field: profiles=[实例B,,小派]).
+			// instance (field: profiles=[b,,a]).
 			if (/--type=/.test(cl)) continue;
 			const p = /--profile[= ]([\w-]+)/.exec(cl);
 			profiles.add(p ? p[1] : "");
@@ -719,7 +719,7 @@ function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
 			// exit — not for the image name to vanish: a sibling profile on the
 			// same install keeps the image name alive, which made phase0a stand
 			// down forever while the arming instance sat dead (0.2.36 field:
-			// 实例B offline 11 min with 小派 still running).
+			// instance B offline 11 min while instance A still ran).
 			`$armPid = ${process.pid}`,
 			// Remove the scheduled task that launched us — the app also sweeps a
 			// stale task at startup, this covers the normal exit paths.
@@ -790,7 +790,7 @@ function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
 			"Start-Sleep -Seconds 2",
 			"KillStaleInstallers",
 			"Start-Sleep -Seconds 2",
-			// Root cause of all 8 outages on the cloud box (现场, 2026-09-06):
+			// Root cause of all 8 outages on the cloud box (field, 2026-09-06):
 			// NSIS installing IN PLACE over the old tree wedges in the
 			// uninstall-old-files step (5min+, zero file writes, WorkingSet 2.2MB)
 			// every single time — while renaming the old install dir away and
@@ -1159,7 +1159,7 @@ let feedRetryTimer: NodeJS.Timeout | undefined;
 export async function checkNow(): Promise<UpdateState> {
 	if (!enabled()) return lastState;
 	if (checking) return lastState;
-	// 小派 got wedged for 12h+ by one stale temp file in the shared updater
+	// One instance got wedged for 12h+ by one stale temp file in the shared updater
 	// cache — clear old partials before every check so a leftover can't block
 	// the next download. Also piggyback the 7-day .old-* install-backup sweep
 	// so manual-rescue leftovers can't accumulate (a check runs every 6h).

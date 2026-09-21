@@ -40,7 +40,7 @@ export function beijingNow(from: Date = new Date()): {
 }
 
 /**
- * Always-on clock tool. Reports titled "每日对账异常统计" ran on 2026-09-19
+ * Always-on clock tool. Reports titled "每日任务统计" ran on 2026-09-19
  * while the real Beijing date was 2026-09-18 — the model has no way to know the
  * real date and guessed wrong. Any date-sensitive task (yesterday, today,
  * weekly reports) must read the real time from here, never from memory.

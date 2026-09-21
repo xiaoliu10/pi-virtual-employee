@@ -44,18 +44,18 @@ function writerFor(dir) {
 test("a normal skill writes under a POSIX-style user dir", async () => {
 	const writer = writerFor(userDir);
 	const r = await writer.upsert({
-		name: "recon-backup",
-		description: "对账文件备份流程，日终对账时触发",
-		content: "# 步骤\n1. 进页面\n2. 搜索商户号\n3. 勾选备份\n\n## 完成标准\n下载核验。",
+		name: "daily-backup",
+		description: "日报文件备份流程，每日日终触发",
+		content: "# 步骤\n1. 进页面\n2. 导出报表\n3. 勾选备份\n\n## 完成标准\n下载核验。",
 	});
 	assert.equal(r.outcome, "created", JSON.stringify(r));
 	const body = await readFile(join(userDir, "recon-backup", "SKILL.md"), "utf8");
-	assert.match(body, /对账文件备份流程/);
+	assert.match(body, /日报文件备份流程/);
 });
 
 test("Chinese skill names write successfully", async () => {
 	const r = await writerFor(userDir).upsert({
-		name: "对账备份流程",
+		name: "日报备份流程",
 		description: "中文技能名测试",
 		content: "# 正文\n步骤说明。",
 	});
@@ -73,7 +73,7 @@ test("path traversal names are rejected", async () => {
 // (hardcoded "/" prefix) directly.
 test("containment prefix must use the path's own separator (the Windows bug class)", () => {
 	const winBase = "C:\\Users\\admin\\AppData\\Roaming\\pi-virtual-employee\\profiles\\main\\skills";
-	const winTarget = `${winBase}\\recon-backup\\SKILL.md`;
+	const winTarget = `${winBase}\\daily-backup\\SKILL.md`;
 	// Old buggy logic:
 	assert.equal(winTarget.startsWith(winBase + "/"), false, "the hardcoded slash is exactly why Windows writes were rejected");
 	// Required logic — accept either separator form:

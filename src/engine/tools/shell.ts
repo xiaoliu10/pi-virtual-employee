@@ -38,8 +38,8 @@ import { resolveRole, type Role } from "../../security/permissions.js";
  *   operator — interactive confirmation required; executable whitelist applies
  *              (composition still rejected).
  *   admin    — interactive confirmation required; whitelist BYPASSED (full
- *              shell: composition/script files allowed — 现场-equivalent
- *              capability on a dedicated jump box).
+ *              shell: composition/script files allowed — a full shell on a
+ *              dedicated jump box).
  * Scheduled-task actors inherit their creator's role (re-checked live every
  * fire); unattended runs skip the per-message confirmation as before.
  */
@@ -370,7 +370,7 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 			"可选 workingDir：命令的工作目录（绝对路径，如 C:\\Users\\me\\project），脚本用相对路径读写数据文件时需要；不影响可执行文件白名单。定时任务无人值守执行时，run_command 以任务创建者身份放行（按该用户当前角色定级），无需消息内含「确认」，但 operator 的白名单校验照常生效。",
 		parameters: Type.Object({
 			command: Type.String({ description: `要执行的命令，如「tasklist /FI "PID eq 19060"」「taskkill /PID 19060 /F」「python scripts/gen_report.py」。跑脚本直接给脚本文件路径，不要用 python -c 内联代码（括号会被拦截）。` }),
-			workingDir: Type.Optional(Type.String({ description: "可选：命令的工作目录绝对路径，如 C:\\Users\\admin\\assistant-home\\project。脚本按相对路径找数据文件时必填。" })),
+			workingDir: Type.Optional(Type.String({ description: "可选：命令的工作目录绝对路径，如 C:\\Users\\admin\\project。脚本按相对路径找数据文件时必填。" })),
 			background: Type.Optional(Type.Boolean({ description: "true=后台启动并返回 sessionId，再用 manage_process poll/log 跟踪；默认 false=同步等待命令结束。" })),
 		}),
 		async execute(_toolCallId, params, signal) {

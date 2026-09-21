@@ -190,7 +190,7 @@ const AI_CARD_TEMPLATE_ID = "675cde2f-f526-40cb-b828-f5b2b57b8b77.schema";
 
 /**
  * DingTalk's AI-card markdown renderer refuses to render a table whose first
- * row directly follows a text line (same pitfall 现场 patches). Ensure a
+ * row directly follows a text line (the same pitfall LobsterAI patches). Ensure a
  * blank line precedes every table block — a pure text transform, safe to run
  * on any reply.
  */

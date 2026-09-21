@@ -1,4 +1,4 @@
-# 更新卡死手动修复 Runbook（供 现场 / 管理员在服务器上执行）
+# 更新卡死手动修复 Runbook（供管理员/运维在部署机上执行）
 
 适用症状：`updater.log` 出现 `install requested` 后长时间无 `startup: pending install ... SUCCEEDED`，
 且存在存活的 `Pi-Virtual-Employee-Setup*` 安装器进程（NSIS 卡在卸载旧版本步骤）。
@@ -36,11 +36,11 @@ $p = Start-Process -FilePath $dl -ArgumentList '/S' -PassThru
 $p.WaitForExit(300000) | Out-Null
 "install exit code = $($p.ExitCode)"
 
-# 5) 重启全部 profile（本机为 实例B / 小派，按实际情况增减）
-$exe = "C:\Users\admin\AppData\Local\Programs\Pi Virtual Employee\Pi Virtual Employee.exe"
-Start-Process -FilePath $exe -ArgumentList @('--profile', '实例B')
+# 5) 重启全部 profile（按实际部署增减）
+$exe = "$env:LOCALAPPDATA\Programs\Pi Virtual Employee\Pi Virtual Employee.exe"
+Start-Process -FilePath $exe -ArgumentList @('--profile', 'work')
 Start-Sleep -Seconds 15
-Start-Process -FilePath $exe -ArgumentList @('--profile', '小派')
+Start-Process -FilePath $exe -ArgumentList @('--profile', 'home')
 ```
 
 ## 验证

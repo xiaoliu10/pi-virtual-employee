@@ -154,10 +154,10 @@ test("cut point falls back to the last user turn when the tail is inside the fin
 // gave no sense of task position, so the heartbeat now summarizes a side-channel
 // slice: the TASK statement plus a recent tail.
 test("progress context keeps the task goal in view alongside the recent tail", () => {
-	const goal = user("任务：对账 7 月渠道账单，核对每笔退款");
+	const goal = user("任务：整理 7 月运营数据，核对每笔异常");
 	const filler = [];
 	for (let i = 0; i < 30; i += 1) filler.push(assistant("中间步骤。" + "步".repeat(2400)));
-	const recent = [user("继续"), assistant("正在核对第 3 批退款明细。")];
+	const recent = [user("继续"), assistant("正在核对第 3 批异常明细。")];
 	const messages = [goal, ...filler, ...recent];
 
 	const slice = progressContextSlice(messages, 20_000);
@@ -179,7 +179,7 @@ test("progress context keeps the task goal in view alongside the recent tail", (
 // user boundary to cut on — now the forced path keeps the task statement and
 // summarizes the middle.
 test("forced cut handles single-turn transcripts: keep the task, summarize the middle", () => {
-	const task = user("任务：对账 7 月渠道账单，逐商户下载对账文件");
+	const task = user("任务：整理 7 月运营数据，逐部门导出明细文件");
 	const messages = [task];
 	// One long turn: alternating assistant narration and tool results.
 	for (let i = 0; i < 30; i += 1) {

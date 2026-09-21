@@ -136,7 +136,7 @@ test("the correction label is narrow: real corrections yes, ordinary chatter no"
 	}
 	for (const text of [
 		"帮我把上周的订单汇总一下",
-		"这个月的对账做完了吗",
+		"这个月的报表做完了吗",
 		"好的，谢谢",
 		"确认",
 		"", // empty

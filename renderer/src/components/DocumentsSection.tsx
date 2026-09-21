@@ -167,7 +167,7 @@ export function DocumentsSection({ documents, onUpdate }: Props) {
 				<Card title={editing ? "编辑资源" : "新增资源"} desc="链接类填 URL；文件类用下方按钮选择并上传。">
 					<div className="grid grid-cols-2 gap-4">
 						<Field label="名称">
-							<input className={inputCls} value={form.name} placeholder="如：支付宝对账接口文档 v2" onChange={(e) => setForm({ ...form, name: e.target.value })} />
+							<input className={inputCls} value={form.name} placeholder="如：订单系统接口文档 v2" onChange={(e) => setForm({ ...form, name: e.target.value })} />
 						</Field>
 						<Field label="适用对接方" hint="多个用逗号分隔，如：支付宝, 微信">
 							<input className={inputCls} value={form.partners} onChange={(e) => setForm({ ...form, partners: e.target.value })} />
