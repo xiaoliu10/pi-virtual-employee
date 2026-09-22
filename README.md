@@ -86,13 +86,16 @@ npm run verify:immutable   # 不可变内核绊线：安全红线、权限判定
 
 ## 打包与发布
 
-Windows(NSIS) 安装包与自动更新文件上传到 Gitee 仓库的 `latest` tag release（国内网络下载快）；已安装客户端经 electron-updater 自动检查更新。Linux(AppImage) 支持本地构建。
+Windows(NSIS) 安装包与自动更新文件上传到 Gitee 仓库的 `latest` tag release（国内网络下载快），已安装客户端经 electron-updater 自动检查更新；**同一版本同时发布到 GitHub Releases，带 Windows 与 macOS(Apple Silicon) 双端安装包**。Linux(AppImage) 支持本地构建。
 
 ```bash
 cp .env.example .env       # 填入 GITEE_TOKEN（需 projects 权限）
-npm run package:win        # typecheck + build + 原生二进制 + electron-builder
-npm run release            # 发布前自动跑 immutable 校验与全部测试
+npm run package:win        # Windows 安装包（typecheck + build + 原生二进制 + electron-builder）
+npm run package:mac        # macOS dmg（Apple Silicon，未签名）
+npm run release            # 发布前自动跑 immutable 校验与全部测试；Gitee + GitHub 双端上传
 ```
+
+macOS 包未做签名/公证：首次打开需在应用上**右键 → 打开**以绕过 Gatekeeper。`gh` CLI 需已登录（GitHub 上传走它）。
 
 原生模块（better-sqlite3 + sqlite-vec）按目标平台预编译进安装包（`resources/native/`），打包机无需目标平台编译工具链。
 

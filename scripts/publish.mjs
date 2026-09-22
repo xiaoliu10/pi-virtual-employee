@@ -13,6 +13,9 @@
  *   4. upload every artifact to the new release.
  *   5. re-fetch the release and verify every asset's browser_download_url is
  *      reachable (HEAD) so we never advertise a dead link.
+ *   6. push the version tag to GitHub and create/update the GitHub release
+ *      with the Windows installer + macOS dmg (both REQUIRED; see
+ *      publishToGitHub below).
  *
  * Auth: GITEE_TOKEN env (personal access token). Dry-run: --dry-run lists
  * what would be uploaded without touching Gitee.
@@ -297,6 +300,75 @@ async function retainVersionRelease() {
 const KEEP_VERSION_RELEASES = 3;
 if (!dryRun) await retainVersionRelease();
 else console.log("[publish] (dry-run) would retain a version-tagged rollback release");
+
+/**
+ * GitHub release: the same version tag on GitHub carries the Windows installer
+ * AND the macOS dmg. Gitee stays Windows-only — it is the auto-update feed the
+ * Windows box pulls from, and its 100 MB asset cap makes big artifacts a poor
+ * fit. BOTH packages are required here: a GitHub release missing the mac dmg
+ * is exactly the half-published state the artifact gate exists to prevent.
+ * Uploads go through the `gh` CLI (pre-authenticated); the version tag is
+ * pushed first so the release points at the released commit.
+ */
+const GH_REMOTE = "github";
+const GH_REPO = `${OWNER}/${REPO}`;
+const GH_TAG = `v${version}`;
+
+async function publishToGitHub(artifacts) {
+	const dmgName = `Pi-Virtual-Employee-Mac-${version}-arm64.dmg`;
+	const dmgPath = join(releaseDir, dmgName);
+	let dmgSize;
+	try {
+		dmgSize = (await stat(dmgPath)).size;
+	} catch {
+		console.error(`[publish] missing artifact: ${dmgName} (run package:mac first — GitHub releases need the Windows AND macOS packages)`);
+		process.exit(1);
+	}
+	// latest.yml is the Gitee feed's metadata (its URLs point at Gitee) — not
+	// part of the GitHub release.
+	const ghArtifacts = [
+		...artifacts.filter((a) => a.name !== "latest.yml"),
+		{ name: dmgName, path: dmgPath, size: dmgSize },
+	];
+	if (dryRun) {
+		console.log(`[publish] (dry-run) would push ${GH_TAG} to ${GH_REMOTE} and create the GitHub release with:`);
+		for (const a of ghArtifacts) console.log(`  ${a.name}  ${(a.size / 1048576).toFixed(1)} MiB`);
+		return;
+	}
+
+	console.log(`[publish] pushing ${GH_TAG} to ${GH_REMOTE} …`);
+	execFileSync("git", ["push", GH_REMOTE, `refs/tags/${GH_TAG}`], { cwd: root, stdio: "inherit" });
+
+	const ghArgs = ["release", "--repo", GH_REPO];
+	const existing = spawnSync("gh", [...ghArgs, "view", GH_TAG, "--json", "name"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	const paths = ghArtifacts.map((a) => a.path);
+	if (existing.status === 0) {
+		console.log(`[publish] GitHub release ${GH_TAG} exists; uploading assets (clobber)`);
+		execFileSync("gh", [...ghArgs, "upload", GH_TAG, "--clobber", ...paths], { cwd: root, stdio: "inherit" });
+	} else {
+		console.log(`[publish] creating GitHub release ${GH_TAG}`);
+		execFileSync("gh", [...ghArgs, "create", GH_TAG, "--title", `v${version}`, "--notes", releaseNotes, ...paths], { cwd: root, stdio: "inherit" });
+	}
+
+	const check = JSON.parse(spawnSync("gh", [...ghArgs, "view", GH_TAG, "--json", "assets"], { encoding: "utf8" }).stdout ?? "{}");
+	const got = new Set((check.assets ?? []).map((a) => a.name));
+	for (const a of ghArtifacts) {
+		if (!got.has(a.name)) throw new Error(`verify: ${a.name} missing from GitHub release assets`);
+		console.log(`[publish] verified on GitHub: ${a.name}`);
+	}
+}
+
+if (!dryRun) {
+	try {
+		await publishToGitHub(artifacts);
+	} catch (err) {
+		console.error(`[publish] GITHUB PUBLISH FAILED: ${err instanceof Error ? err.message : String(err)}`);
+		console.error("[publish] The Gitee feed above is already live; re-run `npm run release` after fixing (it safely rebuilds both).");
+		process.exit(1);
+	}
+} else {
+	await publishToGitHub(artifacts);
+}
 
 console.log("[publish] done. Auto-update feed now serves:");
 console.log(`  ${API.replace("api/v5", "")}${OWNER}/${REPO}/releases/download/${TAG}/latest.yml`);

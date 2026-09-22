@@ -35,6 +35,7 @@
 		"prepare:native:win": "node scripts/prepare-win-native.mjs",
 		"prepare:native:linux": "node scripts/prepare-linux-native.mjs",
 		"package:win": "npm run typecheck && npm run build && npm run prepare:native:win && electron-builder --win nsis --x64",
+		"package:mac": "npm run typecheck && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg --arm64",
 		"package:linux": "npm run typecheck && npm run build && npm run prepare:native:linux && electron-builder --linux AppImage --x64",
 		"release": "node scripts/publish.mjs",
 		"release:dry": "node scripts/publish.mjs --dry-run",
@@ -132,13 +133,15 @@
 		"mac": {
 			"target": [
 				{
-					"target": "dir",
+					"target": "dmg",
 					"arch": [
 						"arm64"
 					]
 				}
 			],
-			"icon": "build/icon.png"
+			"icon": "build/icon.png",
+			"category": "public.app-category.productivity",
+			"artifactName": "Pi-Virtual-Employee-Mac-${version}-arm64.${ext}"
 		},
 		"nsis": {
 			"oneClick": true,
