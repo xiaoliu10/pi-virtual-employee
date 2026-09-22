@@ -69,7 +69,7 @@
 			"path": "scripts/test-permissions.mjs",
 			"kind": "file",
 			"why": "守护权限模型的断言本身",
-			"sha256": "1f8b40daf339df958864b7fceb234d95c0015d63b960a2afd8c1f1bb1b630420"
+			"sha256": "8deb44bcd471d781082911dbbd5c8c7ce5f0187cee02471a830f9361698eeccc"
 		},
 		{
 			"id": "test-immutable",
