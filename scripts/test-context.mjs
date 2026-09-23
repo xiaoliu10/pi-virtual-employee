@@ -25,7 +25,8 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 		contents: `
-			export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW } from "./src/engine/context.ts";
+			export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow } from "./src/engine/context.ts";
+			export { shouldCompact, DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-agent-core";
 			export { estimateTokens } from "@earendil-works/pi-agent-core";
 		`,
 		resolveDir: root,
@@ -37,7 +38,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -260,4 +261,24 @@ test("stale usage floor must not survive a compaction cut", () => {
 	const plain = assistant("回答");
 	assert.equal(stripStaleUsage(u), u);
 	assert.equal(stripStaleUsage(plain), plain);
+});
+
+// Field 2026-09-23: a litellm qwen relay rejected a request with 73729 input
+// tokens because 131072 OUTPUT tokens were also requested (73729 + 131072 =
+// 204801 > 204800). Both compaction gates must measure against
+// window − output reservation, not the raw window.
+test("usableContextWindow subtracts the output reservation (the litellm 1-token-over failure)", () => {
+	assert.equal(usableContextWindow(204800, 131072), 73728, "204800 window with a 131072 output cap leaves exactly 73728 of input");
+	assert.equal(usableContextWindow(204800, undefined), 204800, "no maxTokens → raw window");
+	assert.equal(usableContextWindow(200000, 32768), 167232, "normal reservation");
+	// A bogus over-large maxTokens must not zero the budget — floored at window/4.
+	assert.equal(usableContextWindow(204800, 999_999), 51_200);
+	assert.equal(usableContextWindow(204800, 0), 204800);
+});
+
+test("the output reservation makes the compaction gate fire where the raw window would not", () => {
+	// Real gate settings (shouldCompact = tokens > window − reserveTokens).
+	const tokens = 100_000;
+	assert.equal(shouldCompact(tokens, usableContextWindow(204800, 131072), DEFAULT_COMPACTION_SETTINGS), true, "100k input vs 73728 usable → compact BEFORE the provider rejects");
+	assert.equal(shouldCompact(tokens, 204800, DEFAULT_COMPACTION_SETTINGS), false, "against the raw window the same transcript looked fine — that is the bug");
 });

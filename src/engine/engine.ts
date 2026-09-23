@@ -38,7 +38,10 @@ import { isLocalConversation, resolveRole } from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
-import { estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, truncateToFit } from "./context.js";
+import { estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, truncateToFit, usableContextWindow } from "./context.js";
+
+/** Default single-reply output cap for relay (custom baseUrl) models without an explicit per-model override. */
+const RELAY_DEFAULT_MAX_OUTPUT = 32_768;
 import { SkillLoader, pickActiveSkills } from "./skills/skill-loader.js";
 import { SkillWriter } from "./skills/skill-writer.js";
 import { formatInlineSkills } from "./skills/skills-prompt.js";
@@ -415,9 +418,21 @@ export class EmployeeEngine implements EmployeeRuntime {
 		const ctxOverride = supplier.modelContextWindow?.[modelId];
 		const contextWindow = typeof ctxOverride === "number" && ctxOverride > 0 ? Math.floor(ctxOverride) : base.contextWindow;
 		// Max output tokens: same inherit-vs-override story (base caps can silently
-		// truncate a relay model's long answers/reports).
+		// truncate a relay model's long answers/reports). Relay models get an extra
+		// default clamp: registries carry the TRUE upstream max (e.g. 131072), but a
+		// gateway often fronts a model whose real output cap is far smaller, and an
+		// oversized output reservation alone can blow the context window
+		// (field 2026-09-23: litellm qwen — 73729 input + 131072 requested output
+		// > 204800 → ContextWindowExceededError). 32K covers every report this app
+		// generates; set an explicit per-model value (settings dialog or
+		// manage_settings) to raise or lower it.
 		const maxTokOverride = supplier.modelMaxTokens?.[modelId];
-		const maxTokens = typeof maxTokOverride === "number" && maxTokOverride > 0 ? Math.floor(maxTokOverride) : base.maxTokens;
+		const maxTokens =
+			typeof maxTokOverride === "number" && maxTokOverride > 0
+				? Math.floor(maxTokOverride)
+				: baseUrl
+					? Math.min(base.maxTokens ?? RELAY_DEFAULT_MAX_OUTPUT, RELAY_DEFAULT_MAX_OUTPUT)
+					: base.maxTokens;
 		return { ...base, id: modelId, name: modelId, input, contextWindow, ...(maxTokens !== undefined ? { maxTokens } : {}), ...(baseUrl ? { baseUrl } : {}) };
 	}
 
@@ -835,7 +850,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 				// mid-turn, and continue. Only a transcript that genuinely cannot shrink
 				// (e.g. recovery itself failed) ends the turn for the summary path.
 				const window = agent.state.model.contextWindow || FALLBACK_CONTEXT_WINDOW;
-				const budget = window - this.compactionReserve();
+				// Measure against window − output reservation: the provider accepts
+				// input + requested_output ≤ window, so reserving 131072 output tokens
+				// leaves ~73k of usable input — not the 188k the raw window suggests
+				// (field 2026-09-23, the exact failure this line closes).
+				const budget = usableContextWindow(window, agent.state.model.maxTokens) - this.compactionReserve();
 				if (estimateTokensSafe(agent.state.messages) >= budget) {
 					try {
 						const recovered = await this.recoverFromContextOverflow(agent);

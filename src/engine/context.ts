@@ -124,6 +124,23 @@ export function estimateTokensSafe(messages: AgentMessage[]): number {
 	return Math.max(tokens, estimateContextTokens(messages).tokens);
 }
 
+/**
+ * The input-token ceiling the provider will actually accept for this model:
+ * the raw context window MINUS the output reservation. Providers reject
+ * `input + max_output > window` — field 2026-09-23: a litellm qwen relay
+ * rejected a request with 73729 input tokens because 131072 output tokens
+ * were ALSO requested (73729 + 131072 = 204801 > 204800), so the compaction
+ * gates must measure against window − output, not the raw window.
+ *
+ * Floored at a quarter of the window so a bogus (over-large) maxTokens can
+ * never shrink the usable budget to zero. Shared by maybeCompact and the
+ * engine's mid-turn budget gate so both measure the same ceiling.
+ */
+export function usableContextWindow(contextWindow: number, maxTokens?: number): number {
+	const reserve = typeof maxTokens === "number" && maxTokens > 0 ? Math.floor(maxTokens) : 0;
+	return Math.max(contextWindow - reserve, Math.floor(contextWindow / 4));
+}
+
 /** Same rule as estimateTokensSafe, for a single message. */
 export function estimateMessageTokens(message: AgentMessage): number {
 	const text = messageText(message);
@@ -370,7 +387,7 @@ export async function maybeCompact(agent: Agent, models: Models, force = false):
 	// CJK-aware: pi's own estimate divides characters by 4, which under-counts a
 	// Chinese transcript badly enough that compaction never fires (see
 	// estimateTokensSafe). Overshooting only compacts a bit sooner.
-	if (!force && !shouldCompact(estimateTokensSafe(messages), contextWindow, settings)) {
+	if (!force && !shouldCompact(estimateTokensSafe(messages), usableContextWindow(contextWindow, model.maxTokens), settings)) {
 		return { compacted: false, skipReason: "below_threshold" };
 	}
 
