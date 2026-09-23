@@ -42,6 +42,11 @@ import { resolveRole, type Role } from "../../security/permissions.js";
  *              dedicated jump box).
  * Scheduled-task actors inherit their creator's role (re-checked live every
  * fire); unattended runs skip the per-message confirmation as before.
+ *
+ * Single-chat AND group chats are both allowed (user ruling 2026-09-23, field:
+ * an SLS triage needed run_command from the group where the task lived). The
+ * gates that actually matter hold in either: platform-verified sender, live
+ * role resolution, and an explicit 「确认」 in the sender's own current message.
  */
 function gateCommandRole(
 	deps: Pick<ShellToolDeps, "config" | "resolveActor" | "conversationId">,
@@ -56,8 +61,7 @@ function gateCommandRole(
 	if (!actor && deps.conversationId.startsWith("sched:")) {
 		return refuse("该定时任务创建时未记录创建者身份，无法无人值守执行命令。请管理员在 IM 单聊中使用 authorize_scheduled_task 给该任务授权。");
 	}
-	if (!actor) return refuse("当前会话不是 IM 单聊（无经过验证的发送者身份），命令执行只能在 IM 单聊中进行。");
-	if (actor.chatType !== "single") return refuse("命令执行只允许在单聊中进行，群聊不开放（群内无法可靠鉴别操作者）。");
+	if (!actor) return refuse("当前会话没有经过验证的发送者身份，无法执行命令。");
 	if (!actor.senderId) return refuse("无法识别发送者身份（senderId 为空），拒绝执行。");
 	const role = resolveRole(deps.config, actor.senderId);
 	if (role === "viewer") {
@@ -359,7 +363,7 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 		name: "run_command",
 		label: "命令执行（分级）",
 		description:
-			"在部署机器上按角色分级执行 shell 命令（仅限 IM 单聊，需在当前消息明确「确认」）。" +
+			"在部署机器上按角色分级执行 shell 命令（单聊群聊均可，按平台验证的发送者身份与角色授权，需在当前消息明确「确认」）。" +
 			"权限分级：viewer 不可执行；operator 只能执行 capabilities.shell.allowedCommands 白名单内的可执行文件（* 表示全部），且串联、管道、重定向、变量展开、脚本扩展名和可执行文件路径均被拒绝，每次只跑一条独立命令；" +
 			"admin 不受白名单与组合语法限制（完整 shell：可用 powershell -Command 管道、重定向、脚本串联等），仅工作目录仍须为不含引号的绝对路径。" +
 			"默认用于运维诊断：tasklist 查看进程、taskkill 按单个 PID 结束进程、systeminfo/whoami/hostname/netstat/ping/ipconfig 查看本机状态。" +
