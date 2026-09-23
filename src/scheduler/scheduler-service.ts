@@ -24,6 +24,14 @@ export interface SchedulerRunner {
 }
 
 const TICK_MS = 60_000;
+/**
+ * Hard ceiling on one task run. Field incident 2026-09-22: a scheduled run that
+ * never settled (its turn sits OUTSIDE the IM watchdog, which only covers IM
+ * conversations) held `ticking` forever — every later tick early-returned and
+ * the whole scheduler froze for ~4h while the app otherwise looked healthy. A
+ * wedged run may now waste only its own timeout, never the scheduler.
+ */
+const DEFAULT_RUN_TIMEOUT_MS = 60 * 60_000;
 
 export class SchedulerService {
 	private runner: SchedulerRunner | null = null;
@@ -33,7 +41,10 @@ export class SchedulerService {
 	/** task-level re-entrancy guard: the same task running past its period is skipped, never run twice. */
 	private readonly inFlight = new Set<string>();
 
-	constructor(private readonly store: ScheduledTaskStore) {}
+	constructor(
+		private readonly store: ScheduledTaskStore,
+		private readonly runTimeoutMs: number = DEFAULT_RUN_TIMEOUT_MS,
+	) {}
 
 	setRunner(runner: SchedulerRunner): void {
 		this.runner = runner;
@@ -123,7 +134,7 @@ export class SchedulerService {
 				this.inFlight.add(task.id);
 				const next = this.safeNext(task.cron);
 				try {
-					const { status } = await this.runner.runTask(task);
+					const { status } = await this.runWithTimeout(task);
 					this.store.markRun(task.id, status, next);
 				} catch (err) {
 					this.store.markRun(task.id, "error:" + (err as Error).message.slice(0, 200), next);
@@ -134,6 +145,26 @@ export class SchedulerService {
 		} finally {
 			this.ticking = false;
 		}
+	}
+
+	/**
+	 * One task run, bounded by runTimeoutMs. The losing run keeps executing in
+	 * the background (an engine turn can't be meaningfully cancelled from here),
+	 * but its eventual rejection is swallowed — the recorded outcome is the
+	 * timeout, and the scheduler has already moved on.
+	 */
+	private runWithTimeout(task: ScheduledTaskRow): Promise<{ status: string }> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(
+				() => reject(new Error(`run_timeout:运行超过 ${Math.round(this.runTimeoutMs / 60_000)} 分钟，被调度器强制记败（任务自身可能仍在后台执行）`)),
+				this.runTimeoutMs,
+			);
+			timer.unref?.();
+		});
+		const run = this.runner!.runTask(task);
+		run.catch(() => {}); // a late failure after a timeout must not become unhandled
+		return Promise.race([run, timeout]).finally(() => clearTimeout(timer));
 	}
 
 	private safeNext(cron: string): number | null {
