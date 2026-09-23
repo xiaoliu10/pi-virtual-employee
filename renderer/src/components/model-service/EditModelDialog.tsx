@@ -73,9 +73,9 @@ export function EditModelDialog(props: EditModelDialogProps) {
 
 					<label className="block">
 						<span className="mb-2 block text-sm font-medium text-slate-800">
-							最大输出 Token <span className="ml-1 cursor-help text-[#a1a1a6]" title="单次回复的最大输出长度（tokens）。该值同时占用上下文窗口（输入+输出≤窗口），配大了会挤掉可用输入甚至被网关直接拒绝。中转模型未填写时默认收敛到 32768；请按网关的真实限额填写（如 qwen 32K）。">?</span>
+							最大输出 Token <span className="ml-1 cursor-help text-[#a1a1a6]" title="单次回复的最大输出长度（tokens）。该值同时占用上下文窗口（输入+输出≤窗口），配大了会挤掉可用输入甚至被网关直接拒绝。未填写时应用会先向网关查询（litellm /model/info），查不到才回退默认 32768。">?</span>
 						</span>
-						<input type="number" min={0} value={maxTokens} onChange={(e) => setMaxTokens(e.target.value)} className={inputCls} placeholder="留空 = 中转默认 32768" />
+						<input type="number" min={0} value={maxTokens} onChange={(e) => setMaxTokens(e.target.value)} className={inputCls} placeholder="留空 = 先查网关，查不到默认 32K" />
 					</label>
 
 					<div>

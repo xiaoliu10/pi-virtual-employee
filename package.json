@@ -19,6 +19,7 @@
 		"verify:immutable": "node scripts/verify-immutable.mjs",
 		"test:scheduler": "node --test scripts/test-scheduler.mjs",
 		"test:scheduler-service": "node --test scripts/test-scheduler-service.mjs",
+		"test:model-info": "node --test scripts/test-model-info.mjs",
 		"test:telemetry": "node --test scripts/test-telemetry.mjs",
 		"test:immutable": "node --test scripts/test-immutable.mjs",
 		"test:proposals": "node --test scripts/test-proposals.mjs",

@@ -39,6 +39,7 @@ import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
 import { estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, truncateToFit, usableContextWindow } from "./context.js";
+import { fetchModelInfo, type RemoteModelInfo } from "./model-info.js";
 
 /** Default single-reply output cap for relay (custom baseUrl) models without an explicit per-model override. */
 const RELAY_DEFAULT_MAX_OUTPUT = 32_768;
@@ -380,6 +381,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 		}
 	};
 
+	private readonly modelInfoCache = new Map<string, RemoteModelInfo | null>();
+	/** Bumped when a gateway answer lands, so sessions built with the fallback get rebuilt. */
+	private modelInfoRevision = 0;
+
 	private findSupplier(supplierId: string | null | undefined): Supplier | undefined {
 		if (!supplierId) return undefined;
 		return this.config.all().model.suppliers.find((supplier) => supplier.id === supplierId);
@@ -434,6 +439,53 @@ export class EmployeeEngine implements EmployeeRuntime {
 					? Math.min(base.maxTokens ?? RELAY_DEFAULT_MAX_OUTPUT, RELAY_DEFAULT_MAX_OUTPUT)
 					: base.maxTokens;
 		return { ...base, id: modelId, name: modelId, input, contextWindow, ...(maxTokens !== undefined ? { maxTokens } : {}), ...(baseUrl ? { baseUrl } : {}) };
+	}
+
+	/**
+	 * Final model resolution order for maxTokens (user ruling 2026-09-23):
+	 * ① explicit per-model config override (withIdentity already applied it);
+	 * ② the gateway's own model-info answer (cached, fetched once in background);
+	 * ③ the static fallback (relay: min(registry, 32K); direct: registry value).
+	 * Resolution is synchronous — a cold cache builds with ③ and the session is
+	 * rebuilt once ② lands.
+	 */
+	private resolveModel(supplier: Supplier, modelId: string): Model<Api> {
+		const base = this.buildModel(supplier, modelId);
+		const override = supplier.modelMaxTokens?.[modelId];
+		if (typeof override === "number" && override > 0) return base;
+		const key = `${supplier.id}:${modelId}`;
+		if (this.modelInfoCache.has(key)) {
+			return this.withRemoteInfo(base, this.modelInfoCache.get(key) ?? null);
+		}
+		if (supplier.baseUrl.trim()) {
+			void this.prefetchModelInfo(supplier, modelId, key);
+		} else {
+			// Direct provider: no gateway to ask — cache the miss so we never re-try.
+			this.modelInfoCache.set(key, null);
+		}
+		return base;
+	}
+
+	/** Apply a gateway answer on top of the fallback-resolved model. */
+	private withRemoteInfo(base: Model<Api>, info: RemoteModelInfo | null): Model<Api> {
+		const cap = info?.maxOutputTokens;
+		if (!cap || cap <= 0) return base;
+		// An output cap at or above the window is a gateway misreport; keep it
+		// usable rather than trusting it blindly.
+		const maxTokens = Math.max(Math.min(cap, base.contextWindow), 1024);
+		if (base.maxTokens === maxTokens) return base;
+		return { ...base, maxTokens };
+	}
+
+	/** Fetch the gateway's model info once; cache the answer (or the miss). */
+	private async prefetchModelInfo(supplier: Supplier, modelId: string, key: string): Promise<void> {
+		if (this.modelInfoCache.has(key)) return;
+		const info = await fetchModelInfo(supplier.baseUrl, modelId, supplier.apiKey || undefined).catch(() => null);
+		this.modelInfoCache.set(key, info);
+		if (info) {
+			this.modelInfoRevision += 1;
+			console.log(`[engine] model-info: ${modelId} maxOutput=${info.maxOutputTokens ?? "?"} (from ${supplier.id} gateway)`);
+		}
 	}
 
 	/** Effective image-input capability for a configured model (override else base). For the settings UI. */
@@ -536,7 +588,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// will be rebuilt on its next inbound message.
 		if (cached) {
 			const builtAt = (cached as Agent & { __skillsRevision?: number }).__skillsRevision ?? 0;
-			if ((builtAt >= this.skillsRevision && builtAt >= this.memoryRevision) || cached.state.isStreaming) return cached;
+			if ((builtAt >= this.skillsRevision && builtAt >= this.memoryRevision && builtAt >= this.modelInfoRevision) || cached.state.isStreaming) return cached;
 			this.sessions.delete(conversationId);
 		}
 
@@ -545,7 +597,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			const agent = new Agent({
 				initialState: {
 					systemPrompt: buildSystemPrompt(this.promptPartsFor(conversationId)),
-				model: this.buildModel(supplier, modelId),
+				model: this.resolveModel(supplier, modelId),
 				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onRoleRefusal: (cid, info) => this.noteAuthorizationNeeded(cid, info), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules) }),
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
@@ -560,7 +612,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		});
 
 		this.applyToolStepCap(agent);
-		const revision = Math.max(this.skillsRevision, this.memoryRevision);
+		const revision = Math.max(this.skillsRevision, this.memoryRevision, this.modelInfoRevision);
 		(agent as Agent & { __skillsRevision?: number }).__skillsRevision = revision;
 		this.sessions.set(conversationId, agent);
 		return agent;
