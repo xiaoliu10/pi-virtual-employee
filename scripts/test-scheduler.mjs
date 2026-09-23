@@ -285,3 +285,97 @@ test("an unaddressed authorization resolves the single pending task, and asks wh
 	assert.equal(res.details.unauthorized, 2);
 	assert.match(res.content[0].text, /有 2 个任务没有执行身份/);
 });
+
+// Field incident 2026-09-22: a task created in a GROUP had its push target
+// silently rerouted to the editor's 1:1 chat — the model passed bindCurrent
+// because "the edit came from here". Editing CONTENT must never touch the push
+// target; rebinding an existing target is an explicitly confirmed operation.
+function bindBuild(t, rows, who, conversationId = "dt:boss") {
+	const scheduler = bindFake(t, rows);
+	const tools = createSchedulerTools(scheduler, conversationId, "im", store(t, {}), () => who);
+	return { scheduler, tools };
+}
+
+function bindFake(t, rows) {
+	const tasks = rows.map((r, i) => ({
+		id: `t${i + 1}`,
+		title: r.title,
+		cron: "0 9 * * *",
+		enabled: 1,
+		conversation_id: r.conversation_id ?? null,
+		origin: r.conversation_id ? "im" : "console",
+		created_by: null,
+		last_run_at: null,
+		next_run_at: Date.now() + 3_600_000,
+		last_status: null,
+		created_at: Date.now(),
+		updated_at: Date.now(),
+	}));
+	return {
+		list: () => tasks,
+		get: (id) => tasks.find((x) => x.id === id),
+		create: (input) => {
+			const row = { ...tasks[0], ...input, id: `t${tasks.length + 1}` };
+			tasks.push(row);
+			return row;
+		},
+		delete: () => {},
+		setEnabled: () => {},
+		setCreatedBy: () => undefined,
+		update: (id, patch, nextRunAt) => {
+			const row = tasks.find((x) => x.id === id);
+			if (!row) return undefined;
+			Object.assign(row, {
+				...(patch.title !== undefined ? { title: patch.title } : {}),
+				...(patch.prompt !== undefined ? { prompt: patch.prompt } : {}),
+				...(patch.cron !== undefined ? { cron: patch.cron } : {}),
+				...(patch.conversationId !== undefined ? { conversation_id: patch.conversationId } : {}),
+				...(nextRunAt !== undefined ? { next_run_at: nextRunAt } : {}),
+				updated_at: Date.now(),
+			});
+			return row;
+		},
+		validateCron: () => {},
+	};
+}
+
+test("editing a task from another conversation never touches its push target", async (t) => {
+	const h = bindBuild(t, [{ title: "对账日报", conversation_id: "dt:group:g1" }], actor("boss", "single", "把任务标题改一下"));
+	let res = await tool(h.tools, "update_scheduled_task").execute("u1", { id: "t1", title: "新标题" });
+	assert.equal(res.details.ok, true);
+	assert.equal(h.scheduler.get("t1").conversation_id, "dt:group:g1", "the group target survives a 1:1 edit");
+	assert.match(res.content[0].text, /推送目标未变/, "the reply states the target was left alone");
+});
+
+test("bindCurrent from another conversation is refused without an explicit 「确认」", async (t) => {
+	const h = bindBuild(t, [{ title: "对账日报", conversation_id: "dt:group:g1" }], actor("boss", "single", "顺便把任务改绑一下"));
+	let res = await tool(h.tools, "update_scheduled_task").execute("u1", { id: "t1", title: "新标题", bindCurrent: true });
+	assert.equal(res.details.ok, false);
+	assert.equal(res.details.needsConfirmation, true);
+	assert.equal(h.scheduler.get("t1").conversation_id, "dt:group:g1", "refusal leaves the group target intact");
+	assert.equal(h.scheduler.get("t1").title, "对账日报", "the whole call is refused atomically — no half-applied patch");
+	assert.match(res.content[0].text, /未改绑推送目标/);
+	assert.match(res.content[0].text, /包含「确认」/);
+
+	// With the explicit confirmation in the current message, the rebind goes through.
+	const ok = bindBuild(t, [{ title: "对账日报", conversation_id: "dt:group:g1" }], actor("boss", "single", "把推送改到这个群，确认"));
+	res = await tool(ok.tools, "update_scheduled_task").execute("u2", { id: "t1", bindCurrent: true });
+	assert.equal(res.details.ok, true);
+	assert.equal(ok.scheduler.get("t1").conversation_id, "dt:boss", "confirmed rebind moves the target");
+	assert.match(res.content[0].text, /推送目标→当前单聊/);
+});
+
+test("binding a target-less (console/legacy) task is the rescue path and needs no confirmation", async (t) => {
+	const h = bindBuild(t, [{ title: "控制台遗留" }], actor("boss", "single", "帮它配个推送"));
+	const res = await tool(h.tools, "update_scheduled_task").execute("u1", { id: "t1", bindCurrent: true });
+	assert.equal(res.details.ok, true);
+	assert.equal(h.scheduler.get("t1").conversation_id, "dt:boss");
+	assert.equal(res.details.pushTargetChanged, true);
+});
+
+test("bindCurrent from the task's own conversation is a no-op change, no ceremony", async (t) => {
+	const h = bindBuild(t, [{ title: "群任务", conversation_id: "dt:group:g1" }], actor("boss", "single", "改下标题"), "dt:group:g1");
+	const res = await tool(h.tools, "update_scheduled_task").execute("u1", { id: "t1", title: "改名", bindCurrent: true });
+	assert.equal(res.details.ok, true);
+	assert.equal(h.scheduler.get("t1").conversation_id, "dt:group:g1");
+});

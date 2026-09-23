@@ -12,7 +12,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { SchedulerService } from "../../scheduler/scheduler-service.js";
 import type { ConfigStore } from "../../db/config-store.js";
-import { maskId, isSchedulerActor, requireConfirmedAdmin, type ActorContext } from "./admin.js";
+import { maskId, isExplicitConfirmation, isSchedulerActor, requireConfirmedAdmin, type ActorContext } from "./admin.js";
 import { resolveRole } from "../../security/permissions.js";
 
 function fmtTime(ms: number | null): string {
@@ -328,16 +328,17 @@ export function createSchedulerTools(
 		name: "update_scheduled_task",
 		label: "修改定时任务",
 		description:
-			"修改已有定时任务的标题 / 执行指令 / cron / 推送目标，无需删除重建（执行历史保留）。" +
-			"改推送目标最常用的方式是 bindCurrent=true：在正确的群聊/单聊里调用，把任务的结果推送改绑到当前会话——" +
-			"例如任务当初建错了群，现在在正确的群里改绑即可。只传想改的字段。" +
+			"修改已有定时任务的标题 / 执行指令 / cron，无需删除重建（执行历史保留）。" +
+			"修改内容【绝不会】改动推送目标——推送目标是创建时明确指定的（比如某个群聊），在别的会话里改内容它保持不变；" +
+			"不要为了「把结果发到这里」而改绑，也不要因为正在某个会话里编辑任务就传 bindCurrent。" +
+			"只有对方明确要求把推送改绑到当前会话时才传 bindCurrent=true；且改绑一个已有推送目标的任务，必须让对方在当前消息中包含「确认」。" +
 			"改 prompt 前必须先用 get_scheduled_task 读原文（本工具不返回旧值），禁止凭记忆盲改。",
 		parameters: Type.Object({
 			id: Type.String({ description: "任务 id（来自 list_scheduled_tasks）" }),
 			title: Type.Optional(Type.String({ description: "新的任务标题" })),
 			prompt: Type.Optional(Type.String({ description: "新的到点执行指令" })),
 			cron: Type.Optional(Type.String({ description: "新的 5 字段 cron（本地时间），如 0 9 * * *" })),
-			bindCurrent: Type.Optional(Type.Boolean({ description: "true=把推送目标改绑为当前会话" })),
+			bindCurrent: Type.Optional(Type.Boolean({ description: "true=把推送目标改绑为当前会话。仅当对方明确要求改绑；改绑已有推送目标需当前消息含「确认」" })),
 		}),
 		async execute(_toolCallId, params) {
 			const p = params as { id: string; title?: string; prompt?: string; cron?: string; bindCurrent?: boolean };
@@ -345,7 +346,31 @@ export function createSchedulerTools(
 			if (p.title !== undefined) patch.title = p.title;
 			if (p.prompt !== undefined) patch.prompt = p.prompt;
 			if (p.cron !== undefined) patch.cron = p.cron;
-			if (p.bindCurrent) patch.conversationId = conversationId;
+			// The push target is where results LAND; the editing conversation is where
+			// the request CAME from. Conflating the two silently reroutes a group
+			// task's output into whoever's DM happened to edit it (field 2026-09-22).
+			// Rebinding an EXISTING target is therefore a confirmed operation: a task
+			// without any target (console/legacy) may be bound freely — that is the
+			// rescue path, not a reroute.
+			if (p.bindCurrent) {
+				const existing = scheduler.get(p.id);
+				if (existing?.conversation_id && existing.conversation_id !== conversationId) {
+					const actor = resolveActor?.(conversationId);
+					if (!actor || !isExplicitConfirmation(actor.text)) {
+						const targetLabel = existing.conversation_id.startsWith("dt:group:") ? "某个群聊" : "一个单聊";
+						return {
+							content: [{
+								type: "text",
+								text:
+									`⛔ 未改绑推送目标：任务「${existing.title}」创建时已明确推送回${targetLabel}，修改内容不影响它。` +
+									`如果对方确实要把推送改绑到当前会话，请让对方在当前消息里包含「确认」后再执行；只是要改任务内容就不要传 bindCurrent。`,
+							}],
+							details: { ok: false, needsConfirmation: true },
+						};
+					}
+				}
+				patch.conversationId = conversationId;
+			}
 			if (Object.keys(patch).length === 0) {
 				return { content: [{ type: "text", text: "没有给出任何要修改的字段（title / prompt / cron / bindCurrent）。" }], details: { ok: false } };
 			}
@@ -362,10 +387,11 @@ export function createSchedulerTools(
 				patch.prompt !== undefined ? "执行指令" : null,
 				patch.cron !== undefined ? `cron（下次执行 ${fmtTime(updated.next_run_at)}）` : null,
 				patch.conversationId !== undefined ? `推送目标→${patch.conversationId?.startsWith("dt:group:") ? "当前群聊" : "当前单聊"}` : null,
+				patch.conversationId === undefined ? "推送目标未变" : null,
 			].filter(Boolean) as string[];
 			return {
 				content: [{ type: "text", text: `✅ 已更新定时任务「${updated.title}」：${changes.join("、")}。执行历史保留，下次执行：${fmtTime(updated.next_run_at)}。` }],
-				details: { ok: true, id: updated.id, nextRunAt: updated.next_run_at },
+				details: { ok: true, id: updated.id, nextRunAt: updated.next_run_at, pushTargetChanged: patch.conversationId !== undefined },
 			};
 		},
 	};
