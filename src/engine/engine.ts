@@ -111,6 +111,12 @@ function extractText(message: AgentMessage): string {
 		.join("");
 }
 
+/** Text of a message regardless of shape (user messages carry string content). */
+function messageTextOf(message: AgentMessage): string {
+	const content = (message as { content?: unknown }).content;
+	return typeof content === "string" ? content : extractText(message);
+}
+
 /**
  * Transient stream failures worth one retry: dropped connections and relay
  * hiccups (e.g. the local ccr relay restarting mid-stream, an upstream
@@ -1300,33 +1306,30 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/**
-	 * A brief, best-effort snapshot of what the agent is currently doing, for the
-	 * long-task progress heartbeat. Derived purely from the live transcript (the
-	 * most recent assistant narration) — no extra LLM call, since the agent is
-	 * mid-turn and can't be prompted concurrently. Read-only snapshot.
+	 * Goal-level fallback for the long-task heartbeat when the side-channel LLM
+	 * pass is unavailable. Field feedback 2026-09-23: quoting the latest
+	 * assistant narration verbatim leaks low-level execution mechanics
+	 * ("重置把分页调回了 10/页") and says nothing about the user's task, so the
+	 * fallback reports the TASK GOAL instead of the raw last step.
 	 */
 	briefProgress(agent: Agent): string {
-		const msgs = agent.state.messages;
-		for (let i = msgs.length - 1; i >= 0; i--) {
-			const m = msgs[i];
-			if (m.role !== "assistant") continue;
-			const text = extractText(m).trim();
-			if (text) {
-				const snippet = text.replace(/\s+/g, " ").slice(0, 100);
-				return `⏳ 任务仍在进行中（已耗时较长）。最近进展：${snippet}`;
-			}
-		}
-		return "⏳ 任务仍在进行中（已耗时较长），请稍候，完成后会立即回复结果。";
+		const first = agent.state.messages.find((m) => m.role === "user");
+		const goal = first ? messageTextOf(first).replace(/\s+/g, " ").trim() : "";
+		const snippet = goal.length > 60 ? goal.slice(0, 60) + "…" : goal;
+		return snippet
+			? `⏳ 任务仍在进行中（已耗时较长）。任务：${snippet}。完成后会立即回复结果，请稍候。`
+			: "⏳ 任务仍在进行中（已耗时较长），请稍候，完成后会立即回复结果。";
 	}
 
 	/**
 	 * Long-task heartbeat, upgraded (field request 2026-09-17): the raw
 	 * latest-narration snippet ("检查表格当前行状态") gives the user no sense of
 	 * WHERE the task is. This runs a side-channel LLM pass over the task
-	 * statement + recent tail (see progressContextSlice) for a concrete ≤100-char
-	 * progress report. Never mutates agent state, never competes with the live
-	 * turn's request beyond one extra call; falls back to the raw snippet when
-	 * the side call fails or the transcript is too small to be worth it.
+	 * statement + recent tail (see progressContextSlice) for a goal-level
+	 * ≤100-char progress report. Never mutates agent state, never competes with
+	 * the live turn's request beyond one extra call; falls back to the
+	 * goal-level note (briefProgress) when the side call fails or the
+	 * transcript is too small to be worth it.
 	 */
 	async progressBrief(agent: Agent, conversationId?: string): Promise<string> {
 		const fallback = () => this.briefProgress(agent);
@@ -1344,7 +1347,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				model,
 				512, // ~0.8×512 tokens of output budget — plenty for 100 Chinese chars
 				undefined,
-				"这是正在执行中的任务的对话记录节选（开头是任务目标，后面是最近的进展）。请用不超过100字的中文，向用户报告任务当前进展：进行到哪一步、刚完成了什么、接下来要做什么。只依据记录中真实发生的事与工具真实返回，绝不编造未发生的进度；判断不了整体位置时，如实说明当前正在做的具体一步。",
+				"这是正在执行中的任务的对话记录节选：开头是任务目标，后面是最近的执行记录。请以整个任务的视角，用不超过100字的中文向用户汇报总体进展：围绕任务目标，已完成到什么程度、当前处于哪个阶段、接下来做什么。把琐碎的执行步骤归纳为面向任务目标的阶段性成果；忽略并禁止提及工具名、参数、重试、分页调整、报错重试等单次操作的技术细节，也不要原样复述日志片段；只依据记录中真实发生的事，绝不编造未发生的进度；判断不了整体位置时，如实说明仍在处理中。",
 				undefined,
 			);
 			if (!result.ok || !result.value?.trim()) return fallback();
