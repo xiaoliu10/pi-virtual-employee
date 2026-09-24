@@ -1515,7 +1515,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 			console.warn("[engine] overflow compaction failed:", err instanceof Error ? err.message : err);
 		}
 		const window = agent.state.model.contextWindow || FALLBACK_CONTEXT_WINDOW;
-		const target = Math.max(4_000, Math.floor((window - this.compactionReserve()) / 2));
+		// Aim at half the USABLE window, not half of window − reserve: the goal
+		// must land BELOW the budget gate's line (usable − reserve), otherwise a
+		// successful drop still fails the re-check and the turn gets chopped anyway
+		// (field 2026-09-23: 94208 target vs a 57344 budget).
+		const target = Math.max(4_000, Math.floor(usableContextWindow(window, agent.state.model.maxTokens) / 2));
 		const dropped = truncateToFit(agent, target);
 		if (dropped === null) {
 			console.warn("[engine] context overflow: nothing left to drop (transcript already minimal)");

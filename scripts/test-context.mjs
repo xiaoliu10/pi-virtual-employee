@@ -113,6 +113,40 @@ test("last-resort truncation frees room and keeps a usable tail on a turn bounda
 	assert.equal(tiny.state.messages.length, 2, "nothing was destroyed");
 });
 
+// Field incident 2026-09-23: a single-turn task (one goal + a long execution
+// trace of run_command OCR attempts) hit the budget gate mid-turn; the
+// summarizer call failed once (relay under load), and the "last resort" then
+// gave up too: the drop target (94k) exceeded the whole transcript (~60k), and
+// the forward scan for a user boundary ran off the end (single turn → none).
+// Recovery reported "nothing left to drop" and the turn was chopped — although
+// a deterministic partial drop was trivially possible. Pinned: truncateToFit
+// must ALWAYS be able to shrink such a transcript.
+test("last-resort drop works for single-turn transcripts and oversized targets", () => {
+	const task = user("任务：识别堡垒机登录页验证码并用 ddddocr 完成登录");
+	const messages = [task];
+	for (let i = 0; i < 30; i += 1) {
+		messages.push(assistant(`第 ${i} 步尝试 OCR。` + "试".repeat(1800)));
+		messages.push({ role: "toolResult", content: [{ type: "text", text: "无输出" + "果".repeat(300) }], timestamp: Date.now() });
+	}
+	const agent = { state: { messages } };
+	const before = estimateTokensSafe(agent.state.messages);
+	assert.ok(before > 40_000, `fixture must be big (got ${before})`);
+
+	// Target far above the transcript size — the old code hit cut=0 → null.
+	const dropped = truncateToFit(agent, before + 40_000);
+	assert.ok(dropped !== null && dropped > 0, "must drop instead of giving up when the target exceeds the transcript");
+	assert.equal(agent.state.messages[0].role, "compactionSummary", "the cut is disclosed, not silent");
+	assert.equal(agent.state.messages[1], task, "the task statement is kept verbatim");
+	assert.equal(agent.state.messages[2].role, "assistant", "tail must not open on an orphaned toolResult");
+	const after = estimateTokensSafe(agent.state.messages);
+	assert.ok(after < before * 0.75, `must actually free room (${before} → ${after})`);
+
+	// Too short to split → honest null rather than an empty transcript.
+	const tiny = { state: { messages: [user("你好"), assistant("你好，有什么可以帮你？")] } };
+	assert.equal(truncateToFit(tiny, 1), null);
+	assert.equal(tiny.state.messages.length, 2, "nothing was destroyed");
+});
+
 // Field incident 2026-09-17: the fallback window was 128k while a litellm-relayed
 // qwen really has 204800 — the budget gate drew its line on the fake figure and
 // never let the conversation breathe. The default is now 200k (relay models can

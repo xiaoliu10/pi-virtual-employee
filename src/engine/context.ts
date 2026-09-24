@@ -19,7 +19,7 @@ import {
 	generateSummary,
 	shouldCompact,
 } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Models, TextContent, Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Models, RetryPolicy, TextContent, Usage } from "@earendil-works/pi-ai";
 import type { MessageRow } from "../db/history-store.js";
 
 /** Bound on persisted messages replayed into a fresh session. Older turns stay
@@ -32,6 +32,14 @@ const REHYDRATE_MAX_MESSAGES = 40;
  * and then never compacting (field incident 2026-09-17). Relay/alias models
  * should now also set the per-model override in the settings UI. */
 export const FALLBACK_CONTEXT_WINDOW = 200_000;
+
+/** Bounded retry for the compaction summarizer. It runs unattended (after-turn
+ * and mid-turn overflow recovery), and without a policy a SINGLE transient
+ * relay error failed the whole recovery chain — field 2026-09-23: automatic
+ * compaction had succeeded repeatedly, then one failed call chopped a
+ * long-running task. 2 retries, 1s/2s backoff; deterministic errors still fail
+ * fast (retryAssistantCall classifies them as non-retryable). */
+const COMPACTION_SUMMARY_RETRY: RetryPolicy = { enabled: true, maxRetries: 2, baseDelayMs: 1_000 };
 
 const ZERO_USAGE: Usage = {
 	input: 0,
@@ -202,35 +210,60 @@ export function isContextOverflowError(text: string): boolean {
 }
 
 /**
- * Last-resort shrink for when compaction cannot help (a single enormous tool
- * result, or a transcript too short to split). Keeps a recent tail starting on a
- * user turn and replaces the dropped head with an explicit note, so the model
- * knows history was cut instead of silently losing it.
+ * Last-resort shrink for when compaction cannot help (the summarizer call
+ * failed, or nothing to split). Keeps a recent tail and replaces the dropped
+ * head with an explicit note, so the model knows history was cut instead of
+ * silently losing it. Returns how many messages were dropped, or null when
+ * nothing could be dropped (already minimal) — the caller then gives up
+ * honestly rather than looping.
  *
- * Returns how many messages were dropped, or null when nothing could be dropped
- * (already minimal) — the caller then gives up honestly rather than looping.
+ * Field incident 2026-09-23: for a SINGLE-TURN transcript (one task statement +
+ * a long execution trace) this used to give up in two ways: the drop target
+ * (94k) exceeded the whole transcript (~60k) so the walk-back hit index 0, and
+ * the forward scan for a user boundary ran off the end (single turn → none).
+ * Recovery then reported "nothing left to drop" and the turn was chopped even
+ * though a deterministic partial drop was trivially possible. Fixed: the goal
+ * is capped at half the transcript, and when no user boundary exists the task
+ * statement is kept verbatim at the seam (mirrors findForcedCompactionCut).
  */
 export function truncateToFit(agent: Agent, targetTokens: number, now = new Date().toISOString()): number | null {
 	const messages = agent.state.messages;
 	if (messages.length <= 2) return null;
+	const before = estimateTokensSafe(messages);
+	// A target larger than the transcript itself can never be reached by the
+	// walk-back — cap it at half of what is here so the cut always lands inside.
+	const goal = Math.min(targetTokens, Math.max(4_000, Math.floor(before / 2)));
 	let cut = messages.length;
 	let kept = 0;
-	while (cut > 0 && kept < targetTokens) {
+	while (cut > 0 && kept < goal) {
 		cut--;
 		kept += estimateMessageTokens(messages[cut]);
 	}
 	// Start the kept tail on a user turn so the provider sees a clean turn order.
+	let taskAnchor = -1;
+	const walkBack = cut;
 	while (cut < messages.length && messages[cut].role !== "user") cut++;
+	if (cut >= messages.length) {
+		// No user boundary in the kept window — single-turn transcript. Keep the
+		// task statement verbatim and drop from right after it instead of giving up.
+		taskAnchor = messages.findIndex((m) => m.role === "user");
+		if (taskAnchor < 0 || taskAnchor >= walkBack) return null;
+		cut = walkBack;
+		// The kept tail must not open on an orphaned toolResult (its toolCall would
+		// be dropped — providers reject that sequence).
+		while (cut < messages.length && messages[cut].role === "toolResult") cut++;
+	}
 	if (cut === 0 || cut >= messages.length) return null;
-	const dropped = cut;
-	const before = estimateTokensSafe(messages);
+	const dropped = taskAnchor >= 0 ? cut - 1 : cut;
+	if (dropped <= 0) return null;
+	const keptMessages = taskAnchor >= 0 ? [messages[taskAnchor], ...messages.slice(cut)] : messages.slice(cut);
 	agent.state.messages = [
 		createCompactionSummaryMessage(
 			`（上下文超出模型上限，本次请求已丢弃更早的 ${dropped} 条消息以继续；完整历史仍可在会话记录中查看。）`,
 			before,
 			now,
 		),
-		...messages.slice(cut),
+		...keptMessages,
 	];
 	console.log(`[engine] context overflow: dropped ${dropped} older messages (~${before} tokens before)`);
 	return dropped;
@@ -431,6 +464,8 @@ export async function maybeCompact(agent: Agent, models: Models, force = false):
 		undefined,
 		undefined,
 		previousSummary,
+		undefined,
+		COMPACTION_SUMMARY_RETRY,
 	);
 	if (!result.ok) {
 		console.warn("[engine] compaction summary failed:", result.error);
