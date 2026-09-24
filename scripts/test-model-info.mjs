@@ -40,9 +40,22 @@ test("parses the litellm /model/info shape (nested model_info, max_output_tokens
 	assert.equal(info?.maxInputTokens, 172032);
 });
 
-test("older shape without max_output_tokens falls back to max_tokens", () => {
-	const json = { data: [{ model_name: "qwen", model_info: { max_tokens: 8192 } }] };
-	assert.equal(parseModelInfoResponse(json, "qwen")?.maxOutputTokens, 8192);
+test("max_tokens alone is the CONTEXT ceiling, never the output cap (field 2026-09-23)", () => {
+	// litellm custom entries report max_tokens = context (131072) with no
+	// max_output_tokens. Reading that as output re-created the fictional
+	// reservation and collapsed the budget to ~57K → constant
+	// "compaction couldn't free enough space" while the gateway served 150K-input requests.
+	const json = { data: [{ model_name: "qwen", model_info: { max_tokens: 131072 } }] };
+	const info = parseModelInfoResponse(json, "qwen");
+	assert.equal(info?.maxOutputTokens, undefined, "context must not masquerade as the output cap");
+	assert.equal(info?.contextLength, 131072);
+});
+
+test("nested max_output_tokens wins over max_tokens for the output cap", () => {
+	const json = { data: [{ model_name: "qwen", model_info: { max_tokens: 204800, max_output_tokens: 32768 } }] };
+	const info = parseModelInfoResponse(json, "qwen");
+	assert.equal(info?.maxOutputTokens, 32768);
+	assert.equal(info?.contextLength, 204800);
 });
 
 test("fields at the top level (non-nested variant) are honored", () => {

@@ -6,10 +6,11 @@
  * oversized output reservation alone blew the context window).
  *
  * Target API: LiteLLM-style `GET {baseUrl}/model/info` (also tried at
- * `/v1/model/info`), which reports per-model `max_output_tokens` /
- * `max_tokens` / `max_input_tokens`. Any failure (no gateway, wrong shape,
- * auth required, timeout) degrades to null and the engine falls back to its
- * static default — this lookup is an enhancement, never a hard dependency.
+ * `/v1/model/info`). Only `max_output_tokens` is treated as an output cap —
+ * `max_tokens`/`context_length` describe the CONTEXT ceiling and land in
+ * `contextLength`. Any failure (no gateway, wrong shape, auth required,
+ * timeout) degrades to null and the engine falls back to its static default —
+ * this lookup is an enhancement, never a hard dependency.
  */
 export interface RemoteModelInfo {
 	/** Single-reply output cap in tokens. */
@@ -50,11 +51,20 @@ export function parseModelInfoResponse(json: unknown, modelId: string): RemoteMo
 	// Fields may sit at the top level (older litellm) or nested in model_info.
 	const info = { ...(entry as Record<string, unknown>), ...(entry.model_info ?? {}) } as LiteLLMEntry;
 	const num = (v: unknown): number | undefined => (typeof v === "number" && v > 0 ? Math.floor(v) : undefined);
-	const maxOutputTokens = num(info.max_output_tokens) ?? num(info.max_tokens);
+	// ONLY max_output_tokens is an output cap. In litellm's model_info,
+	// `max_tokens` is the model's CONTEXT ceiling (their own docs list
+	// gpt-3.5-turbo as max_tokens: 4097 — that was its window). Field
+	// 2026-09-23: a custom qwen entry reported max_tokens: 131072 (context)
+	// with no max_output_tokens; reading that as the output cap re-created
+	// the fictional 131072 reservation (0.2.93) — usable budget collapsed to
+	// ~57K and every long task died with "compaction couldn't free enough
+	// space" while the gateway happily served 150K-token requests.
+	const maxOutputTokens = num(info.max_output_tokens);
+	const contextLength = num(info.context_length) ?? num(info.max_tokens);
 	const result: RemoteModelInfo = {
 		maxOutputTokens,
 		maxInputTokens: num(info.max_input_tokens),
-		contextLength: num(info.context_length),
+		contextLength,
 	};
 	return result.maxOutputTokens || result.maxInputTokens || result.contextLength ? result : null;
 }

@@ -470,8 +470,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 	private withRemoteInfo(base: Model<Api>, info: RemoteModelInfo | null): Model<Api> {
 		const cap = info?.maxOutputTokens;
 		if (!cap || cap <= 0) return base;
-		// An output cap at or above the window is a gateway misreport; keep it
-		// usable rather than trusting it blindly.
+		// An output cap consuming more than half the window is a gateway
+		// misreport (context leaked into the output field — field 2026-09-23,
+		// 131072 "output" on a 204800 window): ignoring it keeps the static
+		// fallback instead of a budget-collapsing reservation.
+		if (cap > base.contextWindow / 2) return base;
 		const maxTokens = Math.max(Math.min(cap, base.contextWindow), 1024);
 		if (base.maxTokens === maxTokens) return base;
 		return { ...base, maxTokens };
