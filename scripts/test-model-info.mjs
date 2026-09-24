@@ -18,14 +18,14 @@ const workDir = await mkdtemp(join(root, "node_modules/.modelinfo-test-"));
 process.on("exit", () => { void rm(workDir, { recursive: true, force: true }); });
 const bundle = join(workDir, "model-info.mjs");
 await build({
-	stdin: { contents: 'export { parseModelInfoResponse } from "./src/engine/model-info.ts";', resolveDir: root, loader: "ts" },
+	stdin: { contents: 'export { parseModelInfoResponse, resolveEffectiveLimits } from "./src/engine/model-info.ts";', resolveDir: root, loader: "ts" },
 	outfile: bundle,
 	bundle: true,
 	platform: "node",
 	format: "esm",
 	packages: "external",
 });
-const { parseModelInfoResponse } = await import(pathToFileURL(bundle).href);
+const { parseModelInfoResponse, resolveEffectiveLimits } = await import(pathToFileURL(bundle).href);
 
 test("parses the litellm /model/info shape (nested model_info, max_output_tokens)", () => {
 	const json = {
@@ -84,4 +84,30 @@ test("a gateway that only reports max_input_tokens still yields usable info", ()
 	assert.equal(info?.maxInputTokens, 172800, "the one real signal must survive parsing");
 	assert.equal(info?.maxOutputTokens, undefined);
 	assert.equal(info?.contextLength, undefined);
+});
+
+test("resolveEffectiveLimits: user arithmetic 204800 − 172800 = 32000 output", () => {
+	// User ruling 2026-09-24: with the total window pinned and the gateway
+	// reporting only the input ceiling, output is DERIVED, not guessed.
+	const base = { contextWindow: 131072, maxTokens: 32768 }; // inherited registry junk
+	const r = resolveEffectiveLimits(base, { maxInputTokens: 172800 }, { hasCtxOverride: true, ctxOverride: 204800 });
+	assert.equal(r.contextWindow, 204800, "the pinned window wins");
+	assert.equal(r.maxTokens, 32000, "output = pinned window − gateway input ceiling");
+});
+
+test("resolveEffectiveLimits: no window pin → window adopts input ceiling + output fallback", () => {
+	const r = resolveEffectiveLimits({ contextWindow: 131072, maxTokens: 32768 }, { maxInputTokens: 172800 }, { hasCtxOverride: false });
+	assert.equal(r.contextWindow, 205568, "172800 input + 32768 output fallback");
+	assert.equal(r.maxTokens, 32768);
+});
+
+test("resolveEffectiveLimits: gateway-reported output cap wins over derivation", () => {
+	const r = resolveEffectiveLimits({ contextWindow: 204800, maxTokens: 32768 }, { maxInputTokens: 172800, maxOutputTokens: 16384 }, { hasCtxOverride: true, ctxOverride: 204800 });
+	assert.equal(r.maxTokens, 16384);
+});
+
+test("resolveEffectiveLimits: no gateway info → base unchanged", () => {
+	const base = { contextWindow: 131072, maxTokens: 32768 };
+	const r = resolveEffectiveLimits(base, null, { hasCtxOverride: false });
+	assert.deepEqual(r, base);
 });

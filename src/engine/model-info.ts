@@ -91,3 +91,52 @@ export async function fetchModelInfo(
 	}
 	return null;
 }
+
+/**
+ * Fold a gateway answer into fallback-resolved limits.
+ *
+ * Resolution order per field (user rulings 2026-09-23/24):
+ *   output cap:  config override > gateway max_output_tokens >
+ *                (window override − gateway input ceiling) > fallback
+ *   window:      config override > (gateway input ceiling + output) > fallback
+ *
+ * `hasCtxOverride/ctxOverride` reflect the config's contextWindow override.
+ * The last-resort fallback for output is whatever the registry supplied.
+ */
+export function resolveEffectiveLimits(
+	base: { contextWindow: number; maxTokens?: number },
+	info: RemoteModelInfo | null,
+	opts: { hasCtxOverride: boolean; ctxOverride?: number } = { hasCtxOverride: false },
+): { contextWindow: number; maxTokens?: number } {
+	let contextWindow = base.contextWindow;
+	let maxTokens = base.maxTokens;
+	const inputCeiling = info?.maxInputTokens && info.maxInputTokens > 0 ? Math.floor(info.maxInputTokens) : undefined;
+
+	// Window: the gateway's input ceiling is ground truth about the real
+	// deployment (verified 2026-09-24: qwen reports max_input_tokens=172800,
+	// every other field null). A pinned override wins; otherwise adopt the
+	// input ceiling + output fallback.
+	if (opts.hasCtxOverride && opts.ctxOverride && opts.ctxOverride > 0) {
+		contextWindow = Math.floor(opts.ctxOverride);
+	} else if (inputCeiling) {
+		contextWindow = inputCeiling + (maxTokens ?? 0);
+	}
+
+	// Output cap: ① gateway-reported.
+	const cap = info?.maxOutputTokens && info.maxOutputTokens > 0 ? Math.floor(info.maxOutputTokens) : undefined;
+	if (cap) {
+		// A cap consuming more than half the window is a gateway misreport
+		// (context leaked into the output field) — ignore it.
+		if (cap <= base.contextWindow / 2) maxTokens = Math.max(Math.min(cap, contextWindow), 1024);
+		return { contextWindow, maxTokens };
+	}
+	// ② derived: user-pinned window − gateway input ceiling
+	// (204800 − 172800 = 32000 — user arithmetic 2026-09-24).
+	if (opts.hasCtxOverride && opts.ctxOverride && inputCeiling && opts.ctxOverride > inputCeiling) {
+		const derived = Math.floor(opts.ctxOverride) - inputCeiling;
+		if (derived >= 1024) maxTokens = Math.min(derived, Math.floor(opts.ctxOverride / 2));
+		return { contextWindow, maxTokens };
+	}
+	// ③ fallback: registry value (relays were already clamped by the caller).
+	return { contextWindow, maxTokens };
+}
