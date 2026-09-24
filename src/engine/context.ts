@@ -380,6 +380,32 @@ export function findForcedCompactionCut(messages: AgentMessage[], keepRecentToke
 }
 
 /**
+ * The instruction finalSummary appends as a synthetic USER message (engine.ts).
+ * It is scaffolding, not a user task — but it persists in the transcript, and a
+ * later compaction can anchor on it as a "user boundary" and summarize away the
+ * REAL task message. Anything extracting "the user's task" from a transcript
+ * (heartbeat goal, progress slice) must skip it, or the internal prompt leaks
+ * verbatim to the user (field 2026-09-24: the heartbeat quoted "现在请不要调用
+ * 任何工具…" as the task name after a budget-gate summary plus compaction).
+ */
+export const FINAL_SUMMARY_PROMPT =
+	"现在请不要调用任何工具，直接用一段简明的中文总结：你刚才为完成用户请求做了哪些尝试？最终是成功还是失败？如果没成功，具体卡在哪一步、需要用户怎么配合或提供什么？只输出这段总结。只依据本次对话中真实发生的事与工具真实返回的数据，不要补充任何你没实际取到的数字、结论或「大概是这样」的推测；没取到就直说没取到。";
+
+const SYNTHETIC_USER_PREFIX = "现在请不要调用任何工具，直接用一段简明的中文总结：";
+
+/** True for the finalSummary scaffolding message — never a real user task. */
+export function isSyntheticUserMessage(message: AgentMessage): boolean {
+	if (message.role !== "user") return false;
+	const content = (message as { content?: unknown }).content;
+	return typeof content === "string" && content.replace(/\s+/g, " ").trim().startsWith(SYNTHETIC_USER_PREFIX);
+}
+
+/** First real (non-synthetic) user message — the task anchor for progress reports. */
+export function taskAnchorOf(messages: AgentMessage[]): AgentMessage | undefined {
+	return messages.find((m) => m.role === "user" && !isSyntheticUserMessage(m));
+}
+
+/**
  * Context for the heartbeat progress summary (field request 2026-09-17: the
  * raw latest-narration snippet read like "检查表格当前行状态" — no sense of
  * where the task actually is). The side-channel LLM call gets the TASK
@@ -396,7 +422,7 @@ export function progressContextSlice(messages: AgentMessage[], keepRecentTokens 
 		kept += estimateMessageTokens(messages[cut]);
 	}
 	const tail = messages.slice(cut);
-	const first = messages.find((m) => m.role === "user");
+	const first = taskAnchorOf(messages);
 	if (first && !tail.includes(first)) return [first, ...tail];
 	return tail;
 }

@@ -24,11 +24,11 @@ process.on("exit", () => { void rm(workDir, { recursive: true, force: true }); }
 const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
-		contents: `
-			export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow } from "./src/engine/context.ts";
-			export { shouldCompact, DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-agent-core";
-			export { estimateTokens } from "@earendil-works/pi-agent-core";
-		`,
+			contents: `
+				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf } from "./src/engine/context.ts";
+				export { shouldCompact, DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-agent-core";
+				export { estimateTokens } from "@earendil-works/pi-agent-core";
+			`,
 		resolveDir: root,
 		loader: "ts",
 	},
@@ -38,7 +38,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -356,4 +356,37 @@ test("forced cut fires when normal cut captures only a prior compactionSummary",
 	const oldAfterSummary = old.slice(1);
 	assert.ok(oldAfterSummary.length > 0, "must have new content to summarize (not empty_head)");
 	assert.ok(estimateTokensSafe(oldAfterSummary) > 10_000, "the summarizable content must be substantial");
+});
+
+// Field incident 2026-09-24 (user report: "这个prompt 怎么直接发出来了"): the
+// long-task heartbeat leaked the INTERNAL finalSummary instruction to the user
+// ("⏳ 任务仍在进行中（已耗时较长）。任务：现在请不要调用任何工具，直接用一段
+// 简明的中文总结：…"). Chain: budget gate ends the turn → finalSummary appends
+// its instruction as a synthetic USER message in the persistent transcript → a
+// later compaction anchors on it as a user boundary and summarizes away the
+// REAL task message → the heartbeat's goal-pick (first user message) finds the
+// instruction and quotes its first 60 chars as the task name. Pinned: synthetic
+// instructions are never picked as the task goal.
+test("synthetic final-summary instruction is never picked as the task goal", () => {
+	const realTask = user("任务：整理本周告警并出周报");
+	const synthetic = user(FINAL_SUMMARY_PROMPT);
+	assert.ok(isSyntheticUserMessage(synthetic), "the finalSummary prompt must be detected");
+	assert.ok(!isSyntheticUserMessage(realTask), "a real task must NOT be flagged");
+	assert.ok(!isSyntheticUserMessage(assistant("现在请不要调用任何工具，直接用一段简明的中文总结：回应")), "only user-role messages are flagged");
+
+	// Anchor picks the real task even when the instruction came first.
+	assert.equal(taskAnchorOf([synthetic, realTask]), realTask);
+
+	// The leak case: real task compacted away, only the instruction remains →
+	// NO anchor (falls back to the goal-less heartbeat line), never the instruction.
+	assert.equal(taskAnchorOf([synthetic, assistant("总结：已完成。")]), undefined, "the instruction itself must never be the task goal (this was the leak)");
+
+	// Progress slice must not PREPEND the instruction into the goal slot when the
+	// keep-window doesn't cover it (transcript larger than the slice budget).
+	const big = [];
+	for (let i = 0; i < 10; i += 1) big.push(assistant("执行中。" + "行".repeat(1500)));
+	const sliceOnly = progressContextSlice([synthetic, ...big], 2_000);
+	assert.ok(!sliceOnly.includes(synthetic), "with the real task compacted away, the instruction is never put in the goal slot");
+	const sliceReal = progressContextSlice([realTask, synthetic, ...big], 2_000);
+	assert.equal(sliceReal[0], realTask, "the real task is the goal");
 });

@@ -38,7 +38,7 @@ import { isLocalConversation, resolveRole } from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
-import { estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, truncateToFit, usableContextWindow } from "./context.js";
+import { estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, taskAnchorOf, truncateToFit, usableContextWindow } from "./context.js";
 import { fetchModelInfo, resolveEffectiveLimits, type RemoteModelInfo } from "./model-info.js";
 
 /** Default single-reply output cap for relay (custom baseUrl) models without an explicit per-model override. */
@@ -1350,7 +1350,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// Enforce the instruction structurally: the final-summary turn must not be
 			// able to start another tool loop after the safety cap has already fired.
 			agent.state.tools = [];
-			await agent.prompt("现在请不要调用任何工具，直接用一段简明的中文总结：你刚才为完成用户请求做了哪些尝试？最终是成功还是失败？如果没成功，具体卡在哪一步、需要用户怎么配合或提供什么？只输出这段总结。只依据本次对话中真实发生的事与工具真实返回的数据，不要补充任何你没实际取到的数字、结论或「大概是这样」的推测；没取到就直说没取到。");
+			await agent.prompt(FINAL_SUMMARY_PROMPT);
 		} catch (err) {
 			console.warn("[engine] final summary prompt failed:", err instanceof Error ? err.message : err);
 		} finally {
@@ -1382,7 +1382,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * fallback reports the TASK GOAL instead of the raw last step.
 	 */
 	briefProgress(agent: Agent): string {
-		const first = agent.state.messages.find((m) => m.role === "user");
+		// taskAnchorOf skips the finalSummary scaffolding message — a synthetic
+		// user-role instruction that must never be quoted as the task goal
+		// (field 2026-09-24: it leaked verbatim into this heartbeat line).
+		const first = taskAnchorOf(agent.state.messages);
 		const goal = first ? messageTextOf(first).replace(/\s+/g, " ").trim() : "";
 		const snippet = goal.length > 60 ? goal.slice(0, 60) + "…" : goal;
 		return snippet
