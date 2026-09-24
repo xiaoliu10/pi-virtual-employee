@@ -75,3 +75,13 @@ test("garbage shapes are null: no data array, wrong types, zero/negative values"
 	assert.equal(parseModelInfoResponse({ data: [{ model_name: "qwen" }] }, "qwen"), null, "entry with no numeric info");
 	assert.equal(parseModelInfoResponse({ data: [{ model_name: "qwen", model_info: { max_output_tokens: -5 } }] }, "qwen"), null);
 });
+
+test("a gateway that only reports max_input_tokens still yields usable info", () => {
+	// Real litellm gateway (verified 2026-09-24): qwen reports ONLY
+	// max_input_tokens=172800 — max_tokens/max_output_tokens/context_length all null.
+	const json = { data: [{ model_name: "qwen", model_info: { max_input_tokens: 172800 } }] };
+	const info = parseModelInfoResponse(json, "qwen");
+	assert.equal(info?.maxInputTokens, 172800, "the one real signal must survive parsing");
+	assert.equal(info?.maxOutputTokens, undefined);
+	assert.equal(info?.contextLength, undefined);
+});

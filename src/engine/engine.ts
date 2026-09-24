@@ -455,7 +455,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 		if (typeof override === "number" && override > 0) return base;
 		const key = `${supplier.id}:${modelId}`;
 		if (this.modelInfoCache.has(key)) {
-			return this.withRemoteInfo(base, this.modelInfoCache.get(key) ?? null);
+			const hasCtxOverride = typeof supplier.modelContextWindow?.[modelId] === "number" && supplier.modelContextWindow![modelId]! > 0;
+			return this.withRemoteInfo(base, this.modelInfoCache.get(key) ?? null, hasCtxOverride);
 		}
 		if (supplier.baseUrl.trim()) {
 			void this.prefetchModelInfo(supplier, modelId, key);
@@ -467,17 +468,31 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/** Apply a gateway answer on top of the fallback-resolved model. */
-	private withRemoteInfo(base: Model<Api>, info: RemoteModelInfo | null): Model<Api> {
+	private withRemoteInfo(base: Model<Api>, info: RemoteModelInfo | null, hasCtxOverride = false): Model<Api> {
+		// The gateway's INPUT ceiling is ground truth about the real deployment
+		// (verified 2026-09-24 on the litellm gateway: qwen reports
+		// max_input_tokens=172800 with every other field null — while the
+		// inherited registry window can be anything). When the user hasn't
+		// pinned a window, adopt input-ceiling + output-reservation as the
+		// working window so compaction measures against reality.
+		let contextWindow = base.contextWindow;
+		const maxTokens = base.maxTokens;
+		if (!hasCtxOverride && info?.maxInputTokens && info.maxInputTokens > 0) {
+			contextWindow = info.maxInputTokens + (maxTokens ?? 0);
+		}
 		const cap = info?.maxOutputTokens;
-		if (!cap || cap <= 0) return base;
+		if (!cap || cap <= 0) {
+			if (contextWindow === base.contextWindow) return base;
+			return { ...base, contextWindow };
+		}
 		// An output cap consuming more than half the window is a gateway
 		// misreport (context leaked into the output field — field 2026-09-23,
 		// 131072 "output" on a 204800 window): ignoring it keeps the static
 		// fallback instead of a budget-collapsing reservation.
 		if (cap > base.contextWindow / 2) return base;
-		const maxTokens = Math.max(Math.min(cap, base.contextWindow), 1024);
-		if (base.maxTokens === maxTokens) return base;
-		return { ...base, maxTokens };
+		const resolved = Math.max(Math.min(cap, base.contextWindow), 1024);
+		if (base.maxTokens === resolved && contextWindow === base.contextWindow) return base;
+		return { ...base, contextWindow, maxTokens: resolved };
 	}
 
 	/** Fetch the gateway's model info once; cache the answer (or the miss). */
