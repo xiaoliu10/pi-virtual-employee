@@ -305,6 +305,33 @@ export function createBrowserTools(
 		},
 	};
 
+	const hover: AgentTool = {
+		name: "browser_hover",
+		label: "浏览器：悬停",
+		description:
+			"纯鼠标移动（不按下任何键），用于触发悬停效果：工具提示、悬浮菜单、hover 高亮。Canvas 远程会话同样适用——远程客户端会把 mousemove 翻译成远程指针移动，堡垒机 webclient 里「只有悬停才弹出的菜单」（如云区切换器）就是本工具的用例。" +
+			"用法与 browser_click_at 相同：先 browser_screenshot 看清画面，把目标的像素坐标传进来。默认在目标处停留 300ms 等菜单渲染；弹出后用 browser_screenshot 确认，再 browser_click_at 点击菜单项。" +
+			"若一次没触发，可加大 dwellMs（如 800）后重试；仍无菜单说明该控件响应别的手势，截图回报，不要反复盲试。",
+		parameters: Type.Object({
+			x: Type.Number({ description: "像素 X 坐标（以 browser_screenshot 画面为准）" }),
+			y: Type.Number({ description: "像素 Y 坐标" }),
+			dwellMs: Type.Optional(Type.Number({ description: "移到目标后的停留时间（毫秒，默认 300，菜单弹出慢可加大）" })),
+		}),
+		async execute(_id, params) {
+			try {
+				const p = params as { x: number; y: number; dwellMs?: number };
+				const r = await browser.mouseHover(resolveOwnerId(), { x: p.x, y: p.y }, { dwellMs: p.dwellMs });
+				const focus = r.focus ? `${r.focus.tag}${r.focus.id ? `#${r.focus.id}` : ""}${r.focus.cls ? `.${r.focus.cls.split(/\s+/)[0]}` : ""}` : "未知";
+				return textResult(
+					`已悬停在 (${r.x}, ${r.y}) 停留 ${r.dwellMs}ms。当前焦点：${focus}。立即 browser_screenshot 查看是否弹出了菜单/提示；弹出后用 browser_click_at 点击菜单项。`,
+					{ x: r.x, y: r.y, dwellMs: r.dwellMs, focus: r.focus },
+				);
+			} catch (err) {
+				return errorResult(err);
+			}
+		},
+	};
+
 	const scroll: AgentTool = {
 		name: "browser_scroll",
 		label: "浏览器：滚动",
@@ -414,5 +441,5 @@ export function createBrowserTools(
 		},
 	};
 
-	return [navigate, read, screenshot, click, clickAt, scroll, drag, type, typeText, pasteText, pressKey, evaluate, tabs];
+	return [navigate, read, screenshot, click, clickAt, hover, scroll, drag, type, typeText, pasteText, pressKey, evaluate, tabs];
 }

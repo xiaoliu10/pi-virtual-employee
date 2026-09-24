@@ -377,6 +377,38 @@ export class BrowserService {
 	}
 
 	/**
+	 * Pure mouse move with NO button press — the hover primitive. Canvas remote
+	 * sessions translate mousemove into remote pointer motion, so hovering a
+	 * toolbar icon in the remote app (tooltip, flyout menu) is reachable exactly
+	 * where click/drag are not the right gesture (field 2026-09-23: the webclient
+	 * shows its cloud-zone menu only on hover). Steps animate the trajectory so
+	 * clients that interpolate movement see a real path, not a teleport.
+	 */
+	async mouseHover(
+		ownerId: string,
+		point: { x: number; y: number },
+		opts: { steps?: number; dwellMs?: number } = {},
+	): Promise<{ ok: boolean; x: number; y: number; dwellMs: number; focus: FocusInfo | null }> {
+		const page = await this.getPage(ownerId);
+		const { x, y } = point;
+		if (x < 0 || y < 0 || x > VIEWPORT.width || y > VIEWPORT.height) {
+			throw new Error(`坐标 (${x}, ${y}) 超出视口 ${VIEWPORT.width}x${VIEWPORT.height}——请以 browser_screenshot 的画面为准（1:1 对应）`);
+		}
+		const steps = Math.min(Math.max(Math.round(opts.steps ?? 8), 1), 40);
+		const dwellMs = Math.min(Math.max(Math.round(opts.dwellMs ?? 300), 0), 5000);
+		// Start the path away from the target so ENTERING it is a real transition
+		// (a single move onto the point may not register as an enter).
+		await page.mouse.move(Math.max(0, x - 60), Math.max(0, y - 40));
+		for (let i = 1; i <= steps; i += 1) {
+			await page.mouse.move(x - 60 + (60 * i) / steps, y - 40 + (40 * i) / steps);
+			await page.waitForTimeout(12);
+		}
+		await page.mouse.move(x, y);
+		if (dwellMs > 0) await page.waitForTimeout(dwellMs);
+		return { ok: true, x, y, dwellMs, focus: await this.focusInfo(await this.getPage(ownerId)) };
+	}
+
+	/**
 	 * Raw wheel scroll at an optional point. Needed inside canvas remote sessions
 	 * (long SQL result grids, terminal scrollback, log panes) where the remote
 	 * app owns the scrollbar and DOM scrolling does nothing. `times` repeats the
