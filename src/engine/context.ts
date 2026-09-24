@@ -429,15 +429,23 @@ export async function maybeCompact(agent: Agent, models: Models, force = false):
 	// Forced passes (explicit /compact, overflow recovery) relax the rule for
 	// single-turn transcripts: the user ORDERED a compaction, so make a genuine
 	// best effort — keep the task statement, summarize the middle (2026-09-18).
+	// Also force when the normal cut only captures a previous compactionSummary
+	// (cut=1 → empty_head): the transcript grew back after a prior compaction and
+	// the new content between summary and tail is exactly what needs summarizing
+	// (field 2026-09-24: 158k context, cut=1, recovery reported "could not free
+	// room" even though 140k of new tool results were summarizable).
 	let keepIndex = -1;
-	if (force && (cut === 0 || cut === messages.length)) {
+	if (force && (cut === 0 || cut === messages.length || (cut <= 1 && messages[0]?.role === "compactionSummary"))) {
 		const forced = findForcedCompactionCut(messages, settings.keepRecentTokens);
 		if (forced) {
 			cut = forced.cut;
 			keepIndex = forced.keepIndex;
 		}
 	}
-	if (cut === 0 || cut === messages.length) return { compacted: false, skipReason: "nothing_to_cut" };
+	if (cut === 0 || cut === messages.length) {
+		if (force) console.log(`[engine] forced compaction skipped: nothing to cut (~${estimateTokensSafe(messages)} tokens, ${messages.length} messages)`);
+		return { compacted: false, skipReason: "nothing_to_cut" };
+	}
 
 	let old = messages.slice(0, cut);
 	let recent = messages.slice(cut);
@@ -453,7 +461,10 @@ export async function maybeCompact(agent: Agent, models: Models, force = false):
 		previousSummary = head.summary;
 		old = old.slice(1);
 	}
-	if (old.length === 0) return { compacted: false, skipReason: "empty_head" };
+	if (old.length === 0) {
+		if (force) console.log(`[engine] forced compaction skipped: nothing new to summarize after previous summary (~${estimateTokensSafe(messages)} tokens)`);
+		return { compacted: false, skipReason: "empty_head" };
+	}
 
 	const tokensBefore = estimateTokensSafe(messages);
 	const result = await generateSummary(

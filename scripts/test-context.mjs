@@ -316,3 +316,44 @@ test("the output reservation makes the compaction gate fire where the raw window
 	assert.equal(shouldCompact(tokens, usableContextWindow(204800, 131072), DEFAULT_COMPACTION_SETTINGS), true, "100k input vs 73728 usable → compact BEFORE the provider rejects");
 	assert.equal(shouldCompact(tokens, 204800, DEFAULT_COMPACTION_SETTINGS), false, "against the raw window the same transcript looked fine — that is the bug");
 });
+
+// Field incident 2026-09-24 (Nova, 06:04): after a successful in-turn compaction
+// brought the context to ~18k, the task generated ~140k of new tool results in 46
+// seconds. The second recovery called findCompactionCut, which walked back 20k
+// from the end and then fell back to cut=1 — capturing ONLY the previous
+// compactionSummary, producing empty_head. The forced-cut fallback was NOT
+// triggered because its condition only checked cut===0 || cut===messages.length,
+// missing cut=1 with a summary head. Recovery then fell to truncateToFit, which
+// could only drop the tiny summary note, and the turn was killed.
+// Pinned: the forced cut must fire when the normal cut captures only a prior summary.
+test("forced cut fires when normal cut captures only a prior compactionSummary", () => {
+	const summary = { role: "compactionSummary", summary: "之前的对话摘要：已完成数据收集。", tokensBefore: 50000, timestamp: Date.now() };
+	const task = user("任务：生成 SLS 日志分析报告");
+	const messages = [summary, task];
+	// 46 seconds of massive tool results (~140k tokens).
+	for (let i = 0; i < 40; i += 1) {
+		messages.push(assistant(`分析第 ${i} 批日志。` + "析".repeat(1500)));
+		messages.push({ role: "toolResult", content: [{ type: "text", text: "日志条目" + "录".repeat(1200) }], timestamp: Date.now() });
+	}
+
+	// Normal cut should land at or before index 1 (only captures the summary).
+	const normalCut = findCompactionCut(messages, 20_000);
+	assert.ok(normalCut <= 1, `normal cut should land on or before the summary head (got ${normalCut})`);
+
+	// The trigger condition from maybeCompact (the fix).
+	const shouldForce = normalCut === 0 || normalCut === messages.length || (normalCut <= 1 && messages[0]?.role === "compactionSummary");
+	assert.ok(shouldForce, "forced cut MUST fire when the normal cut only captures a prior compactionSummary");
+
+	// The forced cut must find a valid cut point for the regrown content.
+	const forced = findForcedCompactionCut(messages, 20_000);
+	assert.ok(forced, "forced cut must find a cut point for regrown post-compaction content");
+	assert.equal(forced.keepIndex, 1, "the task statement is the kept anchor");
+	assert.ok(forced.cut > 2, `the forced cut must go deeper than just the summary (got cut=${forced.cut})`);
+
+	// After extracting previousSummary, the summarizable old is NOT empty.
+	const old = messages.slice(0, forced.cut).filter((_, i) => i !== forced.keepIndex);
+	assert.equal(old[0].role, "compactionSummary", "the previous summary chains in");
+	const oldAfterSummary = old.slice(1);
+	assert.ok(oldAfterSummary.length > 0, "must have new content to summarize (not empty_head)");
+	assert.ok(estimateTokensSafe(oldAfterSummary) > 10_000, "the summarizable content must be substantial");
+});

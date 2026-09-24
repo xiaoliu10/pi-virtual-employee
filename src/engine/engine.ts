@@ -910,7 +910,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 						const recovered = await this.recoverFromContextOverflow(agent);
 						if (recovered && estimateTokensSafe(agent.state.messages) < budget) {
 							console.warn(
-								`[engine] context budget reached mid-task (~${estimateTokensSafe(agent.state.messages)} ≥ ${budget}); compacted in-turn and continuing the task`,
+								`[engine] context budget reached mid-task (~${estimateTokensSafe(agent.state.messages)} < ${budget} after recovery); compacted in-turn and continuing the task`,
 							);
 							return false;
 						}
