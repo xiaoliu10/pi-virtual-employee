@@ -1113,14 +1113,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 			const max = this.config.all().general.maxToolSteps ?? 0;
 			if (contextBudgetHit) {
 				// The budget gate already tried in-turn compaction and could not free
-				// room. Surface that plainly — the user must know WHY the task ended
-				// (context nearly full, auto-compact failed) and what to do next
-				// (manual /compact or /new), not just see a bare summary that looks
-				// like a normal "task done" (field feedback 2026-09-17).
+				// room. Surface that plainly — but honestly: what ended is THIS run,
+				// not the task (field 2026-09-24: the old "本次任务在此结束" was flat
+				// wrong — the scheduled task kept going and completed afterwards).
 				const notice =
-					"⚠️ 上下文已接近模型上限，自动压缩也没能腾出足够空间——本次任务在此结束。\n\n" +
-					"建议：① 发 `/compact` 手动压缩本会话，或 `/new` 开新会话后重发任务；② 把任务拆成更小的步骤，或让我换一种更省上下文的方式取数。\n\n" +
-					"以下为本轮已完成的进展：";
+					"⚠️ 上下文已接近模型上限，自动压缩也没能腾出足够空间——本次执行到此暂停，任务尚未完成。\n\n" +
+					"接下来：定时任务会在下次触发时自动继续（会话压缩后接着做）；也可发 `/compact` 压缩本会话后发「继续」，或 `/new` 开新会话重发任务。\n\n" +
+					"以下是本轮已完成的进展：";
 				reply = capSummary?.trim() ? `${notice}\n\n${capSummary}` : notice;
 			} else {
 				reply =
@@ -1155,9 +1154,14 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 		// Context management: summarize old turns once the transcript approaches
 		// the model's context window (IM chats run indefinitely). Best-effort —
-		// compaction must never break message delivery.
+		// compaction must never break message delivery. When the budget gate just
+		// paused this run the transcript is PROVABLY over threshold — force the
+		// compaction (forced cut + chained summary) so the next trigger of the
+		// task starts under budget and can continue instead of hitting the same
+		// wall (user ruling 2026-09-24: context nearing full → auto-compact →
+		// keep going; stopping the task is never the plan).
 		try {
-			await maybeCompact(agent, this.models).then((r) => r.compacted);
+			await maybeCompact(agent, this.models, contextBudgetHit).then((r) => r.compacted);
 		} catch (err) {
 			console.warn("[engine] compaction failed:", err);
 		}

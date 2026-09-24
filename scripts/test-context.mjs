@@ -390,3 +390,33 @@ test("synthetic final-summary instruction is never picked as the task goal", () 
 	const sliceReal = progressContextSlice([realTask, synthetic, ...big], 2_000);
 	assert.equal(sliceReal[0], realTask, "the real task is the goal");
 });
+
+// Field incident 2026-09-24 (SLS task): killed with "recovery could not free
+// room (~158293 ≥ 156416)" — the SAME 158293 appeared as both the before-drop
+// and after-drop number. truncateToFit kept the tail verbatim, including the
+// assistant's provider-usage record from the PRE-drop request, which floors
+// estimateTokensSafe at the old size — so a drop that DID free room was
+// re-checked as still-over-budget and the turn died (same bug class as
+// maybeCompact's 0.2.85 strip, which the fallback path never got).
+// Pinned: after truncateToFit the estimate must reflect the KEPT content.
+test("truncateToFit drop is honestly re-measured: stale usage floor must not survive", () => {
+	const withUsage = (text, total) => ({
+		role: "assistant",
+		content: [{ type: "text", text }],
+		usage: { totalTokens: total },
+		stopReason: "stop",
+		timestamp: Date.now(),
+	});
+	const messages = [user("任务：检查所有机器组心跳")];
+	for (let i = 0; i < 50; i += 1) messages.push(withUsage(`第 ${i} 步结果。` + "果".repeat(1600), 158_293));
+	const agent = { state: { messages } };
+	const before = estimateTokensSafe(messages);
+	assert.ok(before >= 158_293, "the usage floor pins the pre-drop estimate (fixture setup)");
+
+	const dropped = truncateToFit(agent, 60_000);
+	assert.ok(dropped !== null && dropped > 0, "must drop");
+
+	const after = estimateTokensSafe(agent.state.messages);
+	assert.ok(after < 158_293, `post-drop estimate must reflect kept content, not the pre-drop usage floor (got ${after})`);
+	assert.ok(after < before * 0.5, `the drop must be visible in the measure (${before} → ${after})`);
+});

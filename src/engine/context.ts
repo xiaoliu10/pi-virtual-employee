@@ -263,7 +263,13 @@ export function truncateToFit(agent: Agent, targetTokens: number, now = new Date
 			before,
 			now,
 		),
-		...keptMessages,
+		// A kept assistant's usage record describes the PRE-drop request; left in
+		// place it floors estimateTokensSafe at the old size, so the budget gate's
+		// re-check reads a successful drop as still-over-budget and kills a task
+		// that was actually saved (field 2026-09-24: "dropped … (~158293 before)"
+		// → "could not free room (~158293 …)" — same number both sides). The
+		// summary path already strips (maybeCompact); the fallback must too.
+		...keptMessages.map(stripStaleUsage),
 	];
 	console.log(`[engine] context overflow: dropped ${dropped} older messages (~${before} tokens before)`);
 	return dropped;
