@@ -25,7 +25,8 @@ const bundle = join(workDir, "update.mjs");
 await build({
 	stdin: {
 		contents: `
-			export { describeStatus, normalizeAutoUpdate } from "./src/engine/tools/update.ts";
+			export { describeStatus, normalizeAutoUpdate, createManageUpdateTool } from "./src/engine/tools/update.ts";
+			export { ConfigStore } from "./src/db/config-store.ts";
 		`,
 		resolveDir: root,
 		loader: "ts",
@@ -36,7 +37,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { describeStatus } = await import(pathToFileURL(bundle).href);
+const { describeStatus, normalizeAutoUpdate, createManageUpdateTool, ConfigStore } = await import(pathToFileURL(bundle).href);
 
 const base = (phase, extra = {}) => ({
 	currentVersion: "0.2.66",
@@ -104,4 +105,51 @@ test("ready status text maps the confirmation phrase to install_now", () => {
 
 	const auto = describeStatus(base("ready", { targetVersion: "0.2.88", lastCheckAt: now }), "full");
 	assert.match(auto, /install_now/, "auto-mode ready text must offer install_now for 立刻安装 requests");
+});
+
+// User rulings 2026-09-23 + 2026-09-29 applied to manage_update: a platform-
+// verified admin in ANY chat is authorized without a per-message 「确认」 —
+// action=update schedules an idle restart (non-destructive, mirrors the
+// unattended auto-update flow) so "和 Nova 对话就能让它自己升级重启" works.
+// install_now still demands an explicit 「确认」: it kills in-flight tasks and
+// restarts the app immediately. Non-admins are refused outright.
+test("manage_update gates: group admin runs update directly; install_now keeps its confirmation", async (t) => {
+	const { DatabaseSync } = await import("node:sqlite");
+	const db = new DatabaseSync(":memory:");
+	db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+	const config = new ConfigStore(db);
+	t.after(() => db.close());
+	config.replaceAll({ security: { adminStaffIds: ["boss"] } });
+	const actor = { channel: "dingtalk", chatType: "group", senderId: "boss", text: "升级到最新版" };
+	const updates = {
+		isSupported: () => ({ supported: true }),
+		getStatus: () => base("ready", { targetVersion: "0.2.101" }),
+		checkNow: async () => base("idle"),
+		requestUpdateAndInstall: () => ({ started: true, mode: "checking", status: base("checking") }),
+		installNow: () => ({ started: true, status: base("ready", { targetVersion: "0.2.101" }) }),
+	};
+	const tool = createManageUpdateTool({ config, resolveActor: () => actor, onConfigChanged: () => {}, conversationId: "dt:group:ops", updates });
+
+	// Admin in a GROUP without 「确认」: update schedules an idle restart.
+	const upd = await tool.execute("u1", { action: "update" });
+	assert.equal(upd.details.started, true, "group admin runs update directly — no confirmation needed");
+	assert.match(upd.content[0].text, /已安排更新/);
+
+	// install_now is destructive (kills in-flight tasks): still needs 「确认」.
+	actor.text = "马上装";
+	const refused = await tool.execute("u2", { action: "install_now" });
+	assert.equal(refused.details.refused, true);
+	assert.match(refused.content[0].text, /包含「确认」/);
+
+	// Non-admin in the same group is refused outright, even with the phrase.
+	actor.senderId = "peasant";
+	actor.text = "确认更新到最新版";
+	const denied = await tool.execute("u3", { action: "update" });
+	assert.match(denied.content[0].text, /不是本系统的管理员/);
+
+	// install_now with an explicit confirmation proceeds.
+	actor.senderId = "boss";
+	const now = await tool.execute("u4", { action: "install_now" });
+	assert.equal(now.details.started, true);
+	assert.match(now.content[0].text, /已开始立即安装/);
 });
