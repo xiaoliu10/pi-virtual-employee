@@ -33,13 +33,13 @@ const REHYDRATE_MAX_MESSAGES = 40;
  * should now also set the per-model override in the settings UI. */
 export const FALLBACK_CONTEXT_WINDOW = 200_000;
 
-/** Bounded retry for the compaction summarizer. It runs unattended (after-turn
- * and mid-turn overflow recovery), and without a policy a SINGLE transient
- * relay error failed the whole recovery chain — field 2026-09-23: automatic
- * compaction had succeeded repeatedly, then one failed call chopped a
- * long-running task. 2 retries, 1s/2s backoff; deterministic errors still fail
- * fast (retryAssistantCall classifies them as non-retryable). */
-const COMPACTION_SUMMARY_RETRY: RetryPolicy = { enabled: true, maxRetries: 2, baseDelayMs: 1_000 };
+/** Bounded retry for harness-side summarizer calls (compaction + heartbeat
+ * progress brief). They run unattended, and without a policy a SINGLE transient
+ * relay error failed the whole chain — field 2026-09-23: automatic compaction
+ * had succeeded repeatedly, then one failed call chopped a long-running task.
+ * 2 retries, 1s/2s backoff; deterministic errors still fail fast
+ * (retryAssistantCall classifies them as non-retryable). */
+export const SUMMARIZER_RETRY: RetryPolicy = { enabled: true, maxRetries: 2, baseDelayMs: 1_000 };
 
 const ZERO_USAGE: Usage = {
 	input: 0,
@@ -529,7 +529,7 @@ export async function maybeCompact(
 		undefined,
 		previousSummary,
 		undefined,
-		COMPACTION_SUMMARY_RETRY,
+		SUMMARIZER_RETRY,
 	);
 	if (!result.ok) {
 		console.warn("[engine] compaction summary failed:", result.error);

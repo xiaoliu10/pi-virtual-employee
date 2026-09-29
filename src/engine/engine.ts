@@ -38,7 +38,7 @@ import { isLocalConversation, resolveRole } from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
-import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, truncateToFit, usableContextWindow } from "./context.js";
+import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, SUMMARIZER_RETRY, truncateToFit, usableContextWindow } from "./context.js";
 import { fetchModelInfo, resolveEffectiveLimits, type RemoteModelInfo } from "./model-info.js";
 
 /** Default single-reply output cap for relay (custom baseUrl) models without an explicit per-model override. */
@@ -1405,18 +1405,29 @@ export class EmployeeEngine implements EmployeeRuntime {
 			if (estimateTokensSafe(msgs) < 2_000) return fallback();
 			const context = progressContextSlice(msgs);
 			const model = agent.state.model;
-			// The side pass is real work on the turn's behalf — count it as life so
-			// the stall watchdog sees the servicing, not just the main loop.
-			if (conversationId) this.touchActivity(conversationId);
-			const result = await generateSummary(
-				context,
-				this.models,
-				model,
-				512, // ~0.8×512 tokens of output budget — plenty for 100 Chinese chars
-				undefined,
-				"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过100字的中文向用户汇报总体进展：围绕目标，已完成到什么程度、当前处于哪个阶段、接下来做什么。节选中更早的其他请求都是早已完成的旧任务，与本报告无关，绝对不要提及它们。节选中若出现「## Goal」「## Constraints」开头的结构化文本，那是历史压缩总结的模板，不是进展汇报——绝对不要照抄或复述它，用自己的一句话概括当前目标再汇报。把琐碎的执行步骤归纳为面向目标的阶段性成果；忽略并禁止提及工具名、参数、重试、分页调整、报错重试等单次操作的技术细节，也不要原样复述日志片段；只依据记录中真实发生的事，绝不编造未发生的进度；判断不了整体位置时，如实说明仍在处理中。",
-				undefined,
-			);
+			// The side pass goes directly through models, so without tracking it is
+			// INVISIBLE to the stall watchdog — and, worse, field 2026-09-29: a hung
+			// call left the manager's progressInFlight flag stuck true, so ALL later
+			// heartbeats were silently skipped ("30 minutes with no push"). Count it
+			// as in-flight life and bound it: a heartbeat brief is a tiny 512-token
+			// call — 60s is generous; on abort it falls back to the plain line.
+			const signal = conversationId ? this.beginSideLlmCall(conversationId, 60_000) : undefined;
+			let result;
+			try {
+				result = await generateSummary(
+					context,
+					this.models,
+					model,
+					512, // ~0.8×512 tokens of output budget — plenty for 100 Chinese chars
+					signal,
+					"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过100字的中文向用户汇报总体进展：围绕目标，已完成到什么程度、当前处于哪个阶段、接下来做什么。节选中更早的其他请求都是早已完成的旧任务，与本报告无关，绝对不要提及它们。节选中若出现「## Goal」「## Constraints」开头的结构化文本，那是历史压缩总结的模板，不是进展汇报——绝对不要照抄或复述它，用自己的一句话概括当前目标再汇报。把琐碎的执行步骤归纳为面向目标的阶段性成果；忽略并禁止提及工具名、参数、重试、分页调整、报错重试等单次操作的技术细节，也不要原样复述日志片段；只依据记录中真实发生的事，绝不编造未发生的进度；判断不了整体位置时，如实说明仍在处理中。",
+					undefined, // previousSummary
+					undefined, // thinkingLevel
+					SUMMARIZER_RETRY,
+				);
+			} finally {
+				if (conversationId) this.endSideLlmCall(conversationId);
+			}
 			if (!result.ok || !result.value?.trim()) return fallback();
 			const text = result.value.replace(/\s+/g, " ").trim().slice(0, 140);
 			return `⏳ 任务仍在进行中。${text}`;
@@ -1531,12 +1542,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** Register a direct-to-models side call (compaction) as in-flight life for
 	 * the stall watchdog, bounded by the engine's per-request timeout so a dead
 	 * call self-terminates like any other. Returns the abort signal for the call. */
-	private beginSideLlmCall(conversationId: string): AbortSignal {
+	private beginSideLlmCall(conversationId: string, timeoutOverrideMs?: number): AbortSignal {
 		this.llmInFlight.set(conversationId, (this.llmInFlight.get(conversationId) ?? 0) + 1);
 		this.touchActivity(conversationId);
 		const controller = new AbortController();
-		const timeoutMs = this.opts.timeoutMs > 0 ? this.opts.timeoutMs : 600_000;
-		const timer = setTimeout(() => controller.abort(new Error("compaction request timed out")), timeoutMs);
+		const timeoutMs = timeoutOverrideMs ?? (this.opts.timeoutMs > 0 ? this.opts.timeoutMs : 600_000);
+		const timer = setTimeout(() => controller.abort(new Error("side llm request timed out")), timeoutMs);
 		timer.unref?.();
 		this.sideCallTimers.set(conversationId, timer);
 		return controller.signal;
