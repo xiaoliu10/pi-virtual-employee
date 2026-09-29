@@ -1,11 +1,11 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { ConfigStore } from "../../db/config-store.js";
+import { hasAnyAdmin, isAdmin } from "../../security/permissions.js";
 import {
+	isExplicitConfirmation,
 	maskId,
 	refuse,
-	requireConfirmedAdmin,
-	requireSingleChatActor,
 	type ActorContext,
 } from "./admin.js";
 
@@ -45,6 +45,35 @@ export interface UpdateToolDeps {
 	onConfigChanged: () => void;
 	conversationId: string;
 	updates: UpdateOperations;
+}
+
+/**
+ * Update-management gate (user rulings 2026-09-23 + 2026-09-29, mirroring
+ * run_command): a platform-verified ADMIN in ANY chat — single or group — is
+ * authorized without a per-message confirmation; update/set_auto are
+ * non-destructive (update restarts only when the engine is idle). install_now
+ * passes requireConfirmation: it kills in-flight tasks and restarts the app
+ * immediately, so a stray phrase must not trigger it. Every call is
+ * audit-logged by the caller.
+ */
+function requireUpdateAdmin(
+	deps: Pick<UpdateToolDeps, "config" | "resolveActor" | "conversationId">,
+	opts: { requireConfirmation?: boolean; confirmationHint?: string } = {},
+): ReturnType<typeof refuse> | { actor: NonNullable<ActorContext>; confirmed: boolean } {
+	const actor = deps.resolveActor(deps.conversationId);
+	if (!actor) return refuse("当前会话没有经过验证的发送者身份，无法执行更新管理操作。");
+	if (!actor.senderId) return refuse("无法识别发送者身份（senderId 为空），拒绝执行。");
+	if (!hasAnyAdmin(deps.config)) {
+		return refuse("管理员尚未设置。请先在单聊中使用 manage_admin 的 claim 动作认领首位管理员。");
+	}
+	if (!isAdmin(deps.config, actor.senderId)) {
+		return refuse("你不是本系统的管理员，无权执行更新管理操作。如需权限请联系现有管理员指派。");
+	}
+	const confirmed = isExplicitConfirmation(actor.text);
+	if (opts.requireConfirmation && !confirmed) {
+		return refuse(opts.confirmationHint ?? "该操作会立即重启应用。请在当前消息中包含「确认」。");
+	}
+	return { actor, confirmed };
 }
 
 /** Auto-update modes (tri-state; legacy booleans map true→full, false→off). */
@@ -132,10 +161,9 @@ export function createManageUpdateTool(deps: UpdateToolDeps): AgentTool {
 		name: "manage_update",
 		label: "应用更新管理",
 		description:
-			"管理本应用自身版本（仅限 IM 单聊）。action=status 查看当前版本/更新状态；action=check 立即检查新版本；" +
-			"action=update 下载并安排空闲时重启安装最新版；action=install_now 立即安装已下载的新版本（不等空闲，会结束进行中的任务并重启）；" +
+			"管理本应用自身版本（单聊群聊均可，按平台验证的管理员身份授权，无需逐次「确认」）。action=status 查看当前版本/更新状态；action=check 立即检查新版本；" +
+			"action=update 下载并安排空闲时重启安装最新版（不中断进行中的任务，等全部任务空闲后自动重启）；action=install_now 立即安装已下载的新版本（不等空闲，会结束进行中的任务并重启，属破坏性操作，仍需当前消息明确「确认」）；" +
 			"action=set_auto 开启或关闭无人值守自动更新（传 enabled=true/false）。" +
-			"安全规则：status 仅单聊可查看；check 需管理员单聊；update、install_now 和 set_auto 必须由管理员在当前消息中明确包含「确认」（或同义明确肯定语），群聊一律拒绝。" +
 			"用户说「立刻安装/马上装」而新版本已下载时用 install_now；用户回复「确认更新到最新版」（download_only 模式提示语）也映射为 install_now。" +
 			"update 是异步操作：收到工具结果后先正常回复「已安排更新」，不要声称已经重启完成；install_now 同理，回复后应用随时会重启。",
 		parameters: Type.Object({
@@ -154,7 +182,7 @@ export function createManageUpdateTool(deps: UpdateToolDeps): AgentTool {
 			};
 
 			if (action === "status") {
-				const gate = requireSingleChatActor(deps);
+				const gate = requireUpdateAdmin(deps);
 				if ("content" in gate) return gate;
 				const capability = deps.updates.isSupported();
 				const status = deps.updates.getStatus();
@@ -171,7 +199,7 @@ export function createManageUpdateTool(deps: UpdateToolDeps): AgentTool {
 			}
 
 			if (action === "check") {
-				const gate = requireConfirmedAdmin(deps, { needConfirmation: false });
+				const gate = requireUpdateAdmin(deps);
 				if ("content" in gate) return gate;
 				const before = deps.updates.getStatus();
 				const after = await deps.updates.checkNow();
@@ -182,17 +210,16 @@ export function createManageUpdateTool(deps: UpdateToolDeps): AgentTool {
 				};
 			}
 
-			const gate = requireConfirmedAdmin(deps, {
-				needConfirmation: true,
-				confirmationHint:
-					action === "update"
-						? "更新会下载安装包并在系统空闲时重启应用。请明确说出要更新，并在当前消息中包含「确认」。"
-						: action === "install_now"
-							? "立即安装会马上重启应用：进行中的任务会被结束、新消息停收，直到安装完成。请明确说出要立即安装，并在当前消息中包含「确认」。"
-							: "变更无人值守自动更新会影响后续版本是否自动安装。请明确说出要开启或关闭，并在当前消息中包含「确认」。",
-			});
+			// User rulings 2026-09-23 + 2026-09-29 (same as run_command): a
+			// platform-verified ADMIN in ANY chat is authorized without a per-message
+			// 「确认」— update/set_auto are non-destructive (update waits for engine
+			// idle before restarting). EXCEPTION: install_now still demands an
+			// explicit 「确认」 — it kills in-flight tasks and restarts immediately.
+			const gate = requireUpdateAdmin(deps, action === "install_now"
+				? { requireConfirmation: true, confirmationHint: "立即安装会马上重启应用：进行中的任务会被结束、新消息停收，直到安装完成。请明确说出要立即安装，并在当前消息中包含「确认」。" }
+				: {});
 			if ("content" in gate) return gate;
-			console.log(`[update] action=${action} authorized by ${maskId(gate.actor.senderId)}`);
+			console.log(`[update] action=${action} authorized by ${maskId(gate.actor.senderId)}${gate.confirmed ? " (confirmed)" : ""}`);
 
 			if (action === "set_auto") {
 				if (typeof enabled !== "boolean" && enabled !== "full" && enabled !== "download_only" && enabled !== "off") {
