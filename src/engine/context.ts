@@ -426,6 +426,11 @@ export function taskAnchorOf(messages: AgentMessage[]): AgentMessage | undefined
  * where the task actually is). The side-channel LLM call gets the CURRENT
  * request (the latest user message, see taskAnchorOf) plus a recent tail of
  * roughly `keepRecentTokens`, deduped when the tail already covers it.
+ *
+ * Historical summary messages (compaction / branch) are EXCLUDED: they carry
+ * the harness's structured template ("## Goal …\n## Constraints & …"), and a
+ * heartbeat model fed one echoed it verbatim as the "progress report" (field
+ * 2026-09-25 screenshot). The anchor + execution tail carry everything needed.
  * Pure slicing — never touches agent state.
  */
 export function progressContextSlice(messages: AgentMessage[], keepRecentTokens = 24_000): AgentMessage[] {
@@ -436,9 +441,11 @@ export function progressContextSlice(messages: AgentMessage[], keepRecentTokens 
 		cut--;
 		kept += estimateMessageTokens(messages[cut]);
 	}
-	const tail = messages.slice(cut);
+	const tail = messages
+		.slice(cut)
+		.filter((m) => m.role !== "compactionSummary" && m.role !== "branchSummary");
 	const anchor = taskAnchorOf(messages);
-	if (anchor && !tail.includes(anchor)) return [anchor, ...tail];
+	if (anchor && !tail.some((m) => m === anchor)) return [anchor, ...tail];
 	return tail;
 }
 

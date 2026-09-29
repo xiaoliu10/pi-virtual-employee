@@ -38,7 +38,7 @@ import { isLocalConversation, resolveRole } from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
-import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, taskAnchorOf, truncateToFit, usableContextWindow } from "./context.js";
+import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, truncateToFit, usableContextWindow } from "./context.js";
 import { fetchModelInfo, resolveEffectiveLimits, type RemoteModelInfo } from "./model-info.js";
 
 /** Default single-reply output cap for relay (custom baseUrl) models without an explicit per-model override. */
@@ -113,12 +113,6 @@ function extractText(message: AgentMessage): string {
 		.filter((part): part is TextContent => part.type === "text")
 		.map((part) => part.text)
 		.join("");
-}
-
-/** Text of a message regardless of shape (user messages carry string content). */
-function messageTextOf(message: AgentMessage): string {
-	const content = (message as { content?: unknown }).content;
-	return typeof content === "string" ? content : extractText(message);
 }
 
 /**
@@ -1381,25 +1375,17 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/**
-	 * Goal-level fallback for the long-task heartbeat when the side-channel LLM
-	 * pass is unavailable. Field feedback 2026-09-23: quoting the latest
-	 * assistant narration verbatim leaks low-level execution mechanics
-	 * ("重置把分页调回了 10/页") and says nothing about the user's task, so the
-	 * fallback reports the TASK GOAL instead of the raw last step.
+	 * Fallback for the long-task heartbeat when the side-channel LLM pass is
+	 * unavailable — deliberately GOAL-LESS. Field history, both directions:
+	 * 2026-09-23 quoting the latest assistant narration leaked low-level
+	 * mechanics ("重置把分页调回了 10/页"); 2026-09-24 quoting a user message
+	 * misquoted MID-TURN STEERING ("如果图片不好识别可以换下一张…") as the task
+	 * name — neither first- nor last-user-message is reliably THE task in a
+	 * long-lived conversation. The always-true line is the only honest fallback;
+	 * the goal-level report is the LLM path's job.
 	 */
-	briefProgress(agent: Agent): string {
-		// taskAnchorOf anchors on the LATEST real user message — the request
-		// currently being executed. Anchoring on the FIRST made a long-lived IM
-		// conversation report a days-old completed task in the heartbeat while a
-		// new request ran (field 2026-09-24 screenshot). It also skips the
-		// finalSummary scaffolding message — a synthetic user-role instruction
-		// that must never be quoted as the task goal.
-		const anchor = taskAnchorOf(agent.state.messages);
-		const goal = anchor ? messageTextOf(anchor).replace(/\s+/g, " ").trim() : "";
-		const snippet = goal.length > 60 ? goal.slice(0, 60) + "…" : goal;
-		return snippet
-			? `⏳ 任务仍在进行中（已耗时较长）。任务：${snippet}。完成后会立即回复结果，请稍候。`
-			: "⏳ 任务仍在进行中（已耗时较长），请稍候，完成后会立即回复结果。";
+	briefProgress(_agent: Agent): string {
+		return "⏳ 任务仍在进行中（已耗时较长），请稍候，完成后会立即回复结果。";
 	}
 
 	/**
@@ -1428,7 +1414,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				model,
 				512, // ~0.8×512 tokens of output budget — plenty for 100 Chinese chars
 				undefined,
-				"这是正在执行中的任务的对话记录节选：最新一条用户请求就是当前正在执行的任务，后面是它的执行记录。请严格只针对这一条当前请求，用不超过100字的中文向用户汇报总体进展：围绕它的目标，已完成到什么程度、当前处于哪个阶段、接下来做什么。节选中更早的其他请求都是早已完成的旧任务，与本报告无关，绝对不要提及它们。把琐碎的执行步骤归纳为面向当前目标的阶段性成果；忽略并禁止提及工具名、参数、重试、分页调整、报错重试等单次操作的技术细节，也不要原样复述日志片段；只依据记录中真实发生的事，绝不编造未发生的进度；判断不了整体位置时，如实说明仍在处理中。",
+				"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过100字的中文向用户汇报总体进展：围绕目标，已完成到什么程度、当前处于哪个阶段、接下来做什么。节选中更早的其他请求都是早已完成的旧任务，与本报告无关，绝对不要提及它们。节选中若出现「## Goal」「## Constraints」开头的结构化文本，那是历史压缩总结的模板，不是进展汇报——绝对不要照抄或复述它，用自己的一句话概括当前目标再汇报。把琐碎的执行步骤归纳为面向目标的阶段性成果；忽略并禁止提及工具名、参数、重试、分页调整、报错重试等单次操作的技术细节，也不要原样复述日志片段；只依据记录中真实发生的事，绝不编造未发生的进度；判断不了整体位置时，如实说明仍在处理中。",
 				undefined,
 			);
 			if (!result.ok || !result.value?.trim()) return fallback();
