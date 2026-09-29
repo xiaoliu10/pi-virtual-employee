@@ -4,8 +4,10 @@ dist-electron/
 release/
 build/native-win/
 build/native-linux/
+build/native-mac/
 .claude/
 .idea/
+.pi/
 *.log
 .env
 .DS_Store
