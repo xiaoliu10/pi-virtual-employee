@@ -285,7 +285,12 @@ export function truncateToFit(agent: Agent, targetTokens: number, now = new Date
  * same tail guard — recent turns stay verbatim, only the old head is
  * summarized. Returns false when there was nothing to do (below threshold, or
  * the transcript is too short to split); failures leave the transcript
- * untouched.
+ * untouched. `signal` aborts the summarizer request itself (field
+ * 2026-09-24: a hung compaction call had NO timeout and was INVISIBLE to the
+ * stall watchdog — it bypasses makeStreamFn — so the turn's watchdog fired on
+ * the silent tail and the completed reply was discarded); callers pass an
+ * engine-owned signal so a black-holed relay request ends cleanly instead of
+ * hanging the per-conversation queue.
  */
 /**
  * Walk back until the kept tail is roughly `keepRecentTokens`, then advance to
@@ -448,7 +453,12 @@ export interface CompactOutcome {
 	skipReason?: CompactSkipReason;
 }
 
-export async function maybeCompact(agent: Agent, models: Models, force = false): Promise<CompactOutcome> {
+export async function maybeCompact(
+	agent: Agent,
+	models: Models,
+	force = false,
+	signal?: AbortSignal,
+): Promise<CompactOutcome> {
 	const settings = DEFAULT_COMPACTION_SETTINGS;
 	const messages = agent.state.messages;
 	const model = agent.state.model;
@@ -508,7 +518,7 @@ export async function maybeCompact(agent: Agent, models: Models, force = false):
 		models,
 		model,
 		settings.reserveTokens,
-		undefined,
+		signal,
 		undefined,
 		previousSummary,
 		undefined,
