@@ -2,7 +2,7 @@
 	"name": "pi-virtual-employee",
 	"private": true,
 	"type": "module",
-	"version": "0.2.97",
+	"version": "0.2.98",
 	"description": "Desktop virtual-employee app (Electron) built on the pi agent SDK (@earendil-works/pi-agent-core).",
 	"author": "Pi Virtual Employee",
 	"main": "dist-electron/main.js",
@@ -35,9 +35,10 @@
 		"test:time": "node --test scripts/test-time.mjs",
 		"test:skills": "node --test scripts/test-skills.mjs",
 		"prepare:native:win": "node scripts/prepare-win-native.mjs",
+		"prepare:native:mac": "node scripts/prepare-mac-native.mjs",
 		"prepare:native:linux": "node scripts/prepare-linux-native.mjs",
 		"package:win": "npm run typecheck && npm run build && npm run prepare:native:win && electron-builder --win nsis --x64",
-		"package:mac": "npm run typecheck && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg --arm64",
+		"package:mac": "npm run typecheck && npm run build && npm run prepare:native:mac && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg --arm64",
 		"package:linux": "npm run typecheck && npm run build && npm run prepare:native:linux && electron-builder --linux AppImage --x64",
 		"release": "node scripts/publish.mjs",
 		"release:dry": "node scripts/publish.mjs --dry-run",
@@ -133,6 +134,15 @@
 			"artifactName": "Pi-Virtual-Employee-Setup-${version}-${arch}.${ext}"
 		},
 		"mac": {
+			"extraResources": [
+				{
+					"from": "build/native-mac",
+					"to": "native",
+					"filter": [
+						"**/*"
+					]
+				}
+			],
 			"target": [
 				{
 					"target": "dmg",
