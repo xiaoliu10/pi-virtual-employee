@@ -331,9 +331,10 @@ test("application shutdown ends command supervision and removes retained session
 
 // Field 2026-09-23: an SLS triage needed run_command FROM THE GROUP where the
 // task lived, but the gate refused every non-single chat. User ruling: drop the
-// 1:1-only gate — identity, role tiering, and the explicit 「确认」 hold in
-// groups exactly as in single chats.
-test("run_command works from a group chat: admin+confirm executes, viewer is refused", async (t) => {
+// 1:1-only gate — identity, role tiering, and (for operators) the explicit
+// 「确认」 hold in groups exactly as in single chats. User ruling 2026-09-29:
+// a verified ADMIN initiator is itself the authorization — no confirmation.
+test("run_command from a group chat: admin runs without confirmation, operator still confirms, viewer refused", async (t) => {
 	const { tool, actor, config } = fixture(t);
 	Object.assign(actor, { chatType: "group", conversationId: "dt:group:ops" });
 
@@ -341,18 +342,27 @@ test("run_command works from a group chat: admin+confirm executes, viewer is ref
 	assert.equal(done.details.refused, undefined, "admin + 确认 in a group runs the command");
 	assert.match(done.content[0].text, /finished/);
 
-	// No confirmation in the current message → still refused, same as single chat.
-	const prev = actor.text;
+	// Admin without 确认: the verified initiator IS the authorization (2026-09-29).
 	actor.text = "跑一下这个";
-	const unconfirmed = await tool.execute("g2", { command: "node command.cjs 10", workingDir: workDir });
-	assert.equal(unconfirmed.details.refused, true);
-	assert.match(unconfirmed.content[0].text, /确认/);
-	actor.text = prev;
+	const direct = await tool.execute("g2", { command: "node command.cjs 10", workingDir: workDir });
+	assert.equal(direct.details.refused, undefined, "admin initiator runs directly — no confirmation needed");
+	assert.match(direct.content[0].text, /finished/);
+
+	// Operator: per-message confirmation still required.
+	Object.assign(actor, { senderId: "op-user", text: "跑一下这个" });
+	config.update({ security: { people: [{ staffId: "op-user", role: "operator" }] } });
+	const opRefused = await tool.execute("g3", { command: "node command.cjs 10", workingDir: workDir });
+	assert.equal(opRefused.details.refused, true);
+	assert.match(opRefused.content[0].text, /包含「确认」/);
+	actor.text = "确认执行这个脚本";
+	const opDone = await tool.execute("g4", { command: "node command.cjs 10", workingDir: workDir });
+	assert.equal(opDone.details.refused, undefined, "operator with confirmation executes");
+	assert.match(opDone.content[0].text, /finished/);
 
 	// Viewer in a group is refused on role, exactly as in single chat.
 	Object.assign(actor, { senderId: "peasant", text: "确认" });
 	config.update({ security: { people: [{ staffId: "peasant", role: "viewer" }] } });
-	const denied = await tool.execute("g3", { command: "node command.cjs 10", workingDir: workDir });
+	const denied = await tool.execute("g5", { command: "node command.cjs 10", workingDir: workDir });
 	assert.equal(denied.details.refused, true);
 	assert.match(denied.content[0].text, /没有命令执行权限/);
 });

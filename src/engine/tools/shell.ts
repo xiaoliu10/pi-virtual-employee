@@ -11,11 +11,14 @@
  *
  * Safety posture:
  *  - Shell execution is OFF by default (`capabilities.shell.enabled=false`).
- *  - Each run_command call requires the CURRENT message to contain an explicit
- *    confirmation (the model can't self-authorize by passing a flag) — except
- *    unattended scheduled-task runs, which re-attach the task creator's admin
- *    identity (live whitelist check, no per-message confirmation because the
- *    prompt is fixed text).
+ *  - Each run_command call by an OPERATOR requires the CURRENT message to
+ *    contain an explicit confirmation (the model can't self-authorize by
+ *    passing a flag). Admins are exempt: the task initiator being an
+ *    admin-verified sender is itself the authorization (user ruling
+ *    2026-09-29 — group-chat Python runs kept bouncing off the confirmation
+ *    gate mid-task); every run remains audited. Unattended scheduled-task
+ *    runs also skip per-message confirmation, re-attaching the task creator's
+ *    identity (live whitelist check, prompt is fixed text).
  *  - Only executables on the whitelist may be run; "*" is supported but
  *    documented as "full server control from a stolen admin IM account".
  *  - The command runs with the parent's user token (not elevated); anything
@@ -37,16 +40,17 @@ import { resolveRole, type Role } from "../../security/permissions.js";
  *   viewer   — no command execution at all.
  *   operator — interactive confirmation required; executable whitelist applies
  *              (composition still rejected).
- *   admin    — interactive confirmation required; whitelist BYPASSED (full
- *              shell: composition/script files allowed — a full shell on a
- *              dedicated jump box).
+ *   admin    — NO interactive confirmation (the verified admin sender is the
+ *              authorization, user ruling 2026-09-29); whitelist BYPASSED
+ *              (full shell: composition/script files allowed).
  * Scheduled-task actors inherit their creator's role (re-checked live every
  * fire); unattended runs skip the per-message confirmation as before.
  *
  * Single-chat AND group chats are both allowed (user ruling 2026-09-23, field:
  * an SLS triage needed run_command from the group where the task lived). The
  * gates that actually matter hold in either: platform-verified sender, live
- * role resolution, and an explicit 「确认」 in the sender's own current message.
+ * role resolution, and — for operators — an explicit 「确认」 in the sender's
+ * own current message.
  */
 function gateCommandRole(
 	deps: Pick<ShellToolDeps, "config" | "resolveActor" | "conversationId">,
@@ -67,7 +71,10 @@ function gateCommandRole(
 	if (role === "viewer") {
 		return refuse("当前用户没有命令执行权限（需要 operator 及以上）。如需开通请联系管理员在 security.people 中指派角色。");
 	}
-	if (opts.needConfirmation && !isExplicitConfirmation(actor.text)) {
+	// Admin: no interactive confirmation — the verified admin initiator IS the
+	// authorization (user ruling 2026-09-29; every run stays audited). Only
+	// operators confirm per message.
+	if (opts.needConfirmation && role !== "admin" && !isExplicitConfirmation(actor.text)) {
 		return refuse("该操作会执行命令。请明确说明要执行的操作，并在当前消息中包含「确认」（或同义明确肯定语）。");
 	}
 	return { actor, role };
@@ -363,14 +370,14 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 		name: "run_command",
 		label: "命令执行（分级）",
 		description:
-			"在部署机器上按角色分级执行 shell 命令（单聊群聊均可，按平台验证的发送者身份与角色授权，需在当前消息明确「确认」）。" +
+			"在部署机器上按角色分级执行 shell 命令（单聊群聊均可，按平台验证的发送者身份与角色授权；operator 需在当前消息明确「确认」，admin 直接执行）。" +
 			"权限分级：viewer 不可执行；operator 只能执行 capabilities.shell.allowedCommands 白名单内的可执行文件（* 表示全部），且串联、管道、重定向、变量展开、脚本扩展名和可执行文件路径均被拒绝，每次只跑一条独立命令；" +
 			"admin 不受白名单与组合语法限制（完整 shell：可用 powershell -Command 管道、重定向、脚本串联等），仅工作目录仍须为不含引号的绝对路径。" +
 			"默认用于运维诊断：tasklist 查看进程、taskkill 按单个 PID 结束进程、systeminfo/whoami/hostname/netstat/ping/ipconfig 查看本机状态。" +
 			"长任务传 background=true：启动后立即返回 sessionId，用 manage_process poll 阻塞等待、log 增量读日志、kill 终止；等待超时只返回当前状态，不杀后台进程。同步命令运行时限用 capabilities.shell.timeoutSec（默认 60 秒）；后台进程时限用 backgroundTimeoutSec（默认 0=不限制），管理员可用 manage_settings 修改。" +
 			"采集逻辑先写入 .ps1/.py 脚本，命令只用 powershell -File xxx.ps1 或 python xxx.py，参数通过本地文件传递；脚本先输出 observer start 与时间戳，首次 poll/log 检查启动日志，不能把返回 sessionId 当成任务完成。会话由本应用托管，应用退出会终止进程，重启后不可续接；不要再用 nohup 或自制脱管 launcher。" +
 			"powershell/node/npx 等解释器需管理员显式加入白名单（admin 角色无需）；安装 Chromium 请改用 manage_capabilities setup_browser。" +
-			"安全规则：默认关闭；每次执行必须由操作者在当前消息中明确包含「确认」/confirm/yes/ok；群聊一律拒绝。命令以当前应用用户权限运行，不会自动提权。" +
+			"安全规则：默认关闭；operator 每次执行需在消息中明确包含「确认」/confirm/yes/ok；admin（平台验证身份）发起即授权，直接执行，全部审计留痕。命令以当前应用用户权限运行，不会自动提权。" +
 			"可选 workingDir：命令的工作目录（绝对路径，如 C:\\Users\\me\\project），脚本用相对路径读写数据文件时需要；不影响可执行文件白名单。定时任务无人值守执行时，run_command 以任务创建者身份放行（按该用户当前角色定级），无需消息内含「确认」，但 operator 的白名单校验照常生效。",
 		parameters: Type.Object({
 			command: Type.String({ description: `要执行的命令，如「tasklist /FI "PID eq 19060"」「taskkill /PID 19060 /F」「python scripts/gen_report.py」。跑脚本直接给脚本文件路径，不要用 python -c 内联代码（括号会被拦截）。` }),
