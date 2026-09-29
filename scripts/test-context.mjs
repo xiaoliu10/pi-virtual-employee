@@ -221,6 +221,23 @@ test("progress context anchors on the current request, not days-old goals", () =
 	assert.deepEqual(progressContextSlice([], 20_000), []);
 });
 
+// Field incident 2026-09-25 (screenshot): the heartbeat echoed the harness's
+// structured summary template verbatim ("# Goal 推送类型为电子发票的凭证…")
+// because the slice included a compaction/branch summary message and the model
+// copied the newest content. Historical summaries must never reach the
+// heartbeat summarizer — the anchor + execution tail carry enough.
+test("progress slice excludes historical summary templates", () => {
+	const task = user("任务：推送电子发票凭证到政采网");
+	const compaction = { role: "compactionSummary", summary: "## Goal 推送类型为电子发票的凭证（共 24 张）\n\n## Constraints & Preferences - 凭证类型: 电子", tokensBefore: 90_000, timestamp: Date.now() };
+	const branch = { role: "branchSummary", summary: "## Goal …", fromId: "leaf-1", timestamp: Date.now() };
+	const work = [assistant("正在推送第 3 张凭证。")];
+
+	const slice = progressContextSlice([compaction, task, branch, ...work], 20_000);
+	assert.ok(!slice.includes(compaction) && !slice.includes(branch), "summary templates must not reach the heartbeat summarizer");
+	assert.equal(slice[0], task, "the current request still anchors the slice");
+	assert.ok(slice.includes(work[0]), "execution narration stays in view");
+});
+
 // Field request 2026-09-18: an explicit /compact must EXECUTE, not refuse.
 // Single-turn sessions (one task statement + a huge execution trace) had no
 // user boundary to cut on — now the forced path keeps the task statement and
