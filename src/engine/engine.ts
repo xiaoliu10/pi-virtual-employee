@@ -1386,11 +1386,14 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * fallback reports the TASK GOAL instead of the raw last step.
 	 */
 	briefProgress(agent: Agent): string {
-		// taskAnchorOf skips the finalSummary scaffolding message — a synthetic
-		// user-role instruction that must never be quoted as the task goal
-		// (field 2026-09-24: it leaked verbatim into this heartbeat line).
-		const first = taskAnchorOf(agent.state.messages);
-		const goal = first ? messageTextOf(first).replace(/\s+/g, " ").trim() : "";
+		// taskAnchorOf anchors on the LATEST real user message — the request
+		// currently being executed. Anchoring on the FIRST made a long-lived IM
+		// conversation report a days-old completed task in the heartbeat while a
+		// new request ran (field 2026-09-24 screenshot). It also skips the
+		// finalSummary scaffolding message — a synthetic user-role instruction
+		// that must never be quoted as the task goal.
+		const anchor = taskAnchorOf(agent.state.messages);
+		const goal = anchor ? messageTextOf(anchor).replace(/\s+/g, " ").trim() : "";
 		const snippet = goal.length > 60 ? goal.slice(0, 60) + "…" : goal;
 		return snippet
 			? `⏳ 任务仍在进行中（已耗时较长）。任务：${snippet}。完成后会立即回复结果，请稍候。`
@@ -1423,7 +1426,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				model,
 				512, // ~0.8×512 tokens of output budget — plenty for 100 Chinese chars
 				undefined,
-				"这是正在执行中的任务的对话记录节选：开头是任务目标，后面是最近的执行记录。请以整个任务的视角，用不超过100字的中文向用户汇报总体进展：围绕任务目标，已完成到什么程度、当前处于哪个阶段、接下来做什么。把琐碎的执行步骤归纳为面向任务目标的阶段性成果；忽略并禁止提及工具名、参数、重试、分页调整、报错重试等单次操作的技术细节，也不要原样复述日志片段；只依据记录中真实发生的事，绝不编造未发生的进度；判断不了整体位置时，如实说明仍在处理中。",
+				"这是正在执行中的任务的对话记录节选：最新一条用户请求就是当前正在执行的任务，后面是它的执行记录。请严格只针对这一条当前请求，用不超过100字的中文向用户汇报总体进展：围绕它的目标，已完成到什么程度、当前处于哪个阶段、接下来做什么。节选中更早的其他请求都是早已完成的旧任务，与本报告无关，绝对不要提及它们。把琐碎的执行步骤归纳为面向当前目标的阶段性成果；忽略并禁止提及工具名、参数、重试、分页调整、报错重试等单次操作的技术细节，也不要原样复述日志片段；只依据记录中真实发生的事，绝不编造未发生的进度；判断不了整体位置时，如实说明仍在处理中。",
 				undefined,
 			);
 			if (!result.ok || !result.value?.trim()) return fallback();

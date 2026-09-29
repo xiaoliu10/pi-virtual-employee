@@ -185,22 +185,34 @@ test("cut point falls back to the last user turn when the tail is inside the fin
 	assert.equal(findCompactionCut(roleless, 20_000), 0);
 });
 
-// Field request 2026-09-17: the heartbeat's raw snippet ("检查表格当前行状态")
-// gave no sense of task position, so the heartbeat now summarizes a side-channel
-// slice: the TASK statement plus a recent tail.
-test("progress context keeps the task goal in view alongside the recent tail", () => {
-	const goal = user("任务：整理 7 月运营数据，核对每笔异常");
+// Field incident 2026-09-24 (screenshot): a new reconciliation request got a
+// heartbeat about a DAYS-OLD host-heartbeat task — the slice anchored on the
+// conversation's FIRST user message. In a long-lived IM conversation the
+// anchor must be the LATEST user request; stale goals must never reach the
+// summarizer.
+test("progress context anchors on the current request, not days-old goals", () => {
+	const staleGoal = user("任务（几天前）：在 sls 中检查机组主机心跳是否都为 ok");
 	const filler = [];
 	for (let i = 0; i < 30; i += 1) filler.push(assistant("中间步骤。" + "步".repeat(2400)));
-	const recent = [user("继续"), assistant("正在核对第 3 批异常明细。")];
-	const messages = [goal, ...filler, ...recent];
+	const current = user("统计 9 月 1 日到 27 日对账异常，筛选重复支付、掉单、金额不一致");
+	const work = [assistant("正在核对第 3 批异常明细。")];
+	const messages = [staleGoal, ...filler, current, ...work];
 
 	const slice = progressContextSlice(messages, 20_000);
-	assert.equal(slice[0], goal, "the task statement must always be in view");
-	assert.ok(slice.includes(recent[0]) && slice.includes(recent[1]), "the recent tail must be included");
+	assert.ok(!slice.includes(staleGoal), "days-old goals must NOT be fed to the summarizer");
+	assert.ok(slice.includes(current), "the current request must be in view");
+	assert.ok(slice.some((m) => m.role === "assistant" && JSON.stringify(m.content).includes("正在核对第 3 批异常明细")), "recent narration stays in view");
 	assert.ok(slice.length < messages.length, "the middle bulk is not needed for a progress report");
 
-	// Short transcript where the tail already covers the goal — no duplicate.
+	// The current request OUTSIDE the keep window (its own execution trace
+	// outran the tail): it must be prepended so the goal stays in view.
+	const trace = [];
+	for (let i = 0; i < 30; i += 1) trace.push(assistant("执行。" + "执".repeat(2400)));
+	const slice2 = progressContextSlice([staleGoal, current, ...trace], 20_000);
+	assert.equal(slice2[0], current, "the current request is kept in view when the tail outran it");
+	assert.ok(!slice2.includes(staleGoal));
+
+	// Short transcript where the tail already covers everything — unchanged.
 	const small = [user("任务 A"), assistant("做了一半")];
 	const sliceSmall = progressContextSlice(small, 20_000);
 	assert.equal(sliceSmall.length, small.length);
@@ -376,6 +388,12 @@ test("synthetic final-summary instruction is never picked as the task goal", () 
 
 	// Anchor picks the real task even when the instruction came first.
 	assert.equal(taskAnchorOf([synthetic, realTask]), realTask);
+
+	// Latest real task wins — the heartbeat reports the CURRENT request, not a
+	// days-old completed one (field 2026-09-24 screenshot).
+	const taskA = user("任务A：在 sls 中检查主机心跳");
+	const taskB = user("任务B：统计 9 月对账异常");
+	assert.equal(taskAnchorOf([taskA, taskB]), taskB);
 
 	// The leak case: real task compacted away, only the instruction remains →
 	// NO anchor (falls back to the goal-less heartbeat line), never the instruction.

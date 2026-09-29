@@ -406,17 +406,21 @@ export function isSyntheticUserMessage(message: AgentMessage): boolean {
 	return typeof content === "string" && content.replace(/\s+/g, " ").trim().startsWith(SYNTHETIC_USER_PREFIX);
 }
 
-/** First real (non-synthetic) user message — the task anchor for progress reports. */
+/** The task anchor for progress reports: the LATEST real (non-synthetic) user
+ * message — the request currently being executed. Field 2026-09-24: anchoring
+ * on the FIRST user message made a long-lived IM conversation report a
+ * days-old, long-completed task in the heartbeat while a new request ran.
+ * During an in-flight turn the latest user message IS the current task. */
 export function taskAnchorOf(messages: AgentMessage[]): AgentMessage | undefined {
-	return messages.find((m) => m.role === "user" && !isSyntheticUserMessage(m));
+	return messages.findLast((m) => m.role === "user" && !isSyntheticUserMessage(m));
 }
 
 /**
  * Context for the heartbeat progress summary (field request 2026-09-17: the
  * raw latest-narration snippet read like "检查表格当前行状态" — no sense of
- * where the task actually is). The side-channel LLM call gets the TASK
- * statement (first user message, so the goal is always in view) plus a recent
- * tail of roughly `keepRecentTokens`, deduped when the tail already covers it.
+ * where the task actually is). The side-channel LLM call gets the CURRENT
+ * request (the latest user message, see taskAnchorOf) plus a recent tail of
+ * roughly `keepRecentTokens`, deduped when the tail already covers it.
  * Pure slicing — never touches agent state.
  */
 export function progressContextSlice(messages: AgentMessage[], keepRecentTokens = 24_000): AgentMessage[] {
@@ -428,8 +432,8 @@ export function progressContextSlice(messages: AgentMessage[], keepRecentTokens 
 		kept += estimateMessageTokens(messages[cut]);
 	}
 	const tail = messages.slice(cut);
-	const first = taskAnchorOf(messages);
-	if (first && !tail.includes(first)) return [first, ...tail];
+	const anchor = taskAnchorOf(messages);
+	if (anchor && !tail.includes(anchor)) return [anchor, ...tail];
 	return tail;
 }
 
