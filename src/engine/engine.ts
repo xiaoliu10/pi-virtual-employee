@@ -38,7 +38,7 @@ import { isLocalConversation, resolveRole } from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
-import { estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, taskAnchorOf, truncateToFit, usableContextWindow } from "./context.js";
+import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, taskAnchorOf, truncateToFit, usableContextWindow } from "./context.js";
 import { fetchModelInfo, resolveEffectiveLimits, type RemoteModelInfo } from "./model-info.js";
 
 /** Default single-reply output cap for relay (custom baseUrl) models without an explicit per-model override. */
@@ -146,6 +146,8 @@ export interface EngineOptions {
 export class EmployeeEngine implements EmployeeRuntime {
 	readonly profileId = "customer-service";
 	private readonly sessions = new Map<string, Agent>();
+	/** Per-conversation abort timers bounding side LLM calls (compaction). */
+	private readonly sideCallTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly models: MutableModels;
 	/** Engine-owned credential store handed to the Models registry — lets us
 	 * write supplier keys for providers the SDK resolves auth against. */
@@ -742,7 +744,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			return "⏳ 当前有回合正在进行，等它结束后再试 /compact。";
 		}
 		const before = estimateContextTokens(agent.state.messages).tokens;
-		const { compacted, skipReason } = await maybeCompact(agent, this.models, true);
+		const { compacted, skipReason } = await this.compactWithLife(agent, true);
 		if (!compacted) {
 			// An EXPLICIT /compact must be executed or honestly reported — never
 			// second-guessed with "无需压缩" when the real cause was a summarizer
@@ -1161,7 +1163,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// wall (user ruling 2026-09-24: context nearing full → auto-compact →
 		// keep going; stopping the task is never the plan).
 		try {
-			await maybeCompact(agent, this.models, contextBudgetHit).then((r) => r.compacted);
+			await this.compactWithLife(agent, contextBudgetHit).then((r) => r.compacted);
 		} catch (err) {
 			console.warn("[engine] compaction failed:", err);
 		}
@@ -1508,6 +1510,60 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/**
+	 * Run maybeCompact with the conversation's stall-watchdog life signals and a
+	 * bounded abort. The compaction summarizer goes DIRECTLY through models
+	 * (bypassing makeStreamFn), so it used to be INVISIBLE to the watchdog: no
+	 * llmInFlight increment, no activity touches, and NO timeout — a hung relay
+	 * request kept the turn's silence clock running while the user-visible work
+	 * was already done, the watchdog fired on that silent tail (field
+	 * 2026-09-24: "20 minutes with no progress" measured the PREVIOUS task's
+	 * compaction tail, not the new request), and the manager discarded the
+	 * completed reply. Here the summarizer counts as an in-flight LLM request
+	 * (idle = 0 while it runs) and its own abort timer bounds it — same v3
+	 * contract as every other LLM call: in-flight IS life, the request's own
+	 * timeout bounds a dead one.
+	 */
+	private async compactWithLife(agent: Agent, force = false): Promise<CompactOutcome> {
+		const conversationId = this.conversationIdOf(agent);
+		const signal = conversationId ? this.beginSideLlmCall(conversationId) : undefined;
+		try {
+			return await maybeCompact(agent, this.models, force, signal);
+		} finally {
+			if (conversationId) this.endSideLlmCall(conversationId);
+		}
+	}
+
+	/** Reverse lookup: the conversation a live session agent belongs to. */
+	private conversationIdOf(agent: Agent): string | undefined {
+		for (const [id, session] of this.sessions) if (session === agent) return id;
+		return undefined;
+	}
+
+	/** Register a direct-to-models side call (compaction) as in-flight life for
+	 * the stall watchdog, bounded by the engine's per-request timeout so a dead
+	 * call self-terminates like any other. Returns the abort signal for the call. */
+	private beginSideLlmCall(conversationId: string): AbortSignal {
+		this.llmInFlight.set(conversationId, (this.llmInFlight.get(conversationId) ?? 0) + 1);
+		this.touchActivity(conversationId);
+		const controller = new AbortController();
+		const timeoutMs = this.opts.timeoutMs > 0 ? this.opts.timeoutMs : 600_000;
+		const timer = setTimeout(() => controller.abort(new Error("compaction request timed out")), timeoutMs);
+		timer.unref?.();
+		this.sideCallTimers.set(conversationId, timer);
+		return controller.signal;
+	}
+
+	private endSideLlmCall(conversationId: string): void {
+		const timer = this.sideCallTimers.get(conversationId);
+		if (timer) {
+			clearTimeout(timer);
+			this.sideCallTimers.delete(conversationId);
+		}
+		this.llmInFlight.set(conversationId, Math.max(0, (this.llmInFlight.get(conversationId) ?? 1) - 1));
+		this.touchActivity(conversationId);
+	}
+
+	/**
 	 * Shrink the transcript so the next request fits: summarize the old head first
 	 * (keeps meaning), and if that cannot help — one huge tool result, or too short
 	 * to split — drop the oldest messages outright. Returns false when nothing could
@@ -1515,7 +1571,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 */
 	private async recoverFromContextOverflow(agent: Agent): Promise<boolean> {
 		try {
-			if ((await maybeCompact(agent, this.models, true)).compacted) return true;
+			if ((await this.compactWithLife(agent, true)).compacted) return true;
 		} catch (err) {
 			console.warn("[engine] overflow compaction failed:", err instanceof Error ? err.message : err);
 		}

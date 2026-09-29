@@ -321,7 +321,13 @@ export class IMAdapterManager {
 						// Final turn complete — signal the UI to refresh the task list.
 						this.onActivity?.(msg.conversationId);
 						if (turnTimedOut) {
-							return `⏱️ 本回合已连续 ${turnTimeoutMin} 分钟无任何进展（疑似卡死），已自动中断以解除会话阻塞。请重新发送指令重试；若反复出现，请把任务拆小或分步执行，并联系管理员查看日志定位卡点。`;
+							// A stall that fires AFTER the reply was finalized (field
+							// 2026-09-24: a hung after-turn compaction kept the silence
+							// clock running) must not discard the completed answer —
+							// deliver it with the interrupt notice instead.
+							const notice = `⏱️ 本回合已连续 ${turnTimeoutMin} 分钟无任何进展（疑似卡死），已自动中断以解除会话阻塞。`;
+							if (result.reply) return `${result.reply}\n\n${notice}若反复出现，请联系管理员查看日志定位卡点。`;
+							return `${notice}请重新发送指令重试；若反复出现，请把任务拆小或分步执行，并联系管理员查看日志定位卡点。`;
 						}
 						if (!result.reply) {
 							console.error(`[im] no reply for ${msg.conversationId}:`, result.error ?? "(no error reported)");

@@ -25,7 +25,7 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 			contents: `
-				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf } from "./src/engine/context.ts";
+				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, maybeCompact } from "./src/engine/context.ts";
 				export { shouldCompact, DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-agent-core";
 				export { estimateTokens } from "@earendil-works/pi-agent-core";
 			`,
@@ -38,7 +38,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, maybeCompact } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -389,6 +389,36 @@ test("synthetic final-summary instruction is never picked as the task goal", () 
 	assert.ok(!sliceOnly.includes(synthetic), "with the real task compacted away, the instruction is never put in the goal slot");
 	const sliceReal = progressContextSlice([realTask, synthetic, ...big], 2_000);
 	assert.equal(sliceReal[0], realTask, "the real task is the goal");
+});
+
+// Field incident 2026-09-24: the compaction summarizer goes DIRECTLY through
+// models (bypassing makeStreamFn), so it was INVISIBLE to the stall watchdog and
+// had NO timeout — a hung request kept the PREVIOUS turn's silence clock running
+// while its visible work was already done; the watchdog fired minutes into the
+// NEXT queued request ("本回合已连续 20 分钟无任何进展" only 4 minutes after the
+// new task), and the completed reply was discarded. maybeCompact now takes an
+// abort signal; the engine bounds it and counts the call as in-flight life.
+test("maybeCompact forwards the abort signal to the summarizer request", async () => {
+	const task = user("任务：统计对账异常");
+	const messages = [task];
+	for (let i = 0; i < 30; i += 1) messages.push(assistant("执行。" + "执".repeat(2400)));
+	const agent = { state: { messages, model: { id: "test", contextWindow: 200_000, maxTokens: 131_072 } } };
+
+	let seenSignal;
+	const models = {
+		completeSimple: async (_model, _context, options) => {
+			seenSignal = options.signal;
+			return { stopReason: "aborted", errorMessage: "aborted by test" };
+		},
+	};
+	const controller = new AbortController();
+	controller.abort();
+	const outcome = await maybeCompact(agent, models, true, controller.signal);
+	assert.equal(outcome.compacted, false);
+	assert.equal(outcome.skipReason, "summary_failed", "an aborted summarizer fails the pass cleanly");
+	assert.ok(seenSignal, "the signal must reach the summarizer request");
+	assert.equal(seenSignal.aborted, true, "the caller's signal is the one wired in");
+	assert.equal(agent.state.messages.length, messages.length, "a failed pass leaves the transcript untouched");
 });
 
 // Field incident 2026-09-24 (SLS task): killed with "recovery could not free
