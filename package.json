@@ -107,6 +107,11 @@
 			"dist-electron/**/*",
 			"renderer/dist/**/*",
 			"node_modules/**/*",
+			"!node_modules/@earendil-works/chord/node_modules/**",
+			"!node_modules/esbuild/**",
+			"!node_modules/@esbuild/**",
+			"!node_modules/better-sqlite3/deps/**",
+			"!node_modules/better-sqlite3/src/**",
 			"package.json"
 		],
 		"asarUnpack": [
