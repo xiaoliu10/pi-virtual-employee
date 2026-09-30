@@ -38,6 +38,9 @@ function memoryStore() {
 			return row;
 		},
 		list: () => tasks,
+		get: (id) => tasks.find((x) => x.id === id),
+		setChainState() {},
+		stageAnswer() {},
 		listDue: (now) => tasks.filter((t) => t.enabled && t.next_run_at != null && t.next_run_at <= now),
 		markRun(id, status, nextRunAt) {
 			const t = tasks.find((x) => x.id === id);
@@ -110,4 +113,42 @@ test("overdue tasks run once each and next_run_at advances past the timeout's wa
 	// A second tick immediately after must not re-run it.
 	await svc.tick();
 	assert.equal(a.last_run_at != null && store.tasks.filter((t) => t.id === "a").length, 1);
+});
+
+// Autonomous chains paused for a human must NOT be re-fired by the cron tick —
+// the chain's conversation carries all its progress, and a fresh fire would
+// fork it. The tick records the skip and moves the schedule on.
+test("a pending autonomous chain is skipped by the tick, not re-fired", async () => {
+	const store = memoryStore();
+	store.create({
+		id: "paused", prompt: "x", cron: "* * * * *", next_run_at: Date.now() - 1000,
+		autonomous: 1, max_turns: 20, max_minutes: 120,
+		chain_state: JSON.stringify({ convId: "sched:paused:1", turns: 6, startedAt: Date.now() - 600_000, pending: "human", question: "账号?" }),
+	});
+	let fired = 0;
+	const svc = new SchedulerService(store, 5_000);
+	svc.setRunner({ async runTask() { fired += 1; return { status: "ok" }; } });
+
+	await svc.tick();
+
+	assert.equal(fired, 0, "the runner must not be called for a pending chain");
+	assert.match(store.tasks[0].last_status, /paused:等待人工回复/);
+	assert.ok(store.tasks[0].next_run_at > Date.now(), "schedule moved on");
+});
+
+// fireNow is the resume path: it fires regardless of cron time and shares the
+// inFlight guard with the tick.
+test("fireNow fires a task immediately and is guarded against overlap", async () => {
+	const store = memoryStore();
+	store.create({ id: "now", prompt: "x", cron: "0 9 * * *", next_run_at: Date.now() + 999_999_999 });
+	const ran = [];
+	const svc = new SchedulerService(store, 5_000);
+	svc.setRunner({ async runTask(task) { ran.push(task.id); await sleep(20); return { status: "ok" }; } });
+
+	assert.equal(svc.fireNow("missing"), false);
+	assert.equal(svc.fireNow("now"), true, "fires despite a far-future cron");
+	assert.equal(svc.fireNow("now"), false, "inFlight guard blocks overlap while running");
+	await sleep(60);
+	assert.deepEqual(ran, ["now"]);
+	assert.equal(svc.fireNow("now"), true, "guard releases after the run settles");
 });

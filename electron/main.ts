@@ -17,8 +17,16 @@ import { HistoryStore } from "../src/db/history-store.js";
 import { KnowledgeService } from "../src/knowledge/knowledge-service.js";
 import { BrowserService } from "../src/browser/browser-service.js";
 import { ComputerService } from "../src/computer/computer-service.js";
-import { ScheduledTaskStore } from "../src/db/scheduled-task-store.js";
+import { ScheduledTaskStore, type ScheduledTaskRow } from "../src/db/scheduled-task-store.js";
 import { SchedulerService } from "../src/scheduler/scheduler-service.js";
+import {
+	type AutonomousChainState,
+	buildAutonomousTurnPrefix,
+	budgetExceeded,
+	normalizeBudget,
+	parseChainReply,
+	parseChainState,
+} from "../src/scheduler/autonomous.js";
 import { TelemetryStore } from "../src/db/telemetry-store.js";
 import { ProposalStore } from "../src/engine/proposals.js";
 import { PromptLab } from "../src/db/prompt-lab.js";
@@ -377,7 +385,8 @@ async function main(): Promise<void> {
 	const knowledge = new KnowledgeService(db, config, vecExtension);
 	const browser = new BrowserService(config, userData);
 	const computer = new ComputerService(config, userData);
-	const scheduler = new SchedulerService(new ScheduledTaskStore(db));
+	const scheduledTaskStore = new ScheduledTaskStore(db);
+	const scheduler = new SchedulerService(scheduledTaskStore);
 
 	// Document resources: uploaded files live under the configured documents dir
 	// (default userData/documents). Create the default so the catalog has a home.
@@ -488,8 +497,165 @@ async function main(): Promise<void> {
 	// to userData/logs/im.log — packaged builds have no visible console, and the
 	// fallback reason is the #1 clue when IM formatting looks wrong.
 	setDiagFile(path.join(userData, "logs", "im.log"));
+
+	/** Truncated tail of a long text for progress pushes. */
+	const tailForProgress = (text: string, n = 160) => {
+		const t = text.replace(/\s+\n/g, "\n").trim();
+		return t.length > n ? t.slice(-n) : t;
+	};
+
+	/**
+	 * Autonomous chain runner (field 2026-09-30): one fire keeps working across
+	 * turns in ONE conversation until the model reports done (marker), asks for
+	 * a human, or the budget runs out — then a 「继续」 reply resumes with a
+	 * fresh budget window. Chain state persists per turn so a crash or restart
+	 * leaves a resumable record. See docs/research/autonomous-work.md.
+	 */
+	const runAutonomousTask = async (task: ScheduledTaskRow): Promise<{ status: string }> => {
+		const budget = normalizeBudget(task.max_turns, task.max_minutes);
+		const prior = parseChainState(task.chain_state);
+		// Resume reuses the SAME conversation but resets the budget window; a
+		// fresh chain gets a unique conversation (no bleed between chains).
+		const chain: AutonomousChainState = prior
+			? { ...prior, turns: 0, startedAt: Date.now(), pending: undefined }
+			: { convId: `sched:${task.id}:${Date.now()}`, turns: 0, startedAt: Date.now() };
+		// A staged reply (resume after a human question) is consumed on turn 0 and
+		// then dropped from the persisted state.
+		const stagedAnswer = prior?.answer;
+		history.ensureConversation(chain.convId, `⏰ ${task.title}`);
+		const agent = engine.getOrCreateSession(chain.convId);
+		const pushActivity = (cid: string) => {
+			const wc = mainWindow?.webContents;
+			if (wc && !wc.isDestroyed()) wc.send("im:activity", cid);
+		};
+
+		// In-turn heartbeat (same shape as the IM manager's): every
+		// longTaskProgressMin while a turn is streaming, push a progress note.
+		const progressMin = config.all().general.longTaskProgressMin;
+		let progressInFlight = false;
+		const heartbeat = progressMin > 0 && task.conversation_id
+			? setInterval(() => {
+				if (progressInFlight || !agent.state.isStreaming) return;
+				progressInFlight = true;
+				void engine.progressBrief(agent, chain.convId)
+					.then((note) => {
+						if (agent.state.isStreaming && task.conversation_id) {
+							void im.pushToConversation(task.conversation_id, `⏳ ${note}`);
+						}
+					})
+					.catch(() => {})
+					.finally(() => {
+						progressInFlight = false;
+					});
+			}, progressMin * 60_000)
+			: undefined;
+
+		const reportRun = reportService.startRun({
+			source: "scheduled_task",
+			sourceRef: task.id,
+			title: task.title,
+			trigger: prior?.pending ? "resume" : "cron",
+			inputRef: task.prompt,
+		});
+
+		const persistChain = () => scheduledTaskStore.setChainState(task.id, JSON.stringify(chain));
+		let lastText = "";
+		let outcome: "done" | "human" | "budget" | "error" = "error";
+		let question: string | undefined;
+		try {
+			for (;;) {
+				const prefix = buildAutonomousTurnPrefix({ turn: chain.turns, budget });
+				const answerBlock = chain.turns === 0 && stagedAnswer ? `用户对你上一轮问题的回复：${stagedAnswer}\n\n` : "";
+				const message = chain.turns === 0 ? scheduledTimePrefix() + prefix + answerBlock + task.prompt : prefix + "继续。";
+				const send = await engine.send(agent, message, {
+					// Same creator-identity re-attachment as single-turn runs: guarded
+					// tools authorize against the LIVE role on every turn.
+					...(task.created_by
+						? { actor: { senderId: task.created_by, channel: "scheduler" as const, chatType: "single" as const } }
+						: {}),
+					onPersist: () => {
+						pushActivity(chain.convId);
+						if (task.conversation_id) pushActivity(task.conversation_id);
+					},
+				});
+				chain.turns += 1;
+				lastText = send.reply ?? "";
+				const decision = parseChainReply(lastText);
+				if (send.error) {
+					outcome = "error";
+					lastText = send.error;
+					scheduledTaskStore.setChainState(task.id, null); // hard error — chain over
+					break;
+				}
+				if (decision.kind === "human") {
+					outcome = "human";
+					question = decision.question || decision.text;
+					chain.pending = "human";
+					chain.question = question;
+					persistChain();
+					break;
+				}
+				if (decision.kind === "done") {
+					outcome = "done";
+					lastText = decision.text;
+					scheduledTaskStore.setChainState(task.id, null); // chain complete — no stale state
+					break;
+				}
+				if (budgetExceeded(chain, budget)) {
+					outcome = "budget";
+					chain.pending = "budget";
+					persistChain();
+					break;
+				}
+				// Still working: persist progress, then push a turn-boundary note so
+				// the target chat sees the chain is alive without reading the console.
+				persistChain();
+				if (task.conversation_id) {
+					await im.pushToConversation(
+						task.conversation_id,
+						`⏳ **${task.title}** 第 ${chain.turns}/${budget.maxTurns} 轮完成，继续推进…\n${tailForProgress(decision.text)}`,
+					);
+				}
+			}
+		} finally {
+			if (heartbeat) clearInterval(heartbeat);
+			// Scheduled chains are fire-and-forget: close the chain conversation's
+			// browser page so a paused chain doesn't leak its tab.
+			await browser.releasePage(chain.convId).catch(() => {});
+		}
+
+		reportService.completeRun(reportRun.runId, {
+			status: outcome === "error" ? "error" : "ok",
+			content: lastText || "",
+			error: outcome === "error" ? lastText || null : null,
+		});
+
+		// Deliver the outcome to the target chat (markers stripped by the parser).
+		if (task.conversation_id) {
+			const resumeHint = `\n\n回复「继续 ${task.title}」重置预算继续；不回复则保持暂停。`;
+			const pushText =
+				outcome === "done"
+					? `✅ **自主任务完成：${task.title}**（共 ${chain.turns} 轮）\n\n${lastText}`
+					: outcome === "human"
+						? `⏸️ **自主任务暂停（需要人工）:${task.title}**\n\n${question ?? lastText}\n\n回复「继续 ${task.title}」并附上答案，我会带着你的回复继续。`
+						: outcome === "budget"
+							? `⏸️ **自主任务已达预算：${task.title}**（${chain.turns}/${budget.maxTurns} 轮）\n\n${tailForProgress(lastText, 400)}${resumeHint}`
+							: `⚠️ **自主任务出错停止：${task.title}**\n\n${lastText}`;
+			const pushed = await im.pushToConversation(task.conversation_id, pushText);
+			if (!pushed.ok) console.warn(`[sched] autonomous push failed for ${task.conversation_id}: ${pushed.error}`);
+		}
+
+		const status =
+			outcome === "done" ? "done" :
+			outcome === "human" ? "paused:等待人工回复" :
+			outcome === "budget" ? `paused:预算耗尽（${chain.turns} 轮）` :
+			"error:" + lastText.slice(0, 180);
+		return { status };
+	};
+
 	scheduler.setRunner({
 		async runTask(task) {
+			if (task.autonomous) return runAutonomousTask(task);
 			// Execute in an isolated background conversation, NOT the originating IM
 			// chat. Reusing the IM conversation's Agent would collide with a live IM
 			// turn on the same chat ("Agent is already processing a prompt") — the

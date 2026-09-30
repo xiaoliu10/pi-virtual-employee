@@ -71,9 +71,12 @@ export function createSchedulerTools(
 			title: Type.String({ description: "任务简短标题，如「每日订单早报」" }),
 			prompt: Type.String({ description: "到点要执行的指令，如「查询昨日所有订单状态并汇总异常」" }),
 			cron: Type.String({ description: "5 字段 cron 表达式（本地时间），如 0 9 * * *" }),
+			autonomous: Type.Optional(Type.Boolean({ description: "自主模式：到点后不止执行一轮，而是连续多轮工作直到目标完成、需要人工或预算耗尽（默认预算 20 轮/2小时）。适合「整理并核对月末报表」这类长目标；单次可完成的任务不要开" })),
+			maxTurns: Type.Optional(Type.Number({ description: "自主模式最大轮数（默认 20，上限 200）" })),
+			maxMinutes: Type.Optional(Type.Number({ description: "自主模式最大时长分钟（默认 120，上限 1440）" })),
 		}),
 		async execute(_id, params) {
-			const p = params as { title: string; prompt: string; cron: string };
+			const p = params as { title: string; prompt: string; cron: string; autonomous?: boolean; maxTurns?: number; maxMinutes?: number };
 			try {
 				scheduler.validateCron(p.cron);
 			} catch (err) {
@@ -99,6 +102,9 @@ export function createSchedulerTools(
 				conversationId,
 				origin,
 				createdBy,
+				autonomous: p.autonomous === true,
+				maxTurns: p.autonomous ? (p.maxTurns ?? null) : null,
+				maxMinutes: p.autonomous ? (p.maxMinutes ?? null) : null,
 			});
 			const creatorRole = createdBy && config ? resolveRole(config, createdBy) : undefined;
 			return {
@@ -106,8 +112,8 @@ export function createSchedulerTools(
 					{
 						type: "text",
 						text: conversationId.startsWith("dt:")
-								? `已创建定时任务「${task.title}」。下次执行：${fmtTime(task.next_run_at)}。到点后我会自动执行，并把结果主动推送回当前${conversationId.startsWith("dt:group:") ? "群聊" : "单聊"}。`
-								: `已创建定时任务「${task.title}」。下次执行：${fmtTime(task.next_run_at)}。到点后我会自动执行并把结果记入对话。`,
+								? `已创建定时任务「${task.title}」${task.autonomous ? "（自主模式：将持续多轮工作直到完成、需要人工或预算耗尽；预算耗尽会主动请示是否续跑）" : ""}。下次执行：${fmtTime(task.next_run_at)}。到点后我会自动执行，并把结果主动推送回当前${conversationId.startsWith("dt:group:") ? "群聊" : "单聊"}。`
+								: `已创建定时任务「${task.title}」${task.autonomous ? "（自主模式）" : ""}。下次执行：${fmtTime(task.next_run_at)}。到点后我会自动执行并把结果记入对话。`,
 					},
 					...(createdBy
 						? [{
@@ -324,6 +330,56 @@ export function createSchedulerTools(
 		},
 	};
 
+	const resume: AgentTool = {
+		name: "resume_scheduled_task",
+		label: "续跑自主任务",
+		description:
+			"立即恢复一个因「需要人工」或「预算耗尽」而暂停的自主定时任务（同一会话、预算重置、结果继续推送回原会话）。" +
+			"仅限管理员或任务创建人使用；普通用户要求续跑时说明需要管理员或创建人确认。" +
+			"若是「需要人工」暂停，用户消息里通常已含答案——提醒用户答案会作为下一轮的输入交给任务。" +
+			"没有暂停中的链条时不要调用本工具。",
+		parameters: Type.Object({
+			id: Type.String({ description: "任务 id（来自 list_scheduled_tasks）" }),
+			answer: Type.Optional(Type.String({ description: "对暂停问题的答复（任务因「需要人工」暂停时）；会作为下一轮输入交给任务" })),
+		}),
+		async execute(_id, params) {
+			const p = params as { id: string; answer?: string };
+			const task = scheduler.get(p.id);
+			if (!task) {
+				return { content: [{ type: "text", text: `未找到 id 为 ${p.id} 的定时任务，请先用 list_scheduled_tasks 确认。` }], details: { ok: false } };
+			}
+			if (!task.autonomous || !task.chain_state) {
+				return {
+					content: [{ type: "text", text: `任务「${task.title}」不是自主模式，或当前没有暂停中的执行链条，无需续跑。` }],
+					details: { ok: false },
+				};
+			}
+			// Stage the user's answer onto the chain so the runner's next turn 0
+			// delivers it (the chain lives in its own conversation — the answer text
+			// would otherwise never reach it).
+			if (p.answer) scheduler.stageAnswer(p.id, p.answer);
+			// Admin OR the task's creator: the chain was started under their identity,
+			// so resuming it is within the same authority that created it.
+			const actor = resolveActor?.(conversationId);
+			const role = actor && config ? resolveRole(config, actor.senderId) : "viewer";
+			const isCreator = !!actor?.senderId && actor.senderId === task.created_by;
+			if (role !== "admin" && !isCreator) {
+				return {
+					content: [{ type: "text", text: "⛔ 续跑自主任务需要管理员或任务创建人。" }],
+					details: { ok: false, refused: true },
+				};
+			}
+			const fired = scheduler.fireNow(p.id);
+			if (!fired) {
+				return { content: [{ type: "text", text: "任务正在执行中，请稍后再试。" }], details: { ok: false, busy: true } };
+			}
+			return {
+				content: [{ type: "text", text: `已恢复自主任务「${task.title}」，从上次停下的地方继续。完成后结果会照常推送回原会话。` }],
+				details: { ok: true, resumed: true, id: p.id },
+			};
+		},
+	};
+
 	const updateTask: AgentTool = {
 		name: "update_scheduled_task",
 		label: "修改定时任务",
@@ -339,13 +395,21 @@ export function createSchedulerTools(
 			prompt: Type.Optional(Type.String({ description: "新的到点执行指令" })),
 			cron: Type.Optional(Type.String({ description: "新的 5 字段 cron（本地时间），如 0 9 * * *" })),
 			bindCurrent: Type.Optional(Type.Boolean({ description: "true=把推送目标改绑为当前会话。仅当对方明确要求改绑；改绑已有推送目标需当前消息含「确认」" })),
+			autonomous: Type.Optional(Type.Boolean({ description: "开/关自主模式（连续多轮工作直到完成、需要人工或预算耗尽）" })),
+			maxTurns: Type.Optional(Type.Number({ description: "自主模式最大轮数（默认 20，上限 200）" })),
+			maxMinutes: Type.Optional(Type.Number({ description: "自主模式最大时长分钟（默认 120，上限 1440）" })),
 		}),
 		async execute(_toolCallId, params) {
-			const p = params as { id: string; title?: string; prompt?: string; cron?: string; bindCurrent?: boolean };
-			const patch: { title?: string; prompt?: string; cron?: string; conversationId?: string | null } = {};
+			const p = params as { id: string; title?: string; prompt?: string; cron?: string; bindCurrent?: boolean; autonomous?: boolean; maxTurns?: number; maxMinutes?: number };
+			const patch: { title?: string; prompt?: string; cron?: string; conversationId?: string | null; autonomous?: boolean; maxTurns?: number | null; maxMinutes?: number | null } = {};
 			if (p.title !== undefined) patch.title = p.title;
 			if (p.prompt !== undefined) patch.prompt = p.prompt;
 			if (p.cron !== undefined) patch.cron = p.cron;
+			if (p.autonomous !== undefined) {
+				patch.autonomous = p.autonomous;
+				patch.maxTurns = p.autonomous ? (p.maxTurns ?? null) : null;
+				patch.maxMinutes = p.autonomous ? (p.maxMinutes ?? null) : null;
+			}
 			// The push target is where results LAND; the editing conversation is where
 			// the request CAME from. Conflating the two silently reroutes a group
 			// task's output into whoever's DM happened to edit it (field 2026-09-22).
@@ -386,6 +450,7 @@ export function createSchedulerTools(
 				patch.title !== undefined ? "标题" : null,
 				patch.prompt !== undefined ? "执行指令" : null,
 				patch.cron !== undefined ? `cron（下次执行 ${fmtTime(updated.next_run_at)}）` : null,
+				patch.autonomous !== undefined ? (patch.autonomous ? "开启自主模式" : "关闭自主模式") : null,
 				patch.conversationId !== undefined ? `推送目标→${patch.conversationId?.startsWith("dt:group:") ? "当前群聊" : "当前单聊"}` : null,
 				patch.conversationId === undefined ? "推送目标未变" : null,
 			].filter(Boolean) as string[];
@@ -396,5 +461,5 @@ export function createSchedulerTools(
 		},
 	};
 
-	return [create, list, detail, remove, toggle, authorize, updateTask];
+	return [create, list, detail, remove, toggle, resume, authorize, updateTask];
 }
