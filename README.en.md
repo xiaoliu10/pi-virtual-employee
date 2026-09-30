@@ -6,6 +6,8 @@ A desktop **Virtual Employee** application powered by the `Agent` from the [pi a
 
 The interface takes inspiration from [LobsterAI](https://github.com/netease-youdao/LobsterAI). The product centers on **one built-in employee**: a persistent, configurable digital employee that can chat and run scheduled tasks, not a multi-agent orchestration system.
 
+**How it differs from process-broadcast bots like Hermes**: Hermes replies to the group with the raw result of every single tool call, so one long task easily spams dozens of messages. The virtual employee is **result-oriented** — once it accepts a task it executes silently and replies only with the final result, reporting task progress at a configurable fixed interval for long-running work, without flooding the channel with intermediate details.
+
 ## Features
 
 - **An enterprise-grade bot built around your knowledge base**: Supports both a **built-in knowledge base and external knowledge base integrations**. The built-in knowledge base combines full-text search, vector search, and long-term memory, while external integrations connect to your organization's existing knowledge bases. Answer questions using enterprise knowledge and execute tasks through IM channels such as DingTalk, with role-based access control and confirmation gates for dangerous operations.
