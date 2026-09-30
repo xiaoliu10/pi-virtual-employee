@@ -420,6 +420,32 @@ export function taskAnchorOf(messages: AgentMessage[]): AgentMessage | undefined
 	return messages.findLast((m) => m.role === "user" && !isSyntheticUserMessage(m));
 }
 
+const TRUNCATE_NOTE_PREFIX = "（上下文超出模型上限";
+
+/**
+ * Goal text for the heartbeat's content-free fallback. Deliberately NEVER
+ * quotes user messages — field history is settled on that (2026-09-23: latest
+ * narration leaked low-level mechanics; 2026-09-24: a mid-turn steering line
+ * "如果图片不好识别可以换下一张…" got misquoted as the task name). But the
+ * always-true empty line is ALSO unacceptable (2026-09-29: "这个过程汇报总结
+ * 没有实质性的内容") — so the one remaining honest source is the chained
+ * compaction summary: a curated task record, quoted only when every user
+ * message has been compacted away. Two exclusions: the truncateToFit
+ * discard-note records the cut, not the task; and the summary's structured
+ * template ("## Goal …") is stripped rather than echoed (field 2026-09-25).
+ */
+export function heartbeatGoalOf(messages: AgentMessage[]): string {
+	for (const m of messages) {
+		if (m.role !== "compactionSummary") continue;
+		const summary = String((m as { summary?: unknown }).summary ?? "").replace(/\s+/g, " ").trim();
+		if (!summary || summary.startsWith(TRUNCATE_NOTE_PREFIX)) continue;
+		const template = summary.match(/^##\s*Goal\b[:：]?\s*(.*?)(?:\s*##\s|$)/i);
+		const goal = (template ? template[1] : summary).trim();
+		if (goal) return goal;
+	}
+	return "";
+}
+
 /**
  * Context for the heartbeat progress summary (field request 2026-09-17: the
  * raw latest-narration snippet read like "检查表格当前行状态" — no sense of

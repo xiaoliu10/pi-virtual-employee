@@ -38,7 +38,7 @@ import { isLocalConversation, resolveRole } from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
-import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, SUMMARIZER_RETRY, truncateToFit, usableContextWindow } from "./context.js";
+import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, SUMMARIZER_RETRY, truncateToFit, usableContextWindow } from "./context.js";
 import { fetchModelInfo, resolveEffectiveLimits, type RemoteModelInfo } from "./model-info.js";
 
 /** Default single-reply output cap for relay (custom baseUrl) models without an explicit per-model override. */
@@ -1376,16 +1376,23 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 	/**
 	 * Fallback for the long-task heartbeat when the side-channel LLM pass is
-	 * unavailable — deliberately GOAL-LESS. Field history, both directions:
+	 * unavailable. Field history, four directions — every extreme failed:
 	 * 2026-09-23 quoting the latest assistant narration leaked low-level
 	 * mechanics ("重置把分页调回了 10/页"); 2026-09-24 quoting a user message
-	 * misquoted MID-TURN STEERING ("如果图片不好识别可以换下一张…") as the task
-	 * name — neither first- nor last-user-message is reliably THE task in a
-	 * long-lived conversation. The always-true line is the only honest fallback;
-	 * the goal-level report is the LLM path's job.
+	 * misquoted MID-TURN STEERING ("如果图片不好识别可以换下一张…") as the
+	 * task name; the resulting always-true empty line was then rejected in
+	 * 2026-09-29 ("这个过程汇报总结没有实质性的内容"). What remains honest AND
+	 * substantive: the chained compaction summary via heartbeatGoalOf — a
+	 * curated task record that is neither narration nor steering. When even
+	 * that doesn't exist (no summary, or only a truncateToFit discard-note),
+	 * the empty line is the last resort.
 	 */
-	briefProgress(_agent: Agent): string {
-		return "⏳ 任务仍在进行中（已耗时较长），请稍候，完成后会立即回复结果。";
+	briefProgress(agent: Agent): string {
+		const snippet = heartbeatGoalOf(agent.state.messages);
+		const goal = snippet.length > 60 ? snippet.slice(0, 60) + "…" : snippet;
+		return goal
+			? `⏳ 任务仍在进行中（已耗时较长）。任务：${goal}。完成后会立即回复结果，请稍候。`
+			: "⏳ 任务仍在进行中（已耗时较长），请稍候，完成后会立即回复结果。";
 	}
 
 	/**

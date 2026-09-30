@@ -25,7 +25,7 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 			contents: `
-				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, maybeCompact } from "./src/engine/context.ts";
+				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, heartbeatGoalOf, maybeCompact } from "./src/engine/context.ts";
 				export { shouldCompact, DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-agent-core";
 				export { estimateTokens } from "@earendil-works/pi-agent-core";
 			`,
@@ -38,7 +38,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, maybeCompact } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, heartbeatGoalOf, maybeCompact } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -484,4 +484,34 @@ test("truncateToFit drop is honestly re-measured: stale usage floor must not sur
 	const after = estimateTokensSafe(agent.state.messages);
 	assert.ok(after < 158_293, `post-drop estimate must reflect kept content, not the pre-drop usage floor (got ${after})`);
 	assert.ok(after < before * 0.5, `the drop must be visible in the measure (${before} → ${after})`);
+});
+
+// Field incident 2026-09-29 (user: "这个过程汇报总结没有实质性的内容"): the
+// long-task heartbeat fell back to the goal-less line because EVERY user
+// message — the task statement AND "继续" alike — had been compacted away
+// under later tool results, and the side-channel LLM pass had failed. Field
+// history rules out quoting user messages (narration leak 2026-09-23, steering
+// misquote 2026-09-24); the one remaining honest source is the chained
+// compaction summary. Pinned: the fallback quotes the curated summary — with
+// the "## Goal" template stripped and the truncateToFit discard-note excluded.
+test("heartbeat fallback goal comes from the compaction summary, never user messages", () => {
+	const realSummary = { role: "compactionSummary", summary: "## Goal 检查所有机器组心跳\n## Constraints 只读操作", tokensBefore: 50000, timestamp: Date.now() };
+	const discardNote = { role: "compactionSummary", summary: "（上下文超出模型上限，本次请求已丢弃更早的 3 条消息以继续；完整历史仍可在会话记录中查看。）", tokensBefore: 90000, timestamp: Date.now() };
+	const steering = user("如果图片不好识别可以换下一张");
+
+	// Summary present → goal extracted, template stripped.
+	assert.equal(heartbeatGoalOf([realSummary, assistant("执行中" + "中".repeat(3000))]), "检查所有机器组心跳", "the ## Goal template must be stripped, not echoed");
+
+	// User messages are NEVER quoted (2026-09-24 steering misquote) — even when
+	// one exists, the fallback does not use it; only the summary qualifies.
+	assert.equal(heartbeatGoalOf([steering, assistant("执行中" + "中".repeat(3000))]), "", "a steering user line must not become the task name");
+	assert.equal(heartbeatGoalOf([user("继续"), assistant("执行中" + "中".repeat(3000))]), "", "继续 alone is not a task record");
+
+	// Discard-note records the cut, not the task — excluded even as the head.
+	assert.equal(heartbeatGoalOf([discardNote, assistant("执行中" + "中".repeat(3000))]), "");
+	assert.equal(heartbeatGoalOf([discardNote, realSummary, assistant("执行中" + "中".repeat(3000))]), "检查所有机器组心跳", "a real summary deeper than the discard-note still qualifies");
+
+	// Nothing honest to quote → empty (the goal-less line is the last resort).
+	assert.equal(heartbeatGoalOf([assistant("执行中" + "中".repeat(3000))]), "");
+	assert.equal(heartbeatGoalOf([]), "");
 });
