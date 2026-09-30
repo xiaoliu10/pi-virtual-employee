@@ -421,6 +421,31 @@ export function taskAnchorOf(messages: AgentMessage[]): AgentMessage | undefined
 	return messages.findLast((m) => m.role === "user" && !isSyntheticUserMessage(m));
 }
 
+/** Pure acknowledgments / steering-noise: quoting one back as the task reads
+ * as nonsense (field 2026-09-30: "任务：确认。" when the admin replied 确认). */
+const ACK_RE = /^(确认|确定|同意|收到|好的|好|行|可以|继续|ok|yes|对|嗯+)[!！。.，,、~～\s]*$/i;
+
+/** Latest real user message that actually carries task identity — pure acks
+ * (确认/继续/好的…) and the synthetic finalSummary instruction are skipped.
+ * Used by the heartbeat fallback so a substantial request is quoted instead of
+ * an ack, without needing an LLM pass. */
+export function substantialAnchorOf(messages: AgentMessage[]): string {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role !== "user" || isSyntheticUserMessage(message)) continue;
+		const content = (message as { content?: unknown }).content;
+		const raw = typeof content === "string"
+			? content
+			: Array.isArray(content)
+				? (content as { type?: string; text?: string }[]).filter((part) => part?.type === "text").map((part) => part.text ?? "").join(" ")
+				: "";
+		const text = raw.replace(/\s+/g, "").trim();
+		if (!text || text.length <= 2 || ACK_RE.test(text)) continue;
+		return raw.replace(/\s+/g, " ").trim();
+	}
+	return "";
+}
+
 const TRUNCATE_NOTE_PREFIX = "（上下文超出模型上限";
 
 /**
