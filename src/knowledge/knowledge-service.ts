@@ -34,6 +34,7 @@ import {
 	extractCriticalValues,
 	parseConsolidationOps,
 	parseResearchSynthesis,
+	partitionMergeIds,
 	type ConsolidateReport,
 } from "./consolidation.js";
 
@@ -328,12 +329,23 @@ export class KnowledgeService {
 		let retagged = 0;
 		const txn = this.db.transaction(() => {
 			for (const op of ops.merge) {
+				// Field 2026-09-30: credential entries must stay independent — merging
+				// them into a procedure/spec entry makes its title/tags rank as the
+				// procedure topic, so credential queries (「后台管理地址」「账号密码」)
+				// stop matching even though the values were preserved verbatim.
+				const { mergeable, protected: protectedIds } = partitionMergeIds(op.ids, sourceContent);
+				if (protectedIds.length > 0) {
+					console.warn(
+						`[knowledge] refused to merge ${protectedIds.join(", ")}: contains critical values (kept independent)`,
+					);
+				}
+				if (mergeable.length < 2) continue;
 				// Deterministic credential backstop: if the model redacted/dropped any
 				// critical value (地址/账号/密码/卡号/商户号/密钥/端口…) from a source, force
 				// it back into the merged entry verbatim.
 				const { content, restored } = ensureCriticalValuesPreserved(
 					op.content,
-					op.ids.map(sourceContent),
+					mergeable.map(sourceContent),
 				);
 				if (restored.length > 0) {
 					console.warn(
@@ -341,8 +353,8 @@ export class KnowledgeService {
 						restored.map((r) => r.label).join(", "),
 					);
 				}
-				this.store.mergeEntries(op.ids, { title: op.title, content, tags: op.tags });
-				merged += op.ids.length;
+				this.store.mergeEntries(mergeable, { title: op.title, content, tags: op.tags });
+				merged += mergeable.length;
 				derived += 1;
 			}
 			for (const id of ops.archive) {

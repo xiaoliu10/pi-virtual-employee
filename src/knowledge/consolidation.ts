@@ -39,6 +39,7 @@ export const CONSOLIDATE_SYSTEM = `你是知识库整理助手。分析给定的
 - 合并、泛化或重写任何条目时，必须**逐字保留**上述关键凭据与配置的具体取值，绝不得省略、概括、打码或替换成"从受控凭据库获取""见安全存储"之类的话。
 - 原文是"账号：abc / 密码：xyz"，合并后的条目里也必须照样出现"账号：abc / 密码：xyz"。
 - 含有关键凭据的条目永远有价值，不要 archive。
+- 含有关键凭据的条目**不要参与 merge，保持独立条目**：合并进流程/规范类条目后，新条目的标题与标签会变成流程主题，按"账号/地址/密码"检索时反而查不到这些凭据。
 - 不得以"安全""隐私""脱敏"为由删改这些信息。
 
 规则：
@@ -210,6 +211,29 @@ export function ensureCriticalValuesPreserved(
 		content: `${merged.trimEnd()}\n\n## 关键信息（整理时自动保留，原样勿改）\n${lines.join("\n")}`,
 		restored,
 	};
+}
+
+/**
+ * Field 2026-09-30: a production admin credential entry was merged into a
+ * generic "对账操作规范" procedure entry. The values were preserved verbatim,
+ * but the merged entry's title/tags rank as a procedure topic — queries like
+ * 「后台管理地址」「账号密码」 no longer matched, so the credentials became
+ * unfindable from other pages. Credential-bearing entries must therefore stay
+ * INDEPENDENT and never be absorbed into a merge.
+ *
+ * Splits a merge op's ids into mergeable ids and credential-protected ids.
+ */
+export function partitionMergeIds(
+	ids: string[],
+	contentOf: (id: string) => string,
+): { mergeable: string[]; protected: string[] } {
+	const mergeable: string[] = [];
+	const protectedIds: string[] = [];
+	for (const id of ids) {
+		if (extractCriticalValues(contentOf(id)).length > 0) protectedIds.push(id);
+		else mergeable.push(id);
+	}
+	return { mergeable, protected: protectedIds };
 }
 
 function truncate(s: string, n: number): string {
