@@ -25,7 +25,7 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 			contents: `
-				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, heartbeatGoalOf, maybeCompact } from "./src/engine/context.ts";
+				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact } from "./src/engine/context.ts";
 				export { shouldCompact, DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-agent-core";
 				export { estimateTokens } from "@earendil-works/pi-agent-core";
 			`,
@@ -38,7 +38,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, heartbeatGoalOf, maybeCompact } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -514,4 +514,21 @@ test("heartbeat fallback goal comes from the compaction summary, never user mess
 	// Nothing honest to quote → empty (the goal-less line is the last resort).
 	assert.equal(heartbeatGoalOf([assistant("执行中" + "中".repeat(3000))]), "");
 	assert.equal(heartbeatGoalOf([]), "");
+});
+
+// Field 2026-09-30: the heartbeat fallback quoted a pure acknowledgment as the
+// task ("任务：确认。" when the admin replied 确认). The layered fallback must
+// skip acks/steering-noise and quote the latest SUBSTANTIAL request instead.
+test("substantialAnchorOf skips acknowledgments and picks the latest substantial request", () => {
+	const ack = user("确认");
+	const steering = user("好的");
+	const substantial = user("统计 9 月 1 日到 27 日对账异常，筛选重复支付、掉单、金额不一致");
+	assert.match(substantialAnchorOf([ack, steering, substantial]), /统计 9 月 1 日到 27 日对账异常/, "latest substantial request wins");
+	assert.equal(substantialAnchorOf([ack, steering]), "", "pure acks contribute nothing (generic line)");
+	assert.equal(substantialAnchorOf([]), "");
+
+	// The finalSummary instruction is never quoted, even when it is the only
+	// non-ack user message.
+	const synthetic = user(FINAL_SUMMARY_PROMPT);
+	assert.equal(substantialAnchorOf([synthetic, ack]), "");
 });

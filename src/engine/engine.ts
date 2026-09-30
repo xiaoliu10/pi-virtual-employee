@@ -40,7 +40,7 @@ import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
 import { createMcpManager, type McpManager } from "./tools/mcp.js";
-import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, SUMMARIZER_RETRY, truncateToFit, usableContextWindow } from "./context.js";
+import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, substantialAnchorOf, SUMMARIZER_RETRY, truncateToFit, usableContextWindow } from "./context.js";
 import { fetchModelInfo, resolveEffectiveLimits, type RemoteModelInfo } from "./model-info.js";
 
 /** Default single-reply output cap for relay (custom baseUrl) models without an explicit per-model override. */
@@ -1414,10 +1414,17 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * the empty line is the last resort.
 	 */
 	briefProgress(agent: Agent): string {
-		const snippet = heartbeatGoalOf(agent.state.messages);
-		const goal = snippet.length > 60 ? snippet.slice(0, 60) + "…" : snippet;
-		return goal
-			? `⏳ 任务仍在进行中（已耗时较长）。任务：${goal}。完成后会立即回复结果，请稍候。`
+		// Layered, all deterministic: (1) the chained compaction summary — a
+		// curated goal record; (2) the latest SUBSTANTIAL user request (pure acks
+		// like 「确认」 are skipped — field 2026-09-30: "任务：确认。"); (3) the
+		// always-true generic line. The LLM path remains the primary quality source.
+		const summary = heartbeatGoalOf(agent.state.messages);
+		const request = substantialAnchorOf(agent.state.messages);
+		const goal = (summary || request).replace(/\s+/g, " ").trim();
+		const snippet = goal.length > 60 ? goal.slice(0, 60) + "…" : goal;
+		const label = summary ? "任务" : "当前请求";
+		return snippet
+			? `⏳ 任务仍在进行中（已耗时较长）。${label}：${snippet}。完成后会立即回复结果，请稍候。`
 			: "⏳ 任务仍在进行中（已耗时较长），请稍候，完成后会立即回复结果。";
 	}
 
@@ -1443,8 +1450,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// call left the manager's progressInFlight flag stuck true, so ALL later
 			// heartbeats were silently skipped ("30 minutes with no push"). Count it
 			// as in-flight life and bound it: a heartbeat brief is a tiny 512-token
-			// call — 60s is generous; on abort it falls back to the plain line.
-			const signal = conversationId ? this.beginSideLlmCall(conversationId, 60_000) : undefined;
+			// call, but a busy relay can legitimately take minutes — 180s keeps
+			// progressInFlight from sticking forever without starving slow paths
+			// (field 2026-09-30: 60s aborted almost every attempt under load, so
+			// heartbeats degraded to the generic line).
+			const signal = conversationId ? this.beginSideLlmCall(conversationId, 180_000) : undefined;
 			let result;
 			try {
 				result = await generateSummary(
