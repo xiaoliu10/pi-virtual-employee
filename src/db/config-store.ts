@@ -6,6 +6,7 @@
 import { randomUUID } from "node:crypto";
 import type { DB } from "./sqlite.js";
 import { normalizeTimeoutSec } from "../shared/timeouts.js";
+import { normalizeMcpServers, type McpServerConfig } from "../shared/mcp.js";
 import { DEFAULT_COMPUTER_CONFIG, normalizeComputerConfig, type ComputerConfig } from "../shared/computer.js";
 
 export type ApiType = "anthropic" | "openai";
@@ -299,6 +300,11 @@ export interface AppConfig {
 			/** Default blocking wait for a process poll. 0 = return immediately. */
 			pollTimeoutSec: number;
 		};
+		/** Native MCP connector: external servers' tools bridged into the tool set. */
+		mcp: {
+			enabled: boolean;
+			servers: McpServerConfig[];
+		};
 	};
 	/**
 	 * Report / artifact center. Generated reports (scheduled-task outputs, etc.)
@@ -420,7 +426,10 @@ const DEFAULTS: AppConfig = {
 	prompt: { extra: "", rules: "" },
 	documents: { enabled: false, dir: "" },
 	filesystem: { enabled: false, allowedDirs: ["~/Downloads"] },
-	capabilities: { shell: { enabled: false, allowedCommands: ["tasklist", "taskkill", "ping", "ipconfig", "systeminfo", "whoami", "hostname", "netstat", "where"], timeoutSec: 60, backgroundTimeoutSec: 0, pollTimeoutSec: 30 } },
+	capabilities: {
+		shell: { enabled: false, allowedCommands: ["tasklist", "taskkill", "ping", "ipconfig", "systeminfo", "whoami", "hostname", "netstat", "where"], timeoutSec: 60, backgroundTimeoutSec: 0, pollTimeoutSec: 30 },
+		mcp: { enabled: false, servers: [] },
+	},
 	reports: {
 		enabled: false,
 		target: "gitee",
@@ -548,6 +557,7 @@ function normalizeCapabilities(merged: AppConfig): AppConfig["capabilities"] {
 			.map((c) => c.trim().toLowerCase().replace(/\.(exe|bat|cmd|com|ps1|js)$/i, ""))
 			.filter((c) => c === "*" || /^[a-z0-9._-]+$/.test(c)))]
 		: [];
+	const { servers: mcpServers } = normalizeMcpServers(merged.capabilities?.mcp?.servers);
 	return {
 		shell: {
 			enabled: shell?.enabled === true,
@@ -555,6 +565,10 @@ function normalizeCapabilities(merged: AppConfig): AppConfig["capabilities"] {
 			timeoutSec: normalizeTimeoutSec(shell?.timeoutSec, DEFAULTS.capabilities.shell.timeoutSec),
 			backgroundTimeoutSec: normalizeTimeoutSec(shell?.backgroundTimeoutSec, DEFAULTS.capabilities.shell.backgroundTimeoutSec),
 			pollTimeoutSec: normalizeTimeoutSec(shell?.pollTimeoutSec, DEFAULTS.capabilities.shell.pollTimeoutSec),
+		},
+		mcp: {
+			enabled: merged.capabilities?.mcp?.enabled === true,
+			servers: mcpServers,
 		},
 	};
 }

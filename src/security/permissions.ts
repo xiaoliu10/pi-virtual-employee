@@ -34,6 +34,7 @@ export const CAPABILITY_LABEL: Record<string, string> = {
 	browser: "浏览器操作",
 	computer: "桌面控制",
 	shell: "命令执行",
+	mcp: "MCP 外部工具",
 	filesystem: "文件系统",
 	documents: "文档处理",
 	scheduler: "定时任务",
