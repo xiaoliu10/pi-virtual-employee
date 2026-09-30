@@ -296,6 +296,15 @@ function migrate(db: DB): void {
 	);
 	if (!taskCols.has("created_by")) db.exec("ALTER TABLE scheduled_tasks ADD COLUMN created_by TEXT");
 
+	// Autonomous chaining (2026-09-30): a task may keep working across turns in
+	// ONE conversation until the model reports done / asks for a human / the
+	// budget runs out. chain_state carries the live chain across fires and app
+	// restarts (see src/scheduler/autonomous.ts for the schema semantics).
+	if (!taskCols.has("autonomous")) db.exec("ALTER TABLE scheduled_tasks ADD COLUMN autonomous INTEGER NOT NULL DEFAULT 0");
+	if (!taskCols.has("max_turns")) db.exec("ALTER TABLE scheduled_tasks ADD COLUMN max_turns INTEGER");
+	if (!taskCols.has("max_minutes")) db.exec("ALTER TABLE scheduled_tasks ADD COLUMN max_minutes INTEGER");
+	if (!taskCols.has("chain_state")) db.exec("ALTER TABLE scheduled_tasks ADD COLUMN chain_state TEXT");
+
 	// Document resources: a catalog of deliverable docs the employee can hand to
 	// integration partners. kind=file points at a copied file under documents.dir;
 	// kind=link holds an online URL. partners/scenario drive "give which doc to

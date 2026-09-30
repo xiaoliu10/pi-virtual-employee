@@ -12,6 +12,7 @@
  * (no multi-catch-up).
  */
 import { CronExpressionParser } from "cron-parser";
+import { normalizeBudget, parseChainState } from "./autonomous.js";
 import type {
 	CreateScheduledTaskInput,
 	ScheduledTaskRow,
@@ -89,14 +90,46 @@ export class SchedulerService {
 	}
 
 	/**
-	 * Patch an existing task (title/prompt/cron/push target) without deleting it
-	 * — keeps run history. A cron change is validated and recomputes next_run_at;
-	 * other fields leave the schedule untouched. Returns undefined for an
-	 * unknown id or an invalid cron.
+	 * Stage a user's answer onto a paused chain (resume after need_human).
+	 * Pass-through to the store so tools never touch it directly.
+	 */
+	stageAnswer(id: string, answer: string): void {
+		this.store.stageAnswer(id, answer);
+	}
+
+	/**
+	 * Fire a task immediately, bypassing its cron — the resume/continue path for
+	 * paused autonomous chains. Not awaited: the runner pushes its own results;
+	 * shares the tick's inFlight guard so a resume can never overlap a due fire.
+	 */
+	fireNow(id: string): boolean {
+		const task = this.store.get(id);
+		if (!task || !this.runner || this.inFlight.has(id)) return false;
+		this.inFlight.add(id);
+		void this.runner
+			.runTask(task)
+			.catch((err) => console.error(`[scheduler] fireNow ${id} failed:`, (err as Error).message))
+			.finally(() => this.inFlight.delete(id));
+		return true;
+	}
+
+	/**
+	 * Patch an existing task (title/prompt/cron/push target/autonomous opts)
+	 * without deleting it — keeps run history. A cron change is validated and
+	 * recomputes next_run_at; other fields leave the schedule untouched. Returns
+	 * undefined for an unknown id or an invalid cron.
 	 */
 	update(
 		id: string,
-		patch: { title?: string; prompt?: string; cron?: string; conversationId?: string | null },
+		patch: {
+			title?: string;
+			prompt?: string;
+			cron?: string;
+			conversationId?: string | null;
+			autonomous?: boolean;
+			maxTurns?: number | null;
+			maxMinutes?: number | null;
+		},
 	): ScheduledTaskRow | undefined {
 		const task = this.store.get(id);
 		if (!task) return undefined;
@@ -109,6 +142,9 @@ export class SchedulerService {
 			}
 			nextRunAt = this.safeNext(patch.cron);
 		}
+		// Turning autonomy OFF also drops any paused chain — there is nothing to
+		// resume once the task is no longer autonomous.
+		if (patch.autonomous === false) this.store.setChainState(id, null);
 		return this.store.update(id, patch, nextRunAt);
 	}
 
@@ -131,6 +167,14 @@ export class SchedulerService {
 			const now = Date.now();
 			for (const task of this.store.listDue(now)) {
 				if (this.inFlight.has(task.id)) continue; // still running — skip this occurrence
+				// An autonomous chain paused for a human waits for an explicit resume
+				// (resume_scheduled_task); a fresh cron fire must not fork it — the
+				// chain's conversation carries all its progress.
+				if (task.autonomous && parseChainState(task.chain_state)?.pending) {
+					const next = this.safeNext(task.cron);
+					this.store.markRun(task.id, task.chain_state?.includes('"budget"') ? "paused:预算耗尽，等待续跑（跳过本次触发）" : "paused:等待人工回复（跳过本次触发）", next);
+					continue;
+				}
 				this.inFlight.add(task.id);
 				const next = this.safeNext(task.cron);
 				try {
@@ -148,17 +192,23 @@ export class SchedulerService {
 	}
 
 	/**
-	 * One task run, bounded by runTimeoutMs. The losing run keeps executing in
-	 * the background (an engine turn can't be meaningfully cancelled from here),
+	 * One task run, bounded by a per-task timeout. Autonomous tasks get their
+	 * own budget window (max_minutes) plus margin — a 20-turn chain cannot fit
+	 * the default 1h ceiling (field 2026-09-30: the chain would be recorded as
+	 * timed-out while still working). The losing run keeps executing in the
+	 * background (an engine turn can't be meaningfully cancelled from here),
 	 * but its eventual rejection is swallowed — the recorded outcome is the
 	 * timeout, and the scheduler has already moved on.
 	 */
 	private runWithTimeout(task: ScheduledTaskRow): Promise<{ status: string }> {
+		const autonomousMarginMs = 30 * 60_000;
+		const budget = normalizeBudget(task.max_turns, task.max_minutes);
+		const timeoutMs = task.autonomous ? budget.maxMinutes * 60_000 + autonomousMarginMs : this.runTimeoutMs;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const timeout = new Promise<never>((_, reject) => {
 			timer = setTimeout(
-				() => reject(new Error(`run_timeout:运行超过 ${Math.round(this.runTimeoutMs / 60_000)} 分钟，被调度器强制记败（任务自身可能仍在后台执行）`)),
-				this.runTimeoutMs,
+				() => reject(new Error(`run_timeout:运行超过 ${Math.round(timeoutMs / 60_000)} 分钟，被调度器强制记败（任务自身可能仍在后台执行）`)),
+				timeoutMs,
 			);
 			timer.unref?.();
 		});

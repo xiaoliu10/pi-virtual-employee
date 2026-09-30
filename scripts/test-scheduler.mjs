@@ -62,8 +62,10 @@ function fakeScheduler(t, rows) {
 		last_status: null,
 		created_at: Date.now(),
 		updated_at: Date.now(),
+		...r,
 	}));
 	return {
+		tasks,
 		list: () => tasks,
 		setCreatedBy: (id, senderId) => {
 			const found = tasks.find((x) => x.id === id);
@@ -75,6 +77,20 @@ function fakeScheduler(t, rows) {
 			const row = { ...tasks[0], ...input, id: `t${tasks.length + 1}`, created_by: input.createdBy ?? null };
 			tasks.push(row);
 			return row;
+		},
+		get: (id) => tasks.find((x) => x.id === id),
+		stageAnswer: (id, answer) => {
+			const found = tasks.find((x) => x.id === id);
+			if (!found?.chain_state) return;
+			const chain = JSON.parse(found.chain_state);
+			chain.answer = answer;
+			found.chain_state = JSON.stringify(chain);
+		},
+		fireNow: (id) => {
+			const found = tasks.find((x) => x.id === id);
+			if (!found || !found.autonomous || !found.chain_state) return false;
+			found.fired = (found.fired ?? 0) + 1;
+			return true;
 		},
 		delete: () => {},
 		setEnabled: () => {},
@@ -378,4 +394,52 @@ test("bindCurrent from the task's own conversation is a no-op change, no ceremon
 	const res = await tool(h.tools, "update_scheduled_task").execute("u1", { id: "t1", title: "改名", bindCurrent: true });
 	assert.equal(res.details.ok, true);
 	assert.equal(h.scheduler.get("t1").conversation_id, "dt:group:g1");
+});
+
+// Autonomous chain resume: admin or creator may fire a paused chain; others
+// are refused; a chain-less task is a no-op. The user's answer is staged onto
+// the chain so the runner's next turn 0 delivers it.
+test("resume_scheduled_task: creator may resume a paused chain with an answer", async (t) => {
+	const { scheduler, tools } = build1(
+		t,
+		{ security: { adminStaffIds: ["boss"] } },
+		[
+			{
+				title: "月末对账",
+				created_by: "alice",
+				autonomous: 1,
+				max_turns: 20,
+				max_minutes: 120,
+				chain_state: JSON.stringify({ convId: "sched:t1:1", turns: 7, startedAt: Date.now(), pending: "human", question: "账号?" }),
+			},
+		],
+		actor("alice"),
+	);
+	const res = await tool(tools, "resume_scheduled_task").execute("r1", { id: "t1", answer: "账号是 ops_admin" });
+	assert.equal(res.details.ok, true);
+	assert.equal(scheduler.tasks[0].fired, 1, "the chain was fired via fireNow");
+	const chain = JSON.parse(scheduler.tasks[0].chain_state);
+	assert.equal(chain.answer, "账号是 ops_admin", "the answer is staged for the next turn 0");
+});
+
+test("resume_scheduled_task: non-admin non-creator is refused; chain-less task is a no-op", async (t) => {
+	const { tools } = build1(
+		t,
+		{ security: { adminStaffIds: ["boss"] } },
+		[
+			{
+				title: "月末对账",
+				created_by: "alice",
+				autonomous: 1,
+				chain_state: JSON.stringify({ convId: "sched:t1:1", turns: 7, startedAt: Date.now(), pending: "budget" }),
+			},
+			{ title: "普通早报", created_by: "alice" },
+		],
+		actor("mallory"),
+	);
+	const refused = await tool(tools, "resume_scheduled_task").execute("r1", { id: "t1" });
+	assert.equal(refused.details.refused, true, "neither admin nor creator");
+
+	const plain = await tool(tools, "resume_scheduled_task").execute("r2", { id: "t2" });
+	assert.equal(plain.details.ok, false, "a non-autonomous task has nothing to resume");
 });
