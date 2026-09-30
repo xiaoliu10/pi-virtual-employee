@@ -10,6 +10,7 @@
  * Alias / relay model ids (not in the pi-ai registry) are supported by cloning a
  * base model of the matching api type and overriding id + baseUrl.
  */
+import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import { randomUUID } from "node:crypto";
 import { Agent, convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "@earendil-works/pi-agent-core";
 import type { AgentEvent, AgentMessage, Skill, StreamFn } from "@earendil-works/pi-agent-core";
@@ -38,6 +39,7 @@ import { isLocalConversation, resolveRole } from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
+import { createMcpManager, type McpManager } from "./tools/mcp.js";
 import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, SUMMARIZER_RETRY, truncateToFit, usableContextWindow } from "./context.js";
 import { fetchModelInfo, resolveEffectiveLimits, type RemoteModelInfo } from "./model-info.js";
 
@@ -203,6 +205,24 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.syncProviderCredentials();
 		this.skillLoader = new SkillLoader(paths.builtinSkillsDir, paths.userSkillsDir);
 		this.skillWriter = new SkillWriter(this.skillLoader, paths.userSkillsDir);
+		this.mcpManager = createMcpManager();
+		void this.refreshMcp();
+	}
+
+	/** MCP connector: refresh tool caches from capabilities.mcp. When the tool
+	 * surface actually changed, mark config changed so live sessions rebuild
+	 * with the new tools (the manager consolidates concurrent refreshes and
+	 * only reports a change when the tool names moved). */
+	private async refreshMcp(): Promise<void> {
+		try {
+			const { changed, report } = await this.mcpManager.refresh(this.config);
+			if (changed) {
+				console.log(`[engine] mcp tools changed: ${report.map((r) => `${r.name}=${r.ok ? r.tools : `err:${r.error ?? "?"}`}`).join(", ")}`);
+				this.markConfigChanged();
+			}
+		} catch (err) {
+			console.warn("[engine] mcp refresh failed:", err instanceof Error ? err.message : err);
+		}
 	}
 
 	/**
@@ -212,6 +232,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 */
 	private telemetry?: TelemetryStore;
 	setTelemetryStore(store: TelemetryStore): void { this.telemetry = store; }
+
+	/** MCP connector (external servers' tools bridged as native tools). */
+	private mcpManager!: McpManager;
 
 	/**
 	 * Per-session rules override, used ONLY by the prompt lab's evaluation runs.
@@ -592,7 +615,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				initialState: {
 					systemPrompt: buildSystemPrompt(this.promptPartsFor(conversationId)),
 				model: this.resolveModel(supplier, modelId),
-				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onRoleRefusal: (cid, info) => this.noteAuthorizationNeeded(cid, info), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules) }),
+				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onRoleRefusal: (cid, info) => this.noteAuthorizationNeeded(cid, info), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules), mcp: { enabled: cfg.capabilities.mcp?.enabled ?? false, tools: this.mcpManager.tools() } }),
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
 				messages: rehydrateMessages(this.history.listMessages(conversationId)),
@@ -786,6 +809,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 		void this.computer?.syncConfig();
 		this.syncProviderCredentials();
 		this.skillsRevision += 1;
+		// MCP server list may have changed (capabilities.mcp.servers); refresh is
+		// change-gated so a settings write that touched nothing MCP-related is a no-op.
+		void this.refreshMcp();
 	}
 
 	/**
@@ -1426,11 +1452,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 					this.models,
 					model,
 					512, // ~0.8×512 tokens of output budget — plenty for 100 Chinese chars
-					signal,
 					"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过100字的中文向用户汇报总体进展：围绕目标，已完成到什么程度、当前处于哪个阶段、接下来做什么。节选中更早的其他请求都是早已完成的旧任务，与本报告无关，绝对不要提及它们。节选中若出现「## Goal」「## Constraints」开头的结构化文本，那是历史压缩总结的模板，不是进展汇报——绝对不要照抄或复述它，用自己的一句话概括当前目标再汇报。把琐碎的执行步骤归纳为面向目标的阶段性成果；忽略并禁止提及工具名、参数、重试、分页调整、报错重试等单次操作的技术细节，也不要原样复述日志片段；只依据记录中真实发生的事，绝不编造未发生的进度；判断不了整体位置时，如实说明仍在处理中。",
 					undefined, // previousSummary
 					undefined, // thinkingLevel
 					SUMMARIZER_RETRY,
+					undefined, // callbacks
+					signal ? withAbortSignal(signal, BACKGROUND_CONTEXT) : BACKGROUND_CONTEXT,
 				);
 			} finally {
 				if (conversationId) this.endSideLlmCall(conversationId);

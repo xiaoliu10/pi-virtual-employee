@@ -10,6 +10,7 @@
  *    passes pi's compaction threshold, older turns are summarized into a
  *    single compaction-summary message while a recent tail is kept verbatim.
  */
+import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	createCompactionSummaryMessage,
@@ -546,16 +547,19 @@ export async function maybeCompact(
 	}
 
 	const tokensBefore = estimateTokensSafe(messages);
+	// pi 0.99 moved the abort signal into the chord context (10th arg).
+	const context = signal ? withAbortSignal(signal, BACKGROUND_CONTEXT) : BACKGROUND_CONTEXT;
 	const result = await generateSummary(
 		old,
 		models,
 		model,
 		settings.reserveTokens,
-		signal,
 		undefined,
 		previousSummary,
 		undefined,
 		SUMMARIZER_RETRY,
+		undefined,
+		context,
 	);
 	if (!result.ok) {
 		console.warn("[engine] compaction summary failed:", result.error);

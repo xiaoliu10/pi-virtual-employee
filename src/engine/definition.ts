@@ -153,6 +153,9 @@ export interface ToolSetOptions {
 	runEvalTurn?: (input: string, variantText: string) => Promise<string>;
 	/** Assembles the system prompt as it would be with a candidate rules text. */
 	buildPromptWithRules?: (rules: string) => string;
+	/** MCP external tools: enabled flag from capabilities.mcp, tools from the
+	 * connector manager's cache (empty until its first refresh lands). */
+	mcp?: { enabled: boolean; tools: AgentTool<any>[] };
 }
 
 /** Assemble the employee's tools; capability tools are conditional on their config flags. */
@@ -227,6 +230,11 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 		);
 	}
 	if (options.reportsEnabled) tools.push(guarded("reports", createSaveReportTool(options.reportService, options.conversationId)));
+	// MCP external tools — guarded under the "mcp" capability like every other
+	// capability tool; the tool list comes from the connector manager's cache.
+	if (options.mcp?.enabled && options.mcp.tools.length > 0) {
+		tools.push(...guardAll("mcp", options.mcp.tools));
+	}
 	// Skill authoring is an always-on channel: explicit 技能/Skill intent writes
 	// here; everything else defaults to the knowledge base (see prompt routing rules).
 	tools.push(guarded("learn", createSaveToSkillTool(options.skillWriter, options.onSkillsChanged)));
