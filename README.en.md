@@ -8,6 +8,8 @@ The interface takes inspiration from [LobsterAI](https://github.com/netease-youd
 
 **How it differs from process-broadcast bots like Hermes**: Hermes replies to the group with the raw result of every single tool call, so one long task easily spams dozens of messages. The virtual employee is **result-oriented** — once it accepts a task it executes silently and replies only with the final result, reporting task progress at a configurable fixed interval for long-running work, without flooding the channel with intermediate details.
 
+**How it differs from LobsterAI (龙虾)**: LobsterAI has no self-evolution loop, and its dream-style memory consolidation generalizes memories at the cost of fine-grained data — once a memory is summarized, part of its precision is gone. The virtual employee closes both gaps: a **self-evolution loop** (runtime telemetry → failure clustering → improvement proposals → prompt self-evaluation `prompt_lab`, where critical red-line failures veto acceptance), and knowledge consolidation that **preserves key values verbatim** — merged-away originals are only archived, never deleted, and restorable anytime, so generalization never costs precision.
+
 ## Features
 
 - **An enterprise-grade bot built around your knowledge base**: Supports both a **built-in knowledge base and external knowledge base integrations**. The built-in knowledge base combines full-text search, vector search, and long-term memory, while external integrations connect to your organization's existing knowledge bases. Answer questions using enterprise knowledge and execute tasks through IM channels such as DingTalk, with role-based access control and confirmation gates for dangerous operations.
