@@ -20,6 +20,8 @@ import type { Api, ImageContent, Model, MutableModels, TextContent } from "@eare
 import type { ConfigStore, Supplier } from "../db/config-store.js";
 import type { HistoryStore } from "../db/history-store.js";
 import { inferConversationOrigin } from "../db/history-store.js";
+import type { WorkItemStore } from "../db/work-item-store.js";
+import { buildMiningPrompt, hasMiningSecrets, isDuplicateGoal, MINING_SYSTEM, parseMiningReply, validateMiningProposal, type ConversationDigest } from "../scheduler/mining.js";
 import { looksLikeCorrection, type TelemetryStore, type TurnStatus } from "../db/telemetry-store.js";
 import type { ProposalStore } from "./proposals.js";
 import type { PromptLab } from "../db/prompt-lab.js";
@@ -235,6 +237,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 	/** MCP connector (external servers' tools bridged as native tools). */
 	private mcpManager!: McpManager;
+	/** Work items (autonomous work phase 2). Set by main after construction; absent → work tools off. */
+	workItems?: WorkItemStore;
+	/** Main-process bridge for work items: fire a window now / push to a conversation. */
+	workBridge?: { fireItem: (id: string) => boolean; push: (conversationId: string, text: string) => Promise<{ ok: boolean; error?: string }> };
+	/** Shared by automatic + manual mining; cursors live durably in HistoryStore. */
+	private miningInFlight = false;
 
 	/**
 	 * Per-session rules override, used ONLY by the prompt lab's evaluation runs.
@@ -544,8 +552,109 @@ export class EmployeeEngine implements EmployeeRuntime {
 		return { supplier: defaultSupplier, modelId: config.model.defaultModelId };
 	}
 
-	/** One-shot text completion with the default model and no tools (for knowledge consolidation). */
-	async complete(systemPrompt: string, userPrompt: string): Promise<string> {
+	/**
+	 * Automatic calls read durable per-source deltas; manual calls supply sinceTs
+	 * (24h by default at the tool bridge), without changing automatic cursors.
+	 * No shared digest, KB, or foreign task titles enter a source's model call.
+	 */
+	async mineRecentWork(opts: { maxProposals?: number; sinceTs?: number; sourceConversationId?: string; signal?: AbortSignal } = {}): Promise<{
+		proposals: { title: string; goal: string; evidence: string; conditions: string; originConversation: string | null; id: string; delivered?: boolean; deliveryError?: string }[];
+		scanned: number;
+		error?: string;
+	}> {
+		if (!this.workItems) return { proposals: [], scanned: 0, error: "工作项未启用" };
+		if (this.miningInFlight) return { proposals: [], scanned: 0, error: "任务挖掘正在进行，请稍后再试" };
+		this.miningInFlight = true;
+		const created: Awaited<ReturnType<EmployeeEngine["mineRecentWork"]>>["proposals"] = [];
+		const errors: string[] = [];
+		let scanned = 0;
+		try {
+			const now = Date.now();
+			const deadline = now + 180_000;
+			const maxProposals = Number.isFinite(opts.maxProposals) ? Math.min(Math.max(Math.floor(opts.maxProposals!), 1), 5) : 3;
+			const lookback = Number.isFinite(opts.sinceTs) ? opts.sinceTs! : now - 24 * 60 * 60_000;
+			const manual = opts.sinceTs !== undefined;
+			const conversations = this.history.listConversations()
+				.filter((c) => inferConversationOrigin(c.id) === "im" && (!opts.sourceConversationId || opts.sourceConversationId === c.id))
+				// Old sources with an unprocessed backlog must not starve behind busy chats.
+				.sort((a, b) => (this.history.getMiningCursor(a.id)?.createdAt ?? lookback) - (this.history.getMiningCursor(b.id)?.createdAt ?? lookback));
+			for (const c of conversations) {
+				if (created.length >= maxProposals) break;
+				if (opts.signal?.aborted || Date.now() >= deadline) {
+					errors.push("挖掘已取消或达到本次 3 分钟时限；未扫描来源下次重试");
+					break;
+				}
+				const cursor = (!manual && this.history.getMiningCursor(c.id)) || { createdAt: lookback, rowid: 0 };
+				const rows = this.history.listMiningMessages(c.id, cursor, now, 25);
+				if (!rows.length) continue;
+				if (scanned >= 12) break;
+				// Persist the initial baseline too: repeated failures over >24h must
+				// not slide the lookback forward and silently drop an unscanned page.
+				if (!manual && !this.history.getMiningCursor(c.id)) this.history.setMiningCursor(c.id, cursor);
+				scanned += 1;
+				try {
+					const source: ConversationDigest = {
+						id: c.id, title: "", lines: [],
+						messages: rows.filter((m) => m.role === "user" && m.content && !hasMiningSecrets(m.content))
+							.map((m) => ({ id: m.id, content: m.content.slice(0, 1000) })),
+					};
+					const existingGoals = this.workItems.list()
+						.filter((i) => i.origin_conversation === c.id && !["done", "cancelled"].includes(i.status))
+						.map((i) => i.goal);
+					const mined = source.messages!.length ? parseMiningReply(await this.complete(
+						MINING_SYSTEM,
+						buildMiningPrompt([source], [], { maxConversations: 1, maxLinesPerConversation: 25 }),
+						{ signal: opts.signal, timeoutMs: Math.max(1, Math.min(60_000, deadline - Date.now())) },
+					), true) : [];
+					for (const p of mined) {
+						if (created.length >= maxProposals) break;
+						if (!validateMiningProposal(p, source) || isDuplicateGoal(p.goal, existingGoals)) continue;
+						const row = this.workItems.create({
+							title: p.title, goal: p.goal, originConversation: c.id,
+							originNote: `[${c.id} / ${p.evidenceMessageId}] ${p.evidence}`, status: "proposed",
+						});
+						const proposal = { title: p.title, goal: p.goal, evidence: p.evidence, conditions: p.conditions, originConversation: c.id, id: row.id, delivered: false, deliveryError: "" };
+						created.push(proposal); // Durable proposal survives even if delivery fails.
+						existingGoals.push(p.goal);
+						if (p.conditions) this.workItems.setField(row.id, "set_conditions", p.conditions);
+						try {
+							if (!this.workBridge) throw new Error("推送通道未连接");
+							const message = `📋 **自主工作提案（尚未创建执行任务）**\nID：${row.id}\n标题：${p.title}\n\n目标：${p.goal}\n执行条件（提示约束，非硬时间锁）：${p.conditions || "未明确，执行前需核实"}\n依据：${p.evidence}\n来源：${c.id} / 消息 ${p.evidenceMessageId}\n\n管理员回复「确认创建 ${row.id}」或「确认创建 ${p.title}」后才开工。`;
+							// Push APIs do not expose cancellation; report timeout as unconfirmed,
+							// not delivered. The persisted item remains discoverable via list.
+							let timer: ReturnType<typeof setTimeout> | undefined;
+							try {
+								const result = await Promise.race([
+									this.workBridge.push(c.id, message),
+									new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("推送超时，送达状态未知")), Math.max(1, Math.min(15_000, deadline - Date.now()))); }),
+								]);
+								if (!result.ok) throw new Error(result.error || "推送返回 ok:false");
+								proposal.delivered = true;
+							} finally { if (timer) clearTimeout(timer); }
+						} catch (err) {
+							proposal.deliveryError = (err as Error).message || String(err);
+							errors.push(`提案 ${row.id} 已保存但未确认送达：${proposal.deliveryError}；可用 manage_work_items list 查询`);
+							console.warn("[work] proposal delivery failed:", row.id, proposal.deliveryError);
+						}
+					}
+					if (!manual) {
+						const last = rows[rows.length - 1];
+						this.history.setMiningCursor(c.id, { createdAt: last.created_at, rowid: last.mining_rowid });
+					}
+				} catch (err) {
+					errors.push(`来源 ${c.id} 挖掘失败（游标未推进）：${(err as Error).message || String(err)}`);
+				}
+			}
+		} catch (err) {
+			errors.push((err as Error).message || String(err));
+		} finally {
+			this.miningInFlight = false;
+		}
+		return { proposals: created, scanned, ...(errors.length ? { error: errors.join("\n") } : {}) };
+	}
+
+	/** Tool-free side channel. Optional cancellation leaves knowledge consolidation's call unchanged. */
+	async complete(systemPrompt: string, userPrompt: string, opts: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<string> {
 		const { supplier, modelId } = this.resolveDefaultModel();
 		const agent = new Agent({
 			initialState: { systemPrompt, model: this.buildModel(supplier, modelId), tools: [] },
@@ -558,11 +667,23 @@ export class EmployeeEngine implements EmployeeRuntime {
 				reply += extractText(event.message);
 			}
 		});
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
 		try {
-			await agent.prompt(userPrompt);
+			if (opts.signal?.aborted) throw new Error("Completion aborted");
+			const cancelled = new Promise<never>((_, reject) => {
+				onAbort = () => { agent.abort(); reject(new Error("Completion aborted")); };
+				opts.signal?.addEventListener("abort", onAbort, { once: true });
+				if (Number.isFinite(opts.timeoutMs) && opts.timeoutMs! > 0) {
+					timer = setTimeout(() => { agent.abort(); reject(new Error("Completion timed out")); }, opts.timeoutMs);
+				}
+			});
+			await Promise.race([agent.prompt(userPrompt), cancelled]);
 			if (agent.state.errorMessage) throw new Error(agent.state.errorMessage);
 			return reply.trim();
 		} finally {
+			if (timer) clearTimeout(timer);
+			if (onAbort) opts.signal?.removeEventListener("abort", onAbort);
 			unsubscribe();
 			agent.abort();
 		}
@@ -615,7 +736,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				initialState: {
 					systemPrompt: buildSystemPrompt(this.promptPartsFor(conversationId)),
 				model: this.resolveModel(supplier, modelId),
-				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onRoleRefusal: (cid, info) => this.noteAuthorizationNeeded(cid, info), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules), mcp: { enabled: cfg.capabilities.mcp?.enabled ?? false, tools: this.mcpManager.tools() } }),
+				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), onRoleRefusal: (cid, info) => this.noteAuthorizationNeeded(cid, info), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules), mcp: { enabled: cfg.capabilities.mcp?.enabled ?? false, tools: this.mcpManager.tools() }, work: this.workItems ? { items: this.workItems, fireItem: (id) => this.workBridge?.fireItem(id) ?? false, mine: (opts) => this.mineRecentWork({ ...opts, sinceTs: Date.now() - 24 * 60 * 60_000, sourceConversationId: inferConversationOrigin(conversationId) === "im" ? conversationId : undefined }) } : undefined }),
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
 				messages: rehydrateMessages(this.history.listMessages(conversationId)),
@@ -1331,7 +1452,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// Unattended context for scheduler-owned conversations: tells the model to
 			// detect login state instead of re-logging-in / asking for OTP codes, and
 			// to stop and ask for re-login when expired.
-			isScheduledRun: conversationId.startsWith("sched:"),
+			isScheduledRun: conversationId.startsWith("sched:") || conversationId.startsWith("work:"),
 		};
 	}
 

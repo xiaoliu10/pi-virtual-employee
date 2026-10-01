@@ -305,6 +305,14 @@ export interface AppConfig {
 			enabled: boolean;
 			servers: McpServerConfig[];
 		};
+		/** Work-item mining: periodic background pass over recent IM conversations
+		 * that proposes autonomous work items for admin confirmation. Off by default
+		 * — admins opt in; on-demand mining via manage_work_items is always available. */
+		autonomousMining: {
+			enabled: boolean;
+			/** Hours between background mining passes (1-24). */
+			intervalHours: number;
+		};
 	};
 	/**
 	 * Report / artifact center. Generated reports (scheduled-task outputs, etc.)
@@ -429,6 +437,7 @@ const DEFAULTS: AppConfig = {
 	capabilities: {
 		shell: { enabled: false, allowedCommands: ["tasklist", "taskkill", "ping", "ipconfig", "systeminfo", "whoami", "hostname", "netstat", "where"], timeoutSec: 60, backgroundTimeoutSec: 0, pollTimeoutSec: 30 },
 		mcp: { enabled: false, servers: [] },
+		autonomousMining: { enabled: false, intervalHours: 4 },
 	},
 	reports: {
 		enabled: false,
@@ -569,6 +578,10 @@ function normalizeCapabilities(merged: AppConfig): AppConfig["capabilities"] {
 		mcp: {
 			enabled: merged.capabilities?.mcp?.enabled === true,
 			servers: mcpServers,
+		},
+		autonomousMining: {
+			enabled: merged.capabilities?.autonomousMining?.enabled === true,
+			intervalHours: Math.min(24, Math.max(1, Math.floor(Number(merged.capabilities?.autonomousMining?.intervalHours) || 4))),
 		},
 	};
 }
