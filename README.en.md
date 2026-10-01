@@ -21,6 +21,7 @@ The interface takes inspiration from [LobsterAI](https://github.com/netease-youd
 - **IM integration**: DingTalk direct and group chats (persistent Stream connections with no public endpoint required; streaming AI card replies, emoji reactions, file transfers, @mentions, and slash command parsing), plus an echo channel for testing.
 - **Tools**: A knowledge base with full-text and vector search, including a long-term memory layer; web research; browser automation (complex forms, iframes, and downloads); local files; a document library; controlled command execution (background sessions, allowlists, and double confirmation); Computer Use for desktop interaction; and **MCP external tools** (a native MCP connector: standard mcpServers config, stdio / streamable HTTP, tools bridged as `mcp__server__tool` under the same role gating).
 - **Scheduled tasks**: Cron scheduling, unattended execution, automatic delivery of results to the originating conversation, and permissions inherited from the task creator.
+- **Autonomous work items**: Discover ongoing goals from conversations → propose → get admin confirmation; persist conditions, progress and lessons, choose follow-up times based on real dependencies, and ask humans when resources or coordination are needed.
 - **Report publishing**: Save task outputs as HTML and publish them as locally accessible links, with automatic chunking for long reports sent through IM.
 - **Permissions and security**: Three roles based on platform-verified identities (viewer / operator / admin), conversation-level capability requirements, confirmation gates for dangerous operations, and prompt-injection defenses that treat page and file content as data rather than instructions.
 - **Self-maintenance**: Automatic application updates (a standalone watchdog installer and a version circuit breaker), runtime telemetry, failure clustering, an improvement proposal loop, and prompt self-evaluation (`prompt_lab`, where any critical safety test failure blocks acceptance).
@@ -70,6 +71,21 @@ All configuration is stored in SQLite. You can edit it in **Settings**, or an ad
 ### IM Commands
 
 @mention the bot in a group chat, or send commands directly in a direct chat: `/new` starts a new conversation, `/compact` compacts context, `/stop` stops the current task, `/model` switches models, and `/perm` shows permissions. Create scheduled tasks in natural language (for example, “Every day at 9 AM, …”). They run automatically and deliver results back to the originating conversation.
+
+### Autonomous Work: Propose First, Confirm Before Execution
+
+A work item is a **persistent goal, not a cron job**. An admin can request “Find work you could own” (`manage_work_items action=mine`) in the source direct/group chat. On-demand mining defaults to a bounded **24-hour** lookback in that conversation. Proposals include ID, title, goal, full conditions and quoted message provenance. They are persisted as `proposed`, **never started automatically**. Reply “确认创建 <id/title>” in the same source chat to start. Use `action=list/get` to inspect status and notes. Failed delivery leaves the proposal accessible; it must not be described as delivered.
+
+Background mining is **disabled by default**. In an **IM direct chat**, an admin can use `manage_settings` with explicit “确认” in the current message:
+
+- Enable: `action=set path=capabilities.autonomousMining.enabled value=true`; disable with `false`.
+- Interval: `action=set path=capabilities.autonomousMining.intervalHours value=4` (default **4 hours**, range **1–24**; the background loop checks hourly, not at an exact deadline).
+
+Each source has its own model call and durable SQLite cursor. No combined cross-chat digests, foreign task titles or KB content are supplied; private-chat proposals are not copied into groups. History is **untrusted data**, never an instruction override. Source IDs and verbatim message evidence are validated, and sensitive messages are filtered. Excerpts go to the configured model provider: check your organization's data policy first.
+
+During execution, `manage_work` persists conditions, progress and lessons. Follow-up intervals depend on output availability and dependencies rather than fixed high-frequency polling. Long-lived goals continue across windows until explicitly completed. **Conditions are prompt guidance, not hard time locks or business-rule validators.** Human resources, permissions or cross-unit coordination require pausing for an admin; reply “确认继续 <id/title>” with an answer in the source chat to resume. Reusable non-sensitive lessons may be saved to the KB under existing permissions; private information must not be shared.
+
+Limits: up to 12 sources per pass, 25 messages per source (user excerpts capped at 1,000 characters), 5 proposals, 3 minutes overall and 60 seconds per source model call. Automatic mining continues from the last successful page, initially looking back 24 hours; manual scans do not advance automatic cursors. Truncation and strict evidence checks can miss candidates, so this is not a complete audit. A push timeout means delivery is unknown, not that an execution task was automatically created.
 
 ## Architecture
 

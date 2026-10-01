@@ -17,7 +17,7 @@ export interface ConversationRow {
 	updated_at: number;
 	model_supplier_id: string | null;
 	model_model_id: string | null;
-	/** Where the conversation was created: 'console' (the desktop UI) or 'im' (a messaging channel). */
+	/** Origin: console, im, scheduled, work, or eval (never infer trust from a stored label). */
 	origin: string;
 }
 
@@ -38,8 +38,25 @@ export interface MemberRow {
 	message_count: number;
 }
 
+export interface MiningMessageRow extends MessageRow {
+	/** SQLite insertion order disambiguates messages sharing a millisecond. */
+	mining_rowid: number;
+}
+
+export interface MiningCursor {
+	createdAt: number;
+	rowid: number;
+}
+
 export class HistoryStore {
-	constructor(private readonly db: DB) {}
+	constructor(private readonly db: DB) {
+		// Runtime state, not user configuration. Safe for existing profiles too.
+		db.exec(`CREATE TABLE IF NOT EXISTS work_mining_cursors (
+			conversation_id TEXT PRIMARY KEY,
+			created_at INTEGER NOT NULL,
+			message_rowid INTEGER NOT NULL
+		)`);
+	}
 
 	listConversations(): ConversationRow[] {
 		return this.db
@@ -102,12 +119,46 @@ export class HistoryStore {
 	deleteConversation(id: string): void {
 		this.db.prepare("DELETE FROM messages WHERE conversation_id = ?").run(id);
 		this.db.prepare("DELETE FROM conversations WHERE id = ?").run(id);
+		this.db.prepare("DELETE FROM work_mining_cursors WHERE conversation_id = ?").run(id);
 	}
 
 	listMessages(conversationId: string): MessageRow[] {
 		return this.db
 			.prepare("SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC")
 			.all(conversationId) as MessageRow[];
+	}
+
+	/** Recent tail for explicit lookbacks; automatic mining uses durable pages below. */
+	listMessagesSince(conversationId: string, sinceTs: number, limit = 40): MessageRow[] {
+		return this.db
+			.prepare(
+				"SELECT * FROM (SELECT * FROM messages WHERE conversation_id = ? AND created_at > ? ORDER BY created_at DESC LIMIT ?) ORDER BY created_at ASC",
+			)
+			.all(conversationId, sinceTs, limit) as MessageRow[];
+	}
+
+	getMiningCursor(conversationId: string): MiningCursor | undefined {
+		return this.db.prepare(
+			"SELECT created_at AS createdAt, message_rowid AS rowid FROM work_mining_cursors WHERE conversation_id = ?",
+		).get(conversationId) as MiningCursor | undefined;
+	}
+
+	/** Oldest unprocessed page, NOT the tail: bounded scans must not skip backlog. */
+	listMiningMessages(conversationId: string, cursor: MiningCursor, untilTs: number, limit = 25): MiningMessageRow[] {
+		return this.db.prepare(`SELECT *, rowid AS mining_rowid FROM messages
+			WHERE conversation_id = ? AND (created_at > ? OR (created_at = ? AND rowid > ?))
+			AND created_at <= ? ORDER BY created_at ASC, rowid ASC LIMIT ?`)
+			.all(conversationId, cursor.createdAt, cursor.createdAt, cursor.rowid, untilTs, limit) as MiningMessageRow[];
+	}
+
+	/** Advance only after a successful source scan; failures remain retryable. */
+	setMiningCursor(conversationId: string, cursor: MiningCursor): void {
+		this.db.prepare(`INSERT INTO work_mining_cursors (conversation_id, created_at, message_rowid)
+			VALUES (?, ?, ?) ON CONFLICT(conversation_id) DO UPDATE SET
+			created_at = excluded.created_at, message_rowid = excluded.message_rowid
+			WHERE excluded.created_at > work_mining_cursors.created_at OR
+			(excluded.created_at = work_mining_cursors.created_at AND excluded.message_rowid > work_mining_cursors.message_rowid)`)
+			.run(conversationId, cursor.createdAt, cursor.rowid);
 	}
 
 	/** Per-conversation model override (null → use global default). */
@@ -176,12 +227,14 @@ export class HistoryStore {
 
 /**
  * Infer a conversation's origin from its id. IM adapters prefix ids with their
- * channel (`dt:` / `feishu:` / `wecom:` / `echo:`); scheduled tasks use `sched:`;
- * everything else (bare uuids) is the console UI.
+ * channel (`dt:` / `feishu:` / `wecom:` / `echo:`); scheduled tasks use `sched:`,
+ * autonomous work uses `work:`; everything else (bare uuids) is the console UI.
  */
 export function inferConversationOrigin(id: string): string {
 	if (/^(dt|feishu|wecom|echo):/.test(id)) return "im";
 	if (id.startsWith("sched:")) return "scheduled";
+	// Unattended work MUST NOT inherit the console's implicit admin trust.
+	if (id.startsWith("work:")) return "work";
 	// Prompt-lab evaluation runs: isolated, never persisted, excluded from telemetry
 	// so the improvement loop does not measure its own experiments.
 	if (id.startsWith("eval:")) return "eval";

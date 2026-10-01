@@ -18,6 +18,9 @@ import { KnowledgeService } from "../src/knowledge/knowledge-service.js";
 import { BrowserService } from "../src/browser/browser-service.js";
 import { ComputerService } from "../src/computer/computer-service.js";
 import { ScheduledTaskStore, type ScheduledTaskRow } from "../src/db/scheduled-task-store.js";
+import { WorkItemStore } from "../src/db/work-item-store.js";
+import { WorkService, buildWorkLearning } from "../src/scheduler/work-service.js";
+import { resolveRole } from "../src/security/permissions.js";
 import { SchedulerService } from "../src/scheduler/scheduler-service.js";
 import {
 	type AutonomousChainState,
@@ -442,6 +445,11 @@ async function main(): Promise<void> {
 	const telemetry = new TelemetryStore(db);
 	engine.setTelemetryStore(telemetry);
 	engine.setProposalStore(new ProposalStore(proposalsDir));
+
+	// Work items (autonomous work phase 2): mined from daily conversations,
+	// confirmed by an admin, worked across self-scheduled windows.
+	const workItemStore = new WorkItemStore(db);
+	engine.workItems = workItemStore;
 	// Prompt lab: evaluation cases + variants + history for prompt.rules. The
 	// red-line cases are seeded once so a fresh box can evaluate a candidate
 	// without having to invent an evaluation set first. Evaluation runs go through
@@ -653,6 +661,53 @@ async function main(): Promise<void> {
 		return { status };
 	};
 
+	/**
+	 * Work-item window runner (autonomous work phase 2): one window of focused
+	 * work on a work item, in its permanent `work:<id>` conversation. Outcomes:
+	 * done (→ knowledge write-back), human (→ wait for a reply), self-scheduled
+	 * (the model declares its own next check time). Frequency is the model's
+	 * judgement — the tick only wakes items at their declared time.
+	 */
+	const workService = new WorkService({
+		store: workItemStore,
+		isAdmin: (senderId) => {
+			const security = config.all().security;
+			// A permissive defaultRole must not resurrect a removed confirmer.
+			const declared = security.adminStaffIds.includes(senderId) || security.people?.some((p) => p.staffId === senderId && p.role === "admin");
+			return !!declared && resolveRole(config, senderId) === "admin";
+		},
+		open: (item, convId) => {
+			history.ensureConversation(convId, `🧭 ${item.title}`);
+			return engine.getOrCreateSession(convId);
+		},
+		send: (agent, message, senderId) => engine.send(agent, message, {
+			actor: { senderId, channel: "scheduler", chatType: "single" },
+			onPersist: (cid) => {
+				const wc = mainWindow?.webContents;
+				if (wc && !wc.isDestroyed()) wc.send("im:activity", cid);
+			},
+		}),
+		release: (convId) => browser.releasePage(convId),
+		push: (cid, text) => im.pushToConversation(cid, text),
+		canLearn: () => {
+			const kb = config.all().kb;
+			return kb.enabled && kb.learn.enabled;
+		},
+		learn: (item, result) => {
+			const input = buildWorkLearning(item, result);
+			if (input) knowledge.saveLearned(input);
+		},
+		onError: () => console.warn("[work] lifecycle operation failed; inspect local work history before resuming"),
+	});
+	const fireWorkItem = (id: string): boolean => workService.fireItem(id);
+	let workMiningTimer: ReturnType<typeof setInterval> | undefined;
+	const stopWork = (): Promise<void> => {
+		if (workMiningTimer) clearInterval(workMiningTimer);
+		workMiningTimer = undefined;
+		return workService.stop();
+	};
+	app.on("before-quit", () => { void stopWork(); });
+
 	scheduler.setRunner({
 		async runTask(task) {
 			if (task.autonomous) return runAutonomousTask(task);
@@ -756,6 +811,32 @@ async function main(): Promise<void> {
 	// Start ticking only after IM adapters have connected, so an overdue task fired
 	// during startup can immediately push its result instead of missing the channel.
 	scheduler.start();
+
+	// Work-item bridge: the tools/engine fire windows and push proposals through
+	// the IM adapters. Wiring lives here because `im` is created above.
+	engine.workBridge = {
+		fireItem: fireWorkItem,
+		push: (cid, text) => im.pushToConversation(cid, text),
+	};
+	// Recovery + dispatch only after IM initialization and bridge installation.
+	workService.start();
+
+	// Background mining (autonomous work phase 2): off by default — admins opt
+	// in via capabilities.autonomousMining. Checked hourly; fires per its
+	// interval. On-demand mining (manage_work_items action=mine) is unaffected.
+	let lastMiningRun = 0;
+	workMiningTimer = setInterval(() => {
+		const mining = config.all().capabilities.autonomousMining;
+		if (!mining?.enabled) return;
+		if (Date.now() - lastMiningRun < mining.intervalHours * 3_600_000) return;
+		lastMiningRun = Date.now();
+		void engine
+			.mineRecentWork({ maxProposals: 2 })
+			.then((r) => {
+				if (r.error) console.warn("[work] background mining failed:", r.error);
+			})
+			.catch((err) => console.warn("[work] background mining failed:", (err as Error).message));
+	}, 60 * 60_000);
 
 	ipcMain.handle("server:port", () => port);
 	const computerAction = async (event: Electron.IpcMainInvokeEvent, action: string) => {
@@ -1361,6 +1442,7 @@ async function main(): Promise<void> {
 		prepareToInstall: async () => {
 			// electron-updater spawns NSIS before app.quit(). Release every process /
 			// listener that can keep the old app tree alive before calling it.
+			await stopWork();
 			scheduler.stop();
 			disposeShellCommands(config);
 			await im.stopAll();

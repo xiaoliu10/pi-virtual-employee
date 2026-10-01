@@ -305,6 +305,38 @@ function migrate(db: DB): void {
 	if (!taskCols.has("max_minutes")) db.exec("ALTER TABLE scheduled_tasks ADD COLUMN max_minutes INTEGER");
 	if (!taskCols.has("chain_state")) db.exec("ALTER TABLE scheduled_tasks ADD COLUMN chain_state TEXT");
 
+	// Work items (autonomous work phase-2, 2026-09-30): mined from daily IM
+	// conversations, confirmed by an admin, then worked by the employee across
+	// SELF-SCHEDULED windows — the model declares its own next check time
+	// (e.g. "after the 08:00-09:30 auto-reconciliation window") instead of a
+	// fixed polling cadence. Conditions/lessons persist on the item so every
+	// window works with the full picture, and completion writes the lessons back
+	// to the knowledge base (self-evolution).
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS work_items (
+			id                   TEXT PRIMARY KEY,
+			title                TEXT NOT NULL,
+			goal                 TEXT NOT NULL,
+			conditions           TEXT,
+			progress             TEXT,
+			lessons              TEXT,
+			origin_conversation  TEXT,
+			origin_note          TEXT,
+			status               TEXT NOT NULL DEFAULT 'proposed',
+			question             TEXT,
+			next_check_at        INTEGER,
+			created_by           TEXT,
+			created_at           INTEGER NOT NULL,
+			updated_at           INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_work_items_due ON work_items(status, next_check_at);
+	`);
+	const workCols = new Set(
+		(db.prepare("PRAGMA table_info(work_items)").all() as { name: string }[]).map((r) => r.name),
+	);
+	// Staged reply for a waiting_human resume — consumed by the next window's turn 0.
+	if (!workCols.has("answer")) db.exec("ALTER TABLE work_items ADD COLUMN answer TEXT");
+
 	// Document resources: a catalog of deliverable docs the employee can hand to
 	// integration partners. kind=file points at a copied file under documents.dir;
 	// kind=link holds an online URL. partners/scenario drive "give which doc to

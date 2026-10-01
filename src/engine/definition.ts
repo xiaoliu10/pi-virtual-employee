@@ -14,6 +14,8 @@ import type { ReportService } from "../reports/report-service.js";
 import type { DownloadService } from "../downloads/download-service.js";
 import type { SkillWriter } from "./skills/skill-writer.js";
 import type { ConfigStore } from "../db/config-store.js";
+import type { WorkItemStore } from "../db/work-item-store.js";
+import { createWorkTools } from "./tools/work.js";
 import type { TelemetryStore } from "../db/telemetry-store.js";
 import { createMyStatsTool } from "./tools/telemetry.js";
 import { createProposeImprovementTool } from "./tools/proposals.js";
@@ -156,6 +158,19 @@ export interface ToolSetOptions {
 	/** MCP external tools: enabled flag from capabilities.mcp, tools from the
 	 * connector manager's cache (empty until its first refresh lands). */
 	mcp?: { enabled: boolean; tools: AgentTool<any>[] };
+	/** Work items (autonomous work phase 2): mined/confirmed goals worked by the
+	 * employee across self-scheduled windows. Absent → manage_work* are off. */
+	work?: {
+		items: WorkItemStore;
+		/** Fire a work window now (confirm kickoff / resume). Provided by main. */
+		fireItem: (id: string) => boolean;
+		/** On-demand mining over recent conversation deltas (admin-triggered). */
+		mine: (opts: { maxProposals?: number }) => Promise<{
+			proposals: { title: string; goal: string; evidence: string; conditions: string; originConversation: string | null; id: string }[];
+			scanned: number;
+			error?: string;
+		}>;
+	};
 }
 
 /** Assemble the employee's tools; capability tools are conditional on their config flags. */
@@ -234,6 +249,18 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 	// capability tool; the tool list comes from the connector manager's cache.
 	if (options.mcp?.enabled && options.mcp.tools.length > 0) {
 		tools.push(...guardAll("mcp", options.mcp.tools));
+	}
+	// Work items: internal notebook + admin-gated management (the tools carry
+	// their own admin checks, same pattern as authorize_scheduled_task).
+	if (options.work) {
+		tools.push(...createWorkTools({
+			workItems: options.work.items,
+			fireItem: options.work.fireItem,
+			mine: options.work.mine,
+			config: options.config,
+			resolveActor: options.resolveActor,
+			conversationId: options.conversationId,
+		}));
 	}
 	// Skill authoring is an always-on channel: explicit 技能/Skill intent writes
 	// here; everything else defaults to the knowledge base (see prompt routing rules).
