@@ -425,3 +425,25 @@ test("a pause landing during release suppresses the stale scheduled push (L4)", 
 	assert.equal(h.store.get(item.id).status, "waiting_human");
 	assert.match(h.store.get(item.id).question, /管理员先停一下/);
 });
+
+test("an admin update-nextCheck landing during release wins over the run's stale schedule metadata (Copilot fast-follow)", async t => {
+	let updatedDuringRelease = false;
+	const h = fixture(t, {
+		send: () => ({ reply: "阶段成果\n[[NEXT_CHECK]]: 30m | 等批次" }),
+		release: async h => {
+			if (!updatedDuringRelease) {
+				updatedDuringRelease = true;
+				const row = h.store.list()[0];
+				h.store.setSchedule(row.id, h.clock.now() + 2 * 3_600_000, "管理员改期到两小时后");
+				await flush();
+			}
+		},
+	});
+	const item = h.create();
+	h.service.start(); await flush();
+	await h.service.whenIdle(); await flush();
+	const push = h.pushes.find(p => /下次跟进/.test(p.text));
+	assert.ok(push, "scheduled push still lands (row stays scheduled)");
+	assert.match(push.text, /管理员改期到两小时后/, "push announces the admin's new schedule, not the run's local one");
+	assert.doesNotMatch(push.text, /30 分钟|等批次/);
+});

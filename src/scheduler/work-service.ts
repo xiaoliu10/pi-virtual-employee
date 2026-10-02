@@ -253,10 +253,17 @@ export class WorkService<Session extends WorkSession> {
 			// message for an item whose status has since changed (subagent review L4).
 			const nowRow = store.get(item.id);
 			if (!nowRow || nowRow.status !== fresh.status) return;
+			// Schedule metadata comes from the re-read row, not the run's locals: an
+			// admin update-nextCheck landing during release() keeps the row scheduled
+			// but with a newly persisted time — pushing the locals would announce the
+			// stale schedule (Copilot review on the fast-follow PR).
+			const scheduledAt = nowRow.next_check_at ?? nextCheckAt!;
+			const scheduledReason = nowRow.next_check_reason ?? nextReason;
+			const streak = nowRow.fixed_streak ?? 0;
 			const text = nowRow.status === "done"
 				? `✅ **自主任务完成：${nowRow.title}**\n\n${lastText}`
 				: nowRow.status === "scheduled"
-					? `🔁 **自主任务阶段进展：${nowRow.title}**\n\n${lastText.slice(-500)}\n\n下次跟进：${new Date(nextCheckAt!).toLocaleString("zh-CN", { hour12: false })}${nextReason ? `（${nextReason}）` : ""}${nextStreak >= 3 ? `\n\n⚠️ 已连续 ${nextStreak} 次只在相近的固定时间跟进这一个点。如果这是因为它有新信息可查（如某个批次在该时刻生成），写明依据可继续；但记得覆盖今天其他观察点。若这件工作每天只在这一处查、且查了也不需要判断动作，可建议管理员转成定时任务，工作项留给需要判断力的跟进。` : ""}`
+					? `🔁 **自主任务阶段进展：${nowRow.title}**\n\n${lastText.slice(-500)}\n\n下次跟进：${new Date(scheduledAt).toLocaleString("zh-CN", { hour12: false })}${scheduledReason ? `（${scheduledReason}）` : ""}${streak >= 3 ? `\n\n⚠️ 已连续 ${streak} 次只在相近的固定时间跟进这一个点。如果这是因为它有新信息可查（如某个批次在该时刻生成），写明依据可继续；但记得覆盖今天其他观察点。若这件工作每天只在这一处查、且查了也不需要判断动作，可建议管理员转成定时任务，工作项留给需要判断力的跟进。` : ""}`
 					: `⏸️ **自主任务需要人工：${nowRow.title}**\n\n${nowRow.question}\n\n请管理员回复「继续 ${nowRow.title}」并附上答复；未明确恢复前不会自动执行。`;
 			try { await this.opts.push(fresh.origin_conversation, text); } catch (err) { this.opts.onError?.(err); }
 		}

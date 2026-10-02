@@ -333,7 +333,7 @@ export function createWorkTools(deps: {
 					}
 				}
 				return {
-					content: [{ type: "text", text: `已暂停「${item.title}」。如在执行中，当前窗口会立即中止；回复「确认继续」并附答复可恢复。` }],
+					content: [{ type: "text", text: `已暂停「${item.title}」。如在执行中，已请求立即中止当前窗口（在飞动作会尽快停下）；回复「确认继续」并附答复可恢复。` }],
 					details: { ok: true, paused: true, abortRequested, question: paused.question },
 				};
 			}
@@ -351,7 +351,7 @@ export function createWorkTools(deps: {
 				}
 			}
 			return {
-				content: [{ type: "text", text: `已取消工作项「${item.title}」。如在执行中，当前窗口会立即中止。` }],
+				content: [{ type: "text", text: `已取消工作项「${item.title}」。如在执行中，已请求立即中止当前窗口（在飞动作会尽快停下）。` }],
 				details: { ok: true, cancelled: true, abortRequested },
 			};
 		},
