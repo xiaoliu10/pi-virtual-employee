@@ -372,7 +372,7 @@ test("routine cadence: prefix carries the last check + warning; streak accumulat
 	await h.clock.advance(6 * 3_600_000);
 	assert.equal(h.sends.length, 1);
 	assert.match(h.sends[0].message, /【上次跟进】.*16:00.*（每日巡检）/);
-	assert.match(h.sends[0].message, /【节奏警示】/);
+	assert.match(h.sends[0].message, /【节奏提示】/);
 	assert.match(h.sends[0].message, /连续 2 次/);
 	const row = h.store.get(item.id);
 	assert.equal(row.status, "scheduled");

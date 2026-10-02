@@ -164,14 +164,14 @@ test("window prefix injects the last check and confronts repeated fixed slots", 
 	});
 	assert.match(calm, /【上次跟进】/);
 	assert.match(calm, /每日巡检/);
-	assert.match(calm, /时间必须有依据/);
-	assert.doesNotMatch(calm, /节奏警示/);
+	assert.match(calm, /时间必须写明依据/);
+	assert.doesNotMatch(calm, /节奏提示/);
 
 	const hot = buildWorkWindowPrefix({
 		title: "月末对账", goal: "核对流水", turn: 0, budget,
 		lastCheck: { at: new Date("2026-10-01T16:00:00").getTime(), reason: null, streak: 2 },
 	});
-	assert.match(hot, /【节奏警示】/);
+	assert.match(hot, /【节奏提示】/);
 	assert.match(hot, /连续 2 次/);
 	assert.match(hot, /定时任务/);
 });
@@ -180,7 +180,8 @@ test("firstWindow adds the plan block before the protocol; later turns and non-k
 	const budget = { maxTurns: 15, maxMinutes: 30 };
 	const first = buildWorkWindowPrefix({ title: "月末对账", goal: "核对流水", turn: 0, budget, firstWindow: true });
 	assert.match(first, /【首个窗口：先出跟进计划】/);
-	assert.match(first, /不要默认每天固定时刻/);
+	assert.match(first, /一天可以多次/);
+	assert.match(first, /观察点/);
 	assert.match(first, /无需等待确认/);
 	assert.ok(first.indexOf("【首个窗口：先出跟进计划】") < first.indexOf("窗口规则："), "plan block precedes the protocol");
 	const later = buildWorkWindowPrefix({ title: "月末对账", goal: "核对流水", turn: 1, budget, firstWindow: true });
