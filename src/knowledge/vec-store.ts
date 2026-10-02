@@ -100,9 +100,22 @@ export class VecStore {
 		}
 	}
 
+	/**
+	 * kb_vec is created LAZILY by ensureTable — a loaded extension does NOT imply
+	 * the table exists (a deployment whose embed provider was never fully
+	 * configured never creates it), and an import/restore may drop it later.
+	 * Always verify: cleanup runs are rare, one sqlite_master lookup is cheap.
+	 */
+	private hasTable(): boolean {
+		const row = this.db
+			.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='kb_vec'")
+			.get() as { name?: string } | undefined;
+		return !!row?.name;
+	}
+
 	/** Insert (or replace) the vector for a kb_chunks rowid. */
 	upsert(rowid: number, embedding: Float32Array, chunkId: string, source: string): void {
-		if (!this.available) return;
+		if (!this.available || !this.hasTable()) return;
 		const buf = Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);
 		this.db.prepare("DELETE FROM kb_vec WHERE rowid = ?").run(toInt(rowid));
 		this.db
@@ -110,15 +123,21 @@ export class VecStore {
 			.run(toInt(rowid), buf, chunkId, source);
 	}
 
+	/** Chunk cleanup fires on delete/archive/replace/import — and saveLearned's
+	 * re-chunk deletes chunks even on the very first save. Before this guard,
+	 * a deployment whose embed provider was never fully configured had NO
+	 * kb_vec table (extension loaded fine), so the first save/archive threw
+	 * "no such table: kb_vec" and the entry was lost (field 2026-10-01).
+	 * Nothing-to-delete is the correct no-op. */
 	deleteByRowids(rowids: number[]): void {
-		if (!this.available || rowids.length === 0) return;
+		if (!this.available || !this.hasTable() || rowids.length === 0) return;
 		const placeholders = rowids.map(() => "?").join(",");
 		this.db.prepare(`DELETE FROM kb_vec WHERE rowid IN (${placeholders})`).run(...rowids.map(toInt));
 	}
 
 	/** KNN search over the query vector; returns chunk ids + cosine distance. */
 	knn(embedding: Float32Array, k: number): VecKnnHit[] {
-		if (!this.available) return [];
+		if (!this.available || !this.hasTable()) return [];
 		const buf = Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);
 		return this.db
 			.prepare(
@@ -133,7 +152,7 @@ export class VecStore {
 
 	/** Remove all vectors (used before a full reindex). */
 	clear(): void {
-		if (!this.available) return;
+		if (!this.available || !this.hasTable()) return;
 		this.db.exec("DELETE FROM kb_vec");
 	}
 

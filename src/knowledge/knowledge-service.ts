@@ -655,7 +655,10 @@ export class KnowledgeService {
 		const kb = this.kb();
 		if (!kb.local.hybrid.vectorEnabled || !this.vec.isAvailable()) return null;
 		const emb = kb.local.embedding;
-		if (!emb.model) return null;
+		// A zero/invalid dimension can never create kb_vec (ensureTable skips it)
+		// and would leave every indexing batch failing forever — treat the embed
+		// provider as unconfigured and degrade to pure BM25 instead.
+		if (!emb.model || !emb.dimensions || emb.dimensions <= 0) return null;
 
 		const endpoint = this.resolveEmbedEndpoint(emb);
 		if (!endpoint.baseUrl || !endpoint.apiKey) return null;
