@@ -133,3 +133,82 @@ test("fixed_streak only moves while scheduled; reason persists and clears with s
 	assert.equal(store.get(item.id).next_check_reason, null, "stale reason must not survive into waiting_human");
 	assert.equal(store.get(item.id).fixed_streak, 3, "streak number is retained but only read on scheduled wake");
 });
+
+test("admin setSchedule reschedules queued/waiting_human/scheduled; working and terminal refuse", t => {
+	const { store } = fixture(t);
+	const item = create(store);
+	store.confirm(item.id, "admin");
+	const at = Date.now() + 3_600_000;
+	const scheduled = store.setSchedule(item.id, at, "等晚间批次");
+	assert.equal(scheduled.status, "scheduled");
+	assert.equal(scheduled.next_check_at, at);
+	assert.equal(scheduled.next_check_reason, "等晚间批次");
+	assert.equal(scheduled.question, null);
+	// COALESCE: rescheduling without a new reason keeps the stored one.
+	assert.equal(store.setSchedule(item.id, at + 60_000).next_check_reason, "等晚间批次");
+	// queued → waiting_human (via the real runner path) → scheduled again.
+	assert.ok(store.claim(item.id, at + 60_000));
+	store.setStatus(item.id, "waiting_human", "需要人工", null);
+	const fromWaiting = store.setSchedule(item.id, at + 60_000, "改等批次");
+	assert.equal(fromWaiting.status, "scheduled");
+	assert.equal(fromWaiting.question, null);
+	assert.equal(fromWaiting.next_check_reason, "改等批次", "an explicit new reason replaces the old one");
+	// A mid-window reschedule would fight the runner: working refuses.
+	assert.ok(store.claim(item.id, at + 60_000));
+	assert.equal(store.setSchedule(item.id, at + 120_000, "改期攻击"), undefined);
+	assert.equal(store.get(item.id).status, "working");
+	assert.equal(store.get(item.id).next_check_at, null);
+	// Terminal states are untouchable.
+	store.setStatus(item.id, "done", null, null);
+	assert.equal(store.setSchedule(item.id, at + 180_000), undefined);
+	assert.equal(store.get(item.id).status, "done");
+	assert.equal(store.get(item.id).fixed_streak, 0, "setSchedule never touches the streak meter");
+});
+
+test("admin pause turns queued/scheduled/working into waiting_human with the marker question", t => {
+	for (const [status, reason, expected] of [
+		["queued", "先核对口径", "管理员暂停：先核对口径"],
+		["scheduled", "", "管理员暂停：管理员主动暂停"],
+		["working", undefined, "管理员暂停：管理员主动暂停"],
+	]) {
+		const { store } = fixture(t);
+		const item = create(store, status);
+		const paused = store.pause(item.id, reason);
+		assert.equal(paused.status, "waiting_human");
+		assert.equal(paused.question, expected);
+		assert.equal(paused.next_check_at, null, "pause clears any pending follow-up");
+		assert.equal(paused.next_check_reason, null);
+		// Already paused (waiting_human) refuses: no double-pause overwrite.
+		assert.equal(store.pause(item.id, "重复暂停"), undefined);
+		assert.equal(store.get(item.id).question, expected);
+	}
+});
+
+test("pause refuses proposed and terminal states", t => {
+	for (const status of ["proposed", "done", "cancelled"]) {
+		const { store } = fixture(t);
+		const item = create(store, status);
+		assert.equal(store.pause(item.id), undefined);
+		assert.equal(store.get(item.id).status, status);
+	}
+});
+
+test("setField accepts admin rewrites of title/goal but never terminal rows", t => {
+	const { store } = fixture(t);
+	const item = create(store, "working");
+	assert.equal(store.setField(item.id, "title", "新标题").title, "新标题");
+	assert.equal(store.setField(item.id, "goal", "新目标").goal, "新目标");
+	store.setStatus(item.id, "done", null, null);
+	assert.equal(store.setField(item.id, "title", "晚到改写").title, "新标题", "terminal rows ignore late rewrites");
+	assert.equal(store.get(item.id).title, "新标题");
+});
+
+test("setSchedule and pause notify subscribers so the service wakes immediately", t => {
+	const { store } = fixture(t);
+	const item = create(store, "queued");
+	const events = [];
+	store.subscribe((id) => events.push(id));
+	store.setSchedule(item.id, Date.now() + 60_000);
+	store.pause(item.id);
+	assert.deepEqual(events, [item.id, item.id]);
+});

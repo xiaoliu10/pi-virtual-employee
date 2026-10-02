@@ -121,11 +121,36 @@ export class WorkItemStore {
 			.run(Math.max(0, Math.floor(streak)), id);
 	}
 
-	/** Notebook edits must not mutate terminal items, including late aborted tools. */
-	setField(id: string, field: "conditions" | "progress" | "set_conditions" | "set_progress", value: string): WorkItemRow | undefined {
+	/** Notebook and admin-rewrite edits must not mutate terminal items, including late aborted tools. */
+	setField(id: string, field: "title" | "goal" | "conditions" | "progress" | "set_conditions" | "set_progress", value: string): WorkItemRow | undefined {
 		const column = field === "set_conditions" ? "conditions" : field === "set_progress" ? "progress" : field;
-		if (column !== "conditions" && column !== "progress") return undefined;
+		if (column !== "title" && column !== "goal" && column !== "conditions" && column !== "progress") return undefined;
 		this.db.prepare(`UPDATE work_items SET ${column} = ?, updated_at = ? WHERE id = ? AND status NOT IN ('done', 'cancelled')`).run(value.slice(0, 8000), Date.now(), id);
+		return this.get(id);
+	}
+
+	/** Admin reschedule: only states that are not mid-window or ended. Keeps the
+	 * previous reason when none is given; never touches fixed_streak (the meter
+	 * still reads the streak recorded at the last scheduled wake). */
+	setSchedule(id: string, nextCheckAt: number, reason?: string): WorkItemRow | undefined {
+		const result = this.db.prepare(`UPDATE work_items SET status = 'scheduled', question = NULL, next_check_at = ?,
+			next_check_reason = COALESCE(?, next_check_reason), updated_at = ? WHERE id = ? AND status IN ('queued', 'waiting_human', 'scheduled')`)
+			.run(nextCheckAt, reason === undefined ? null : reason, Date.now(), id);
+		if (!result.changes) return undefined;
+		this.changed(id);
+		return this.get(id);
+	}
+
+	/** Admin pause: any active state becomes an explicit waiting_human with a
+	 * marker question. The service's subscribe watches this marker and aborts
+	 * the in-flight window instead of waiting for the next turn checkpoint. */
+	pause(id: string, reason?: string): WorkItemRow | undefined {
+		const question = `管理员暂停：${reason || "管理员主动暂停"}`.slice(0, 500);
+		const result = this.db.prepare(`UPDATE work_items SET status = 'waiting_human', question = ?, next_check_at = NULL, next_check_reason = NULL, updated_at = ?
+			WHERE id = ? AND status IN ('queued', 'scheduled', 'working')`)
+			.run(question, Date.now(), id);
+		if (!result.changes) return undefined;
+		this.changed(id);
 		return this.get(id);
 	}
 	addLesson(id: string, lesson: string): WorkItemRow | undefined {

@@ -440,11 +440,14 @@ export class IMAdapterManager {
 		}
 	}
 
-	/** Test hook: push a message through the echo channel adapter (if running). */
-	async simulate(conversationId: string, text: string): Promise<string> {
+	/** Test hook: push a message through the echo channel adapter (if running).
+	 *
+	 * The optional `actor` is forwarded as a platform-verified sender so the
+	 * local console can exercise the admin/RBAC pipeline. Test-channel only. */
+	async simulate(conversationId: string, text: string, actor?: InboundActor): Promise<string> {
 		const echo = [...this.active.values()].find((a): a is EchoAdapter => a instanceof EchoAdapter);
 		if (!echo) throw new Error("no echo channel is active");
-		return echo.simulate(conversationId, text);
+		return echo.simulate(conversationId, text, actor);
 	}
 }
 

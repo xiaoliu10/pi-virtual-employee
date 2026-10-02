@@ -175,3 +175,16 @@ test("window prefix injects the last check and confronts repeated fixed slots", 
 	assert.match(hot, /连续 2 次/);
 	assert.match(hot, /定时任务/);
 });
+
+test("firstWindow adds the plan block before the protocol; later turns and non-kickoffs omit it", () => {
+	const budget = { maxTurns: 15, maxMinutes: 30 };
+	const first = buildWorkWindowPrefix({ title: "月末对账", goal: "核对流水", turn: 0, budget, firstWindow: true });
+	assert.match(first, /【首个窗口：先出跟进计划】/);
+	assert.match(first, /不要默认每天固定时刻/);
+	assert.match(first, /无需等待确认/);
+	assert.ok(first.indexOf("【首个窗口：先出跟进计划】") < first.indexOf("窗口规则："), "plan block precedes the protocol");
+	const later = buildWorkWindowPrefix({ title: "月末对账", goal: "核对流水", turn: 1, budget, firstWindow: true });
+	assert.doesNotMatch(later, /【首个窗口：先出跟进计划】/);
+	const notKickoff = buildWorkWindowPrefix({ title: "月末对账", goal: "核对流水", turn: 0, budget });
+	assert.doesNotMatch(notKickoff, /【首个窗口：先出跟进计划】/);
+});

@@ -165,7 +165,16 @@ export interface WorkItemWindowContext {
 	/** Previous self-declared follow-up, injected so the model judges rhythm
 	 * with facts instead of re-declaring "明天同一时间" by default. */
 	lastCheck?: { at: number; reason?: string | null; streak: number };
+	/** True for a queued kickoff with no history/resume: the model must lay out
+	 * a short follow-up plan before starting (field feedback 2026-10-02: the
+	 * first window executed immediately without a plan). */
+	firstWindow?: boolean;
 }
+
+// A true kickoff must plan before acting — and the plan must justify its own
+// rhythm (field 2026-10-02: 自主任务的要素在于不定时，固定每天一次和定时任务没区别).
+const FIRST_WINDOW_PLAN =
+	"【首个窗口：先出跟进计划】给出简要计划再开始第一步：① 分几步完成目标；② 每步何时查/做什么及依据（数据何时生成、依赖何时就绪）——节奏按需而定，不要默认每天固定时刻；③ 需要提前落实的条件。计划写完即开始第一步，无需等待确认。";
 
 /** System-side prefix for every window turn — goal, memory, budget, protocol. */
 export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
@@ -173,6 +182,7 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 	if (ctx.conditions?.trim()) memory.push(`【执行条件（务必遵守）】\n${ctx.conditions.trim()}`);
 	if (ctx.progress?.trim()) memory.push(`【此前进展】\n${ctx.progress.trim()}`);
 	if (ctx.lessons?.length) memory.push(`【踩坑记录（别再踩）】\n${ctx.lessons.map((l) => `- ${l}`).join("\n")}`);
+	if (ctx.firstWindow && ctx.turn === 0) memory.push(FIRST_WINDOW_PLAN);
 	const head = ctx.turn === 0 ? "【工作窗口开始】" : `【工作窗口继续 · 本窗第 ${ctx.turn + 1} 轮】`;
 	const answerBlock = ctx.answer ? `\n用户对你上一轮问题的回复：${ctx.answer}\n` : "";
 	const lastCheck = ctx.lastCheck

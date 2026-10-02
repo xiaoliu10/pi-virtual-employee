@@ -90,7 +90,32 @@ function fixture(opts = {}) {
 		setField(id, field, content) {
 			writes.push([field, id, content]);
 			const item = rows.get(id);
-			item[field === "set_conditions" ? "conditions" : "progress"] = content;
+			if (!item || item.status === "done" || item.status === "cancelled") return undefined;
+			const column = field === "set_conditions" ? "conditions" : field === "set_progress" ? "progress" : field;
+			if (!["title", "goal", "conditions", "progress"].includes(column)) return undefined;
+			item[column] = content;
+			return item;
+		},
+		setSchedule(id, at, reason) {
+			const item = rows.get(id);
+			if (!item || !["queued", "waiting_human", "scheduled"].includes(item.status)) return undefined;
+			writes.push(["setSchedule", id, at, reason]);
+			events.push("setSchedule");
+			Object.assign(item, { status: "scheduled", question: null, next_check_at: at });
+			if (reason !== undefined) item.next_check_reason = reason;
+			return item;
+		},
+		pause(id, reason) {
+			const item = rows.get(id);
+			if (!item || !["queued", "scheduled", "working"].includes(item.status)) return undefined;
+			writes.push(["pause", id, reason]);
+			events.push("pause");
+			Object.assign(item, {
+				status: "waiting_human",
+				question: `管理员暂停：${reason || "管理员主动暂停"}`.slice(0, 500),
+				next_check_at: null,
+				next_check_reason: null,
+			});
 			return item;
 		},
 		addLesson(id, content) {
@@ -115,7 +140,11 @@ function fixture(opts = {}) {
 		...(opts.withCancel ? { cancelItem: async (id) => {
 			events.push("abort");
 			cancelled.push(id);
-			assert.equal(rows.get(id).status, "cancelled", "persist cancellation BEFORE aborting");
+			const st = rows.get(id)?.status;
+			assert.ok(
+				st === "cancelled" || (st === "waiting_human" && String(rows.get(id).question ?? "").startsWith("管理员暂停")),
+				"persist the durable stop BEFORE aborting",
+			);
 			if (opts.failAbort) throw new Error("executor unavailable");
 		} } : {}),
 		mine: async (params) => {
@@ -205,6 +234,18 @@ for (const [label, invalid] of invalidActors) {
 			refused(await f.items({ action, id: ID, answer: "不要写入" }), f);
 		});
 	}
+}
+
+for (const [label, invalid] of invalidActors) {
+	test(`update/pause refuse ${label} without writes or executor calls`, async () => {
+		const f = fixture({
+			actor: invalid,
+			security: { adminStaffIds: ["admin", "revoked"], people: [{ staffId: "revoked", role: "viewer" }, { staffId: "operator", role: "operator" }] },
+			rows: [row({ status: "scheduled", next_check_at: Date.now() + 3_600_000, created_by: invalid?.senderId ?? "admin" })],
+		});
+		refused(await f.items({ action: "update", id: ID, conditions: "不得写入", nextCheck: "30m" }), f);
+		refused(await f.items({ action: "pause", id: ID, reason: "不得写入" }), f);
+	});
 }
 
 for (const text of ["继续", "你好", "可以改吗", "不要确认", "不确认", "取消，确认", "别执行了，确认", "确认但停止", "no confirm", "don't confirm", "", undefined]) {
@@ -368,6 +409,142 @@ test("failed cancellation never aborts executor or claims success", async () => 
 	const f = fixture({ failCancel: true, withCancel: true });
 	assert.equal((await f.items({ action: "cancel", id: ID })).details.ok, false);
 	assert.deepEqual(f.cancelled, []);
+});
+
+test("confirm applies admin rewrites before queueing and still records the confirming admin", async () => {
+	const f = fixture({ actor: actor({ chatType: "group", text: "确认创建" }) });
+	const result = await f.items({
+		action: "confirm", id: ID.slice(0, 8),
+		title: "  新标题  ", goal: "改成按需跟进，删掉每天16:30", conditions: "有异常才查，不固定时刻",
+	});
+	assert.equal(result.details.ok, true);
+	assert.deepEqual(result.details.modified, ["标题", "目标", "执行条件"]);
+	assert.match(result.content[0].text, /已按管理员要求修改/);
+	assert.equal(f.rows.get(ID).title, "新标题");
+	assert.equal(f.rows.get(ID).goal, "改成按需跟进，删掉每天16:30");
+	assert.equal(f.rows.get(ID).conditions, "有异常才查，不固定时刻");
+	assert.equal(f.rows.get(ID).status, "queued");
+	assert.equal(f.rows.get(ID).created_by, "admin", "confirming admin is still the rewriter");
+	assert.deepEqual(f.writes, [
+		["title", ID, "新标题"],
+		["goal", ID, "改成按需跟进，删掉每天16:30"],
+		["conditions", ID, "有异常才查，不固定时刻"],
+		["confirm", ID, "admin"],
+	]);
+	assert.deepEqual(f.fired, [ID]);
+});
+
+test("confirm with a partial rewrite applies only the given field", async () => {
+	const f = fixture({ actor: actor({ text: "确认创建" }) });
+	const result = await f.items({ action: "confirm", id: ID, goal: "只改目标" });
+	assert.equal(result.details.ok, true);
+	assert.deepEqual(result.details.modified, ["目标"]);
+	assert.equal(f.rows.get(ID).title, row().title, "untitled rewrite keeps the mined title");
+	assert.equal(f.rows.get(ID).conditions, row().conditions);
+});
+
+for (const [label, params] of [
+	["empty title", { title: "   " }],
+	["oversized title", { title: "长".repeat(81) }],
+	["empty goal", { goal: "" }],
+	["oversized goal", { goal: "长".repeat(2001) }],
+	["oversized conditions", { conditions: "长".repeat(1001) }],
+	["nontext title", { title: 42 }],
+]) {
+	test(`confirm refuses ${label} with zero writes and no queueing`, async () => {
+		const f = fixture({ actor: actor({ text: "确认创建" }) });
+		const result = await f.items({ action: "confirm", id: ID, ...params });
+		refused(result, f);
+		assert.equal(f.rows.get(ID).status, "proposed", "all-or-nothing: nothing applied");
+		assert.match(result.content[0].text, /不能为空|不能超过|必须是文本/);
+	});
+}
+
+test("update reschedules a waiting_human item and rewrites conditions without an explicit confirmation phrase", async () => {
+	const f = fixture({
+		actor: actor({ text: "改成等批次生成后再查" }),
+		rows: [row({ status: "waiting_human", question: "需要人工" })],
+	});
+	const before = Date.now();
+	const result = await f.items({ action: "update", id: ID, nextCheck: "30m", conditions: "等晚间批次生成后再查", reason: "等批次" });
+	assert.equal(result.details.ok, true);
+	assert.equal(result.details.applied.length, 2);
+	const item = f.rows.get(ID);
+	assert.equal(item.status, "scheduled");
+	assert.equal(item.question, null, "reschedule clears the human question");
+	assert.ok(item.next_check_at >= before + 30 * 60_000, "30m lands at least 30 minutes out");
+	assert.ok(item.next_check_at < before + 31 * 60_000);
+	assert.equal(item.next_check_reason, "等批次");
+	assert.equal(item.conditions, "等晚间批次生成后再查");
+	assert.equal(f.writes.length, 2);
+	assert.deepEqual(f.writes[0], ["conditions", ID, "等晚间批次生成后再查"]);
+	assert.equal(f.writes[1][0], "setSchedule");
+	assert.equal(f.writes[1][2], item.next_check_at);
+	assert.equal(f.writes[1][3], "等批次");
+});
+
+for (const [label, status, params, pattern] of [
+	["invalid nextCheck", "waiting_human", { nextCheck: "垃圾" }, /15 分钟|非法/],
+	["too-near nextCheck", "waiting_human", { nextCheck: "1m" }, /15 分钟/],
+	["nextCheck while working", "working", { nextCheck: "30m" }, /等本轮结束/],
+	["nextCheck on a proposal", "proposed", { nextCheck: "30m" }, /确认创建/],
+	["terminal state", "done", {}, /不能调整/],
+	["no fields at all", "waiting_human", {}, /提供要调整/],
+	["empty rewrite", "waiting_human", { title: " " }, /不能为空/],
+]) {
+	test(`update refuses ${label} without mutation`, async () => {
+		const f = fixture({ rows: [row({ status, created_by: "admin" })] });
+		const result = await f.items({ action: "update", id: ID, ...params });
+		refused(result, f);
+		assert.match(result.content[0].text, pattern);
+	});
+}
+
+test("update applies text rewrites mid-window and on proposals", async () => {
+	const working = fixture({ rows: [row({ status: "working", created_by: "admin" })] });
+	const ok = await working.items({ action: "update", id: ID, conditions: "本轮就生效的新条件", goal: "执行中也能改目标" });
+	assert.equal(ok.details.ok, true);
+	assert.deepEqual(ok.details.applied, ["目标", "执行条件"]);
+	assert.equal(working.rows.get(ID).conditions, "本轮就生效的新条件");
+	const proposed = fixture({ rows: [row({ status: "proposed" })] });
+	assert.equal((await proposed.items({ action: "update", id: ID, title: "提案也能先改标题" })).details.ok, true);
+	assert.equal(proposed.rows.get(ID).title, "提案也能先改标题");
+});
+
+test("pause turns a scheduled item into a marked waiting_human and best-effort aborts", async () => {
+	const f = fixture({ rows: [row({ status: "scheduled", next_check_at: Date.now() + 3_600_000, next_check_reason: "每日巡检" })], withCancel: true });
+	const result = await f.items({ action: "pause", id: ID, reason: "先核对口径" });
+	assert.equal(result.details.ok, true);
+	assert.equal(result.details.paused, true);
+	assert.equal(result.details.abortRequested, true);
+	const item = f.rows.get(ID);
+	assert.equal(item.status, "waiting_human");
+	assert.equal(item.question, "管理员暂停：先核对口径");
+	assert.equal(item.next_check_at, null);
+	assert.equal(item.next_check_reason, null);
+	assert.deepEqual(f.writes, [["pause", ID, "先核对口径"]]);
+	assert.deepEqual(f.events, ["pause", "abort"]);
+	assert.match(result.content[0].text, /确认继续/);
+});
+
+for (const [label, status] of [["proposal", "proposed"], ["done", "done"], ["cancelled", "cancelled"], ["already paused", "waiting_human"]]) {
+	test(`pause refuses ${label} without aborting`, async () => {
+		const f = fixture({ rows: [row({ status })], withCancel: true });
+		const result = await f.items({ action: "pause", id: ID });
+		refused(result, f);
+		if (label === "proposal") assert.match(result.content[0].text, /cancel/);
+	});
+}
+
+test("pause stays durable when the abort bridge is missing or fails", async () => {
+	for (const withCancel of [false, true]) {
+		const f = fixture({ rows: [row({ status: "working", created_by: "admin" })], withCancel, failAbort: true });
+		const result = await f.items({ action: "pause", id: ID, reason: "先停一下" });
+		assert.equal(result.details.ok, true);
+		assert.equal(result.details.abortRequested, false);
+		assert.equal(f.rows.get(ID).status, "waiting_human");
+		assert.match(result.content[0].text, /下一检查点停止/);
+	}
 });
 
 function notebookFixture(opts = {}) {

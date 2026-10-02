@@ -83,7 +83,11 @@ export class WorkService<Session extends WorkSession> {
 		if (!this.recovered) { this.opts.store.recoverWorking(); this.recovered = true; }
 		this.running = true;
 		this.unsubscribe = this.opts.store.subscribe((id) => {
-			if (id && id === this.active?.id && this.opts.store.get(id)?.status === "cancelled") this.abortActive("任务已取消");
+			if (id && id === this.active?.id) {
+				const fresh = this.opts.store.get(id);
+				if (fresh?.status === "cancelled") this.abortActive("任务已取消");
+				else if (fresh?.status === "waiting_human" && fresh.question?.startsWith("管理员暂停")) this.abortActive("管理员已暂停任务");
+			}
 			queueMicrotask(() => this.tick());
 		});
 		this.tick();
@@ -170,15 +174,24 @@ export class WorkService<Session extends WorkSession> {
 				}
 				active.session ??= this.opts.open(fresh, convId);
 				const answer = turn === 0 ? fresh.answer : null;
+				// First window = queued kickoff with no history, resume answer or a
+				// previous self-declared follow-up: demand a plan before acting.
+				const firstWindow = turn === 0 && !fresh.progress?.trim() && answer === null && !active.dueAt;
 				const prefix = buildWorkWindowPrefix({
 					title: fresh.title, goal: fresh.goal, conditions: fresh.conditions, progress: fresh.progress,
 					lessons: workLessons(fresh.lessons), turn, budget: this.budget, answer: answer ?? undefined,
+					firstWindow,
 					lastCheck: active.dueAt ? { at: active.dueAt, reason: active.prevReason, streak: active.prevStreak ?? 0 } : undefined,
 				});
 				const result = await this.opts.send(active.session, prefix + (turn === 0 ? "请按目标与执行条件推进工作。" : "继续。"), fresh.created_by);
 				if (result.error) throw new Error(result.error);
 				const current = store.get(item.id);
-				if (!current || current.status !== "working") return; // cancellation wins even over a late DONE
+				// Cancellation wins even over a late DONE: stay silent, the admin already
+				// cancelled it. An admin PAUSE is different — the marker question is
+				// already persisted, so fall through to the normal waiting_human push
+				// below and let the source conversation see why work stopped.
+				if (!current || current.status === "cancelled") return;
+				if (current.status !== "working") { outcome = "waiting_human"; break; }
 				if (active.stopReason || !this.running) { question = active.stopReason ?? "应用停止执行，请管理员明确恢复。"; break; }
 				if (answer !== null) store.clearAnswer(item.id, answer);
 				if (!current.created_by?.trim() || !this.opts.isAdmin(current.created_by)) {
