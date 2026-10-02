@@ -118,8 +118,11 @@ test("fixed_streak only moves while scheduled; reason persists and clears with s
 	store.confirm(item.id, "admin");
 	store.setFixedStreak(item.id, 5);
 	assert.equal(store.get(item.id).fixed_streak, 0, "queued items carry no streak");
+	assert.equal(store.get(item.id).kicked_off, 0, "not kicked off before the first window");
 	const working = store.claim(item.id, Date.now());
 	assert.equal(working.status, "working");
+	assert.equal(working.kicked_off, 1, "claim durably marks the first window");
+	assert.equal(store.get(item.id).kicked_off, 1);
 	store.setStatus(item.id, "scheduled", null, Date.now() + 3_600_000, "等晚间批次");
 	assert.equal(store.get(item.id).next_check_reason, "等晚间批次");
 	store.setFixedStreak(item.id, 3);
@@ -144,6 +147,10 @@ test("admin setSchedule reschedules queued/waiting_human/scheduled; working and 
 	assert.equal(scheduled.next_check_at, at);
 	assert.equal(scheduled.next_check_reason, "等晚间批次");
 	assert.equal(scheduled.question, null);
+	// Admin replacing the schedule RESETS the routine meter: a stale streak plus
+	// one follow-up at the admin's new time must not fire a false warning
+	// (Copilot review 2026-10-02).
+	assert.equal(scheduled.fixed_streak, 0);
 	// COALESCE: rescheduling without a new reason keeps the stored one.
 	assert.equal(store.setSchedule(item.id, at + 60_000).next_check_reason, "等晚间批次");
 	// queued → waiting_human (via the real runner path) → scheduled again.

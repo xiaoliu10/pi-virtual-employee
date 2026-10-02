@@ -486,7 +486,9 @@ test("update reschedules a waiting_human item and rewrites conditions without an
 for (const [label, status, params, pattern] of [
 	["invalid nextCheck", "waiting_human", { nextCheck: "垃圾" }, /15 分钟|非法/],
 	["too-near nextCheck", "waiting_human", { nextCheck: "1m" }, /15 分钟/],
-	["nextCheck while working", "working", { nextCheck: "30m" }, /等本轮结束/],
+	["nextCheck while working", "working", { nextCheck: "30m" }, /pause|等本轮结束/],
+	["text rewrites while working", "working", { conditions: "新条件" }, /pause|等本轮结束/],
+	["goal rewrite while working", "working", { goal: "新目标" }, /pause|等本轮结束/],
 	["nextCheck on a proposal", "proposed", { nextCheck: "30m" }, /确认创建/],
 	["terminal state", "done", {}, /不能调整/],
 	["no fields at all", "waiting_human", {}, /提供要调整/],
@@ -500,15 +502,27 @@ for (const [label, status, params, pattern] of [
 	});
 }
 
-test("update applies text rewrites mid-window and on proposals", async () => {
+test("update refuses mid-window rewrites (stale window could overwrite); queued/proposed still editable", async () => {
+	// Copilot review 2026-10-02: the in-flight window already built its prompt
+	// from the old text; a later manage_work write or its outcome could silently
+	// overwrite the admin's new values. Mid-window rewrites are refused.
 	const working = fixture({ rows: [row({ status: "working", created_by: "admin" })] });
-	const ok = await working.items({ action: "update", id: ID, conditions: "本轮就生效的新条件", goal: "执行中也能改目标" });
-	assert.equal(ok.details.ok, true);
-	assert.deepEqual(ok.details.applied, ["目标", "执行条件"]);
-	assert.equal(working.rows.get(ID).conditions, "本轮就生效的新条件");
+	const before = working.rows.get(ID).conditions;
+	const refusedResult = await working.items({ action: "update", id: ID, conditions: "本轮就生效的新条件", goal: "执行中也能改目标" });
+	refused(refusedResult, working);
+	assert.match(refusedResult.content[0].text, /pause/);
+	assert.equal(working.rows.get(ID).conditions, before, "zero writes while working");
 	const proposed = fixture({ rows: [row({ status: "proposed" })] });
 	assert.equal((await proposed.items({ action: "update", id: ID, title: "提案也能先改标题" })).details.ok, true);
 	assert.equal(proposed.rows.get(ID).title, "提案也能先改标题");
+});
+
+test("update acknowledgement names the updated title when rewritten", async () => {
+	const f = fixture({ rows: [row({ status: "waiting_human", created_by: "admin" })] });
+	const result = await f.items({ action: "update", id: ID, title: "新标题", conditions: "新条件" });
+	assert.equal(result.details.ok, true);
+	assert.match(result.content[0].text, /新标题/);
+	assert.doesNotMatch(result.content[0].text, /月末对账/);
 });
 
 test("pause turns a scheduled item into a marked waiting_human and best-effort aborts", async () => {

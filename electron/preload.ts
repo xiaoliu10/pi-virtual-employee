@@ -34,8 +34,10 @@ const api = {
 	deleteTask: (id: string) => ipcRenderer.invoke("tasks:delete", id),
 	getAutostart: (): Promise<boolean> => ipcRenderer.invoke("autostart:get"),
 	setAutostart: (enabled: boolean): Promise<boolean> => ipcRenderer.invoke("autostart:set", enabled),
-	simulateIM: (conversationId: string, text: string): Promise<string> =>
-		ipcRenderer.invoke("im:simulate", conversationId, text),
+	// Optional actor: console-local test surface (echo channel) can inject a
+	// platform-verified sender to exercise the RBAC/admin pipeline end to end.
+	simulateIM: (conversationId: string, text: string, actor?: { senderId: string; senderName?: string; channel: string; chatType: "single" | "group" }): Promise<string> =>
+		ipcRenderer.invoke("im:simulate", conversationId, text, actor),
 	imChannels: (): Promise<string[]> => ipcRenderer.invoke("im:channels"),
 	/** Subscribe to IM/scheduled activity (main → renderer push) to refresh live. Carries the conversationId that changed. Returns an unsubscribe. */
 	onImActivity: (cb: (conversationId: string) => void): (() => void) => {

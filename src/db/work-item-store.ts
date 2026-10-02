@@ -21,6 +21,8 @@ export interface WorkItemRow {
 	next_check_reason: string | null;
 	/** Consecutive windows that picked the same daily slot (cron degeneration meter). */
 	fixed_streak: number;
+	/** Set by claim() on the first window; durable kickoff-vs-resume marker. */
+	kicked_off: number;
 	/** Verified confirming admin, not the conversation's proposer. */
 	created_by: string | null;
 	/** Retained until the first successful resumed send. */
@@ -58,13 +60,13 @@ export class WorkItemStore {
 			conditions: null, progress: null, lessons: null,
 			origin_conversation: input.originConversation ?? null,
 			origin_note: input.originNote ?? null, status: input.status ?? "proposed",
-			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0,
+			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0, kicked_off: 0,
 			created_by: input.createdBy ?? null,
 			answer: null, created_at: now, updated_at: now,
 		};
 		this.db.prepare(`INSERT INTO work_items
-			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, created_by, answer, created_at, updated_at)
-			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @created_by, @answer, @created_at, @updated_at)`).run(row);
+			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, kicked_off, created_by, answer, created_at, updated_at)
+			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @kicked_off, @created_by, @answer, @created_at, @updated_at)`).run(row);
 		this.changed(row.id);
 		return row;
 	}
@@ -92,7 +94,9 @@ export class WorkItemStore {
 
 	/** Atomic claim prevents duplicate windows. Waiting/proposed are never runnable. */
 	claim(id: string, now: number): WorkItemRow | undefined {
-		const result = this.db.prepare(`UPDATE work_items SET status = 'working', question = NULL, next_check_at = NULL, updated_at = ?
+		// kicked_off marks the first window durably: resumed/crash-recovered runs
+		// must never re-plan (they may have partial effects on record).
+		const result = this.db.prepare(`UPDATE work_items SET status = 'working', question = NULL, next_check_at = NULL, kicked_off = 1, updated_at = ?
 			WHERE id = ? AND (status = 'queued' OR (status = 'scheduled' AND next_check_at <= ?))`).run(now, id, now);
 		return result.changes ? this.get(id) : undefined;
 	}
@@ -130,11 +134,14 @@ export class WorkItemStore {
 	}
 
 	/** Admin reschedule: only states that are not mid-window or ended. Keeps the
-	 * previous reason when none is given; never touches fixed_streak (the meter
-	 * still reads the streak recorded at the last scheduled wake). */
+	 * previous reason when none is given, and RESETS fixed_streak: an admin
+	 * replacing the schedule breaks the measured cadence, so the meter must
+	 * count only the new consecutive cadence — otherwise a stale streak plus one
+	 * follow-up at the admin's new time fires a false routine warning
+	 * (Copilot review 2026-10-02). */
 	setSchedule(id: string, nextCheckAt: number, reason?: string): WorkItemRow | undefined {
 		const result = this.db.prepare(`UPDATE work_items SET status = 'scheduled', question = NULL, next_check_at = ?,
-			next_check_reason = COALESCE(?, next_check_reason), updated_at = ? WHERE id = ? AND status IN ('queued', 'waiting_human', 'scheduled')`)
+			next_check_reason = COALESCE(?, next_check_reason), fixed_streak = 0, updated_at = ? WHERE id = ? AND status IN ('queued', 'waiting_human', 'scheduled')`)
 			.run(nextCheckAt, reason === undefined ? null : reason, Date.now(), id);
 		if (!result.changes) return undefined;
 		this.changed(id);

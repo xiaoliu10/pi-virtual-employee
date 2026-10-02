@@ -15,6 +15,9 @@ interface ActiveWindow<Session> {
 	dueAt?: number | null;
 	prevReason?: string | null;
 	prevStreak?: number;
+	/** Pre-claim kickoff marker: claim() flips the row, so the FIRST-window
+	 * decision must read this snapshot, not the post-claim row. */
+	prevKicked?: number;
 	session?: Session;
 	stopReason?: string;
 	deadline?: ReturnType<typeof setTimeout>;
@@ -134,6 +137,7 @@ export class WorkService<Session extends WorkSession> {
 			const active: ActiveWindow<Session> = {
 				id: due.id, settled: Promise.resolve(),
 				dueAt: due.next_check_at, prevReason: due.next_check_reason, prevStreak: due.fixed_streak ?? 0,
+				prevKicked: due.kicked_off ?? 0,
 			};
 			this.active = active;
 			active.settled = Promise.resolve().then(() => this.run(active)).catch((err) => this.opts.onError?.(err)).finally(() => {
@@ -174,9 +178,14 @@ export class WorkService<Session extends WorkSession> {
 				}
 				active.session ??= this.opts.open(fresh, convId);
 				const answer = turn === 0 ? fresh.answer : null;
-				// First window = queued kickoff with no history, resume answer or a
-				// previous self-declared follow-up: demand a plan before acting.
-				const firstWindow = turn === 0 && !fresh.progress?.trim() && answer === null && !active.dueAt;
+				// Durable kickoff marker: claim() sets kicked_off on the first window,
+				// so resumed/crash-recovered windows never re-plan. A resume without an
+				// answer used to look exactly like a fresh kickoff and get the plan
+				// block again (Copilot review 2026-10-02); progress/answer heuristics
+				// were not enough — a paused-never-started item resuming without an
+				// answer SHOULD still get the plan, and only the durable marker knows.
+				// Read the PRE-CLAIM snapshot: claim() has already flipped the row.
+				const firstWindow = turn === 0 && !active.prevKicked;
 				const prefix = buildWorkWindowPrefix({
 					title: fresh.title, goal: fresh.goal, conditions: fresh.conditions, progress: fresh.progress,
 					lessons: workLessons(fresh.lessons), turn, budget: this.budget, answer: answer ?? undefined,

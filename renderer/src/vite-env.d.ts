@@ -30,7 +30,7 @@ testOss(): Promise<{ ok: boolean; detail: string }>;
 	deleteTask(id: string): Promise<boolean>;
 	getAutostart(): Promise<boolean>;
 	setAutostart(enabled: boolean): Promise<boolean>;
-	simulateIM(conversationId: string, text: string): Promise<string>;
+	simulateIM(conversationId: string, text: string, actor?: { senderId: string; senderName?: string; channel: string; chatType: "single" | "group" }): Promise<string>;
 	imChannels(): Promise<string[]>;
 	onImActivity(cb: (conversationId: string) => void): () => void;
 	listModels(): Promise<import("./lib/types").ModelOption[]>;

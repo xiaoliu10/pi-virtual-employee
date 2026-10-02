@@ -217,23 +217,31 @@ test("a true queued kickoff carries the first-window plan block", async t => {
 });
 
 test("later turns, resumed, progress-carrying and scheduled wakes skip the plan block", async t => {
-	// A resumed window: the admin's answer makes it not a first window.
-	const resumed = fixture(t);
-	const a = resumed.create("waiting_human");
-	resumed.store.resume(a.id, "管理员答复");
+	// A resumed window: window 1 ran to NEED_HUMAN (kicked_off=1 durably),
+	// the admin's answer resumes it as a continuation.
+	const resumed = fixture(t, { send: h => h.sends.length === 1
+		? { reply: "[[NEED_HUMAN]]: 需要审批号" }
+		: { reply: "[[TASK_DONE]]" } });
+	const a = resumed.create();
 	resumed.service.start(); await flush();
-	assert.doesNotMatch(resumed.sends[0].message, /【首个窗口：先出跟进计划】/);
-	assert.match(resumed.sends[0].message, /管理员答复/);
-	// A window with carried progress is a continuation, not a kickoff.
+	assert.match(resumed.sends[0].message, /【首个窗口：先出跟进计划】/, "window 1 is a true kickoff");
+	assert.equal(resumed.store.get(a.id).status, "waiting_human");
+	resumed.store.resume(a.id, "管理员答复"); await flush();
+	assert.doesNotMatch(resumed.sends[1].message, /【首个窗口：先出跟进计划】/, "resumed window never re-plans");
+	assert.match(resumed.sends[1].message, /管理员答复/);
+	// A window with carried progress is a continuation, not a kickoff
+	// (seeded kicked_off=1: a prior window ran; progress without a prior
+	// window is synthetic and the durable marker is the source of truth).
 	const progressed = fixture(t);
 	const b = progressed.create();
+	progressed.db.prepare("UPDATE work_items SET kicked_off = 1 WHERE id = ?").run(b.id);
 	progressed.store.setField(b.id, "progress", "已有前期进展");
 	progressed.service.start(); await flush();
 	assert.doesNotMatch(progressed.sends[0].message, /【首个窗口：先出跟进计划】/);
 	// A scheduled wake (previous self-declared follow-up) is not a first window either.
 	const scheduled = fixture(t);
 	const c = scheduled.create("scheduled");
-	scheduled.db.prepare("UPDATE work_items SET next_check_at = ? WHERE id = ?").run(scheduled.clock.now() - 100, c.id);
+	scheduled.db.prepare("UPDATE work_items SET next_check_at = ?, kicked_off = 1 WHERE id = ?").run(scheduled.clock.now() - 100, c.id);
 	scheduled.service.start(); await flush();
 	assert.doesNotMatch(scheduled.sends[0].message, /【首个窗口：先出跟进计划】/);
 	// Within a first window only turn 0 plans; follow-up turns continue.

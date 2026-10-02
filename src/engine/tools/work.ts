@@ -276,6 +276,13 @@ export function createWorkTools(deps: {
 			if (p.action === "update") {
 				if (item.status === "done" || item.status === "cancelled") return failure("已完成或已取消的工作项不能调整。");
 				if (item.status === "proposed" && p.nextCheck !== undefined) return failure("提案尚未确认，不能设置跟进时间；请先确认创建（confirm 可附带改写）。");
+				// While a window is executing, the runner has already built its prompt
+				// from the OLD text, and a later manage_work write or its outcome could
+				// silently overwrite the admin's new values (Copilot review 2026-10-02).
+				// Refuse mid-window rewrites instead of racing the active window:
+				// pause → update → resume is the safe path.
+				if (item.status === "working" && (p.title !== undefined || p.goal !== undefined || p.conditions !== undefined || p.nextCheck !== undefined))
+					return failure("任务正在执行中，本轮已按旧目标/条件开工；为避免在飞窗口覆盖你的修改，请先 action=pause 暂停，调整后再确认继续（或等本轮结束）。");
 				// Atomic adjust: validate every provided field before any write.
 				const rewrites = collectRewrites(p);
 				if ("failure" in rewrites) return failure(rewrites.failure);
@@ -300,8 +307,11 @@ export function createWorkTools(deps: {
 					if (!scheduled) return failure("调整跟进时间失败，任务可能正在执行中；请等本轮结束后再改期。");
 					applied.push(`下次跟进 → ${fmtTime(nextCheckAt)}${reason ? `（${reason}）` : ""}`);
 				}
+				// Re-read so the acknowledgement names the UPDATED title when the admin
+				// rewrote it (Copilot review 2026-10-02).
+				const afterUpdate = workItems.get(item.id);
 				return {
-					content: [{ type: "text", text: `已更新「${item.title}」：${applied.join("；")}。` }],
+					content: [{ type: "text", text: `已更新「${afterUpdate?.title ?? item.title}」：${applied.join("；")}。` }],
 					details: { ok: true, updated: true, applied },
 				};
 			}
