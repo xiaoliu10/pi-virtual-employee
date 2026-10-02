@@ -298,3 +298,42 @@ test("cleanup also retains the window lock until release settles", async t => {
 	assert.equal(h.sends.length, 2);
 	assert.equal(h.store.get(second.id).status, "done");
 });
+
+test("routine cadence: prefix carries the last check + warning; streak accumulates; push suggests a scheduled task", async t => {
+	const h = fixture(t, { send: h => h.sends.length === 1
+		? { reply: "对账批次 16:00 生成，今日无异常\n[[NEXT_CHECK]]: 明天16:00 | 每日巡检" }
+		: { reply: "无异常\n[[TASK_DONE]]" } });
+	const item = h.create("scheduled");
+	// Seed: this window wakes from a follow-up the model declared for yesterday
+	// 16:00 — already the 2nd consecutive same-daily-slot pick.
+	const dueAt = new Date("2026-10-01T16:00:00").getTime();
+	h.db.prepare("UPDATE work_items SET next_check_at = ?, next_check_reason = ?, fixed_streak = 2 WHERE id = ?")
+		.run(dueAt, "每日巡检", item.id);
+	h.service.start(); await flush();
+	assert.equal(h.sends.length, 0, "not due until 16:00");
+	await h.clock.advance(6 * 3_600_000);
+	assert.equal(h.sends.length, 1);
+	assert.match(h.sends[0].message, /【上次跟进】.*16:00.*（每日巡检）/);
+	assert.match(h.sends[0].message, /【节奏警示】/);
+	assert.match(h.sends[0].message, /连续 2 次/);
+	const row = h.store.get(item.id);
+	assert.equal(row.status, "scheduled");
+	assert.equal(row.fixed_streak, 3, "same slot tomorrow → streak 3");
+	assert.equal(row.next_check_reason, "每日巡检");
+	assert.match(h.pushes[0].text, /连续 3 次/);
+	assert.match(h.pushes[0].text, /定时任务/);
+});
+
+test("a different follow-up slot resets the streak; no conversion suggestion pushed", async t => {
+	const h = fixture(t, { send: h => h.sends.length === 1
+		? { reply: "批次提前了\n[[NEXT_CHECK]]: 2小时 | 等新批次" }
+		: { reply: "[[TASK_DONE]]" } });
+	const item = h.create("scheduled");
+	h.db.prepare("UPDATE work_items SET next_check_at = ?, fixed_streak = 3 WHERE id = ?").run(h.clock.now(), item.id);
+	h.service.start(); await flush();
+	const row = h.store.get(item.id);
+	assert.equal(row.status, "scheduled");
+	assert.equal(row.fixed_streak, 0, "a 2h gap is not a daily slot");
+	assert.equal(row.next_check_reason, "等新批次");
+	assert.doesNotMatch(h.pushes[0].text, /定时任务/);
+});

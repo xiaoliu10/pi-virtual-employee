@@ -325,6 +325,8 @@ function migrate(db: DB): void {
 			status               TEXT NOT NULL DEFAULT 'proposed',
 			question             TEXT,
 			next_check_at        INTEGER,
+			next_check_reason    TEXT,
+			fixed_streak         INTEGER NOT NULL DEFAULT 0,
 			created_by           TEXT,
 			created_at           INTEGER NOT NULL,
 			updated_at           INTEGER NOT NULL
@@ -336,6 +338,12 @@ function migrate(db: DB): void {
 	);
 	// Staged reply for a waiting_human resume — consumed by the next window's turn 0.
 	if (!workCols.has("answer")) db.exec("ALTER TABLE work_items ADD COLUMN answer TEXT");
+	// Adaptive-cadence bookkeeping: the last self-declared reason (re-injected as
+	// context) and how many consecutive windows picked the same daily slot
+	// (>=2 warns the model it is degenerating into a cron, >=3 suggests the
+	// admin convert it to a scheduled task).
+	if (!workCols.has("next_check_reason")) db.exec("ALTER TABLE work_items ADD COLUMN next_check_reason TEXT");
+	if (!workCols.has("fixed_streak")) db.exec("ALTER TABLE work_items ADD COLUMN fixed_streak INTEGER NOT NULL DEFAULT 0");
 
 	// Document resources: a catalog of deliverable docs the employee can hand to
 	// integration partners. kind=file points at a copied file under documents.dir;

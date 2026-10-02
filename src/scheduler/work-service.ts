@@ -4,18 +4,23 @@
  * Abort requests never release the dispatch lock until send actually settles.
  */
 import type { WorkItemRow, WorkItemStore } from "../db/work-item-store.js";
-import { buildWorkWindowPrefix, DEFAULT_WINDOW_BUDGET, parseWindowReply } from "./work.js";
+import { buildWorkWindowPrefix, DEFAULT_WINDOW_BUDGET, nextRoutineStreak, parseWindowReply } from "./work.js";
 import { hasMiningSecrets } from "./mining.js";
 
 interface WorkSession { abort(): void; }
 interface ActiveWindow<Session> {
 	id: string;
+	/** Snapshot of the item's due state BEFORE claim nulls it — the previous
+	 * self-declared follow-up, used for cadence judgement and streak counting. */
+	dueAt?: number | null;
+	prevReason?: string | null;
+	prevStreak?: number;
 	session?: Session;
 	stopReason?: string;
 	deadline?: ReturnType<typeof setTimeout>;
 	settled: Promise<void>;
 }
-type Store = Pick<WorkItemStore, "get" | "listDue" | "nextWakeAt" | "claim" | "recoverWorking" | "subscribe" | "setStatus" | "setField" | "clearAnswer">;
+type Store = Pick<WorkItemStore, "get" | "listDue" | "nextWakeAt" | "claim" | "recoverWorking" | "subscribe" | "setStatus" | "setField" | "clearAnswer" | "setFixedStreak">;
 interface Clock {
 	now(): number;
 	setTimeout(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
@@ -122,7 +127,10 @@ export class WorkService<Session extends WorkSession> {
 				return;
 			}
 			// Set the lock BEFORE starting any async setup, and keep it through cleanup.
-			const active: ActiveWindow<Session> = { id: due.id, settled: Promise.resolve() };
+			const active: ActiveWindow<Session> = {
+				id: due.id, settled: Promise.resolve(),
+				dueAt: due.next_check_at, prevReason: due.next_check_reason, prevStreak: due.fixed_streak ?? 0,
+			};
 			this.active = active;
 			active.settled = Promise.resolve().then(() => this.run(active)).catch((err) => this.opts.onError?.(err)).finally(() => {
 				this.active = undefined;
@@ -139,6 +147,7 @@ export class WorkService<Session extends WorkSession> {
 		let question = "";
 		let nextCheckAt: number | undefined;
 		let nextReason: string | undefined;
+		let nextStreak = 0;
 		let outcome: "done" | "waiting_human" | "scheduled" = "waiting_human";
 		try {
 			if (!this.running) return;
@@ -164,6 +173,7 @@ export class WorkService<Session extends WorkSession> {
 				const prefix = buildWorkWindowPrefix({
 					title: fresh.title, goal: fresh.goal, conditions: fresh.conditions, progress: fresh.progress,
 					lessons: workLessons(fresh.lessons), turn, budget: this.budget, answer: answer ?? undefined,
+					lastCheck: active.dueAt ? { at: active.dueAt, reason: active.prevReason, streak: active.prevStreak ?? 0 } : undefined,
 				});
 				const result = await this.opts.send(active.session, prefix + (turn === 0 ? "请按目标与执行条件推进工作。" : "继续。"), fresh.created_by);
 				if (result.error) throw new Error(result.error);
@@ -180,7 +190,12 @@ export class WorkService<Session extends WorkSession> {
 				if (decision.kind === "done") { outcome = "done"; break; }
 				if (decision.kind === "next_check") {
 					if (decision.nextCheckAt === undefined) { question = "下次跟进时间非法、已过去或不足 15 分钟；请管理员明确恢复并指定合理时间。"; break; }
-					outcome = "scheduled"; nextCheckAt = decision.nextCheckAt; nextReason = decision.nextCheckReason; break;
+					outcome = "scheduled"; nextCheckAt = decision.nextCheckAt; nextReason = decision.nextCheckReason;
+					// Deterministic cron-degeneration meter: consecutive same-daily-slot
+					// follow-ups accumulate; anything else resets. Manual resume (no dueAt)
+					// also resets — conservative by design.
+					nextStreak = nextRoutineStreak(active.dueAt ?? undefined, active.prevStreak ?? 0, nextCheckAt);
+					break;
 				}
 				question = "工作窗口预算已用尽且未声明安全的跟进时间；请核查进展后由管理员明确恢复。";
 			}
@@ -196,7 +211,10 @@ export class WorkService<Session extends WorkSession> {
 			if (active.deadline !== undefined) this.clock.clearTimeout(active.deadline);
 			active.deadline = undefined;
 			// Persist BEFORE release/push/learning, including throws during open/send.
-			if (item && store.get(item.id)?.status === "working") store.setStatus(item.id, outcome, outcome === "waiting_human" ? question || active.stopReason || "请管理员明确恢复。" : null, nextCheckAt ?? null);
+			if (item && store.get(item.id)?.status === "working") {
+				store.setStatus(item.id, outcome, outcome === "waiting_human" ? question || active.stopReason || "请管理员明确恢复。" : null, nextCheckAt ?? null, nextReason);
+				if (outcome === "scheduled") store.setFixedStreak(item.id, nextStreak);
+			}
 			try { await this.opts.release(convId); } catch (err) { this.opts.onError?.(err); }
 		}
 		if (!item) return;
@@ -211,7 +229,7 @@ export class WorkService<Session extends WorkSession> {
 			const text = fresh.status === "done"
 				? `✅ **自主任务完成：${fresh.title}**\n\n${lastText}`
 				: fresh.status === "scheduled"
-					? `🔁 **自主任务阶段进展：${fresh.title}**\n\n${lastText.slice(-500)}\n\n下次跟进：${new Date(nextCheckAt!).toLocaleString("zh-CN", { hour12: false })}${nextReason ? `（${nextReason}）` : ""}`
+					? `🔁 **自主任务阶段进展：${fresh.title}**\n\n${lastText.slice(-500)}\n\n下次跟进：${new Date(nextCheckAt!).toLocaleString("zh-CN", { hour12: false })}${nextReason ? `（${nextReason}）` : ""}${nextStreak >= 3 ? `\n\n⚠️ 已连续 ${nextStreak} 次按几乎相同的固定时间跟进。如果这本质上是每天固定时刻的例行工作，建议管理员改用**定时任务**（对员工说「取消这个工作项，建一个定时任务」即可）；工作项更适合需要判断力的跟进。` : ""}`
 					: `⏸️ **自主任务需要人工：${fresh.title}**\n\n${fresh.question}\n\n请管理员回复「继续 ${fresh.title}」并附上答复；未明确恢复前不会自动执行。`;
 			try { await this.opts.push(fresh.origin_conversation, text); } catch (err) { this.opts.onError?.(err); }
 		}
