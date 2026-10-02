@@ -165,7 +165,16 @@ export interface WorkItemWindowContext {
 	/** Previous self-declared follow-up, injected so the model judges rhythm
 	 * with facts instead of re-declaring "明天同一时间" by default. */
 	lastCheck?: { at: number; reason?: string | null; streak: number };
+	/** True for a queued kickoff with no history/resume: the model must lay out
+	 * a short follow-up plan before starting (field feedback 2026-10-02: the
+	 * first window executed immediately without a plan). */
+	firstWindow?: boolean;
 }
+
+// A true kickoff must plan before acting — and the plan must justify its own
+// rhythm (field 2026-10-02: 自主任务的要素在于不定时，固定每天一次和定时任务没区别).
+const FIRST_WINDOW_PLAN =
+	"【首个窗口：先出跟进计划】给出简要计划再开始第一步：① 分几步完成目标；② 这件工作在一天里哪些时刻会有新信息可查（数据何时生成、批次何时跑完、何时出结果）——列出这些「观察点」及依据，并说明打算怎么覆盖它们（一天可以多次，例如 09:00 查昨日历史、12:30 查今日上午批次、15:00 查今日下午批次）；③ 需要提前落实的条件。计划写完即开始第一步，无需等待确认。";
 
 /** System-side prefix for every window turn — goal, memory, budget, protocol. */
 export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
@@ -173,6 +182,7 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 	if (ctx.conditions?.trim()) memory.push(`【执行条件（务必遵守）】\n${ctx.conditions.trim()}`);
 	if (ctx.progress?.trim()) memory.push(`【此前进展】\n${ctx.progress.trim()}`);
 	if (ctx.lessons?.length) memory.push(`【踩坑记录（别再踩）】\n${ctx.lessons.map((l) => `- ${l}`).join("\n")}`);
+	if (ctx.firstWindow && ctx.turn === 0) memory.push(FIRST_WINDOW_PLAN);
 	const head = ctx.turn === 0 ? "【工作窗口开始】" : `【工作窗口继续 · 本窗第 ${ctx.turn + 1} 轮】`;
 	const answerBlock = ctx.answer ? `\n用户对你上一轮问题的回复：${ctx.answer}\n` : "";
 	const lastCheck = ctx.lastCheck
@@ -181,14 +191,14 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 	// A repeated fixed daily slot means the item has degenerated into a cron.
 	// Confront the model with the measured streak — do NOT rely on its judgement.
 	const cadenceWarning = (ctx.lastCheck?.streak ?? 0) >= 2
-		? `\n【节奏警示】你已经连续 ${ctx.lastCheck!.streak} 次把跟进安排在几乎相同的固定时间——这已经退化成了定时任务。请重新评估：\n- 有明确的外部时间依据（如「对账批次 16:00 生成」）→ 写明依据后可以维持；\n- 没有依据 → 调整节奏：无异常拉长间隔、有异常缩短、非工作日/已知停机时段跳过；\n- 这本质上是每天固定时刻的例行工作 → 本轮推送里明确建议管理员把它转成定时任务，工作项应留给需要判断力的跟进。\n`
+		? `\n【节奏提示】你已连续 ${ctx.lastCheck!.streak} 次把这个观察点安排在相近的固定时间。如果这是因为该时刻确有新信息可查（如「09:00 前历史对账已生成」），写明依据后可以维持；但请确认你覆盖了今天所有的观察点（如 12:30/15:00），不要只查这一个。若这件工作每天只在这一处固定点查、且查了也不需要判断动作，可以考虑建议管理员转成定时任务，工作项留给需要判断力的跟进。\n`
 		: "";
 	const protocol = [
 		`窗口规则：`,
 		`- 本窗口最多 ${ctx.budget.maxTurns} 轮 / ${ctx.budget.maxMinutes} 分钟，请优先推进关键路径，并把重要发现写入进展/踩坑。超时、执行出错或到限仍无安全结束声明会暂停等管理员明确恢复，不自动重试。`,
 		`- 目标全部完成 → 最后一行单独写 ${AUTONOMOUS_DONE_MARK}，上方给出成果总结。`,
 		`- 需要人参与 / 需其他单位配合资源 / 权限不足 → 最后一行单独写 ${AUTONOMOUS_HUMAN_MARK}: 具体需要谁做什么。任务会暂停等人，不要空转。`,
-		`- 本轮告一段落但目标未完成 → 最后一行单独写 ${AUTONOMOUS_NEXT_CHECK_MARK}: 下次跟进时间 | 原因。时间支持 30m/2h/14:30/明天09:40 等；至少距现在 15 分钟。时间必须有依据：数据何时生成、上次发现了什么、依赖何时就绪；无异常主动拉长间隔，有异常缩短，非工作日与已知停机时段跳过，禁止不加思考地写「明天同一时间」。非法/过去/过近时间会暂停等管理员明确恢复。`,
+		`- 本轮告一段落但目标未完成 → 最后一行单独写 ${AUTONOMOUS_NEXT_CHECK_MARK}: 下次跟进时间 | 原因。时间支持 30m/2h/14:30/明天09:40 等；至少距现在 15 分钟。按「观察点」安排：这件工作在一天里哪些时刻会有新信息（数据生成时间、批次完成时间、何时出结果）？在这些时刻安排跟进，一天可以多次（如 09:00 查昨日、12:30 查今日上午、15:00 查今日下午），没有新信息的时段不要空查；发现异常可缩短间隔、提前再查；连续多轮全无异常且多日无新信息才适当拉长。时间必须写明依据，不要不加思考地默认「明天同一时间」。非法/过去/过近时间会暂停等管理员明确恢复。`,
 		`- 工作过程中了解到执行条件（如「系统对账 08:00-09:30 自动跑，此时段勿手动对账」、依赖的单位/资源、账号权限边界）→ 立即用 manage_work 记录到条件里，后续窗口会带着这些条件工作。`,
 		`- 踩过的坑（登录态、页面路径、接口 quirks）→ 用 manage_work 记录，别指望下次还记得。`,
 		`- 无人值守：先检测登录状态再操作，登录过期直接 ${AUTONOMOUS_HUMAN_MARK} 说明，不要索要验证码。`,

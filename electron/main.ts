@@ -49,6 +49,7 @@ import { setupAutoUpdater, getUpdateState, lastCheckTime, checkNow, downloadNow,
 import type { UpdateToolStatus } from "../src/engine/tools/update.js";
 import { IMAdapterManager, availableChannels } from "../src/im/manager.js";
 import { setDiagFile } from "../src/im/diag.js";
+import type { InboundActor } from "../src/im/types.js";
 import {
 	buildEmployeePackage,
 	importEmployeePackage,
@@ -889,8 +890,12 @@ async function main(): Promise<void> {
 		return true;
 	});
 
-	ipcMain.handle("im:simulate", async (_e, conversationId: string, text: string) =>
-		im.simulate(conversationId, text),
+	// `im:simulate` drives the echo test channel from the local console (a
+	// trusted-admin surface). The optional `actor` is forwarded as a
+	// platform-verified sender so the console can exercise the full RBAC/admin
+	// pipeline — test-channel only, never a production IM path.
+	ipcMain.handle("im:simulate", async (_e, conversationId: string, text: string, actor?: InboundActor) =>
+		im.simulate(conversationId, text, actor),
 	);
 	ipcMain.handle("im:channels", () => availableChannels());
 

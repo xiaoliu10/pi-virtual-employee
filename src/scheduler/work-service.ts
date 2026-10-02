@@ -15,6 +15,9 @@ interface ActiveWindow<Session> {
 	dueAt?: number | null;
 	prevReason?: string | null;
 	prevStreak?: number;
+	/** Pre-claim kickoff marker: claim() flips the row, so the FIRST-window
+	 * decision must read this snapshot, not the post-claim row. */
+	prevKicked?: number;
 	session?: Session;
 	stopReason?: string;
 	deadline?: ReturnType<typeof setTimeout>;
@@ -83,7 +86,11 @@ export class WorkService<Session extends WorkSession> {
 		if (!this.recovered) { this.opts.store.recoverWorking(); this.recovered = true; }
 		this.running = true;
 		this.unsubscribe = this.opts.store.subscribe((id) => {
-			if (id && id === this.active?.id && this.opts.store.get(id)?.status === "cancelled") this.abortActive("任务已取消");
+			if (id && id === this.active?.id) {
+				const fresh = this.opts.store.get(id);
+				if (fresh?.status === "cancelled") this.abortActive("任务已取消");
+				else if (fresh?.status === "waiting_human" && fresh.question?.startsWith("管理员暂停")) this.abortActive("管理员已暂停任务");
+			}
 			queueMicrotask(() => this.tick());
 		});
 		this.tick();
@@ -130,6 +137,7 @@ export class WorkService<Session extends WorkSession> {
 			const active: ActiveWindow<Session> = {
 				id: due.id, settled: Promise.resolve(),
 				dueAt: due.next_check_at, prevReason: due.next_check_reason, prevStreak: due.fixed_streak ?? 0,
+				prevKicked: due.kicked_off ?? 0,
 			};
 			this.active = active;
 			active.settled = Promise.resolve().then(() => this.run(active)).catch((err) => this.opts.onError?.(err)).finally(() => {
@@ -170,15 +178,29 @@ export class WorkService<Session extends WorkSession> {
 				}
 				active.session ??= this.opts.open(fresh, convId);
 				const answer = turn === 0 ? fresh.answer : null;
+				// Durable kickoff marker: claim() sets kicked_off on the first window,
+				// so resumed/crash-recovered windows never re-plan. A resume without an
+				// answer used to look exactly like a fresh kickoff and get the plan
+				// block again (Copilot review 2026-10-02); progress/answer heuristics
+				// were not enough — a paused-never-started item resuming without an
+				// answer SHOULD still get the plan, and only the durable marker knows.
+				// Read the PRE-CLAIM snapshot: claim() has already flipped the row.
+				const firstWindow = turn === 0 && !active.prevKicked;
 				const prefix = buildWorkWindowPrefix({
 					title: fresh.title, goal: fresh.goal, conditions: fresh.conditions, progress: fresh.progress,
 					lessons: workLessons(fresh.lessons), turn, budget: this.budget, answer: answer ?? undefined,
+					firstWindow,
 					lastCheck: active.dueAt ? { at: active.dueAt, reason: active.prevReason, streak: active.prevStreak ?? 0 } : undefined,
 				});
 				const result = await this.opts.send(active.session, prefix + (turn === 0 ? "请按目标与执行条件推进工作。" : "继续。"), fresh.created_by);
 				if (result.error) throw new Error(result.error);
 				const current = store.get(item.id);
-				if (!current || current.status !== "working") return; // cancellation wins even over a late DONE
+				// Cancellation wins even over a late DONE: stay silent, the admin already
+				// cancelled it. An admin PAUSE is different — the marker question is
+				// already persisted, so fall through to the normal waiting_human push
+				// below and let the source conversation see why work stopped.
+				if (!current || current.status === "cancelled") return;
+				if (current.status !== "working") { outcome = "waiting_human"; break; }
 				if (active.stopReason || !this.running) { question = active.stopReason ?? "应用停止执行，请管理员明确恢复。"; break; }
 				if (answer !== null) store.clearAnswer(item.id, answer);
 				if (!current.created_by?.trim() || !this.opts.isAdmin(current.created_by)) {
@@ -229,7 +251,7 @@ export class WorkService<Session extends WorkSession> {
 			const text = fresh.status === "done"
 				? `✅ **自主任务完成：${fresh.title}**\n\n${lastText}`
 				: fresh.status === "scheduled"
-					? `🔁 **自主任务阶段进展：${fresh.title}**\n\n${lastText.slice(-500)}\n\n下次跟进：${new Date(nextCheckAt!).toLocaleString("zh-CN", { hour12: false })}${nextReason ? `（${nextReason}）` : ""}${nextStreak >= 3 ? `\n\n⚠️ 已连续 ${nextStreak} 次按几乎相同的固定时间跟进。如果这本质上是每天固定时刻的例行工作，建议管理员改用**定时任务**（对员工说「取消这个工作项，建一个定时任务」即可）；工作项更适合需要判断力的跟进。` : ""}`
+					? `🔁 **自主任务阶段进展：${fresh.title}**\n\n${lastText.slice(-500)}\n\n下次跟进：${new Date(nextCheckAt!).toLocaleString("zh-CN", { hour12: false })}${nextReason ? `（${nextReason}）` : ""}${nextStreak >= 3 ? `\n\n⚠️ 已连续 ${nextStreak} 次只在相近的固定时间跟进这一个点。如果这是因为它有新信息可查（如某个批次在该时刻生成），写明依据可继续；但记得覆盖今天其他观察点。若这件工作每天只在这一处查、且查了也不需要判断动作，可建议管理员转成定时任务，工作项留给需要判断力的跟进。` : ""}`
 					: `⏸️ **自主任务需要人工：${fresh.title}**\n\n${fresh.question}\n\n请管理员回复「继续 ${fresh.title}」并附上答复；未明确恢复前不会自动执行。`;
 			try { await this.opts.push(fresh.origin_conversation, text); } catch (err) { this.opts.onError?.(err); }
 		}

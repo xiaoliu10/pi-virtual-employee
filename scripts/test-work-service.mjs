@@ -187,6 +187,72 @@ test("cancel aborts immediately, holds single-window lock until send settles, an
 	assert.equal(h.clock.timers.size, 0);
 });
 
+test("admin pause mid-window aborts the send; a late reply cannot overwrite the pause", async t => {
+	const h = fixture(t, { send: h => h.sends.length === 1 ? gate.promise : { reply: "[[TASK_DONE]]" } });
+	const gate = h.gate(); const first = h.create(); const second = h.create();
+	h.service.start(); await flush();
+	assert.equal(h.store.get(first.id).status, "working");
+	h.store.pause(first.id, "先核对口径"); await flush();
+	assert.deepEqual(h.aborted, [first.id], "the pause marker triggers an immediate abort");
+	assert.equal(h.sends.length, 1, "abort-ignoring send is still in flight");
+	assert.equal(h.store.get(first.id).status, "waiting_human");
+	assert.equal(h.store.get(first.id).question, "管理员暂停：先核对口径");
+	gate.resolve({ reply: "[[TASK_DONE]]" }); await flush();
+	const row = h.store.get(first.id);
+	assert.equal(row.status, "waiting_human", "the runner must not overwrite the admin pause");
+	assert.equal(row.question, "管理员暂停：先核对口径");
+	assert.ok(h.pushes.some(p => p.cid === "dt:source" && /管理员暂停/.test(p.text)), "source push carries the pause marker question");
+	assert.equal(h.sends.length, 2, "queued work proceeds once the window settles");
+	assert.equal(h.store.get(second.id).status, "done");
+	assert.equal(h.learned.length, 1, "only the second item completed");
+});
+
+test("a true queued kickoff carries the first-window plan block", async t => {
+	const h = fixture(t);
+	const item = h.create();
+	h.service.start(); await flush();
+	assert.match(h.sends[0].message, /【首个窗口：先出跟进计划】/);
+	assert.ok(h.sends[0].message.indexOf("【首个窗口：先出跟进计划】") < h.sends[0].message.indexOf("窗口规则："));
+	assert.equal(h.store.get(item.id).status, "done");
+});
+
+test("later turns, resumed, progress-carrying and scheduled wakes skip the plan block", async t => {
+	// A resumed window: window 1 ran to NEED_HUMAN (kicked_off=1 durably),
+	// the admin's answer resumes it as a continuation.
+	const resumed = fixture(t, { send: h => h.sends.length === 1
+		? { reply: "[[NEED_HUMAN]]: 需要审批号" }
+		: { reply: "[[TASK_DONE]]" } });
+	const a = resumed.create();
+	resumed.service.start(); await flush();
+	assert.match(resumed.sends[0].message, /【首个窗口：先出跟进计划】/, "window 1 is a true kickoff");
+	assert.equal(resumed.store.get(a.id).status, "waiting_human");
+	resumed.store.resume(a.id, "管理员答复"); await flush();
+	assert.doesNotMatch(resumed.sends[1].message, /【首个窗口：先出跟进计划】/, "resumed window never re-plans");
+	assert.match(resumed.sends[1].message, /管理员答复/);
+	// A window with carried progress is a continuation, not a kickoff
+	// (seeded kicked_off=1: a prior window ran; progress without a prior
+	// window is synthetic and the durable marker is the source of truth).
+	const progressed = fixture(t);
+	const b = progressed.create();
+	progressed.db.prepare("UPDATE work_items SET kicked_off = 1 WHERE id = ?").run(b.id);
+	progressed.store.setField(b.id, "progress", "已有前期进展");
+	progressed.service.start(); await flush();
+	assert.doesNotMatch(progressed.sends[0].message, /【首个窗口：先出跟进计划】/);
+	// A scheduled wake (previous self-declared follow-up) is not a first window either.
+	const scheduled = fixture(t);
+	const c = scheduled.create("scheduled");
+	scheduled.db.prepare("UPDATE work_items SET next_check_at = ?, kicked_off = 1 WHERE id = ?").run(scheduled.clock.now() - 100, c.id);
+	scheduled.service.start(); await flush();
+	assert.doesNotMatch(scheduled.sends[0].message, /【首个窗口：先出跟进计划】/);
+	// Within a first window only turn 0 plans; follow-up turns continue.
+	const multi = fixture(t, { send: h => h.sends.length === 1 ? gate.promise : { reply: "[[TASK_DONE]]" } });
+	const gate = multi.gate();
+	multi.create();
+	multi.service.start(); await flush();
+	gate.resolve({ reply: "第一步已完成，继续" }); await flush();
+	assert.doesNotMatch(multi.sends[1].message, /【首个窗口：先出跟进计划】/);
+});
+
 test("deadline actually aborts a hung send, never races it with a new send", async t => {
 	const h = fixture(t, { send: h => h.sends.length === 1 ? gate.promise : { reply: "[[TASK_DONE]]" } });
 	const gate = h.gate(); const first = h.create("waiting_human"); h.store.resume(first.id, "已审批，请核查");
@@ -314,7 +380,7 @@ test("routine cadence: prefix carries the last check + warning; streak accumulat
 	await h.clock.advance(6 * 3_600_000);
 	assert.equal(h.sends.length, 1);
 	assert.match(h.sends[0].message, /【上次跟进】.*16:00.*（每日巡检）/);
-	assert.match(h.sends[0].message, /【节奏警示】/);
+	assert.match(h.sends[0].message, /【节奏提示】/);
 	assert.match(h.sends[0].message, /连续 2 次/);
 	const row = h.store.get(item.id);
 	assert.equal(row.status, "scheduled");
