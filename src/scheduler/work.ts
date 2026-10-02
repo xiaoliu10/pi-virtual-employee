@@ -28,6 +28,27 @@ export const DEFAULT_WINDOW_BUDGET = { maxTurns: 15, maxMinutes: 30 };
 /** Minimum model-selected follow-up interval (reject, never silently clamp). */
 export const MIN_NEXT_CHECK_MS = 15 * 60_000;
 
+/**
+ * True when two follow-up times are essentially "the same time tomorrow": a
+ * 20–28h gap whose wall-clock slots differ by ≤45min. This is how a work item
+ * degenerates into a de-facto cron (field 2026-10-02: 每天对账巡检 declared
+ * 每天 16:30, indistinguishable from a scheduled task) — detectable WITHOUT
+ * trusting the model to self-report.
+ */
+export function isSameDailySlot(prev: number, next: number): boolean {
+	if (!Number.isFinite(prev) || !Number.isFinite(next)) return false;
+	const gap = next - prev;
+	if (gap < 20 * 3_600_000 || gap > 28 * 3_600_000) return false;
+	const a = new Date(prev);
+	const b = new Date(next);
+	return Math.abs(a.getHours() * 60 + a.getMinutes() - (b.getHours() * 60 + b.getMinutes())) <= 45;
+}
+
+/** Streak counter for consecutive same-daily-slot follow-ups; anything else resets. */
+export function nextRoutineStreak(prevAt: number | undefined, prevStreak: number, nextAt: number): number {
+	return prevAt !== undefined && isSameDailySlot(prevAt, nextAt) ? prevStreak + 1 : 0;
+}
+
 export interface WorkWindowDecision {
 	kind: "done" | "human" | "next_check" | "continue";
 	question?: string;
@@ -141,6 +162,9 @@ export interface WorkItemWindowContext {
 	budget: { maxTurns: number; maxMinutes: number };
 	/** The user's reply when resuming from waiting_human. */
 	answer?: string;
+	/** Previous self-declared follow-up, injected so the model judges rhythm
+	 * with facts instead of re-declaring "明天同一时间" by default. */
+	lastCheck?: { at: number; reason?: string | null; streak: number };
 }
 
 /** System-side prefix for every window turn — goal, memory, budget, protocol. */
@@ -151,15 +175,23 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 	if (ctx.lessons?.length) memory.push(`【踩坑记录（别再踩）】\n${ctx.lessons.map((l) => `- ${l}`).join("\n")}`);
 	const head = ctx.turn === 0 ? "【工作窗口开始】" : `【工作窗口继续 · 本窗第 ${ctx.turn + 1} 轮】`;
 	const answerBlock = ctx.answer ? `\n用户对你上一轮问题的回复：${ctx.answer}\n` : "";
+	const lastCheck = ctx.lastCheck
+		? `\n【上次跟进】${new Date(ctx.lastCheck.at).toLocaleString("zh-CN", { hour12: false })}${ctx.lastCheck.reason ? `（${ctx.lastCheck.reason}）` : ""}\n`
+		: "";
+	// A repeated fixed daily slot means the item has degenerated into a cron.
+	// Confront the model with the measured streak — do NOT rely on its judgement.
+	const cadenceWarning = (ctx.lastCheck?.streak ?? 0) >= 2
+		? `\n【节奏警示】你已经连续 ${ctx.lastCheck!.streak} 次把跟进安排在几乎相同的固定时间——这已经退化成了定时任务。请重新评估：\n- 有明确的外部时间依据（如「对账批次 16:00 生成」）→ 写明依据后可以维持；\n- 没有依据 → 调整节奏：无异常拉长间隔、有异常缩短、非工作日/已知停机时段跳过；\n- 这本质上是每天固定时刻的例行工作 → 本轮推送里明确建议管理员把它转成定时任务，工作项应留给需要判断力的跟进。\n`
+		: "";
 	const protocol = [
 		`窗口规则：`,
 		`- 本窗口最多 ${ctx.budget.maxTurns} 轮 / ${ctx.budget.maxMinutes} 分钟，请优先推进关键路径，并把重要发现写入进展/踩坑。超时、执行出错或到限仍无安全结束声明会暂停等管理员明确恢复，不自动重试。`,
 		`- 目标全部完成 → 最后一行单独写 ${AUTONOMOUS_DONE_MARK}，上方给出成果总结。`,
 		`- 需要人参与 / 需其他单位配合资源 / 权限不足 → 最后一行单独写 ${AUTONOMOUS_HUMAN_MARK}: 具体需要谁做什么。任务会暂停等人，不要空转。`,
-		`- 本轮告一段落但目标未完成 → 最后一行单独写 ${AUTONOMOUS_NEXT_CHECK_MARK}: 下次跟进时间 | 原因。时间支持 30m/2h/14:30/明天09:40 等；至少距现在 15 分钟，禁止高频空跑。非法/过去/过近时间会暂停等管理员明确恢复。`,
+		`- 本轮告一段落但目标未完成 → 最后一行单独写 ${AUTONOMOUS_NEXT_CHECK_MARK}: 下次跟进时间 | 原因。时间支持 30m/2h/14:30/明天09:40 等；至少距现在 15 分钟。时间必须有依据：数据何时生成、上次发现了什么、依赖何时就绪；无异常主动拉长间隔，有异常缩短，非工作日与已知停机时段跳过，禁止不加思考地写「明天同一时间」。非法/过去/过近时间会暂停等管理员明确恢复。`,
 		`- 工作过程中了解到执行条件（如「系统对账 08:00-09:30 自动跑，此时段勿手动对账」、依赖的单位/资源、账号权限边界）→ 立即用 manage_work 记录到条件里，后续窗口会带着这些条件工作。`,
 		`- 踩过的坑（登录态、页面路径、接口 quirks）→ 用 manage_work 记录，别指望下次还记得。`,
 		`- 无人值守：先检测登录状态再操作，登录过期直接 ${AUTONOMOUS_HUMAN_MARK} 说明，不要索要验证码。`,
 	].join("\n");
-	return `${head}\n【工作项】${ctx.title}\n【目标】${ctx.goal}\n${[...memory, protocol].join("\n\n")}\n${answerBlock}\n`;
+	return `${head}\n【工作项】${ctx.title}\n【目标】${ctx.goal}\n${[...memory, protocol].join("\n\n")}\n${answerBlock}${lastCheck}${cadenceWarning}\n`;
 }

@@ -111,3 +111,25 @@ test("generic status writes cannot bypass admin confirm or explicit human resume
 		assert.equal(store.get(item.id).status, status);
 	}
 });
+
+test("fixed_streak only moves while scheduled; reason persists and clears with state", t => {
+	const { store } = fixture(t);
+	const item = create(store);
+	store.confirm(item.id, "admin");
+	store.setFixedStreak(item.id, 5);
+	assert.equal(store.get(item.id).fixed_streak, 0, "queued items carry no streak");
+	const working = store.claim(item.id, Date.now());
+	assert.equal(working.status, "working");
+	store.setStatus(item.id, "scheduled", null, Date.now() + 3_600_000, "等晚间批次");
+	assert.equal(store.get(item.id).next_check_reason, "等晚间批次");
+	store.setFixedStreak(item.id, 3);
+	assert.equal(store.get(item.id).fixed_streak, 3);
+	store.setStatus(item.id, "waiting_human", "需要人工", null);
+	assert.equal(store.get(item.id).status, "scheduled", "only the runner (from working) may leave scheduled");
+	// Real runner path: the due scheduled item is claimed back to working, then paused.
+	const again = store.claim(item.id, Date.now() + 7_200_000);
+	assert.equal(again.status, "working");
+	store.setStatus(item.id, "waiting_human", "需要人工", null);
+	assert.equal(store.get(item.id).next_check_reason, null, "stale reason must not survive into waiting_human");
+	assert.equal(store.get(item.id).fixed_streak, 3, "streak number is retained but only read on scheduled wake");
+});

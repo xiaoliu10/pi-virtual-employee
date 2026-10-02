@@ -17,6 +17,10 @@ export interface WorkItemRow {
 	status: WorkItemStatus;
 	question: string | null;
 	next_check_at: number | null;
+	/** Why the model picked next_check_at — re-injected as context next window. */
+	next_check_reason: string | null;
+	/** Consecutive windows that picked the same daily slot (cron degeneration meter). */
+	fixed_streak: number;
 	/** Verified confirming admin, not the conversation's proposer. */
 	created_by: string | null;
 	/** Retained until the first successful resumed send. */
@@ -54,12 +58,13 @@ export class WorkItemStore {
 			conditions: null, progress: null, lessons: null,
 			origin_conversation: input.originConversation ?? null,
 			origin_note: input.originNote ?? null, status: input.status ?? "proposed",
-			question: null, next_check_at: null, created_by: input.createdBy ?? null,
+			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0,
+			created_by: input.createdBy ?? null,
 			answer: null, created_at: now, updated_at: now,
 		};
 		this.db.prepare(`INSERT INTO work_items
-			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, created_by, answer, created_at, updated_at)
-			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @created_by, @answer, @created_at, @updated_at)`).run(row);
+			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, created_by, answer, created_at, updated_at)
+			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @created_by, @answer, @created_at, @updated_at)`).run(row);
 		this.changed(row.id);
 		return row;
 	}
@@ -99,13 +104,21 @@ export class WorkItemStore {
 	}
 
 	/** Runner outcomes only transition working; terminal and human states stay safe. */
-	setStatus(id: string, status: WorkItemStatus, question: string | null, nextCheckAt: number | null): WorkItemRow | undefined {
+	setStatus(id: string, status: WorkItemStatus, question: string | null, nextCheckAt: number | null, nextCheckReason?: string | null): WorkItemRow | undefined {
 		if (!["waiting_human", "scheduled", "done", "cancelled"].includes(status)) return this.get(id);
 		const guard = status === "cancelled" ? "status NOT IN ('done', 'cancelled')" : "status = 'working'";
-		this.db.prepare(`UPDATE work_items SET status = ?, question = ?, next_check_at = ?, updated_at = ? WHERE id = ? AND ${guard}`)
-			.run(status, question, nextCheckAt, Date.now(), id);
+		// Reason is always overwritten: stale reasons must not survive into states
+		// where next_check_at was cleared (waiting_human/done/cancelled).
+		this.db.prepare(`UPDATE work_items SET status = ?, question = ?, next_check_at = ?, next_check_reason = ?, updated_at = ? WHERE id = ? AND ${guard}`)
+			.run(status, question, nextCheckAt, nextCheckReason ?? null, Date.now(), id);
 		this.changed(id);
 		return this.get(id);
+	}
+
+	/** Cron-degeneration meter; only meaningful while the item stays scheduled. */
+	setFixedStreak(id: string, streak: number): void {
+		this.db.prepare("UPDATE work_items SET fixed_streak = ? WHERE id = ? AND status = 'scheduled'")
+			.run(Math.max(0, Math.floor(streak)), id);
 	}
 
 	/** Notebook edits must not mutate terminal items, including late aborted tools. */

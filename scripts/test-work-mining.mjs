@@ -2,7 +2,7 @@
  * No network/Electron/native addon: real SQL via node:sqlite; only Agent is mocked.
  */
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { after, test } from "node:test";
 import { dirname, join } from "node:path";
@@ -318,10 +318,9 @@ test("work: is nonlocal; missing actor fails privileged capability checks", t =>
 test("failed delivery keeps a real SQL proposal, conditions and provenance accessible after restart", async t => {
 	const path = join(dir, "proposals.sqlite");
 	const db = database(t, path);
-	db.exec(`CREATE TABLE work_items (
-		id TEXT PRIMARY KEY, title TEXT, goal TEXT, conditions TEXT, progress TEXT, lessons TEXT,
-		origin_conversation TEXT, origin_note TEXT, status TEXT, question TEXT, next_check_at INTEGER,
-		created_by TEXT, answer TEXT, created_at INTEGER, updated_at INTEGER)`);
+	// Canonical schema from sqlite.ts so store columns never drift from the app.
+	db.exec((await readFile(join(root, "src/db/sqlite.ts"), "utf8")).match(/CREATE TABLE IF NOT EXISTS work_items \([\s\S]*?\);/)[0]);
+	if (!db.prepare("PRAGMA table_info(work_items)").all().some((c) => c.name === "answer")) db.exec("ALTER TABLE work_items ADD COLUMN answer TEXT");
 	const history = new HistoryStore(db);
 	history.ensureConversation(source.id, null);
 	insert(db, source.id, "real-message", source.messages[0].content);

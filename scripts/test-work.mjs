@@ -34,7 +34,7 @@ await build({
 	packages: "external",
 });
 const work = await import(pathToFileURL(bundle).href);
-const { parseWindowReply, parseNextCheck, buildWorkWindowPrefix, parseMiningReply, isDuplicateGoal } = work;
+const { parseWindowReply, parseNextCheck, buildWorkWindowPrefix, parseMiningReply, isDuplicateGoal, isSameDailySlot, nextRoutineStreak } = work;
 
 test("parseWindowReply classifies the four window outcomes", () => {
 	const done = parseWindowReply("对账完成，共 1204 笔无异常。\n[[TASK_DONE]]");
@@ -140,4 +140,38 @@ test("follow-up strictly rejects impossible, past, malformed and <15-minute time
 	}
 	assert.equal(parseNextCheck("15min", now), now.getTime() + 15 * 60_000);
 	assert.equal(parseNextCheck("2026-09-30T10:15:00", now), now.getTime() + 15 * 60_000);
+});
+
+test("isSameDailySlot/nextRoutineStreak measure cron degeneration deterministically", () => {
+	const t0 = new Date("2026-10-01T16:00:00").getTime();
+	const nextDay = new Date("2026-10-02T16:10:00").getTime(); // 24h10m later, slot diff 10m
+	const evening = new Date("2026-10-02T18:00:00").getTime(); // 26h later, slot diff 2h
+	const twoDays = new Date("2026-10-03T16:00:00").getTime(); // 48h later
+	assert.ok(isSameDailySlot(t0, nextDay));
+	assert.ok(!isSameDailySlot(t0, evening));
+	assert.ok(!isSameDailySlot(t0, twoDays));
+	assert.ok(!isSameDailySlot(NaN, nextDay));
+	assert.equal(nextRoutineStreak(t0, 2, nextDay), 3);
+	assert.equal(nextRoutineStreak(t0, 2, evening), 0, "a different slot resets the streak");
+	assert.equal(nextRoutineStreak(undefined, 2, nextDay), 0, "manual resume resets (conservative)");
+});
+
+test("window prefix injects the last check and confronts repeated fixed slots", () => {
+	const budget = { maxTurns: 15, maxMinutes: 30 };
+	const calm = buildWorkWindowPrefix({
+		title: "月末对账", goal: "核对流水", turn: 0, budget,
+		lastCheck: { at: new Date("2026-10-01T16:00:00").getTime(), reason: "每日巡检", streak: 1 },
+	});
+	assert.match(calm, /【上次跟进】/);
+	assert.match(calm, /每日巡检/);
+	assert.match(calm, /时间必须有依据/);
+	assert.doesNotMatch(calm, /节奏警示/);
+
+	const hot = buildWorkWindowPrefix({
+		title: "月末对账", goal: "核对流水", turn: 0, budget,
+		lastCheck: { at: new Date("2026-10-01T16:00:00").getTime(), reason: null, streak: 2 },
+	});
+	assert.match(hot, /【节奏警示】/);
+	assert.match(hot, /连续 2 次/);
+	assert.match(hot, /定时任务/);
 });
