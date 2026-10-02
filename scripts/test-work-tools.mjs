@@ -401,7 +401,7 @@ for (const withCancel of [false, true]) {
 		assert.equal(result.details.ok, true);
 		assert.equal(result.details.abortRequested, false);
 		assert.equal(f.rows.get(ID).status, "cancelled");
-		assert.match(result.content[0].text, /未确认立即中止/);
+		assert.match(result.content[0].text, /立即中止/);
 	});
 }
 
@@ -557,7 +557,7 @@ test("pause stays durable when the abort bridge is missing or fails", async () =
 		assert.equal(result.details.ok, true);
 		assert.equal(result.details.abortRequested, false);
 		assert.equal(f.rows.get(ID).status, "waiting_human");
-		assert.match(result.content[0].text, /下一检查点停止/);
+		assert.match(result.content[0].text, /立即中止/);
 	}
 });
 

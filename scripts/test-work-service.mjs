@@ -403,3 +403,47 @@ test("a different follow-up slot resets the streak; no conversion suggestion pus
 	assert.equal(row.next_check_reason, "等新批次");
 	assert.doesNotMatch(h.pushes[0].text, /定时任务/);
 });
+
+test("a pause landing during release suppresses the stale scheduled push (L4)", async t => {
+	// The runner decides scheduled; while release() is still awaited, an admin
+	// pause flips the row to waiting_human. The post-finally capture must see it
+	// (fresh.status !== outcome) and skip the stale "下次跟进 X" push entirely.
+	let pausedDuringRelease = false;
+	const h = fixture(t, {
+		send: () => ({ reply: "阶段成果\n[[NEXT_CHECK]]: 30m | 等批次" }),
+		release: async h => {
+			if (!pausedDuringRelease) {
+				pausedDuringRelease = true;
+				h.store.pause(h.store.list()[0].id, "管理员先停一下");
+				await flush();
+			}
+		},
+	});
+	const item = h.create();
+	h.service.start(); await flush();
+	assert.ok(h.pushes.every(p => !/下次跟进/.test(p.text)), "no stale scheduled push after a concurrent pause");
+	assert.equal(h.store.get(item.id).status, "waiting_human");
+	assert.match(h.store.get(item.id).question, /管理员先停一下/);
+});
+
+test("an admin update-nextCheck landing during release wins over the run's stale schedule metadata (Copilot fast-follow)", async t => {
+	let updatedDuringRelease = false;
+	const h = fixture(t, {
+		send: () => ({ reply: "阶段成果\n[[NEXT_CHECK]]: 30m | 等批次" }),
+		release: async h => {
+			if (!updatedDuringRelease) {
+				updatedDuringRelease = true;
+				const row = h.store.list()[0];
+				h.store.setSchedule(row.id, h.clock.now() + 2 * 3_600_000, "管理员改期到两小时后");
+				await flush();
+			}
+		},
+	});
+	const item = h.create();
+	h.service.start(); await flush();
+	await h.service.whenIdle(); await flush();
+	const push = h.pushes.find(p => /下次跟进/.test(p.text));
+	assert.ok(push, "scheduled push still lands (row stays scheduled)");
+	assert.match(push.text, /管理员改期到两小时后/, "push announces the admin's new schedule, not the run's local one");
+	assert.doesNotMatch(push.text, /30 分钟|等批次/);
+});

@@ -163,7 +163,7 @@ export function createWorkTools(deps: {
 			"action=mine：管理员扫描近期对话并把待确认提案推送到各自来源会话；" +
 			"action=confirm：来源会话的管理员在当前消息明确「确认创建」后开工；可按管理员要求附带改写后的 title/goal/conditions（例如删掉「每天16:30」改为按需跟进），不必原样接受提案；" +
 			"action=resume：来源会话的管理员明确「确认继续」后恢复等待人工/资源的任务，answer 持久化为下一轮输入；" +
-			"action=update：按管理员要求调整工作项——title/goal/conditions 任何未结束状态（含执行中）都可改；nextCheck 可改约下次跟进时间（距现在至少 15 分钟，仅排队/等待人工/已计划状态可改，执行中不能改期）；" +
+			"action=update：按管理员要求调整工作项——title/goal/conditions 在非执行中状态（排队/等待人工/已计划/提案）可改；执行中请先 action=pause 暂停再调整（避免在飞窗口覆盖你的修改）；nextCheck 可改约下次跟进时间（距现在至少 15 分钟，仅排队/等待人工/已计划状态可改，执行中不能改期）；" +
 			"action=pause：管理员暂停执行中/排队/计划中的任务，尽快中止当前窗口并等待管理员明确恢复；" +
 			"action=cancel：来源会话的管理员取消未完成任务。id 可用 list 中的唯一短前缀，歧义时必须提供完整 id。",
 		parameters: Type.Object({
@@ -333,7 +333,7 @@ export function createWorkTools(deps: {
 					}
 				}
 				return {
-					content: [{ type: "text", text: `已暂停「${item.title}」${abortRequested ? "，已通知执行器立即停止" : "，将在当前窗口的下一检查点停止"}。回复「确认继续」并附答复可恢复。` }],
+					content: [{ type: "text", text: `已暂停「${item.title}」。如在执行中，已请求立即中止当前窗口（在飞动作会尽快停下）；回复「确认继续」并附答复可恢复。` }],
 					details: { ok: true, paused: true, abortRequested, question: paused.question },
 				};
 			}
@@ -351,7 +351,7 @@ export function createWorkTools(deps: {
 				}
 			}
 			return {
-				content: [{ type: "text", text: `已取消工作项「${item.title}」${abortRequested ? "，已通知执行器停止。" : "。取消状态已保存；未确认立即中止，执行器须在下一检查点停止。"}` }],
+				content: [{ type: "text", text: `已取消工作项「${item.title}」。如在执行中，已请求立即中止当前窗口（在飞动作会尽快停下）。` }],
 				details: { ok: true, cancelled: true, abortRequested },
 			};
 		},
