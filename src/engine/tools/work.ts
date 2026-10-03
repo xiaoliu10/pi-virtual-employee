@@ -15,7 +15,7 @@ const STATUS_LABEL: Record<string, string> = {
 	proposed: "待确认提案",
 	queued: "已确认待开工",
 	working: "执行中",
-	waiting_human: "等待管理员确认继续",
+	waiting_human: "等待管理员恢复",
 	scheduled: "按计划跟进",
 	done: "已完成",
 	cancelled: "已取消",
@@ -109,7 +109,7 @@ export function createWorkTools(deps: {
 		}
 		if (!currentAdmin(config, actor.senderId)) return failure("此操作需要当前管理员权限，创建人或默认角色不能代替管理员授权。");
 		if (needConfirmation && (typeof actor.text !== "string" || !isExplicitConfirmation(actor.text))) {
-			return failure("请管理员在任务来源会话的当前消息中明确确认（例如「确认创建」或「确认继续」）；资源或人工阻塞必须确认后才能继续。");
+			return failure("请管理员在任务来源会话的当前消息中明确确认（如「确认创建」）。");
 		}
 		return { actor };
 	}
@@ -120,7 +120,7 @@ export function createWorkTools(deps: {
 		description:
 			"仅在当前自主任务的 work:<id> 工作窗口内记录信息；需要该任务创建管理员的有效调度身份且任务正在执行。" +
 			"action=set_conditions：记录执行条件/时间窗/依赖；action=add_lesson：记录踩坑；action=set_progress：更新进展。" +
-			"这些信息会跨窗口保留。资源或人工阻塞应等待来源会话的管理员确认继续，不要通过笔记自行恢复。",
+			"这些信息会跨窗口保留。资源或人工阻塞应等待来源会话的管理员恢复，不要通过笔记自行恢复。",
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("set_conditions"), Type.Literal("add_lesson"), Type.Literal("set_progress")]),
 			content: Type.String({ description: "要记录的内容，简明具体" }),
@@ -287,7 +287,7 @@ export function createWorkTools(deps: {
 				// Refuse mid-window rewrites instead of racing the active window:
 				// pause → update → resume is the safe path.
 				if (item.status === "working" && (p.title !== undefined || p.goal !== undefined || p.conditions !== undefined || p.nextCheck !== undefined))
-					return failure("任务正在执行中，本轮已按旧目标/条件开工；为避免在飞窗口覆盖你的修改，请先 action=pause 暂停，调整后再确认继续（或等本轮结束）。");
+					return failure("任务正在执行中，本轮已按旧目标/条件开工；为避免在飞窗口覆盖你的修改，请先 action=pause 暂停后再调整（或等本轮结束）。");
 				// Atomic adjust: validate every provided field before any write.
 				const rewrites = collectRewrites(p);
 				if ("failure" in rewrites) return failure(rewrites.failure);
@@ -338,7 +338,7 @@ export function createWorkTools(deps: {
 					}
 				}
 				return {
-					content: [{ type: "text", text: `已暂停「${item.title}」。如在执行中，已请求立即中止当前窗口（在飞动作会尽快停下）；回复「确认继续」并附答复可恢复。` }],
+					content: [{ type: "text", text: `已暂停「${item.title}」。如在执行中，已请求立即中止当前窗口（在飞动作会尽快停下）；管理员直接回复答复内容即可恢复。` }],
 					details: { ok: true, paused: true, abortRequested, question: paused.question },
 				};
 			}

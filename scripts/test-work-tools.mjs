@@ -276,6 +276,9 @@ test("a revoked live admin cannot rely on an earlier confirmation", async () => 
 test("default admin without named admin declaration grants no work authority", async () => {
 	const f = fixture({ security: { adminStaffIds: [], people: [], defaultRole: "admin" } });
 	refused(await f.items({ action: "confirm", id: ID }), f);
+	// Resume is now phrase-free, so the named-admin declaration is the ONLY
+	// thing standing between a defaultRole=admin context and unattended runs.
+	refused(await f.items({ action: "resume", id: ID, answer: "不应写入" }), f);
 });
 
 test("explicit role-assigned admin can confirm without legacy whitelist", async () => {
@@ -548,7 +551,7 @@ test("pause turns a scheduled item into a marked waiting_human and best-effort a
 	assert.equal(item.next_check_reason, null);
 	assert.deepEqual(f.writes, [["pause", ID, "先核对口径"]]);
 	assert.deepEqual(f.events, ["pause", "abort"]);
-	assert.match(result.content[0].text, /确认继续/);
+	assert.match(result.content[0].text, /直接回复答复内容/);
 });
 
 for (const [label, status] of [["proposal", "proposed"], ["done", "done"], ["cancelled", "cancelled"], ["already paused", "waiting_human"]]) {
