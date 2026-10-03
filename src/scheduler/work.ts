@@ -174,7 +174,7 @@ export interface WorkItemWindowContext {
 // A true kickoff must plan before acting — and the plan must justify its own
 // rhythm (field 2026-10-02: 自主任务的要素在于不定时，固定每天一次和定时任务没区别).
 const FIRST_WINDOW_PLAN =
-	"【首个窗口：先出跟进计划】给出简要计划再开始第一步：① 分几步完成目标；② 这件工作在一天里哪些时刻会有新信息可查（数据何时生成、批次何时跑完、何时出结果）——列出这些「观察点」及依据，并说明打算怎么覆盖它们（一天可以多次，例如 09:00 查昨日历史、12:30 查今日上午批次、15:00 查今日下午批次）；③ 有卡点的工作，计划里要写明「卡点找谁问、问什么」（不确定解决时间就通过 NEED_HUMAN 问清再定跟进）。计划写完即开始第一步，无需等待确认。";
+	"【首个窗口：先出跟进计划】给出简要计划再开始第一步：① 分几步完成目标；② 这件工作在一天里哪些时刻会有新信息可查（数据何时生成、批次何时跑完、何时出结果）——列出这些「观察点」及依据，并说明打算怎么覆盖它们（一天可以多次，例如 09:00 查昨日历史、12:30 查今日上午批次、15:00 查今日下午批次）；③ 有卡点的工作，计划里要写明「卡点找谁问、问什么」（不确定解决时间就通过 [[NEED_HUMAN]] 问清再定跟进）。计划写完即开始第一步，无需等待确认。";
 
 /** System-side prefix for every window turn — goal, memory, budget, protocol. */
 export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
