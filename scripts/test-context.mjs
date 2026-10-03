@@ -559,3 +559,29 @@ test("substantialAnchorOf strips runner-injected scaffolding from the anchor", (
 
 	assert.equal(stripSyntheticPromptPrefix("普通用户消息，没有任何前缀"), "普通用户消息，没有任何前缀", "real user text passes through untouched");
 });
+
+test("substantialAnchorOf strips the autonomous chain scaffold too (turn 0 and continue turns)", () => {
+	const scaffold =
+		"【自主任务模式】这是一个多轮自主任务：你会连续工作多个回合直到达成目标，期间没有人逐条催你。\n" +
+		"预算：最多 30 轮 / 90 分钟，请高效推进，优先完成关键路径。\n" +
+		"回合结束规则（必须遵守）：\n" +
+		"- 目标已全部完成 → 回复最后一行单独写 [[TASK_DONE]]，并在它上面给出成果总结。\n" +
+		"- 卡住了必须问人（缺账号/权限/登录态失效等）→ 最后一行单独写 [[NEED_HUMAN]]: 要问的问题。链条会暂停等人回复。\n" +
+		"- 还没完成也不需要问人 → 正常输出进展即可，不要写任何标记，系统会让你继续。\n" +
+		"- 无人值守：先检测登录状态再操作，登录过期直接 [[NEED_HUMAN]] 说明，不要尝试索要验证码。\n\n";
+	const timePrefix = "【系统注入的真实执行时间：2026-10-03（周六）16:30:11，北京时间。报告中的日期、「昨天/今天」等时间口径一律以此为准，不要自行猜测日期。】\n\n";
+	const turn0 = user(timePrefix + scaffold + "对账异常巡检：查询今日对账情况并汇报异常");
+	const anchor = substantialAnchorOf([turn0]);
+	assert.match(anchor, /^对账异常巡检/, "turn 0 anchor is the real task");
+	assert.doesNotMatch(anchor, /自主任务模式|系统注入/);
+
+	// Later continue turns carry no task identity → fall through the ack skip
+	// to the turn-0 message instead of quoting the scaffold.
+	const continueTurn = user("【自主任务模式 · 第 3 轮】目标尚未完成，请继续推进（不要重复已完成的工作，从上次停下的地方接着干）。继续。");
+	assert.equal(substantialAnchorOf([continueTurn, turn0]), "对账异常巡检：查询今日对账情况并汇报异常");
+});
+
+test("empty goal line does not swallow the next scaffold line; 【工作项】 fallback stays reachable", () => {
+	const windowTurn = user("【工作窗口开始】\n【工作项】兜底工作项\n【目标】\n【执行条件（务必遵守）】\n系统自动对账 08:00-09:30");
+	assert.equal(substantialAnchorOf([windowTurn]), "兜底工作项");
+});
