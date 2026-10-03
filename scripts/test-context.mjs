@@ -25,7 +25,7 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 			contents: `
-				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact } from "./src/engine/context.ts";
+				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix } from "./src/engine/context.ts";
 				export { shouldCompact, DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-agent-core";
 				export { estimateTokens } from "@earendil-works/pi-agent-core";
 			`,
@@ -38,7 +38,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -531,4 +531,31 @@ test("substantialAnchorOf skips acknowledgments and picks the latest substantial
 	// non-ack user message.
 	const synthetic = user(FINAL_SUMMARY_PROMPT);
 	assert.equal(substantialAnchorOf([synthetic, ack]), "");
+});
+
+// Field 2026-10-03: the heartbeat fallback rendered the scheduler-injected
+// time prefix (【系统注入的真实执行时间：…】, glued onto the task prompt by the
+// runner) as the "current request" — the anchor must quote the REAL request.
+// Same class of scaffolding for work windows (【工作窗口开始】…【目标】…).
+test("substantialAnchorOf strips runner-injected scaffolding from the anchor", () => {
+	const timePrefix = "【系统注入的真实执行时间：2026-10-03（周六）16:30:11，北京时间。报告中的日期、「昨天/今天」等时间口径一律以此为准，不要自行猜测日期。】\n\n";
+	const scheduled = user(timePrefix + "对账异常巡检：查询今日对账情况并汇报异常");
+	const anchor = substantialAnchorOf([scheduled]);
+	assert.match(anchor, /^对账异常巡检/, "real task text, not the injected prefix");
+	assert.doesNotMatch(anchor, /系统注入|真实执行时间/);
+
+	// The prefix alone carries no task identity: nothing substantive remains →
+	// the generic line wins over quoting scaffolding.
+	assert.equal(substantialAnchorOf([user(timePrefix)]), "");
+
+	// Work-window turns carry task identity INSIDE the scaffold — the 【目标】
+	// line is the anchor.
+	const windowTurn = user(
+		"【工作窗口开始】\n【工作项】月末对账\n【目标】核对 9 月流水并汇报异常\n" +
+		"【执行条件（务必遵守）】\n系统自动对账 08:00-09:30\n\n窗口规则：\n- 最多 15 轮。\n请按目标与执行条件推进工作。",
+	);
+	const windowAnchor = substantialAnchorOf([windowTurn]);
+	assert.equal(windowAnchor, "核对 9 月流水并汇报异常");
+
+	assert.equal(stripSyntheticPromptPrefix("普通用户消息，没有任何前缀"), "普通用户消息，没有任何前缀", "real user text passes through untouched");
 });
