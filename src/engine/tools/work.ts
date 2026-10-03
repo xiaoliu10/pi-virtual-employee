@@ -162,7 +162,7 @@ export function createWorkTools(deps: {
 			"action=list：列出当前来源会话的工作项；action=get：查看完整目标、执行条件、进展、踩坑和待答问题；" +
 			"action=mine：管理员扫描近期对话并把待确认提案推送到各自来源会话；" +
 			"action=confirm：来源会话的管理员在当前消息明确「确认创建」后开工；可按管理员要求附带改写后的 title/goal/conditions（例如删掉「每天16:30」改为按需跟进），不必原样接受提案；" +
-			"action=resume：来源会话的管理员明确「确认继续」后恢复等待人工/资源的任务，answer 持久化为下一轮输入；" +
+			"action=resume：来源会话的管理员恢复等待人工/资源的任务——把答复直接告诉员工即可（无需确认口令），answer 持久化为下一轮输入；" +
 			"action=update：按管理员要求调整工作项——title/goal/conditions 在非执行中状态（排队/等待人工/已计划/提案）可改；执行中请先 action=pause 暂停再调整（避免在飞窗口覆盖你的修改）；nextCheck 可改约下次跟进时间（距现在至少 15 分钟，仅排队/等待人工/已计划状态可改，执行中不能改期）；" +
 			"action=pause：管理员暂停执行中/排队/计划中的任务，尽快中止当前窗口并等待管理员明确恢复；" +
 			"action=cancel：来源会话的管理员取消未完成任务。id 可用 list 中的唯一短前缀，歧义时必须提供完整 id。",
@@ -189,7 +189,12 @@ export function createWorkTools(deps: {
 			const actor = resolveActor(conversationId);
 			if (!verifiedIMActor(actor, conversationId)) return failure("请在经过平台验证的任务来源 IM 单聊或群聊中管理工作项。");
 			if (p.action !== "list" && p.action !== "get") {
-				const gate = adminGate(actor, p.action === "confirm" || p.action === "resume");
+				// Admin role is the authorization (field 2026-10-03: repeated
+				// confirmation phrases for every resume are gate fatigue); the explicit
+				// phrase stays only on confirm — the one deliberate act that starts
+				// unattended execution. Resume/update/pause/cancel rely on the verified
+				// source + live admin role checks.
+				const gate = adminGate(actor, p.action === "confirm");
 				if ("content" in gate) return gate;
 			}
 

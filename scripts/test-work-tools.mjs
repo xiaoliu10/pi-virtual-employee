@@ -249,12 +249,22 @@ for (const [label, invalid] of invalidActors) {
 }
 
 for (const text of ["继续", "你好", "可以改吗", "不要确认", "不确认", "取消，确认", "别执行了，确认", "确认但停止", "no confirm", "don't confirm", "", undefined]) {
-	for (const action of ["confirm", "resume"]) {
-		test(`${action} requires positive explicit CURRENT confirmation: ${text}`, async () => {
-			const f = fixture({ actor: actor({ text }), rows: [row({ status: action === "confirm" ? "proposed" : "waiting_human" })] });
-			refused(await f.items({ action, id: ID, answer: "不应持久化" }), f);
-		});
-	}
+	test(`confirm requires positive explicit CURRENT confirmation: ${text}`, async () => {
+		const f = fixture({ actor: actor({ text }), rows: [row({ status: "proposed" })] });
+		refused(await f.items({ action: "confirm", id: ID, answer: "不应持久化" }), f);
+	});
+}
+
+// Resume needs NO confirmation phrase (field 2026-10-03: admin role is the
+// authorization — demanding 确认继续 on every reply was pure gate fatigue).
+// The admin's reply itself (verification code, ETA, …) is the staged answer.
+for (const text of ["1234", "预计明天中午解决", "", undefined]) {
+	test(`resume works for a live source admin without any phrase: ${text === undefined ? "(no text)" : text}`, async () => {
+		const f = fixture({ actor: actor({ text }), rows: [row({ status: "waiting_human" })] });
+		const result = await f.items({ action: "resume", id: ID, answer: typeof text === "string" && text ? text : undefined });
+		assert.equal(result.details.ok, true);
+		assert.equal(result.details.resumed, true);
+	});
 }
 
 test("a revoked live admin cannot rely on an earlier confirmation", async () => {
