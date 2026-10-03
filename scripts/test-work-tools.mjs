@@ -249,12 +249,22 @@ for (const [label, invalid] of invalidActors) {
 }
 
 for (const text of ["继续", "你好", "可以改吗", "不要确认", "不确认", "取消，确认", "别执行了，确认", "确认但停止", "no confirm", "don't confirm", "", undefined]) {
-	for (const action of ["confirm", "resume"]) {
-		test(`${action} requires positive explicit CURRENT confirmation: ${text}`, async () => {
-			const f = fixture({ actor: actor({ text }), rows: [row({ status: action === "confirm" ? "proposed" : "waiting_human" })] });
-			refused(await f.items({ action, id: ID, answer: "不应持久化" }), f);
-		});
-	}
+	test(`confirm requires positive explicit CURRENT confirmation: ${text}`, async () => {
+		const f = fixture({ actor: actor({ text }), rows: [row({ status: "proposed" })] });
+		refused(await f.items({ action: "confirm", id: ID, answer: "不应持久化" }), f);
+	});
+}
+
+// Resume needs NO confirmation phrase (field 2026-10-03: admin role is the
+// authorization — demanding 确认继续 on every reply was pure gate fatigue).
+// The admin's reply itself (verification code, ETA, …) is the staged answer.
+for (const text of ["1234", "预计明天中午解决", "", undefined]) {
+	test(`resume works for a live source admin without any phrase: ${text === undefined ? "(no text)" : text}`, async () => {
+		const f = fixture({ actor: actor({ text }), rows: [row({ status: "waiting_human" })] });
+		const result = await f.items({ action: "resume", id: ID, answer: typeof text === "string" && text ? text : undefined });
+		assert.equal(result.details.ok, true);
+		assert.equal(result.details.resumed, true);
+	});
 }
 
 test("a revoked live admin cannot rely on an earlier confirmation", async () => {
@@ -266,6 +276,9 @@ test("a revoked live admin cannot rely on an earlier confirmation", async () => 
 test("default admin without named admin declaration grants no work authority", async () => {
 	const f = fixture({ security: { adminStaffIds: [], people: [], defaultRole: "admin" } });
 	refused(await f.items({ action: "confirm", id: ID }), f);
+	// Resume is now phrase-free, so the named-admin declaration is the ONLY
+	// thing standing between a defaultRole=admin context and unattended runs.
+	refused(await f.items({ action: "resume", id: ID, answer: "不应写入" }), f);
 });
 
 test("explicit role-assigned admin can confirm without legacy whitelist", async () => {
@@ -538,7 +551,7 @@ test("pause turns a scheduled item into a marked waiting_human and best-effort a
 	assert.equal(item.next_check_reason, null);
 	assert.deepEqual(f.writes, [["pause", ID, "先核对口径"]]);
 	assert.deepEqual(f.events, ["pause", "abort"]);
-	assert.match(result.content[0].text, /确认继续/);
+	assert.match(result.content[0].text, /直接回复答复内容/);
 });
 
 for (const [label, status] of [["proposal", "proposed"], ["done", "done"], ["cancelled", "cancelled"], ["already paused", "waiting_human"]]) {

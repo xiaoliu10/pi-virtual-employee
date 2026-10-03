@@ -186,7 +186,7 @@ function harness(t) {
 			assert.doesNotMatch(message, /【首个窗口：先出跟进计划】/);
 			return { reply: "需要审批号才能放行\n[[NEED_HUMAN]]: 需要审批号" };
 		}
-		assert.match(message, /用户对你上一轮问题的回复：审批号 P-778/);
+		assert.match(message, /用户对你上一轮问题的回复：审批号 P-778，已可以直接继续/);
 		return { reply: "审批完成，已提交\n[[TASK_DONE]]" };
 	};
 	// service is referenced by engine.workBridge.fireItem above; assign after.
@@ -302,7 +302,8 @@ test("full lifecycle: seed → mine → confirm → 3 windows → done + learn",
 	assert.equal(row2b.conditions, "审批后 30 分钟内完成");
 
 	// 7. Tool resume: admin explicitly confirms continuation with an answer.
-	const resume = await h.invoke({ action: "resume", id: itemId, answer: "审批号 P-778" }, "确认继续，审批号 P-778");
+		// No confirmation phrase: the plain reply IS the staged answer.
+	const resume = await h.invoke({ action: "resume", id: itemId, answer: "审批号 P-778，已可以直接继续" }, "审批号 P-778，已可以直接继续");
 	assert.match(resume.content[0].text, /已确认恢复/);
 	assert.equal(resume.details.resumed, true);
 	const row2c = h.workItems.get(itemId);
@@ -311,7 +312,7 @@ test("full lifecycle: seed → mine → confirm → 3 windows → done + learn",
 	// the load-bearing assertion is that the answer was staged and is consumed
 	// exactly once by window 3 below.
 	assert.ok(["queued", "working"].includes(row2c.status), `status after resume: ${row2c.status}`);
-	assert.equal(row2c.answer, "审批号 P-778", "answer staged before the next window");
+	assert.equal(row2c.answer, "审批号 P-778，已可以直接继续", "answer staged before the next window");
 	// Window 3 fires (resume re-queued the item; the service picks it up).
 	await flush();
 	assert.equal(h.sends.length, 3, "window 3 send happened");

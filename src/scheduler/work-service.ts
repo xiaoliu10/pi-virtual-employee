@@ -264,7 +264,7 @@ export class WorkService<Session extends WorkSession> {
 				? `✅ **自主任务完成：${nowRow.title}**\n\n${lastText}`
 				: nowRow.status === "scheduled"
 					? `🔁 **自主任务阶段进展：${nowRow.title}**\n\n${lastText.slice(-500)}\n\n下次跟进：${new Date(scheduledAt).toLocaleString("zh-CN", { hour12: false })}${scheduledReason ? `（${scheduledReason}）` : ""}${streak >= 3 ? `\n\n⚠️ 已连续 ${streak} 次只在相近的固定时间跟进这一个点。如果这是因为它有新信息可查（如某个批次在该时刻生成），写明依据可继续；但记得覆盖今天其他观察点。若这件工作每天只在这一处查、且查了也不需要判断动作，可建议管理员转成定时任务，工作项留给需要判断力的跟进。` : ""}`
-					: `⏸️ **自主任务需要人工：${nowRow.title}**\n\n${nowRow.question}\n\n请管理员回复「确认继续 ${nowRow.title}」并附上答复；未明确恢复前不会自动执行。`;
+					: `⏸️ **自主任务需要人工：${nowRow.title}**\n\n${nowRow.question}\n\n管理员在来源会话直接回复答复内容（如验证码、预计解决时间）即可继续；恢复前不会自动执行。`;
 			try { await this.opts.push(fresh.origin_conversation, text); } catch (err) { this.opts.onError?.(err); }
 		}
 	}
