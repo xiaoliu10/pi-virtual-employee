@@ -425,6 +425,40 @@ export function taskAnchorOf(messages: AgentMessage[]): AgentMessage | undefined
  * as nonsense (field 2026-09-30: "任务：确认。" when the admin replied 确认). */
 const ACK_RE = /^(确认|确定|同意|收到|好的|好|行|可以|继续|ok|yes|对|嗯+)[!！。.，,、~～\s]*$/i;
 
+// Scheduler-injected scaffolding glued onto stored user messages by the
+// runners: tools/time.ts scheduledTimePrefix() prepends the fire-time block,
+// and work windows (scheduler/work.ts buildWorkWindowPrefix) prepend a
+// structured 【工作窗口开始】…【目标】… block. The heartbeat anchor must quote
+// the REAL request, not scaffolding (field 2026-10-03: the deterministic
+// fallback rendered 【系统注入的真实执行时间：…】 as the "current request").
+const SCHEDULED_TIME_PREFIX_RE = /^【系统注入的真实执行时间：[^】]*】\s*/;
+const WORK_WINDOW_HEAD_RE = /^【工作窗口(?:开始|继续[^】]*)】/;
+// Autonomous chain scaffold (scheduler/autonomous.ts buildAutonomousTurnPrefix):
+// turn 0 ends with the last protocol line; later turns end with their head.
+// Keep these markers in sync with that builder.
+const AUTONOMOUS_HEAD_RE = /^【自主任务模式】[\s\S]*?不要尝试索要验证码。\s*/;
+const AUTONOMOUS_CONTINUE_RE = /^【自主任务模式 · [^】]*】/;
+
+/** Strip runner-injected prompt scaffolding from a stored user message so
+ * anchors quote the real request/task identity. Work-window turns carry task
+ * identity inside the scaffold (【目标】/【工作项】 lines) — that is what gets
+ * returned; autonomous chain turns yield the task prompt after the protocol
+ * block (later "继续。" turns then fall through the ack skip to the turn-0
+ * message). May return "" when nothing identity-bearing remains. */
+export function stripSyntheticPromptPrefix(raw: string): string {
+	let text = raw.replace(SCHEDULED_TIME_PREFIX_RE, "").trim();
+	if (AUTONOMOUS_HEAD_RE.test(text)) text = text.replace(AUTONOMOUS_HEAD_RE, "").trim();
+	else if (AUTONOMOUS_CONTINUE_RE.test(text)) text = text.replace(AUTONOMOUS_CONTINUE_RE, "").trim();
+	if (WORK_WINDOW_HEAD_RE.test(text)) {
+		// [^\n] (not \s*\S) so an EMPTY goal line doesn't swallow the next
+		// scaffold line — the 【工作项】 fallback must stay reachable.
+		const goal = /^【目标】[ \t]*([^\n]+?)[ \t]*$/m.exec(text)?.[1]?.trim();
+		const item = /^【工作项】[ \t]*([^\n]+?)[ \t]*$/m.exec(text)?.[1]?.trim();
+		text = goal || item || "";
+	}
+	return text;
+}
+
 /** Latest real user message that actually carries task identity — pure acks
  * (确认/继续/好的…) and the synthetic finalSummary instruction are skipped.
  * Used by the heartbeat fallback so a substantial request is quoted instead of
@@ -439,9 +473,10 @@ export function substantialAnchorOf(messages: AgentMessage[]): string {
 			: Array.isArray(content)
 				? (content as { type?: string; text?: string }[]).filter((part) => part?.type === "text").map((part) => part.text ?? "").join(" ")
 				: "";
-		const text = raw.replace(/\s+/g, "").trim();
+		const stripped = stripSyntheticPromptPrefix(raw);
+		const text = stripped.replace(/\s+/g, "").trim();
 		if (!text || text.length <= 2 || ACK_RE.test(text)) continue;
-		return raw.replace(/\s+/g, " ").trim();
+		return stripped.replace(/\s+/g, " ").trim();
 	}
 	return "";
 }

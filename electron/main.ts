@@ -549,7 +549,7 @@ async function main(): Promise<void> {
 				void engine.progressBrief(agent, chain.convId)
 					.then((note) => {
 						if (agent.state.isStreaming && task.conversation_id) {
-							void im.pushToConversation(task.conversation_id, `⏳ ${note}`);
+							void im.pushToConversation(task.conversation_id, note.startsWith("⏳") ? note : `⏳ ${note}`);
 						}
 					})
 					.catch(() => {})
