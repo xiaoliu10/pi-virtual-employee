@@ -302,7 +302,8 @@ test("full lifecycle: seed → mine → confirm → 3 windows → done + learn",
 	assert.equal(row2b.conditions, "审批后 30 分钟内完成");
 
 	// 7. Tool resume: admin explicitly confirms continuation with an answer.
-	const resume = await h.invoke({ action: "resume", id: itemId, answer: "审批号 P-778" }, "确认继续，审批号 P-778");
+		// No confirmation phrase: the plain reply IS the staged answer.
+	const resume = await h.invoke({ action: "resume", id: itemId, answer: "审批号 P-778，已可以直接继续" }, "审批号 P-778，已可以直接继续");
 	assert.match(resume.content[0].text, /已确认恢复/);
 	assert.equal(resume.details.resumed, true);
 	const row2c = h.workItems.get(itemId);
