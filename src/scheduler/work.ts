@@ -37,9 +37,14 @@ export const MIN_NEXT_CHECK_MS = 15 * 60_000;
 export const DEFAULT_NEXT_CHECK_MS = 60 * 60_000;
 /** waiting_human re-reminder cadence (field 2026-10-04: a paused task pushed
  * ONCE then went silent forever — admins miss pushes, and silence = death).
- * No auto-resume (non-idempotent ops); just never let it be silent. */
-export const REMIND_FIRST_MS = 24 * 3_600_000;
-export const REMIND_INTERVAL_MS = 24 * 3_600_000;
+ * No auto-resume (non-idempotent ops); just never let it be silent.
+ * The interval FOLLOWS THE TASK'S OWN RHYTHM: the item's recently declared
+ * NEXT_CHECK gaps (cadence_ms, EMA-smoothed), clamped to [MIN, MAX]. A task
+ * that checks every 2h gets 2h reminders — stalling must not make it quieter
+ * than its normal progress pushes; an unknown/daily rhythm gets 24h. */
+export const REMIND_MIN_MS = 30 * 60_000;
+export const REMIND_DEFAULT_MS = 24 * 3_600_000;
+export const REMIND_MAX_MS = 24 * 3_600_000;
 /** When a scheduled window fires this much late (app was closed/busy), tell
  * the model it is catching up so it re-checks what happened in between. */
 export const LATE_AWARE_MS = 30 * 60_000;

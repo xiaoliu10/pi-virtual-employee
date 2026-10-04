@@ -330,6 +330,7 @@ function migrate(db: DB): void {
 			fallback_streak      INTEGER NOT NULL DEFAULT 0,
 			last_remind_at       INTEGER,
 			remind_count         INTEGER NOT NULL DEFAULT 0,
+			cadence_ms           INTEGER,
 			kicked_off           INTEGER NOT NULL DEFAULT 0,
 			created_by           TEXT,
 			created_at           INTEGER NOT NULL,
@@ -354,6 +355,7 @@ function migrate(db: DB): void {
 	if (!workCols.has("fallback_streak")) db.exec("ALTER TABLE work_items ADD COLUMN fallback_streak INTEGER NOT NULL DEFAULT 0");
 	if (!workCols.has("last_remind_at")) db.exec("ALTER TABLE work_items ADD COLUMN last_remind_at INTEGER");
 	if (!workCols.has("remind_count")) db.exec("ALTER TABLE work_items ADD COLUMN remind_count INTEGER NOT NULL DEFAULT 0");
+	if (!workCols.has("cadence_ms")) db.exec("ALTER TABLE work_items ADD COLUMN cadence_ms INTEGER");
 
 	// Document resources: a catalog of deliverable docs the employee can hand to
 	// integration partners. kind=file points at a copied file under documents.dir;
