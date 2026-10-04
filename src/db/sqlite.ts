@@ -327,6 +327,7 @@ function migrate(db: DB): void {
 			next_check_at        INTEGER,
 			next_check_reason    TEXT,
 			fixed_streak         INTEGER NOT NULL DEFAULT 0,
+			fallback_streak      INTEGER NOT NULL DEFAULT 0,
 			kicked_off           INTEGER NOT NULL DEFAULT 0,
 			created_by           TEXT,
 			created_at           INTEGER NOT NULL,
@@ -348,6 +349,7 @@ function migrate(db: DB): void {
 	// Durable "a window has started" marker: makes resume-vs-kickoff
 	// distinguishable even after a crash (firstWindow planning).
 	if (!workCols.has("kicked_off")) db.exec("ALTER TABLE work_items ADD COLUMN kicked_off INTEGER NOT NULL DEFAULT 0");
+	if (!workCols.has("fallback_streak")) db.exec("ALTER TABLE work_items ADD COLUMN fallback_streak INTEGER NOT NULL DEFAULT 0");
 
 	// Document resources: a catalog of deliverable docs the employee can hand to
 	// integration partners. kind=file points at a copied file under documents.dir;

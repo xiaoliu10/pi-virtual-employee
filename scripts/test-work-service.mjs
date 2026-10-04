@@ -434,6 +434,62 @@ test("an invalid NEXT_CHECK soft-falls-back to the default re-check instead of k
 	assert.match(h.pushes[0].text, /顺延/);
 });
 
+test("empty and past NEXT_CHECK times soft-fall-back too (「空」 branch, expired branch)", async t => {
+	for (const reply of ["[[NEXT_CHECK]] | 只写了原因", "完成今日部分\n[[NEXT_CHECK]]: 2020-01-01 09:00 | 早该查的"]) {
+		const h = fixture(t, { send: () => ({ reply }) });
+		const item = h.create(); h.service.start(); await flush();
+		const row = h.store.get(item.id);
+		assert.equal(row.status, "scheduled", reply);
+		assert.match(row.next_check_reason, /无法解析或已过期/, reply);
+		assert.equal(row.fallback_streak, 1, reply);
+	}
+});
+
+test("three consecutive unusable NEXT_CHECKs escalate to a human; valid schedule and resume reset the meter", async t => {
+	let bad = 0;
+	const h = fixture(t, { send: () => ++bad <= 3
+		? { reply: "[[NEXT_CHECK]]: 嘎嘎 | 等批次" }
+		: { reply: "这轮有进展\n[[NEXT_CHECK]]: 2小时 | 等新批次" } });
+	const item = h.create(); h.service.start(); await flush();
+	let row = h.store.get(item.id);
+	assert.equal(row.status, "scheduled");
+	assert.equal(row.fallback_streak, 1, "first soft fallback recorded");
+
+	// One advance runs the chained re-checks (w2 at +1h, w3 at +2h): both
+	// unusable. Third one escalates instead of looping hourly forever.
+	await h.clock.advance(2 * 3_600_000); await flush();
+	row = h.store.get(item.id);
+	assert.equal(row.status, "waiting_human");
+	assert.match(row.question, /连续 3 次/);
+	assert.match(row.question, /嘎嘎/);
+
+	// Manual resume resets the meter; a valid schedule keeps it at zero.
+	h.store.resume(item.id, "直接开始对账"); await flush();
+	assert.equal(h.store.get(item.id).fallback_streak, 0, "resume clears the meter");
+	row = h.store.get(item.id);
+	assert.equal(row.status, "scheduled");
+	assert.equal(row.fallback_streak, 0, "valid NEXT_CHECK keeps the meter at zero");
+	assert.match(row.next_check_reason, /等新批次/);
+});
+
+test("admin update-reschedule (setSchedule) resets the fallback meter — the escalation's own suggested path", async t => {
+	const h = fixture(t, { send: () => ({ reply: "[[NEXT_CHECK]]: 嘎嘎 | 等批次" }) });
+	const item = h.create(); h.service.start(); await flush();
+	await h.clock.advance(2 * 3_600_000); await flush(); // w2 → fb 2
+	// One advance runs the chained re-checks (w2 at +1h, w3 at +2h): all three
+	// unusable → third one escalates to waiting_human.
+	await h.clock.advance(2 * 3_600_000); await flush();
+	let row = h.store.get(item.id);
+	assert.equal(row.status, "waiting_human");
+	assert.match(row.question, /连续 3 次/);
+	// Admin intervenes via update nextCheck (setSchedule) → meter must reset,
+	// else one more slip escalates instantly at "4 ≥ 3".
+	h.store.setSchedule(item.id, h.clock.now() + 3_600_000, "管理员指定时间");
+	row = h.store.get(item.id);
+	assert.equal(row.status, "scheduled");
+	assert.equal(row.fallback_streak, 0, "setSchedule clears the meter");
+});
+
 test("a pause landing during release suppresses the stale scheduled push (L4)", async t => {
 	// The runner decides scheduled; while release() is still awaited, an admin
 	// pause flips the row to waiting_human. The post-finally capture must see it

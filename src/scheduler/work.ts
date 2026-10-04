@@ -29,10 +29,11 @@ export type WorkItemStatus = "proposed" | "queued" | "working" | "waiting_human"
 export const DEFAULT_WINDOW_BUDGET = { maxTurns: 15, maxMinutes: 30 };
 /** Minimum model-selected follow-up interval (reject, never silently clamp). */
 export const MIN_NEXT_CHECK_MS = 15 * 60_000;
-/** Default re-check (identical to autonomous mode's calm follow-up) used when a
- * window gives no usable NEXT_CHECK: budget exhausted, or the declared time
- * was unparseable/unusable. Keeps the chain alive instead of halting it — a
- * format slip must not kill a task (field 2026-10-03). */
+/** Default re-check (a calm follow-up) used when a work window gives no usable
+ * NEXT_CHECK: the declared time was unparseable/unusable. Keeps the chain
+ * alive instead of halting it — a format slip must not kill a task
+ * (field 2026-10-03). Three consecutive soft-fallbacks escalate to a human.
+ * The window prompt hardcodes 「1 小时」 — keep the wording in sync. */
 export const DEFAULT_NEXT_CHECK_MS = 60 * 60_000;
 
 /**
@@ -232,7 +233,7 @@ export function parseWindowReply(reply: string, now = new Date()): WorkWindowDec
 		return {
 			kind: "next_check",
 			nextCheckAt,
-			nextCheckReason: reasonParts.join("|").trim() || undefined,
+			nextCheckReason: (reasonParts.join("|").trim() || undefined)?.slice(0, 200),
 			nextCheckRaw: (timePart ?? "").trim(),
 			text: stripMarkerLines(reply, ALL_MARKS),
 		};
@@ -283,11 +284,11 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 		: "";
 	const protocol = [
 		`窗口规则：`,
-		`- 本窗口最多 ${ctx.budget.maxTurns} 轮 / ${ctx.budget.maxMinutes} 分钟，请优先推进关键路径，并把重要发现写入进展/踩坑。超时、执行出错或需要人协助会暂停等管理员明确恢复，不自动重试；写不出合法跟进时间时会按默认 1 小时顺延而不会暂停。`,
+		`- 本窗口最多 ${ctx.budget.maxTurns} 轮 / ${ctx.budget.maxMinutes} 分钟，请优先推进关键路径，并把重要发现写入进展/踩坑。超时、执行出错或需要人协助会暂停等管理员明确恢复，不自动重试；写不出合法跟进时间时会按默认 1 小时顺延（连续 3 次除外）而不会暂停。`,
 		`- 收尾顺序：先写完所有正文（进展、发现、汇报），最后一行才是结束标记（${AUTONOMOUS_DONE_MARK} / ${AUTONOMOUS_HUMAN_MARK} / ${AUTONOMOUS_NEXT_CHECK_MARK}）。标记行被输出截断等于没有收尾，窗口会空转到预算耗尽。`,
 		`- 目标全部完成 → 最后一行单独写 ${AUTONOMOUS_DONE_MARK}，上方给出成果总结。`,
 		`- 需要人参与 / 需其他单位配合资源 / 权限不足 → 最后一行单独写 ${AUTONOMOUS_HUMAN_MARK}: 具体需要谁做什么。任务会暂停等人，不要空转。`,
-		`- 本轮告一段落但目标未完成 → 最后一行单独写 ${AUTONOMOUS_NEXT_CHECK_MARK}: 下次跟进时间 | 原因。时间用以下三种写法之一：①「30分钟」「2小时」相对时间；②「2026-10-05 09:40」带年份的完整时间；③「9:40」「9点30」「明天 9:40」钟点。口语变体（「9点半」「上午9点」等）会尽量兼容，但解析不了就判非法并暂停；时间部分不能为空（先时间再「| 原因」）；至少距现在 15 分钟。下次时间完全由本次执行结果决定，不约定固定频率，一天可多次也可隔天：\n  · 有卡点（等第三方补数据、等对方处理、等资源）→ 不要盲目定时重试：如果不确定卡点何时解决，先写 ${AUTONOMOUS_HUMAN_MARK} 把问题抛出来问清楚（如「这个卡点大概什么时候能解决？」），按答复定下次时间；\n  · 时间常识：深夜/非工作时间对接方通常不会处理，把跟进推到对方可能处理的时间，不要空查；\n  · 按「观察点」安排：一天里哪些时刻会有新信息（数据生成、批次跑完、出结果）就在那些时刻查，一天可以多次（如 09:00 查昨日、12:30 查今日上午、15:00 查今日下午）；\n  · 发现异常可缩短间隔、提前再查；连续多轮全无异常且无新信息才拉长。时间必须写明依据，不要不加思考地默认「明天同一时间」。非法/过去/过近时间会暂停等管理员明确恢复。`,
+		`- 本轮告一段落但目标未完成 → 最后一行单独写 ${AUTONOMOUS_NEXT_CHECK_MARK}: 下次跟进时间 | 原因。时间用以下三种写法之一：①「30分钟」「2小时」相对时间；②「2026-10-05 09:40」带年份的完整时间；③「9:40」「9点30」「明天 9:40」钟点。口语变体（「9点半」「上午9点」等）会尽量兼容，但解析不了会按默认 1 小时顺延（连续 3 次无法解析才会暂停；时间部分不能为空——先时间再「| 原因」；至少距现在 15 分钟；非法/过去/过近时间同样顺延不暂停）。下次时间完全由本次执行结果决定，不约定固定频率，一天可多次也可隔天：\n  · 有卡点（等第三方补数据、等对方处理、等资源）→ 不要盲目定时重试：如果不确定卡点何时解决，先写 ${AUTONOMOUS_HUMAN_MARK} 把问题抛出来问清楚（如「这个卡点大概什么时候能解决？」），按答复定下次时间；\n  · 时间常识：深夜/非工作时间对接方通常不会处理，把跟进推到对方可能处理的时间，不要空查；\n  · 按「观察点」安排：一天里哪些时刻会有新信息（数据生成、批次跑完、出结果）就在那些时刻查，一天可以多次（如 09:00 查昨日、12:30 查今日上午、15:00 查今日下午）；\n  · 发现异常可缩短间隔、提前再查；连续多轮全无异常且无新信息才拉长。时间必须写明依据，不要不加思考地默认「明天同一时间」。若写不出合法时间，系统会按默认 1 小时顺延并在推送里告知管理员，不会因格式问题暂停。`,
 		`- 工作过程中了解到执行条件（如「系统对账 08:00-09:30 自动跑，此时段勿手动对账」、依赖的单位/资源、账号权限边界）→ 立即用 manage_work 记录到条件里，后续窗口会带着这些条件工作。`,
 		`- 踩过的坑（登录态、页面路径、接口 quirks）→ 用 manage_work 记录，别指望下次还记得。`,
 		`- 无人值守：先检测登录状态再操作，登录过期直接 ${AUTONOMOUS_HUMAN_MARK} 说明，不要索要验证码。`,
