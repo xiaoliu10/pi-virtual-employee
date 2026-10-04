@@ -463,6 +463,28 @@ export function stripSyntheticPromptPrefix(raw: string): string {
  * (确认/继续/好的…) and the synthetic finalSummary instruction are skipped.
  * Used by the heartbeat fallback so a substantial request is quoted instead of
  * an ack, without needing an LLM pass. */
+/** Tail of the most recent ASSISTANT turn — real execution narration.
+ * Used by the heartbeat fallback's "最近：" line so a failed side-channel
+ * summary still tells the user what is actually happening (field 2026-10-05:
+ * the fallback quoted only the task instruction, not progress). Deliberately
+ * labeled "最近" — never as the task name (field 2026-09-23's leak was
+ * mislabeling narration as the task, not showing it). */
+export function lastAssistantTailOf(messages: AgentMessage[], maxChars = 80): string {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role !== "assistant") continue;
+		const content = (message as { content?: unknown }).content;
+		const text = (typeof content === "string"
+			? content
+			: Array.isArray(content)
+				? (content as { type?: string; text?: string }[]).filter((part) => part?.type === "text").map((part) => part.text ?? "").join("")
+				: "").replace(/\s+/g, " ").trim();
+		if (!text) continue;
+		return text.length > maxChars ? "…" + text.slice(-maxChars) : text;
+	}
+	return "";
+}
+
 export function substantialAnchorOf(messages: AgentMessage[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const message = messages[i];
