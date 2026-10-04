@@ -420,6 +420,13 @@ export interface AppConfig {
 		people?: { staffId: string; name?: string; role: "viewer" | "operator" | "admin" }[];
 		defaultRole?: "viewer" | "operator" | "admin";
 		/**
+		 * 管理员完全访问模式。开启后，管理员（白名单/角色校验不变）在单聊中
+		 * 执行管理操作不再需要每条消息带「确认」口令——管理员身份本身就是
+		 * 授权。只去除口令，不放宽任何身份/来源/白名单校验；关掉立即恢复。
+		 * 开关本身在 manage_access 里开启时仍需一次「确认」（一次性成本）。
+		 */
+		adminFullAccess?: boolean;
+		/**
 		 * Per-conversation capability floors (per GROUP/CHAT). Each entry RAISES
 		 * the minimum role required for a capability inside that conversation
 		 * (e.g. a production-data group may require operator for browser).
@@ -532,6 +539,7 @@ function normalizedAdminIds(value: unknown): string[] {
  */
 function normalizeSecurity(merged: AppConfig): AppConfig["security"] {
 	const raw = merged.security ?? { adminStaffIds: [] };
+	const adminFullAccess = (merged.security as { adminFullAccess?: unknown } | undefined)?.adminFullAccess === true;
 	const isRole = (v: unknown): v is "viewer" | "operator" | "admin" =>
 		v === "viewer" || v === "operator" || v === "admin";
 
@@ -561,6 +569,7 @@ function normalizeSecurity(merged: AppConfig): AppConfig["security"] {
 		adminStaffIds: normalizedAdminIds(raw.adminStaffIds),
 		people: [...byId.values()],
 		defaultRole: isRole(raw.defaultRole) ? raw.defaultRole : "viewer",
+		adminFullAccess,
 		conversations: [...byConv.values()],
 	};
 }

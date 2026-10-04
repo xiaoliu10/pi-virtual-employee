@@ -356,8 +356,9 @@ export function createManageAccessTool(deps: AccessToolDeps): AgentTool {
 					Type.Literal("set_default_role"),
 					Type.Literal("set_conversation"),
 					Type.Literal("remove_conversation"),
+					Type.Literal("set_full_access"),
 				],
-				{ description: "list=查看策略；list_people=已记录人员；list_members=某会话实际出现过的人；set_role/remove_person=单人角色；set_conversation_roles=按会话批量授权；set_default_role=默认角色；set_conversation/remove_conversation=会话门槛" },
+				{ description: "list=查看策略；list_people=已记录人员；list_members=某会话实际出现过的人；set_role/remove_person=单人角色；set_conversation_roles=按会话批量授权；set_default_role=默认角色；set_conversation/remove_conversation=会话门槛；set_full_access=管理员完全访问模式开关（person=on/off，开启后管理操作免「确认」口令）" },
 			),
 			person: Type.Optional(
 				Type.String({
@@ -372,6 +373,7 @@ export function createManageAccessTool(deps: AccessToolDeps): AgentTool {
 			),
 			name: Type.Optional(Type.String({ description: "set_role 可选：备注名，便于后续辨认（如「张工-运维」；留空则用对方姓名）" })),
 			role: Type.Optional(ROLE_ENUM),
+			value: Type.Optional(Type.Union([Type.Literal("on"), Type.Literal("off")], { description: "set_full_access 必填：on=开启完全访问，off=关闭" })),
 			conversationName: Type.Optional(
 				Type.String({
 					description: "set_conversation/set_conversation_roles/list_members/remove_conversation 必填（除非用 conversationId）：**群名**（如「示例群」），也可传 list 显示出的会话 ID。绝不向对方索要 ID。",
@@ -389,8 +391,9 @@ export function createManageAccessTool(deps: AccessToolDeps): AgentTool {
 			),
 		}),
 		async execute(_toolCallId, params) {
-			const { action, person, staffId, name, role, conversationName, conversationId, floors } = params as {
-				action: "list" | "list_people" | "list_members" | "set_role" | "set_conversation_roles" | "remove_person" | "set_default_role" | "set_conversation" | "remove_conversation";
+			const { action, person, staffId, name, role, value, conversationName, conversationId, floors } = params as {
+				action: "list" | "list_people" | "list_members" | "set_role" | "set_conversation_roles" | "remove_person" | "set_default_role" | "set_conversation" | "remove_conversation" | "set_full_access";
+				value?: "on" | "off";
 				person?: string;
 				staffId?: string;
 				name?: string;
@@ -511,6 +514,29 @@ export function createManageAccessTool(deps: AccessToolDeps): AgentTool {
 							`如需整体授权，用 set_conversation_roles 传同一个群名；按人授权用 set_role person=<姓名>。执行前请把名单念给管理员确认。`,
 					}],
 					details: { action, conversationId: conv, memberCount: members.length, members: members.map((m) => ({ staffId: m.staffId, name: m.name })) },
+				};
+			}
+
+			// 完全访问模式开关：开启本身仍需一次「确认」（一次性成本，之后的
+			// 管理操作全部免口令）；关闭永不需口令（回安全态要顺手）。
+			if (action === "set_full_access") {
+				const enable = value === "on";
+				const disable = value === "off";
+				if (!enable && !disable) {
+					return refuse("用法：manage_access action=set_full_access value=on|off（on=开启完全访问，off=关闭）。");
+				}
+				const gate = requireConfirmedAdmin(deps, { needConfirmation: enable, confirmationHint: "开启完全访问模式后，管理员的管理操作将不再需要「确认」口令。请在当前消息中包含「确认」以开启。" });
+				if ("content" in gate) return gate;
+				const current = deps.config.all().security.adminFullAccess === true;
+				if (enable === current) {
+					return { content: [{ type: "text", text: `完全访问模式已经是${current ? "开启" : "关闭"}状态，无需变更。` }], details: { action, unchanged: true } };
+				}
+				deps.config.update({ security: { ...deps.config.all().security, adminFullAccess: enable } });
+				return {
+					content: [{ type: "text", text: enable
+						? "✅ 完全访问模式已开启：管理员的管理操作（改配置、改身份、启停命令等）不再需要「确认」口令，管理员身份即授权。身份/白名单/单聊校验保持不变。随时可用 action=set_full_access person=off 关闭。"
+						: "✅ 完全访问模式已关闭：管理操作恢复需要「确认」口令。" }],
+					details: { action, adminFullAccess: enable },
 				};
 			}
 
