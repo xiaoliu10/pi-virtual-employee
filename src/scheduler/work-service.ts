@@ -156,8 +156,10 @@ export class WorkService<Session extends WorkSession> {
 			const cid = row.origin_conversation;
 			if (!cid) continue;
 			const waitedText = waited >= 24 * 3_600_000 ? `${Math.floor(waited / 24 / 3_600_000)} 天` : `${Math.max(1, Math.floor(waited / 3_600_000))} 小时`;
+			// Copy shows the CLAMPED interval (what reminders actually do), not the
+			// raw cadence — a 36h rhythm reminds every 24h and the text must agree.
 			const rhythm = row.cadence_ms !== null && row.cadence_ms !== undefined
-				? `（原节奏约每 ${row.cadence_ms >= 24 * 3_600_000 ? `${Math.round(row.cadence_ms / 24 / 3_600_000)} 天` : row.cadence_ms >= 3_600_000 ? `${Math.round(row.cadence_ms / 3_600_000)} 小时` : `${Math.max(1, Math.round(row.cadence_ms / 60_000))} 分钟`}一次，期间的观察点都在错过）`
+				? `（原节奏约每 ${(() => { const iv = this.remindInterval(row); return iv >= 24 * 3_600_000 ? `${Math.round(iv / 24 / 3_600_000)} 天` : iv >= 3_600_000 ? `${Math.round(iv / 3_600_000)} 小时` : `${Math.max(1, Math.round(iv / 60_000))} 分钟`; })()}一次，期间的观察点都在错过）`
 				: "";
 			const question = (row.question ?? "").trim().slice(0, 300);
 			const tail = n >= 3

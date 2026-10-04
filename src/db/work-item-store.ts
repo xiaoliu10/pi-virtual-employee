@@ -148,8 +148,10 @@ export class WorkItemStore {
 	}
 	/** Notebook and admin-rewrite edits must not mutate terminal items, including late aborted tools. */
 	/** Track the item's own rhythm: EMA (α=1/3) of declared NEXT_CHECK lead
-	 * times. EMA damps one-off outliers — a daily task that declares "2小时"
-	 * once must not drop to 2h reminders for the rest of its life. */
+	 * times. EMA damps one-off outliers AFTER the rhythm is established — the
+	 * FIRST declaration initializes directly, so an early outlier converges
+	 * back over ~6 windows (too-frequent reminders meanwhile = safe direction).
+	 * Note: soft-fallback (system-imposed 1h) deliberately does NOT feed this. */
 	setCadence(id: string, declaredLeadMs: number): void {
 		const row = this.get(id);
 		if (!row) return;
