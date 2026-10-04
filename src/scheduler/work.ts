@@ -13,7 +13,9 @@
  *   [[TASK_DONE]]                — goal fully met
  *   [[NEED_HUMAN]]: <question>   — blocked on a person / external resource
  *   [[NEXT_CHECK]]: <time> | <why> — self-scheduled follow-up
- * A missed/invalid marker or exhausted budget waits for explicit admin resume.
+ * Budget exhausted and a genuinely blocked marker ([[NEED_HUMAN]]) wait for
+ * explicit admin resume; an unusable NEXT_CHECK time soft-falls-back to the
+ * default re-check so the chain stays alive.
  * Follow-ups must be at least 15 minutes away; no fixed polling cadence.
  */
 import { AUTONOMOUS_DONE_MARK, AUTONOMOUS_HUMAN_MARK } from "./autonomous.js";
@@ -27,6 +29,11 @@ export type WorkItemStatus = "proposed" | "queued" | "working" | "waiting_human"
 export const DEFAULT_WINDOW_BUDGET = { maxTurns: 15, maxMinutes: 30 };
 /** Minimum model-selected follow-up interval (reject, never silently clamp). */
 export const MIN_NEXT_CHECK_MS = 15 * 60_000;
+/** Default re-check (identical to autonomous mode's calm follow-up) used when a
+ * window gives no usable NEXT_CHECK: budget exhausted, or the declared time
+ * was unparseable/unusable. Keeps the chain alive instead of halting it — a
+ * format slip must not kill a task (field 2026-10-03). */
+export const DEFAULT_NEXT_CHECK_MS = 60 * 60_000;
 
 /**
  * True when two follow-up times are essentially "the same time tomorrow": a
@@ -276,7 +283,7 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 		: "";
 	const protocol = [
 		`窗口规则：`,
-		`- 本窗口最多 ${ctx.budget.maxTurns} 轮 / ${ctx.budget.maxMinutes} 分钟，请优先推进关键路径，并把重要发现写入进展/踩坑。超时、执行出错或到限仍无安全结束声明会暂停等管理员明确恢复，不自动重试。`,
+		`- 本窗口最多 ${ctx.budget.maxTurns} 轮 / ${ctx.budget.maxMinutes} 分钟，请优先推进关键路径，并把重要发现写入进展/踩坑。超时、执行出错或需要人协助会暂停等管理员明确恢复，不自动重试；写不出合法跟进时间时会按默认 1 小时顺延而不会暂停。`,
 		`- 收尾顺序：先写完所有正文（进展、发现、汇报），最后一行才是结束标记（${AUTONOMOUS_DONE_MARK} / ${AUTONOMOUS_HUMAN_MARK} / ${AUTONOMOUS_NEXT_CHECK_MARK}）。标记行被输出截断等于没有收尾，窗口会空转到预算耗尽。`,
 		`- 目标全部完成 → 最后一行单独写 ${AUTONOMOUS_DONE_MARK}，上方给出成果总结。`,
 		`- 需要人参与 / 需其他单位配合资源 / 权限不足 → 最后一行单独写 ${AUTONOMOUS_HUMAN_MARK}: 具体需要谁做什么。任务会暂停等人，不要空转。`,

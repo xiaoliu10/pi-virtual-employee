@@ -108,14 +108,28 @@ test("model-selected 30m follow-up uses one exact timer, not periodic polling", 
 	assert.equal(h.store.get(item.id).status, "done");
 });
 
-test("invalid/too-near NEXT_CHECK and markerless exhausted budget wait for humans", async t => {
-	for (const reply of ["[[NEXT_CHECK]]: 1m | 空跑", "[[NEXT_CHECK]]: 垃圾", "进行中"]) {
+test("markerless exhausted budget waits for humans; ANY declared time (even unusable) soft-falls-back", async t => {
+	// Field 2026-10-03: an unusable/unparseable declared time used to pause the
+	// item with NO next time at all — the chain died on a format slip. Both must
+	// keep the chain alive now; only a markerless exhausted budget waits.
+	for (const reply of ["[[NEXT_CHECK]]: 1m | 空跑", "[[NEXT_CHECK]]: 嘎嘎"]) {
 		const h = fixture(t, { send: () => ({ reply }) });
 		const item = h.create(); h.service.start(); await flush();
-		assert.equal(h.store.get(item.id).status, "waiting_human", reply);
-		assert.equal(h.clock.timers.size, 0);
-		assert.equal(h.learned.length, 0);
+		assert.equal(h.store.get(item.id).status, "scheduled", reply);
+		assert.ok(h.clock.timers.size >= 1, reply);
 	}
+	const bare = fixture(t, { send: () => ({ reply: "进行中" }) });
+	const bareItem = bare.create(); bare.service.start(); await flush();
+	assert.equal(bare.store.get(bareItem.id).status, "waiting_human", "markerless exhausted budget");
+	assert.equal(bare.clock.timers.size, 0);
+	assert.equal(bare.learned.length, 0);
+});
+
+test("unparseable NEXT_CHECK no longer kills the chain (soft 1h fallback) — field 2026-10-03", async t => {
+	const h = fixture(t, { send: () => ({ reply: "[[NEXT_CHECK]]: 嘎嘎 09:00!! | 批次后检查" }) });
+	const item = h.create(); h.service.start(); await flush();
+	assert.equal(h.store.get(item.id).status, "scheduled", "chain stays alive");
+	assert.ok(h.clock.timers.size >= 1, "a re-check timer exists");
 });
 
 test("throws and returned errors retain staged answers, settle cleanup and wait (no unsafe retries)", async t => {
@@ -402,6 +416,22 @@ test("a different follow-up slot resets the streak; no conversion suggestion pus
 	assert.equal(row.fixed_streak, 0, "a 2h gap is not a daily slot");
 	assert.equal(row.next_check_reason, "等新批次");
 	assert.doesNotMatch(h.pushes[0].text, /定时任务/);
+});
+
+test("an invalid NEXT_CHECK soft-falls-back to the default re-check instead of killing the chain", async t => {
+	// Field 2026-10-03: an unparseable/past declared time used to pause the item
+	// with no next time at all — the chain died on a format slip. Now it must
+	// stay scheduled on the default 1h re-check, with the raw slip surfaced.
+	const h = fixture(t, { send: () => ({ reply: "进展正常\n[[NEXT_CHECK]]: 嘎嘎 09:00!! | 批次后检查" }) });
+	const item = h.create("scheduled");
+	h.db.prepare("UPDATE work_items SET next_check_at = ? WHERE id = ?").run(h.clock.now(), item.id);
+	h.service.start(); await h.service.whenIdle();
+	const row = h.store.get(item.id);
+	assert.equal(row.status, "scheduled", "chain stays alive, no waiting_human");
+	assert.ok(row.next_check_at !== null && row.next_check_at >= h.clock.now() + 55 * 60_000, "default ~1h re-check");
+	assert.match(row.next_check_reason, /无法解析或已过期/);
+	assert.match(row.next_check_reason, /嘎嘎/);
+	assert.match(h.pushes[0].text, /顺延/);
 });
 
 test("a pause landing during release suppresses the stale scheduled push (L4)", async t => {

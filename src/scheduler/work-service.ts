@@ -4,7 +4,7 @@
  * Abort requests never release the dispatch lock until send actually settles.
  */
 import type { WorkItemRow, WorkItemStore } from "../db/work-item-store.js";
-import { buildWorkWindowPrefix, DEFAULT_WINDOW_BUDGET, nextRoutineStreak, parseWindowReply } from "./work.js";
+import { buildWorkWindowPrefix, DEFAULT_NEXT_CHECK_MS, DEFAULT_WINDOW_BUDGET, nextRoutineStreak, parseWindowReply } from "./work.js";
 import { hasMiningSecrets } from "./mining.js";
 
 interface WorkSession { abort(): void; }
@@ -229,10 +229,18 @@ export class WorkService<Session extends WorkSession> {
 				if (decision.kind === "done") { outcome = "done"; break; }
 				if (decision.kind === "next_check") {
 					if (decision.nextCheckAt === undefined) {
-						// Surface the raw string the model wrote: without it the pause is
-						// undiagnosable from logs alone (field 2026-10-04 — the invalid
-						// format had to be inferred from indirect evidence).
-						question = `下次跟进时间非法（原文「${(decision.nextCheckRaw ?? "").slice(0, 200)}」）：只接受「30分钟」「2026-10-05 09:40」「明天 9:40」三种写法，且至少距现在 15 分钟。请管理员明确恢复并指定合理时间。`;
+						// The model clearly WANTED a follow-up but the declared time was
+						// unparseable or unusable. Halting here killed the whole chain on a
+						// mere format slip (field 2026-10-03: 「今天的执行时间已经过去了，
+						// 没有生成下次执行时间，这个任务是不是就死了」). Soft-fallback
+						// instead: the chain stays alive on the default re-check, the next
+						// window gets another chance to declare a valid time, and the push
+						// surfaces the raw slip so the admin can `update` a proper time.
+						outcome = "scheduled";
+						nextCheckAt = this.clock.now() + DEFAULT_NEXT_CHECK_MS;
+						const raw = (decision.nextCheckRaw ?? "").slice(0, 60);
+						nextReason = `原声明时间「${raw || "空"}」无法解析或已过期，按默认节奏（1 小时后）顺延${decision.nextCheckReason ? `；原依据：${decision.nextCheckReason}` : ""}`;
+						nextStreak = 0;
 						break;
 					}
 					outcome = "scheduled"; nextCheckAt = decision.nextCheckAt; nextReason = decision.nextCheckReason;
