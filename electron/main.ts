@@ -595,7 +595,11 @@ async function main(): Promise<void> {
 		let question: string | undefined;
 		try {
 			for (;;) {
-				const prefix = buildAutonomousTurnPrefix({ turn: chain.turns, budget, kbEnabled: config.all().kb.enabled });
+				const prefix = buildAutonomousTurnPrefix({
+					turn: chain.turns, budget,
+					kbEnabled: config.all().kb.enabled,
+					kbLearn: config.all().kb.enabled && config.all().kb.learn.enabled,
+				});
 				const answerBlock = chain.turns === 0 && stagedAnswer ? `用户对你上一轮问题的回复：${stagedAnswer}\n\n` : "";
 				const message = chain.turns === 0 ? scheduledTimePrefix() + prefix + answerBlock + task.prompt : prefix + "继续。";
 				const send = await engine.send(agent, message, {

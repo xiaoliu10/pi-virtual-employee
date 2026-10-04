@@ -134,8 +134,12 @@ export function buildAutonomousTurnPrefix(opts: {
 	/** Knowledge-base tool availability (same gates as the engine definition).
 	 * Default true: the KB-first protocol references search_knowledge_base. */
 	kbEnabled?: boolean;
+	/** save_to_knowledge needs learn enabled; mirrors the engine definition's
+	 * two-layer gates so the protocol never references a ghost tool. */
+	kbLearn?: boolean;
 }): string {
 	const kbSearch = opts.kbEnabled !== false;
+	const kbLearn = opts.kbLearn !== false;
 	const head =
 		opts.turn === 0
 			? `【自主任务模式】这是一个多轮自主任务：你会连续工作多个回合直到达成目标，期间没有人逐条催你。`
@@ -147,7 +151,7 @@ export function buildAutonomousTurnPrefix(opts: {
 		`- 卡住了必须问人（缺账号/权限/登录态失效等）→ ${kbSearch ? `先用 search_knowledge_base 查一遍（账号密码/地址入口/流程/规则大概率已有沉淀；明显只有人能当场提供的信息如验证码、口头确认可免查，问题里写明为什么没查），` : ""}最后一行单独写 ${AUTONOMOUS_HUMAN_MARK}: 要问的问题${kbSearch ? "，并写明「已查知识库（关键词 X），未找到」及已尝试的办法" : "，写明已尝试的办法"}。链条会暂停等人回复。`,
 		`- 还没完成也不需要问人 → 正常输出进展即可，不要写任何标记，系统会让你继续。`,
 		`- 无人值守：先检测登录状态再操作。${kbSearch ? `登录过期/账号异常 → 先 search_knowledge_base 搜「系统名 + 登录/账号」找最新的账号密码或登录指引，找得到就自己重新登录继续干；知识库确实没有才 ` : `登录过期直接 `}${AUTONOMOUS_HUMAN_MARK} 说明${kbSearch ? "（注明已查知识库无果）" : ""}，不要尝试索要验证码。`,
-		...(kbSearch ? [`- 卡点解决后若沉淀出了可复用的信息（正确账号、新流程、报错根因、服务异常的规避办法），用 save_to_knowledge 存进知识库——下次同类卡点直接查库解决，不再问人。`] : []),
+		...(kbSearch && kbLearn ? [`- 卡点解决后若沉淀出了可复用的信息（正确账号、新流程、报错根因、服务异常的规避办法），用 save_to_knowledge 存进知识库——下次同类卡点直接查库解决，不再问人。`] : []),
 	].join("\n");
 	return `${head}\n${budgetLine}\n${protocol}\n\n`;
 }

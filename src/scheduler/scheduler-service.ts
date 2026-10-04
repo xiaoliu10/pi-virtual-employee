@@ -170,11 +170,11 @@ export class SchedulerService {
 				// An autonomous chain paused for a human waits for an explicit resume
 				// (resume_scheduled_task); a fresh cron fire must not fork it — the
 				// chain's conversation carries all its progress.
-				if (task.autonomous && parseChainState(task.chain_state)?.pending) {
+				const chainPending = task.autonomous ? parseChainState(task.chain_state)?.pending : undefined;
+				if (chainPending) {
 					const next = this.safeNext(task.cron);
-					const pending = parseChainState(task.chain_state)?.pending;
-					const pauseLabel = pending === "budget" ? "paused:预算耗尽，等待续跑（跳过本次触发）"
-						: pending === "stalled" ? "paused:模型无返回，等待处理（跳过本次触发）"
+					const pauseLabel = chainPending === "budget" ? "paused:预算耗尽，等待续跑（跳过本次触发）"
+						: chainPending === "stalled" ? "paused:模型无返回，等待处理（跳过本次触发）"
 						: "paused:等待人工回复（跳过本次触发）";
 					this.store.markRun(task.id, pauseLabel, next);
 					continue;

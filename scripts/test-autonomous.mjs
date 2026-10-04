@@ -119,6 +119,10 @@ test("autonomous chain protocol: KB write-back after a blocker is resolved (fiel
 	// KB off → no ghost tool reference.
 	const noKb = buildAutonomousTurnPrefix({ turn: 0, budget: { maxTurns: 30, maxMinutes: 90 }, kbEnabled: false });
 	assert.doesNotMatch(noKb, /save_to_knowledge/);
+	// learn off (kb on): search stays, the write-back bullet must NOT (ghost tool).
+	const noLearn = buildAutonomousTurnPrefix({ turn: 0, budget: { maxTurns: 30, maxMinutes: 90 }, kbEnabled: true, kbLearn: false });
+	assert.match(noLearn, /search_knowledge_base/);
+	assert.doesNotMatch(noLearn, /save_to_knowledge/);
 });
 
 test("parseChainState round-trips the stalled pending kind (field 2026-10-05)", () => {
