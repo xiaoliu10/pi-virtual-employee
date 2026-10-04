@@ -274,3 +274,19 @@ test("buildWorkWindowPrefix delay-awareness: notes only when late by ≥30min", 
 	// Omitted → no note (kickoffs/resumes).
 	assert.doesNotMatch(buildWorkWindowPrefix({ ...base }), /【延迟说明】/);
 });
+
+test("window protocol: KB-first before escalation; login expiry searches KB; resolution write-back", () => {
+	const prefix = buildWorkWindowPrefix({ title: "巡检", goal: "对账", turn: 0, budget: { maxTurns: 15, maxMinutes: 30 } });
+	// NEED_HUMAN requires a KB check first, and the question must say what was searched.
+	assert.match(prefix, /先用 search_knowledge_base 查一遍/);
+	assert.match(prefix, /已查知识库（关键词 X），未找到/);
+	// Login expiry must NOT instruct skipping KB (field 2026-10-04: KB had the
+	// correct account, the old line said "登录过期直接 NEED_HUMAN").
+	assert.match(prefix, /登录过期\/账号异常 → 先 search_knowledge_base/);
+	assert.doesNotMatch(prefix, /登录过期直接/);
+	// Resolution write-back so the next identical stall never asks again.
+	assert.match(prefix, /save_to_knowledge 存进知识库/);
+	// First-window plan names KB search as the first stop for stall keywords.
+	const first = buildWorkWindowPrefix({ title: "巡检", goal: "对账", turn: 0, budget: { maxTurns: 15, maxMinutes: 30 }, firstWindow: true });
+	assert.match(first, /这类卡点先查知识库搜什么关键词/);
+});
