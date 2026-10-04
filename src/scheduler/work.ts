@@ -275,12 +275,16 @@ export interface WorkItemWindowContext {
 	 * (app closed/busy past the point). The prefix tells the model to
 	 * re-check what happened in between instead of trusting the timeline. */
 	lateByMs?: number;
+	/** KB tool availability (engine definition gates). Protocol must never
+	 * reference unregistered tools; undefined = enabled (tests/legacy). */
+	kbSearchEnabled?: boolean;
+	kbLearnEnabled?: boolean;
 }
 
 // A true kickoff must plan before acting — and the plan must justify its own
 // rhythm (field 2026-10-02: 自主任务的要素在于不定时，固定每天一次和定时任务没区别).
 const FIRST_WINDOW_PLAN =
-	"【首个窗口：先出跟进计划】给出简要计划再开始第一步：① 分几步完成目标；② 这件工作在一天里哪些时刻会有新信息可查（数据何时生成、批次何时跑完、何时出结果）——列出这些「观察点」及依据，并说明打算怎么覆盖它们（一天可以多次，例如 09:00 查昨日历史、12:30 查今日上午批次、15:00 查今日下午批次）；③ 有卡点的工作，计划里要写明「卡点找谁问、问什么」（不确定解决时间就通过 [[NEED_HUMAN]] 问清再定跟进）。计划写完即开始第一步，无需等待确认。";
+	"【首个窗口：先出跟进计划】给出简要计划再开始第一步：① 分几步完成目标；② 这件工作在一天里哪些时刻会有新信息可查（数据何时生成、批次何时跑完、何时出结果）——列出这些「观察点」及依据，并说明打算怎么覆盖它们（一天可以多次，例如 09:00 查昨日历史、12:30 查今日上午批次、15:00 查今日下午批次）；③ 有卡点的工作，计划里要写明「这类卡点先查知识库搜什么关键词；知识库没有再找谁问、问什么」（账号/登录/流程类卡点几乎都先在知识库；不确定解决时间就通过 [[NEED_HUMAN]] 问清再定跟进）。计划写完即开始第一步，无需等待确认。";
 
 /** System-side prefix for every window turn — goal, memory, budget, protocol. */
 export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
@@ -302,16 +306,25 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 	const cadenceWarning = (ctx.lastCheck?.streak ?? 0) >= 2
 		? `\n【节奏提示】你已连续 ${ctx.lastCheck!.streak} 次把这个观察点安排在相近的固定时间。如果这是因为该时刻确有新信息可查（如「09:00 前历史对账已生成」），写明依据后可以维持；但请确认你覆盖了今天所有的观察点（如 12:30/15:00），不要只查这一个。若这件工作每天只在这一处固定点查、且查了也不需要判断动作，可以考虑建议管理员转成定时任务，工作项留给需要判断力的跟进。\n`
 		: "";
+	const kbSearch = ctx.kbSearchEnabled !== false;
+	const kbLearn = ctx.kbLearnEnabled !== false;
+	const needHumanBullet = kbSearch
+		? `- 需要人参与 / 需其他单位配合资源 / 权限不足 → 先用 search_knowledge_base 查一遍（账号密码、地址入口、操作流程、规则这类问题知识库大概率已有沉淀，直接问人等于把知识库当摆设；明显只有人能当场提供的信息——验证码、口头确认、对方答复——可免查，问题里写明为什么没查），确认查不到再最后一行单独写 ${AUTONOMOUS_HUMAN_MARK}: 具体需要谁做什么。问题里必须写明「已查知识库（关键词 X），未找到」，以及已尝试的办法——让管理员一次就能给准信。任务会暂停等人，不要空转。`
+		: `- 需要人参与 / 需其他单位配合资源 / 权限不足 → 最后一行单独写 ${AUTONOMOUS_HUMAN_MARK}: 具体需要谁做什么，并写明已尝试的办法。任务会暂停等人，不要空转。`;
+	const unattendedBullet = kbSearch
+		? `- 无人值守：先检测登录状态再操作。登录过期/账号异常 → 先 search_knowledge_base 搜「系统名 + 登录/账号」找最新的账号密码或登录指引，找得到就自己重新登录继续干；知识库确实没有才 ${AUTONOMOUS_HUMAN_MARK}（注明已查知识库无果）。不要索要验证码。`
+		: `- 无人值守：先检测登录状态再操作，登录过期 ${AUTONOMOUS_HUMAN_MARK} 说明，不要索要验证码。`;
+	const lessonBullet = `- 踩过的坑（登录态、页面路径、接口 quirks）→ 用 manage_work 记录，别指望下次还记得。${kbLearn ? "卡点解决后若沉淀出了可复用的信息（正确账号、新流程、报错根因），用 save_to_knowledge 存进知识库——下次同类卡点直接查库解决，不再问人。" : ""}`;
 	const protocol = [
 		`窗口规则：`,
 		`- 本窗口最多 ${ctx.budget.maxTurns} 轮 / ${ctx.budget.maxMinutes} 分钟，请优先推进关键路径，并把重要发现写入进展/踩坑。超时、执行出错或需要人协助会暂停等管理员明确恢复，不自动重试；写不出合法跟进时间时会按默认 1 小时顺延（连续 3 次除外）而不会暂停。`,
 		`- 收尾顺序：先写完所有正文（进展、发现、汇报），最后一行才是结束标记（${AUTONOMOUS_DONE_MARK} / ${AUTONOMOUS_HUMAN_MARK} / ${AUTONOMOUS_NEXT_CHECK_MARK}）。标记行被输出截断等于没有收尾，窗口会空转到预算耗尽。`,
 		`- 目标全部完成 → 最后一行单独写 ${AUTONOMOUS_DONE_MARK}，上方给出成果总结。`,
-		`- 需要人参与 / 需其他单位配合资源 / 权限不足 → 最后一行单独写 ${AUTONOMOUS_HUMAN_MARK}: 具体需要谁做什么。任务会暂停等人，不要空转。`,
+		needHumanBullet,
 		`- 本轮告一段落但目标未完成 → 最后一行单独写 ${AUTONOMOUS_NEXT_CHECK_MARK}: 下次跟进时间 | 原因。时间用以下三种写法之一：①「30分钟」「2小时」相对时间；②「2026-10-05 09:40」带年份的完整时间；③「9:40」「9点30」「明天 9:40」钟点。口语变体（「9点半」「上午9点」等）会尽量兼容，但解析不了会按默认 1 小时顺延（连续 3 次无法解析才会暂停；时间部分不能为空——先时间再「| 原因」；至少距现在 15 分钟；非法/过去/过近时间同样顺延不暂停）。下次时间完全由本次执行结果决定，不约定固定频率，一天可多次也可隔天：\n  · 有卡点（等第三方补数据、等对方处理、等资源）→ 不要盲目定时重试：如果不确定卡点何时解决，先写 ${AUTONOMOUS_HUMAN_MARK} 把问题抛出来问清楚（如「这个卡点大概什么时候能解决？」），按答复定下次时间；\n  · 时间常识：深夜/非工作时间对接方通常不会处理，把跟进推到对方可能处理的时间，不要空查；\n  · 按「观察点」安排：一天里哪些时刻会有新信息（数据生成、批次跑完、出结果）就在那些时刻查，一天可以多次（如 09:00 查昨日、12:30 查今日上午、15:00 查今日下午）；\n  · 发现异常可缩短间隔、提前再查；连续多轮全无异常且无新信息才拉长。时间必须写明依据，不要不加思考地默认「明天同一时间」。若写不出合法时间，系统会按默认 1 小时顺延并在推送里告知管理员，不会因格式问题暂停。`,
 		`- 工作过程中了解到执行条件（如「系统对账 08:00-09:30 自动跑，此时段勿手动对账」、依赖的单位/资源、账号权限边界）→ 立即用 manage_work 记录到条件里，后续窗口会带着这些条件工作。`,
-		`- 踩过的坑（登录态、页面路径、接口 quirks）→ 用 manage_work 记录，别指望下次还记得。`,
-		`- 无人值守：先检测登录状态再操作，登录过期直接 ${AUTONOMOUS_HUMAN_MARK} 说明，不要索要验证码。`,
+		lessonBullet,
+		unattendedBullet,
 	].join("\n");
 	return `${head}\n【工作项】${ctx.title}\n【目标】${ctx.goal}\n${[...memory, protocol].join("\n\n")}\n${answerBlock}${lastCheck}${lateNote}${cadenceWarning}\n`;
 }

@@ -130,7 +130,11 @@ export function budgetExceeded(state: AutonomousChainState, budget: AutonomousBu
 export function buildAutonomousTurnPrefix(opts: {
 	turn: number;
 	budget: AutonomousBudget;
+	/** Knowledge-base tool availability (same gates as the engine definition).
+	 * Default true: the KB-first protocol references search_knowledge_base. */
+	kbEnabled?: boolean;
 }): string {
+	const kbSearch = opts.kbEnabled !== false;
 	const head =
 		opts.turn === 0
 			? `【自主任务模式】这是一个多轮自主任务：你会连续工作多个回合直到达成目标，期间没有人逐条催你。`
@@ -139,9 +143,9 @@ export function buildAutonomousTurnPrefix(opts: {
 	const protocol = [
 		`回合结束规则（必须遵守）：`,
 		`- 目标已全部完成 → 回复最后一行单独写 ${AUTONOMOUS_DONE_MARK}，并在它上面给出成果总结。`,
-		`- 卡住了必须问人（缺账号/权限/登录态失效等）→ 最后一行单独写 ${AUTONOMOUS_HUMAN_MARK}: 要问的问题。链条会暂停等人回复。`,
+		`- 卡住了必须问人（缺账号/权限/登录态失效等）→ ${kbSearch ? `先用 search_knowledge_base 查一遍（账号密码/地址入口/流程/规则大概率已有沉淀；明显只有人能当场提供的信息如验证码、口头确认可免查，问题里写明为什么没查），` : ""}最后一行单独写 ${AUTONOMOUS_HUMAN_MARK}: 要问的问题${kbSearch ? "，并写明「已查知识库（关键词 X），未找到」及已尝试的办法" : "，写明已尝试的办法"}。链条会暂停等人回复。`,
 		`- 还没完成也不需要问人 → 正常输出进展即可，不要写任何标记，系统会让你继续。`,
-		`- 无人值守：先检测登录状态再操作，登录过期直接 ${AUTONOMOUS_HUMAN_MARK} 说明，不要尝试索要验证码。`,
+		`- 无人值守：先检测登录状态再操作。${kbSearch ? `登录过期/账号异常 → 先 search_knowledge_base 搜「系统名 + 登录/账号」找最新的账号密码或登录指引，找得到就自己重新登录继续干；知识库确实没有才 ` : `登录过期直接 `}${AUTONOMOUS_HUMAN_MARK} 说明${kbSearch ? "（注明已查知识库无果）" : ""}，不要尝试索要验证码。`,
 	].join("\n");
 	return `${head}\n${budgetLine}\n${protocol}\n\n`;
 }

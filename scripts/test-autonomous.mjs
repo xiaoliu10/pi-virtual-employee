@@ -97,3 +97,16 @@ test("buildAutonomousTurnPrefix teaches the marker protocol on every turn", () =
 	assert.ok(first.includes("自主任务模式"), "turn 0 introduces the mode");
 	assert.match(later, /第 6 轮/, "later turns state the round number");
 });
+
+test("autonomous chain protocol: KB-first on stalls and login expiry (field 2026-10-04)", () => {
+	const prefix = buildAutonomousTurnPrefix({ turn: 0, budget: { maxTurns: 30, maxMinutes: 90 } });
+	assert.match(prefix, /先用 search_knowledge_base 查一遍/);
+	assert.match(prefix, /已查知识库（关键词 X），未找到/);
+	assert.match(prefix, /登录过期\/账号异常 → 先 search_knowledge_base/);
+	assert.doesNotMatch(prefix, /登录过期直接/);
+	assert.match(prefix, /验证码、口头确认可免查/);
+	// KB off → no ghost tool references.
+	const noKb = buildAutonomousTurnPrefix({ turn: 0, budget: { maxTurns: 30, maxMinutes: 90 }, kbEnabled: false });
+	assert.doesNotMatch(noKb, /search_knowledge_base/);
+	assert.match(noKb, /登录过期直接/);
+});

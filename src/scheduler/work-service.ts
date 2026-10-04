@@ -40,6 +40,9 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	push(conversationId: string, text: string): Promise<unknown>;
 	/** Live kb.enabled AND kb.learn.enabled, checked at completion. */
 	canLearn?(): boolean;
+	/** Live KB tool availability, forwarded to the window protocol so it never
+	 * references unregistered tools (save_to_knowledge needs learn enabled). */
+	kbFeatures?(): { search: boolean; learn: boolean };
 	learn?(item: WorkItemRow, result: string): void | Promise<void>;
 	budget?: { maxTurns: number; maxMinutes: number };
 	clock?: Clock;
@@ -240,11 +243,12 @@ export class WorkService<Session extends WorkSession> {
 				// answer SHOULD still get the plan, and only the durable marker knows.
 				// Read the PRE-CLAIM snapshot: claim() has already flipped the row.
 				const firstWindow = turn === 0 && !active.prevKicked;
+				const kb = this.opts.kbFeatures?.() ?? { search: true, learn: true };
 				const lateByMs = active.dueAt != null ? Math.max(0, this.clock.now() - active.dueAt) : undefined;
 				const prefix = buildWorkWindowPrefix({
 					title: fresh.title, goal: fresh.goal, conditions: fresh.conditions, progress: fresh.progress,
 					lessons: workLessons(fresh.lessons), turn, budget: this.budget, answer: answer ?? undefined,
-					firstWindow, lateByMs,
+					firstWindow, lateByMs, kbSearchEnabled: kb.search, kbLearnEnabled: kb.learn,
 					lastCheck: active.dueAt ? { at: active.dueAt, reason: active.prevReason, streak: active.prevStreak ?? 0 } : undefined,
 				});
 				const result = await this.opts.send(active.session, prefix + (turn === 0 ? "请按目标与执行条件推进工作。" : "继续。"), fresh.created_by);
