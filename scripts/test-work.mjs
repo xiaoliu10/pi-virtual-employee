@@ -289,4 +289,10 @@ test("window protocol: KB-first before escalation; login expiry searches KB; res
 	// First-window plan names KB search as the first stop for stall keywords.
 	const first = buildWorkWindowPrefix({ title: "巡检", goal: "对账", turn: 0, budget: { maxTurns: 15, maxMinutes: 30 }, firstWindow: true });
 	assert.match(first, /这类卡点先查知识库搜什么关键词/);
+	// Human-only blockers (verification codes) are exempt from the KB check.
+	assert.match(prefix, /验证码、口头确认、对方答复——可免查/);
+	// KB gated off → protocol must not reference unregistered tools.
+	const noKb = buildWorkWindowPrefix({ title: "巡检", goal: "对账", turn: 0, budget: { maxTurns: 15, maxMinutes: 30 }, kbSearchEnabled: false, kbLearnEnabled: false });
+	assert.doesNotMatch(noKb, /search_knowledge_base|save_to_knowledge/);
+	assert.match(noKb, /登录过期/);
 });
