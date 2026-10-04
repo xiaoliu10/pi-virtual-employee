@@ -591,11 +591,15 @@ async function main(): Promise<void> {
 
 		const persistChain = () => scheduledTaskStore.setChainState(task.id, JSON.stringify(chain));
 		let lastText = "";
-		let outcome: "done" | "human" | "budget" | "error" = "error";
+		let outcome: "done" | "human" | "budget" | "stalled" | "error" = "error";
 		let question: string | undefined;
 		try {
 			for (;;) {
-				const prefix = buildAutonomousTurnPrefix({ turn: chain.turns, budget, kbEnabled: config.all().kb.enabled });
+				const prefix = buildAutonomousTurnPrefix({
+					turn: chain.turns, budget,
+					kbEnabled: config.all().kb.enabled,
+					kbLearn: config.all().kb.enabled && config.all().kb.learn.enabled,
+				});
 				const answerBlock = chain.turns === 0 && stagedAnswer ? `用户对你上一轮问题的回复：${stagedAnswer}\n\n` : "";
 				const message = chain.turns === 0 ? scheduledTimePrefix() + prefix + answerBlock + task.prompt : prefix + "继续。";
 				const send = await engine.send(agent, message, {
@@ -616,6 +620,21 @@ async function main(): Promise<void> {
 					outcome = "error";
 					lastText = send.error;
 					scheduledTaskStore.setChainState(task.id, null); // hard error — chain over
+					break;
+				}
+				if (send.deterministic) {
+					// Model service stalled (no content after retries): PAUSE the chain
+					// and wait for an admin instead of dead-ending or burning the rest
+					// of the budget on turns that will fail the same way (field
+					// 2026-10-05). Resumes like human/budget pauses via
+					// resume_scheduled_task — the conversation history is intact, so the
+					// next turn continues from where it stopped. Precedence note: a turn
+					// that THREW (hardError, e.g. login revoked) takes the error branch
+					// above; deterministic covers the no-throw/no-content stall.
+					outcome = "stalled";
+					chain.pending = "stalled";
+					chain.question = "模型服务连续未返回内容，已暂停等待处理";
+					persistChain();
 					break;
 				}
 				if (decision.kind === "human") {
@@ -656,6 +675,9 @@ async function main(): Promise<void> {
 		}
 
 		reportService.completeRun(reportRun.runId, {
+			// stalled is a PAUSE (resumable), not a completion failure — same
+			// reporting as human/budget pauses; the returned status carries the
+			// "paused:模型无返回" signal for the scheduler's last_status.
 			status: outcome === "error" ? "error" : "ok",
 			content: lastText || "",
 			error: outcome === "error" ? lastText || null : null,
@@ -664,6 +686,7 @@ async function main(): Promise<void> {
 		// Deliver the outcome to the target chat (markers stripped by the parser).
 		if (task.conversation_id) {
 			const resumeHint = `\n\n回复「继续 ${task.title}」重置预算继续；不回复则保持暂停。`;
+			const stalledHint = `\n\n通常是模型服务或中转临时不可用，不是任务本身的问题。已暂停等待处理：\n① 检查模型服务状态，或在 设置 → 模型 切换供应商/模型；\n② 处理后恢复任务（resume_scheduled_task 或回复「继续 ${task.title}」），我会原地重试；\n③ 恢复成功后我会把现象与解法沉淀进知识库，下次自动规避。`;
 			const pushText =
 				outcome === "done"
 					? `✅ **自主任务完成：${task.title}**（共 ${chain.turns} 轮）\n\n${lastText}`
@@ -671,7 +694,9 @@ async function main(): Promise<void> {
 						? `⏸️ **自主任务暂停（需要人工）:${task.title}**\n\n${question ?? lastText}\n\n回复「继续 ${task.title}」并附上答案，我会带着你的回复继续。`
 						: outcome === "budget"
 							? `⏸️ **自主任务已达预算：${task.title}**（${chain.turns}/${budget.maxTurns} 轮）\n\n${tailForProgress(lastText, 400)}${resumeHint}`
-							: `⚠️ **自主任务出错停止：${task.title}**\n\n${lastText}`;
+							: outcome === "stalled"
+								? `⏸️ **自主任务卡住：${task.title}**（第 ${chain.turns} 轮模型连续未返回内容）${stalledHint}`
+								: `⚠️ **自主任务出错停止：${task.title}**\n\n${lastText}`;
 			const pushed = await im.pushToConversation(task.conversation_id, pushText);
 			if (!pushed.ok) console.warn(`[sched] autonomous push failed for ${task.conversation_id}: ${pushed.error}`);
 		}
@@ -680,6 +705,7 @@ async function main(): Promise<void> {
 			outcome === "done" ? "done" :
 			outcome === "human" ? "paused:等待人工回复" :
 			outcome === "budget" ? `paused:预算耗尽（${chain.turns} 轮）` :
+			outcome === "stalled" ? `paused:模型无返回，等待处理（${chain.turns} 轮）` :
 			"error:" + lastText.slice(0, 180);
 		return { status };
 	};

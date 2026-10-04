@@ -56,6 +56,9 @@ import { formatInlineSkills } from "./skills/skills-prompt.js";
 
 export interface SendResult {
 	reply: string;
+	/** True when the reply is the canned model-service-stalled apology (no
+	 * content after retries). Chain runners pause-and-wait instead of looping. */
+	deterministic?: boolean;
 	error?: string;
 }
 
@@ -1716,7 +1719,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 			actor: ctx?.actor,
 		});
 
-		return { reply, error: hardError ?? (errorMessage ? loginGuidanceOf(errorMessage) ?? errorMessage : undefined) };
+		// deterministic=true marks the model-service-stalled case (no content after
+		// retries; the reply is the canned apology). Chain runners use it to PAUSE
+		// and wait for an admin instead of burning budget on turns that will fail
+		// the same way (field 2026-10-05).
+		return { reply, error: hardError ?? (errorMessage ? loginGuidanceOf(errorMessage) ?? errorMessage : undefined), deterministic };
 	}
 
 	/** One tool call, linked to the turn that made it. Never throws. */
@@ -1910,7 +1917,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		if (cause) {
 			return `⚠️ 抱歉，这次没能完成你的请求：${cause}。\n\n我已经尽力尝试，但没有成功。可以稍后重试，或把任务拆成更小的步骤再发给我。`;
 		}
-		return `⚠️ 抱歉，这次没能完成你的请求（模型连续多次未返回内容）。我已经尽力尝试，但没有成功。可以稍后重试，或把任务拆成更小的步骤再发给我。`;
+		return `⚠️ 这次的请求没有得到模型回复（模型服务连续多次未返回内容——通常是模型服务或中转临时不可用，不是任务本身的问题）。请稍后重试；若反复出现，请在 设置 → 模型 检查或切换模型供应商。若这是自主/定时任务，恢复重试成功后建议把本次现象与解法沉淀进知识库。`;
 	}
 
 	/**

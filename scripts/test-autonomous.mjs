@@ -110,3 +110,27 @@ test("autonomous chain protocol: KB-first on stalls and login expiry (field 2026
 	assert.doesNotMatch(noKb, /search_knowledge_base/);
 	assert.match(noKb, /登录过期直接/);
 });
+
+test("autonomous chain protocol: KB write-back after a blocker is resolved (field 2026-10-05)", () => {
+	const prefix = buildAutonomousTurnPrefix({ turn: 0, budget: { maxTurns: 30, maxMinutes: 90 } });
+	assert.match(prefix, /卡点解决后若沉淀出了可复用的信息/);
+	assert.match(prefix, /save_to_knowledge 存进知识库/);
+	assert.match(prefix, /服务异常的规避办法/);
+	// KB off → no ghost tool reference.
+	const noKb = buildAutonomousTurnPrefix({ turn: 0, budget: { maxTurns: 30, maxMinutes: 90 }, kbEnabled: false });
+	assert.doesNotMatch(noKb, /save_to_knowledge/);
+	// learn off (kb on): search stays, the write-back bullet must NOT (ghost tool).
+	const noLearn = buildAutonomousTurnPrefix({ turn: 0, budget: { maxTurns: 30, maxMinutes: 90 }, kbEnabled: true, kbLearn: false });
+	assert.match(noLearn, /search_knowledge_base/);
+	assert.doesNotMatch(noLearn, /save_to_knowledge/);
+});
+
+test("parseChainState round-trips the stalled pending kind (field 2026-10-05)", () => {
+	const chain = { convId: "sched:t1:1", turns: 3, startedAt: 1, pending: "stalled", question: "模型服务连续未返回内容" };
+	const raw = JSON.stringify(chain);
+	const parsed = parseChainState(raw);
+	assert.equal(parsed?.pending, "stalled", "stalled must survive the persist/parse round-trip");
+	assert.equal(parsed?.question, "模型服务连续未返回内容");
+	// Unknown pending kinds still drop (existing contract).
+	assert.equal(parseChainState(JSON.stringify({ ...chain, pending: "weird" }))?.pending, undefined);
+});

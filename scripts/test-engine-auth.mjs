@@ -685,6 +685,23 @@ test("expired OAuth surfaces re-login guidance in the conversation reply; unconf
 	assert.match(result2.error ?? "", /账号尚未登录/);
 });
 
+// ── field 2026-10-05: model-service stall marks send results as deterministic ──
+
+test("a model that returns no content marks the send deterministic with the service-stall apology (field 2026-10-05)", async (t) => {
+	// The harness default streamFn yields NO events (relay cut / thinking-only
+	// model) → engine gives up and emits the canned apology; chain runners key
+	// their pause-and-wait on result.deterministic.
+	const { engine, config } = makeEngine(t);
+	config.update({ model: { suppliers: [{ id: "stall-s", name: "stall", enabled: true, apiType: "openai-completions", baseUrl: "https://x.invalid", apiKey: "k", models: ["fake-model"] }], defaultSupplierId: "stall-s", defaultModelId: "fake-model" } });
+	const agent = engine.getOrCreateSession("conv-stall");
+	const result = await engine.send(agent, "hi");
+	assert.match(result.reply, /模型服务连续多次未返回内容/);
+	assert.match(result.reply, /不是任务本身的问题/);
+	assert.match(result.reply, /知识库/);
+	assert.equal(result.deterministic, true, "chain runners pause on this flag");
+	assert.equal(result.error, undefined, "a transport stall is not a hard provider error");
+});
+
 // ── review L2: quota Bearer-key fallback when headers lack Authorization ──
 
 test("authQuota adds the Bearer key when provider headers exist but carry no Authorization (review L2)", async (t) => {
