@@ -108,7 +108,8 @@ export function createWorkTools(deps: {
 			return failure("工作项管理需要来源 IM 单聊或群聊中经过平台验证的发送者身份；定时任务和无身份会话不能确认或恢复工作。");
 		}
 		if (!currentAdmin(config, actor.senderId)) return failure("此操作需要当前管理员权限，创建人或默认角色不能代替管理员授权。");
-		if (needConfirmation && (typeof actor.text !== "string" || !isExplicitConfirmation(actor.text))) {
+		// 管理员完全访问模式：确认创建口令也一并豁免（管理员身份即授权）。
+		if (needConfirmation && config.all().security.adminFullAccess !== true && (typeof actor.text !== "string" || !isExplicitConfirmation(actor.text))) {
 			return failure("请管理员在任务来源会话的当前消息中明确确认（如「确认创建」）。");
 		}
 		return { actor };

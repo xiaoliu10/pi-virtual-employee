@@ -495,6 +495,13 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 														<div className="mt-1 text-xs text-slate-400">名单内的人可在 IM 单聊中修改员工身份、增删管理员、开启受控能力（命令执行等）、创建可无人值守执行受控操作的定时任务。为空 = 未认领：首位在单聊中明确确认身份修改的人自动成为首位管理员。</div>
 													</div>
 												</div>
+												<label className="mt-3 flex items-start gap-2 rounded-lg border border-slate-200 px-3 py-2 cursor-pointer hover:border-slate-300">
+													<input type="checkbox" checked={draft.security.adminFullAccess === true} onChange={(e) => setSecurity({ adminFullAccess: e.target.checked })} className="mt-0.5 h-4 w-4 accent-blue-600" />
+													<span>
+														<span className="text-sm font-medium text-slate-800">管理员完全访问模式</span>
+														<span className="mt-1 block text-xs text-slate-400">开启后，管理员在 IM 单聊中的管理操作（改配置、改身份、启停命令、创建自主任务等）不再需要每条消息带「确认」口令——管理员身份即授权。仅去除口令；身份、白名单、单聊校验保持不变。也可在单聊中用 manage_access 的 set_full_access 动作远程开关。</span>
+													</span>
+												</label>
 												<div className="mt-3 space-y-2">
 													{draft.security.adminStaffIds.length === 0 && (
 														<div className="rounded-lg border border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-700">尚未设置管理员（未认领）。可在此预先填写，或由首位确认者远程认领。</div>

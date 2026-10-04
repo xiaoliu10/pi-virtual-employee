@@ -170,6 +170,24 @@ function refused(result, f) {
 }
 
 for (const chatType of ["group", "single"]) {
+	test(`${chatType} admin full access mode: confirm works WITHOUT 「确认创建」 in the message`, async () => {
+		const f = fixture({
+			conversationId: chatType === "group" ? GROUP : SINGLE,
+			actor: actor({ chatType, text: "就按这个建，直接开始" }),
+			security: { adminFullAccess: true },
+		});
+		const result = await f.items({ action: "confirm", id: ID.slice(0, 8) });
+		assert.equal(result.details.ok, true);
+		assert.equal(result.details.confirmed, true);
+		assert.deepEqual(f.writes, [["confirm", ID, "admin"]]);
+	});
+	test(`${chatType} without full access, a confirm lacking 「确认创建」 is still refused`, async () => {
+		const f = fixture({
+			conversationId: chatType === "group" ? GROUP : SINGLE,
+			actor: actor({ chatType, text: "就按这个建，直接开始" }),
+		});
+		refused(await f.items({ action: "confirm", id: ID.slice(0, 8) }), f);
+	});
 	test(`${chatType} verified admin confirms a proposal and records confirming identity`, async () => {
 		const f = fixture({ conversationId: chatType === "group" ? GROUP : SINGLE, actor: actor({ chatType, text: "确认创建" }) });
 		const result = await f.items({ action: "confirm", id: ID.slice(0, 8) });

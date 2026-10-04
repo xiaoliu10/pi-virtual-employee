@@ -187,6 +187,8 @@ export interface AppConfig {
 	};
 	security: {
 		adminStaffIds: string[];
+		/** 管理员完全访问模式：管理操作免「确认」口令（身份/白名单校验不变）。 */
+		adminFullAccess?: boolean;
 		/** Per-person roles, resolved from the platform-verified sender id. */
 		people?: { staffId: string; name?: string; role: "viewer" | "operator" | "admin" }[];
 		/** Role for senders with no explicit entry (default "viewer"). */

@@ -119,7 +119,8 @@ export function requireConfirmedAdmin(
 	if (!isAdmin(deps.config, actor.senderId)) {
 		return refuse("你不是本系统的管理员，无权执行此操作。如需管理员权限，请联系现有管理员在单聊中添加，或用 manage_access 指派 admin 角色。");
 	}
-	if (opts.needConfirmation && !isExplicitConfirmation(actor.text)) {
+	// 管理员完全访问模式：管理员身份本身就是授权，口令只对非管理员时代有意义。
+	if (opts.needConfirmation && deps.config.all().security.adminFullAccess !== true && !isExplicitConfirmation(actor.text)) {
 		return refuse(
 			opts.confirmationHint ??
 				"该操作会影响当前员工运行。请明确说明要执行的操作，并在当前消息中包含「确认」（或同义明确肯定语）。",

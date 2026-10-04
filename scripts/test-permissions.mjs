@@ -241,6 +241,54 @@ test("manage_access writes roles, default role, and floors; validates input", as
 	assert.deepEqual(config.all().security.conversations, []);
 });
 
+test("admin full access mode: gates skip the confirmation phrase; the switch itself needs one", async (t) => {
+	const { config } = store(t, { security: { adminStaffIds: ["boss"] } });
+	const make = (text) => createManageAccessTool({
+		config, resolveActor: () => actor("boss", "single", text), onConfigChanged: () => {}, conversationId: "dt:boss",
+	});
+
+	// Enabling REQUIRES an explicit confirmation (one-time cost, by design).
+	let tool = make("开个完全访问");
+	let res = await tool.execute("f1", { action: "set_full_access", value: "on" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /确认/);
+	assert.equal(config.all().security.adminFullAccess, false, "not enabled without confirmation");
+
+	// With 确认 → on. Idempotent re-enable is a no-op.
+	tool = make("开启完全访问，确认");
+	res = await tool.execute("f2", { action: "set_full_access", value: "on" });
+	assert.match(res.content[0].text, /已开启/);
+	assert.equal(config.all().security.adminFullAccess, true);
+	res = await tool.execute("f3", { action: "set_full_access", value: "on" });
+	assert.match(res.content[0].text, /已经是开启/);
+
+	// With the flag on, admin writes NO LONGER need the phrase.
+	tool = make("给 u9 开个 admin");
+	res = await tool.execute("f4", { action: "set_role", staffId: "u9", role: "admin" });
+	assert.equal(res.details.refused, undefined, "no confirmation needed in full-access mode");
+	assert.deepEqual(config.all().security.people, [{ staffId: "u9", role: "admin" }]);
+
+	// Disabling never needs a phrase; gates immediately require 确认 again.
+	res = await tool.execute("f5", { action: "set_full_access", value: "off" });
+	assert.match(res.content[0].text, /已关闭/);
+	assert.equal(config.all().security.adminFullAccess, false);
+	res = await tool.execute("f6", { action: "set_role", staffId: "u10", role: "operator" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /确认/);
+
+	// Invalid toggle value.
+	res = await tool.execute("f7", { action: "set_full_access", value: "maybe" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /value=on\|off/);
+
+	// Regression: the older wrong field name `person` must NOT toggle (the tool
+	// hints once said person=off by mistake; that path now refuses cleanly).
+	res = await tool.execute("f8", { action: "set_full_access", person: "off" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /value=on\|off/);
+	assert.equal(config.all().security.adminFullAccess, false, "person=off did not silently disable");
+});
+
 test("the last admin cannot be demoted or removed through manage_access", async (t) => {
 	const { config } = store(t, { security: { adminStaffIds: [], people: [{ staffId: "solo", role: "admin" }] } });
 	const tool = createManageAccessTool({
