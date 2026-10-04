@@ -259,3 +259,18 @@ test("firstWindow adds the plan block before the protocol; later turns and non-k
 	const notKickoff = buildWorkWindowPrefix({ title: "月末对账", goal: "核对流水", turn: 0, budget });
 	assert.doesNotMatch(notKickoff, /【首个窗口：先出跟进计划】/);
 });
+
+test("buildWorkWindowPrefix delay-awareness: notes only when late by ≥30min", () => {
+	const base = { title: "巡检", goal: "对账", turn: 1, budget: { maxTurns: 15, maxMinutes: 30 }, lastCheck: { at: 1_000, reason: "下午观察点", streak: 0 } };
+	// 20 minutes late → below threshold, no note.
+	const onTime = buildWorkWindowPrefix({ ...base, lateByMs: 20 * 60_000 });
+	assert.doesNotMatch(onTime, /【延迟说明】/);
+	// 3 hours late → note with original slot and duration.
+	const late = buildWorkWindowPrefix({ ...base, lateByMs: 3 * 3_600_000 });
+	assert.match(late, /【延迟说明】/);
+	assert.match(late, /晚了约 3 小时/);
+	assert.match(late, /原定 /);
+	assert.match(late, /下午观察点|快速核查/);
+	// Omitted → no note (kickoffs/resumes).
+	assert.doesNotMatch(buildWorkWindowPrefix({ ...base }), /【延迟说明】/);
+});

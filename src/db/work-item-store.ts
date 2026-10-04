@@ -23,6 +23,9 @@ export interface WorkItemRow {
 	fixed_streak: number;
 	/** Consecutive windows whose NEXT_CHECK was unusable (soft-fallback meter). */
 	fallback_streak: number;
+	/** waiting_human re-reminder bookkeeping (updated_at is the entry time). */
+	last_remind_at: number | null;
+	remind_count: number;
 	/** Set by claim() on the first window; durable kickoff-vs-resume marker. */
 	kicked_off: number;
 	/** Verified confirming admin, not the conversation's proposer. */
@@ -62,13 +65,13 @@ export class WorkItemStore {
 			conditions: null, progress: null, lessons: null,
 			origin_conversation: input.originConversation ?? null,
 			origin_note: input.originNote ?? null, status: input.status ?? "proposed",
-			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0, fallback_streak: 0, kicked_off: 0,
+			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0, fallback_streak: 0, last_remind_at: null, remind_count: 0, kicked_off: 0,
 			created_by: input.createdBy ?? null,
 			answer: null, created_at: now, updated_at: now,
 		};
 		this.db.prepare(`INSERT INTO work_items
-			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, kicked_off, created_by, answer, created_at, updated_at)
-			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @kicked_off, @created_by, @answer, @created_at, @updated_at)`).run(row);
+			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, last_remind_at, remind_count, kicked_off, created_by, answer, created_at, updated_at)
+			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @last_remind_at, @remind_count, @kicked_off, @created_by, @answer, @created_at, @updated_at)`).run(row);
 		this.changed(row.id);
 		return row;
 	}
@@ -104,7 +107,7 @@ export class WorkItemStore {
 	}
 	/** A crash may have applied external effects. Never blindly retry these items. */
 	recoverWorking(): void {
-		this.db.prepare(`UPDATE work_items SET status = 'waiting_human', question = ?, next_check_at = NULL, updated_at = ? WHERE status = 'working'`)
+		this.db.prepare(`UPDATE work_items SET status = 'waiting_human', question = ?, next_check_at = NULL, last_remind_at = NULL, remind_count = 0, updated_at = ? WHERE status = 'working'`)
 			.run("应用曾在执行中退出；请管理员核查已发生的操作，再明确恢复。", Date.now());
 		this.changed();
 	}
@@ -115,7 +118,11 @@ export class WorkItemStore {
 		const guard = status === "cancelled" ? "status NOT IN ('done', 'cancelled')" : "status = 'working'";
 		// Reason is always overwritten: stale reasons must not survive into states
 		// where next_check_at was cleared (waiting_human/done/cancelled).
-		this.db.prepare(`UPDATE work_items SET status = ?, question = ?, next_check_at = ?, next_check_reason = ?, updated_at = ? WHERE id = ? AND ${guard}`)
+		// Reminder bookkeeping cleared on EVERY transition: re-entering
+		// waiting_human is a fresh stall — a stale count/last_remind_at would
+		// push an expired reminder instantly (interval > 24h reschedules) and
+		// escalate the copy prematurely (same lesson as fallback_streak).
+		this.db.prepare(`UPDATE work_items SET status = ?, question = ?, next_check_at = ?, next_check_reason = ?, last_remind_at = NULL, remind_count = 0, updated_at = ? WHERE id = ? AND ${guard}`)
 			.run(status, question, nextCheckAt, nextCheckReason ?? null, Date.now(), id);
 		this.changed(id);
 		return this.get(id);
@@ -137,6 +144,18 @@ export class WorkItemStore {
 		return row;
 	}
 	/** Notebook and admin-rewrite edits must not mutate terminal items, including late aborted tools. */
+	/** Record a reminder attempt (attempt-based: push failures must not spin
+	 * the tick). Guarded to waiting_human so a racing resume is not counted. */
+	markReminded(id: string, at: number): WorkItemRow | undefined {
+		// updated_at deliberately untouched: it stays the waiting_human ENTRY
+		// time, the "已等待 X" reference for every future reminder.
+		const result = this.db.prepare(`UPDATE work_items SET last_remind_at = ?, remind_count = remind_count + 1 WHERE id = ? AND status = 'waiting_human'`)
+			.run(at, id);
+		if (!result.changes) return undefined;
+		const row = this.get(id);
+		this.changed(id);
+		return row;
+	}
 	setField(id: string, field: "title" | "goal" | "conditions" | "progress" | "set_conditions" | "set_progress", value: string): WorkItemRow | undefined {
 		const column = field === "set_conditions" ? "conditions" : field === "set_progress" ? "progress" : field;
 		if (column !== "title" && column !== "goal" && column !== "conditions" && column !== "progress") return undefined;
@@ -154,7 +173,7 @@ export class WorkItemStore {
 	 * update path). */
 	setSchedule(id: string, nextCheckAt: number, reason?: string): WorkItemRow | undefined {
 		const result = this.db.prepare(`UPDATE work_items SET status = 'scheduled', question = NULL, next_check_at = ?,
-			next_check_reason = COALESCE(?, next_check_reason), fixed_streak = 0, fallback_streak = 0, updated_at = ? WHERE id = ? AND status IN ('queued', 'waiting_human', 'scheduled')`)
+			next_check_reason = COALESCE(?, next_check_reason), fixed_streak = 0, fallback_streak = 0, last_remind_at = NULL, remind_count = 0, updated_at = ? WHERE id = ? AND status IN ('queued', 'waiting_human', 'scheduled')`)
 			.run(nextCheckAt, reason === undefined ? null : reason, Date.now(), id);
 		if (!result.changes) return undefined;
 		this.changed(id);
@@ -166,7 +185,7 @@ export class WorkItemStore {
 	 * the in-flight window instead of waiting for the next turn checkpoint. */
 	pause(id: string, reason?: string): WorkItemRow | undefined {
 		const question = `管理员暂停：${reason || "管理员主动暂停"}`.slice(0, 500);
-		const result = this.db.prepare(`UPDATE work_items SET status = 'waiting_human', question = ?, next_check_at = NULL, next_check_reason = NULL, updated_at = ?
+		const result = this.db.prepare(`UPDATE work_items SET status = 'waiting_human', question = ?, next_check_at = NULL, next_check_reason = NULL, last_remind_at = NULL, remind_count = 0, updated_at = ?
 			WHERE id = ? AND status IN ('queued', 'scheduled', 'working')`)
 			.run(question, Date.now(), id);
 		if (!result.changes) return undefined;
@@ -205,7 +224,7 @@ export class WorkItemStore {
 	/** Single atomic transition: only explicit resume may queue waiting_human. */
 	resume(id: string, answer?: string): WorkItemRow | undefined {
 		const result = this.db.prepare(`UPDATE work_items SET status = 'queued', question = NULL, next_check_at = NULL, fallback_streak = 0,
-			answer = COALESCE(?, answer), updated_at = ? WHERE id = ? AND status = 'waiting_human'`)
+			last_remind_at = NULL, remind_count = 0, answer = COALESCE(?, answer), updated_at = ? WHERE id = ? AND status = 'waiting_human'`)
 			.run(answer === undefined ? null : answer.slice(0, 2000), Date.now(), id);
 		if (!result.changes) return undefined;
 		this.changed(id);

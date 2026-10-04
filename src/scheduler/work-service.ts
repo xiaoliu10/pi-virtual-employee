@@ -4,7 +4,7 @@
  * Abort requests never release the dispatch lock until send actually settles.
  */
 import type { WorkItemRow, WorkItemStore } from "../db/work-item-store.js";
-import { buildWorkWindowPrefix, DEFAULT_NEXT_CHECK_MS, DEFAULT_WINDOW_BUDGET, nextRoutineStreak, parseWindowReply } from "./work.js";
+import { buildWorkWindowPrefix, DEFAULT_NEXT_CHECK_MS, DEFAULT_WINDOW_BUDGET, nextRoutineStreak, parseWindowReply, REMIND_FIRST_MS, REMIND_INTERVAL_MS } from "./work.js";
 import { hasMiningSecrets } from "./mining.js";
 
 interface WorkSession { abort(): void; }
@@ -25,7 +25,7 @@ interface ActiveWindow<Session> {
 	deadline?: ReturnType<typeof setTimeout>;
 	settled: Promise<void>;
 }
-type Store = Pick<WorkItemStore, "get" | "listDue" | "nextWakeAt" | "claim" | "recoverWorking" | "subscribe" | "setStatus" | "setField" | "clearAnswer" | "setFixedStreak" | "setFallbackStreak">;
+type Store = Pick<WorkItemStore, "get" | "listDue" | "listByStatus" | "nextWakeAt" | "claim" | "recoverWorking" | "subscribe" | "setStatus" | "setField" | "clearAnswer" | "setFixedStreak" | "setFallbackStreak" | "markReminded">;
 interface Clock {
 	now(): number;
 	setTimeout(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
@@ -125,14 +125,51 @@ export class WorkService<Session extends WorkSession> {
 		this.active.deadline = undefined;
 		try { this.active.session?.abort(); } catch (err) { this.opts.onError?.(err); }
 	}
+	/** Reminder deadline for a waiting_human row: entry-time (updated_at) +
+	 * FIRST, afterwards last_remind_at + INTERVAL. */
+	private remindDeadline(row: WorkItemRow): number {
+		return (row.last_remind_at ?? row.updated_at) + (row.last_remind_at !== null ? REMIND_INTERVAL_MS : REMIND_FIRST_MS);
+	}
+	private remindDeadlines(): number[] {
+		return this.opts.store.listByStatus("waiting_human").map(r => this.remindDeadline(r));
+	}
+	/** waiting_human re-reminder sweep (field 2026-10-04: a paused task pushed
+	 * once then went silent forever — admins miss pushes, silence = death).
+	 * Never auto-resumes (non-idempotent ops); just refuses to be silent.
+	 * Attempt-based counting: markReminded lands BEFORE the push so a failing
+	 * push cannot spin the tick; the status guard drops racing resumes. */
+	private sweepReminders(): void {
+		const now = this.clock.now();
+		for (const row of this.opts.store.listByStatus("waiting_human")) {
+			if (this.remindDeadline(row) > now) continue;
+			const waited = now - row.updated_at;
+			const n = (row.remind_count ?? 0) + 1;
+			if (!this.opts.store.markReminded(row.id, now)) continue;
+			const cid = row.origin_conversation;
+			if (!cid) continue;
+			const waitedText = waited >= 24 * 3_600_000 ? `${Math.floor(waited / 24 / 3_600_000)} 天` : `${Math.max(1, Math.floor(waited / 3_600_000))} 小时`;
+			const question = (row.question ?? "").trim().slice(0, 300);
+			const tail = n >= 3
+				? `\n\n这已经是第 ${n} 次提醒：如果这件工作已经不需要了，请回复取消它；仍需要则直接回复答复内容让它继续。`
+				: "\n\n直接回复答复内容（如验证码、预计解决时间）即可继续；如果已经不需要了，可以取消这个任务。";
+			const text = `⏸️ 自主任务仍在等待人工：${row.title.slice(0, 200)}\n\n已等待约 ${waitedText}${question ? `。上次的问题：${question}` : ""}${tail}`;
+			try { void Promise.resolve(this.opts.push(cid, text)).catch((err) => this.opts.onError?.(err)); } catch (err) { this.opts.onError?.(err); }
+		}
+	}
+
 	private tick(): void {
 		if (!this.running || this.active) return;
 		this.clearWake();
 		try {
+			this.sweepReminders();
 			const due = this.opts.store.listDue(this.clock.now())[0];
 			if (!due) {
-				const at = this.opts.store.nextWakeAt();
-				if (at !== undefined) this.wakeTimer = this.clock.setTimeout(() => { this.wakeTimer = undefined; this.tick(); }, Math.min(2_147_483_647, Math.max(0, at - this.clock.now())));
+				// Wake for the earliest of: scheduled follow-up OR pending waiting_human
+				// reminder. Without the reminder half, an all-waiting_human board has NO
+				// timer at all — tick never fires and reminders never happen (the exact
+				// silent-death this sweep exists to prevent).
+				const at = Math.min(this.opts.store.nextWakeAt() ?? Number.POSITIVE_INFINITY, ...this.remindDeadlines());
+				if (at !== Number.POSITIVE_INFINITY) this.wakeTimer = this.clock.setTimeout(() => { this.wakeTimer = undefined; this.tick(); }, Math.min(2_147_483_647, Math.max(0, at - this.clock.now())));
 				return;
 			}
 			// Set the lock BEFORE starting any async setup, and keep it through cleanup.
@@ -190,10 +227,11 @@ export class WorkService<Session extends WorkSession> {
 				// answer SHOULD still get the plan, and only the durable marker knows.
 				// Read the PRE-CLAIM snapshot: claim() has already flipped the row.
 				const firstWindow = turn === 0 && !active.prevKicked;
+				const lateByMs = active.dueAt != null ? Math.max(0, this.clock.now() - active.dueAt) : undefined;
 				const prefix = buildWorkWindowPrefix({
 					title: fresh.title, goal: fresh.goal, conditions: fresh.conditions, progress: fresh.progress,
 					lessons: workLessons(fresh.lessons), turn, budget: this.budget, answer: answer ?? undefined,
-					firstWindow,
+					firstWindow, lateByMs,
 					lastCheck: active.dueAt ? { at: active.dueAt, reason: active.prevReason, streak: active.prevStreak ?? 0 } : undefined,
 				});
 				const result = await this.opts.send(active.session, prefix + (turn === 0 ? "请按目标与执行条件推进工作。" : "继续。"), fresh.created_by);
