@@ -76,10 +76,10 @@ export function ModelServiceSection({ model, onUpdate }: Props) {
 	};
 
 	/** 「添加为模型供应商」on the login-done page: create (or refresh an
-	 *  existing same-authProvider) supplier with the catalog's model list
-	 *  prefilled. Auth rides the stored account credential — apiKey/baseUrl
-	 *  stay empty. Preserves per-model overrides on refresh; switches back to
-	 *  the supplier list with the supplier selected. */
+	 *  existing same-authProvider) supplier with the catalog's UNTRUNCATED model
+	 *  list (modelsAll — review L4) prefilled. Auth rides the stored account
+	 *  credential — apiKey/baseUrl stay empty. Preserves per-model overrides on
+	 *  refresh; switches back to the supplier list with the supplier selected. */
 	const addSupplierFromAuth = (entry: AuthCatalogEntry) => {
 		const existing = model.suppliers.find((supplier) => supplier.authProvider === entry.provider);
 		const supplier: Supplier = {
@@ -89,7 +89,7 @@ export function ModelServiceSection({ model, onUpdate }: Props) {
 			apiType: existing?.apiType ?? "openai",
 			baseUrl: "",
 			apiKey: "",
-			models: entry.models.map((m) => m.id),
+			models: entry.modelsAll.map((m) => m.id),
 			...(existing?.modelImage ? { modelImage: existing.modelImage } : {}),
 			...(existing?.modelContextWindow ? { modelContextWindow: existing.modelContextWindow } : {}),
 			...(existing?.modelMaxTokens ? { modelMaxTokens: existing.modelMaxTokens } : {}),

@@ -14,7 +14,7 @@ import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/conte
 import { randomUUID } from "node:crypto";
 import { Agent, convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "@earendil-works/pi-agent-core";
 import type { AgentEvent, AgentMessage, Skill, StreamFn } from "@earendil-works/pi-agent-core";
-import { createModels } from "@earendil-works/pi-ai";
+import { createModels, ModelsError } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { Api, AuthInteraction, AuthPrompt, AuthEvent, CredentialStore, ImageContent, Model, MutableModels, TextContent } from "@earendil-works/pi-ai";
 import type { ConfigStore, Supplier } from "../db/config-store.js";
@@ -130,6 +130,30 @@ function extractText(message: AgentMessage): string {
  */
 const TRANSIENT_STREAM_ERROR =
 	/terminated|fetch failed|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|ETIMEDOUT|UND_ERR|overloaded|502|503|connection error|network error/i;
+
+/**
+ * Chinese guidance for the two login-related pi-ai failure shapes (review H4):
+ * an expired/failed OAuth refresh and a provider with no stored credential.
+ * Mapped HERE — where the error bubbles into the conversation reply — never
+ * inside pi-ai. The message-text mirrors exist because agent.state.errorMessage
+ * carries plain text only (the error class is lost); a real ModelsError's code
+ * wins when present. Anything else passes through untouched.
+ */
+const OAUTH_REFRESH_FAILED_RE = /OAuth refresh (?:failed|returned a token that expires too soon)/;
+const PROVIDER_NOT_CONFIGURED_RE = /Provider is not configured/;
+
+function loginGuidanceOf(err: unknown): string | undefined {
+	const message = err instanceof Error ? err.message : String(err ?? "");
+	const code = err instanceof ModelsError ? err.code : undefined;
+	const isOauth = code === "oauth" || (!code && OAUTH_REFRESH_FAILED_RE.test(message));
+	const isNotConfigured = (code === "auth" || !code) && PROVIDER_NOT_CONFIGURED_RE.test(message);
+	if (!isOauth && !isNotConfigured) return undefined;
+	// The provider id shows up as "… for <id>" / "Provider is not configured: <id>".
+	const id = /(?:failed for|too soon for|not configured:)\s*([\w-]+)/.exec(message)?.[1];
+	const provider = (AUTH_PROVIDER_LABELS as Record<string, { name: string }>)[id ?? ""]?.name ?? id ?? "";
+	if (isOauth) return `${provider ? `${provider} ` : ""}授权已过期，请到 设置 → 账号登录 重新登录`;
+	return `${provider ? `${provider} ` : ""}账号尚未登录，请到 设置 → 账号登录 完成登录`;
+}
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -471,7 +495,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 			if (!registered) {
 				throw new Error(`模型 "${modelId}" 不可用：请先在账号登录中完成 ${supplier.authProvider} 登录或刷新模型列表`);
 			}
-			return this.withIdentity(registered, supplier, modelId);
+			// supplier.baseUrl is deliberately IGNORED here (review H3): the
+			// registry model's own baseUrl is the only place the OAuth access
+			// token may be sent. A hand-edited/imported supplier.baseUrl must
+			// never be able to redirect account credentials to another host —
+			// model:test passes renderer drafts straight through and imports may
+			// carry arbitrary baseUrl values, so this path defends itself.
+			return this.withIdentity(registered, { ...supplier, baseUrl: "" }, modelId);
 		}
 		const preferredApi = supplier.apiType === "openai" ? "openai-completions" : "anthropic-messages";
 		// For openai we prefer a completions-api provider (groq/openrouter/...) since
@@ -539,10 +569,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 			const hasCtxOverride = typeof ctxOverride === "number" && ctxOverride > 0;
 			return this.withRemoteInfo(base, this.modelInfoCache.get(key) ?? null, hasCtxOverride, ctxOverride);
 		}
-		if (supplier.baseUrl.trim()) {
+		if (!supplier.authProvider && supplier.baseUrl.trim()) {
 			void this.prefetchModelInfo(supplier, modelId, key);
 		} else {
-			// Direct provider: no gateway to ask — cache the miss so we never re-try.
+			// Direct provider / account-login supplier: no gateway to ask — cache
+			// the miss so we never re-try. (An authProvider supplier's baseUrl is
+			// ignored by design — review H3 — so it never seeds a prefetch either.)
 			this.modelInfoCache.set(key, null);
 		}
 		return base;
@@ -732,7 +764,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				}
 			});
 			await Promise.race([agent.prompt(userPrompt), cancelled]);
-			if (agent.state.errorMessage) throw new Error(agent.state.errorMessage);
+			if (agent.state.errorMessage) throw new Error(loginGuidanceOf(agent.state.errorMessage) ?? agent.state.errorMessage);
 			return reply.trim();
 		} finally {
 			if (timer) clearTimeout(timer);
@@ -1095,9 +1127,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 					authType = credential.type;
 				}
 			}
-			const models = (this.models.getProvider(provider)?.getModels() ?? [])
-				.slice(0, EmployeeEngine.AUTH_CATALOG_MODEL_CAP)
-				.map((m) => ({ id: m.id, name: m.name }));
+			const modelsAll = (this.models.getProvider(provider)?.getModels() ?? []).map((m) => ({ id: m.id, name: m.name }));
 			entries.push({
 				provider,
 				name: label.name,
@@ -1105,7 +1135,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 				kind: label.kind,
 				configured,
 				...(authType ? { authType } : {}),
-				models,
+				// Display-capped for the catalog card; supplier creation prefills from
+				// the UNTRUNCATED modelsAll (review L4) so a capped card can never
+				// silently truncate the supplier's model list.
+				models: modelsAll.slice(0, EmployeeEngine.AUTH_CATALOG_MODEL_CAP),
+				modelsAll,
 			});
 		}
 		return { providers: entries, authPath: this.authStorePath() };
@@ -1310,7 +1344,14 @@ export class EmployeeEngine implements EmployeeRuntime {
 					Object.entries(auth.auth.headers).filter((entry): entry is [string, string] => entry[1] !== null),
 				)
 			: undefined;
-		const headers = resolvedHeaders ?? (auth.auth.apiKey ? { Authorization: `Bearer ${auth.auth.apiKey}` } : undefined);
+		// Bearer-key fallback fires whenever NO explicit Authorization is present —
+		// headers existing alone used to suppress the key (review L2), producing
+		// anonymous calls against providers that need the credential.
+		const headers = resolvedHeaders?.Authorization !== undefined
+			? resolvedHeaders
+			: auth.auth.apiKey
+				? { ...resolvedHeaders, Authorization: `Bearer ${auth.auth.apiKey}` }
+				: resolvedHeaders;
 		const response = await fetch(url, { headers, signal: AbortSignal.timeout(10_000) });
 		if (response.status === 401) throw new Error("登录已过期，请重新完成账号登录");
 		if (!response.ok) throw new Error(`套餐接口返回 ${response.status}`);
@@ -1479,7 +1520,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		});
 		try {
 			await agent.prompt("Reply with exactly: OK");
-			if (agent.state.errorMessage) throw new Error(agent.state.errorMessage);
+			if (agent.state.errorMessage) throw new Error(loginGuidanceOf(agent.state.errorMessage) ?? agent.state.errorMessage);
 			return reply.trim() || "连接成功";
 		} finally {
 			unsubscribe();
@@ -1576,7 +1617,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 		try {
 			retried = await this.promptWithRetry(agent, message, ctx?.images);
 		} catch (err) {
-			hardError = err instanceof Error ? err.message : String(err);
+			// Login-shaped failures get actionable Chinese guidance (review H4) at
+			// this bubble-up point; everything else keeps its original message.
+			hardError = loginGuidanceOf(err) ?? (err instanceof Error ? err.message : String(err));
 			console.error(`[engine] prompt failed for ${conversationId}:`, err);
 		} finally {
 			unsubscribe();
@@ -1628,11 +1671,14 @@ export class EmployeeEngine implements EmployeeRuntime {
 		}
 
 		// Last resort: model/relay unreachable or still empty — emit a deterministic
-		// reply so the user is never left waiting in silence.
+		// reply so the user is never left waiting in silence. An in-turn login
+		// failure (agent.state.errorMessage carries text only) gets the same
+		// re-login guidance mapped as a thrown ModelsError would (review H4).
 		if (!reply.trim()) {
 			deterministic = true;
-			reply = this.deterministicFailure(hardError || errorMessage);
-			console.warn(`[engine] no reply produced for ${conversationId}; emitted deterministic failure (${hardError || errorMessage || "no error reported"})`);
+			const cause = hardError || (errorMessage ? loginGuidanceOf(errorMessage) ?? errorMessage : undefined);
+			reply = this.deterministicFailure(cause);
+			console.warn(`[engine] no reply produced for ${conversationId}; emitted deterministic failure (${cause || "no error reported"})`);
 		}
 
 		reply = reply.trim();
@@ -1670,7 +1716,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			actor: ctx?.actor,
 		});
 
-		return { reply, error: hardError ?? (errorMessage || undefined) };
+		return { reply, error: hardError ?? (errorMessage ? loginGuidanceOf(errorMessage) ?? errorMessage : undefined) };
 	}
 
 	/** One tool call, linked to the turn that made it. Never throws. */

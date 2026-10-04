@@ -6,7 +6,7 @@
  * streams chat through it), the IM adapter manager, and autostart. All
  * GUI-facing state (config, tasks, autostart) flows over IPC.
  */
-import { app, BrowserWindow, clipboard, dialog, ipcMain } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from "electron";
 import { mkdir, readFile, writeFile, copyFile, readdir, rm } from "node:fs/promises";
 import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -175,6 +175,18 @@ function createWindow(): void {
 	} else {
 		mainWindow.loadFile(path.join(__dirname, "../renderer/dist/index.html"));
 	}
+
+	// No renderer-initiated child windows (review H5): every window.open is
+	// denied in-app; https URLs are handed to the SYSTEM browser instead, so an
+	// OAuth page can never render inside a window we do not control.
+	mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+		try {
+			if (new URL(url).protocol === "https:") void shell.openExternal(url);
+		} catch {
+			/* unparsable → just deny */
+		}
+		return { action: "deny" };
+	});
 
 	if (activeProfile !== "default") mainWindow.setTitle(`虚拟员工 — ${activeProfile}`);
 
@@ -1032,23 +1044,32 @@ async function main(): Promise<void> {
 	onMainWindowClosed = () => engine.authLoginCancel();
 	// Settings-page-only surface: reject events not originating from the main
 	// window's top frame (same guard as computer:manage).
+	const fromMainWindow = (event: Electron.IpcMainInvokeEvent): boolean =>
+		!!mainWindow && event.sender === mainWindow.webContents && event.senderFrame === mainWindow.webContents.mainFrame;
 	const authFromSettings = (event: Electron.IpcMainInvokeEvent): void => {
-		if (!mainWindow || event.sender !== mainWindow.webContents || event.senderFrame !== mainWindow.webContents.mainFrame) {
+		if (!fromMainWindow(event)) {
 			throw new Error("账号登录只能由本应用设置页管理。");
 		}
 	};
-	ipcMain.handle(AUTH_IPC.catalog, () => engine.authCatalog());
+	ipcMain.handle(AUTH_IPC.catalog, (e) => {
+		authFromSettings(e);
+		return engine.authCatalog();
+	});
 	ipcMain.handle(AUTH_IPC.login, (e, provider: string) => {
 		authFromSettings(e);
 		return engine.authLogin(provider, authBridge);
 	});
-	ipcMain.handle(AUTH_IPC.loginStatus, () => engine.authLoginStatus());
+	ipcMain.handle(AUTH_IPC.loginStatus, (e) => {
+		authFromSettings(e);
+		return engine.authLoginStatus();
+	});
 	ipcMain.handle(AUTH_IPC.loginAnswer, (e, promptId: string, value: string) => {
 		authFromSettings(e);
 		engine.authLoginAnswer(promptId, value);
 		return true;
 	});
-	ipcMain.handle(AUTH_IPC.loginCancel, () => {
+	ipcMain.handle(AUTH_IPC.loginCancel, (e) => {
+		authFromSettings(e);
 		engine.authLoginCancel();
 		return true;
 	});
@@ -1059,6 +1080,19 @@ async function main(): Promise<void> {
 	ipcMain.handle(AUTH_IPC.quota, (e, provider: string) => {
 		authFromSettings(e);
 		return engine.authQuota(provider);
+	});
+	//「打开授权页面」: https-only hand-off to the system browser (review H5) —
+	// no in-app child window (setWindowOpenHandler denies), no other schemes.
+	ipcMain.handle(AUTH_IPC.openExternal, (e, url: string) => {
+		authFromSettings(e);
+		let parsed: URL;
+		try {
+			parsed = new URL(String(url));
+		} catch {
+			throw new Error("无效的链接");
+		}
+		if (parsed.protocol !== "https:") throw new Error("仅允许打开 https 链接");
+		return shell.openExternal(parsed.href);
 	});
 
 	// --- Prompt management (editable built-in rules + live preview) ---

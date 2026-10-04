@@ -49,8 +49,14 @@ export interface AuthCatalogEntry {
 	configured: boolean;
 	/** Credential type when configured. */
 	authType?: "api_key" | "oauth";
-	/** Model ids offered by this provider (pi-ai registry), display order. */
+	/** Model ids offered by this provider (pi-ai registry), display order.
+	 * Display-capped by the engine (AUTH_CATALOG_MODEL_CAP) — supplier creation
+	 * must prefill from the UNTRUNCATED `modelsAll` instead (review L4). */
 	models: { id: string; name: string }[];
+	/** Untruncated model list (pi-ai registry, display order) — the prefill
+	 * source for「添加为模型供应商」so the display cap never truncates what a
+	 * created supplier actually carries (review L4). */
+	modelsAll: { id: string; name: string }[];
 }
 
 export interface AuthCatalogResponse {
@@ -71,7 +77,6 @@ export interface AuthLoginState {
 	deviceCode?: string;
 	/** Provider asks a question (API key paste / select / manual code). */
 	prompt?: AuthPromptView;
-	error?: string;
 }
 
 export interface AuthPromptOption {
@@ -111,4 +116,8 @@ export const AUTH_IPC = {
 	quota: "settings:auth-quota",
 	/** Main → renderer push of AuthLoginState updates for the active login. */
 	loginEvent: "settings:auth-login-event",
+	/** Renderer asks main to open an https URL in the system browser (login
+	 * dialog's「打开授权页面」). Main enforces https + main-window origin — no
+	 * in-app child window, no other schemes (review H5). */
+	openExternal: "shell:open-external",
 } as const;

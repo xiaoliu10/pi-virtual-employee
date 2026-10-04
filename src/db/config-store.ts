@@ -595,18 +595,26 @@ function normalizeCapabilities(merged: AppConfig): AppConfig["capabilities"] {
 }
 
 export function newSupplier(partial: Partial<Supplier> = {}): Supplier {
+	const authProvider = normalizedAuthProvider(partial.authProvider);
 	return {
 		id: partial.id?.trim() || randomUUID(),
 		name: partial.name?.trim() || "新供应商",
 		enabled: partial.enabled ?? true,
 		apiType: partial.apiType === "openai" ? "openai" : "anthropic",
-		baseUrl: partial.baseUrl?.trim() ?? "",
-		apiKey: partial.apiKey ?? "",
+		// Account-login suppliers carry NO baseUrl/apiKey of their own (review
+		// H3, defense in depth): their auth resolves from auth.json inside pi-ai
+		// and their endpoints come from the provider registry. A hand-edited or
+		// imported baseUrl must never redirect OAuth access tokens to another
+		// host, and a per-supplier key would shadow the account. Cleared on
+		// EVERY normalize path (config read/update/import), not just in the
+		// engine's model builder.
+		baseUrl: authProvider ? "" : partial.baseUrl?.trim() ?? "",
+		apiKey: authProvider ? "" : partial.apiKey ?? "",
 		models: normalizedModels(partial.models),
 		modelImage: normalizedModelImage(partial.modelImage),
 		modelContextWindow: normalizedModelContextWindow(partial.modelContextWindow),
 		modelMaxTokens: normalizedModelContextWindow(partial.modelMaxTokens),
-		authProvider: normalizedAuthProvider(partial.authProvider),
+		authProvider,
 	};
 }
 

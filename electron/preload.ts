@@ -71,6 +71,9 @@ const api = {
 		ipcRenderer.on(AUTH_IPC.loginEvent, listener);
 		return () => ipcRenderer.removeListener(AUTH_IPC.loginEvent, listener);
 	},
+	/** Open an https URL in the system browser (login dialog「打开授权页面」).
+	 * Main enforces https + main-window origin; no in-app child window. */
+	openExternal: (url: string): Promise<void> => ipcRenderer.invoke(AUTH_IPC.openExternal, url),
 	exportEmployee: (opts?: unknown): Promise<{ path: string; size: number } | null> =>
 		ipcRenderer.invoke("employee:export", opts),
 	importEmployee: (args: { mode: "new" | "overwrite"; profileName?: string }): Promise<unknown> =>

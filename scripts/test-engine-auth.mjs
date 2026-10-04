@@ -66,10 +66,21 @@ await build({
 								// would skip the provider entirely).
 								const response = await this.opts.streamFn(this.state.model, [{ role: "user", content: input, id: "u1" }], {});
 								if (response && typeof response[Symbol.asyncIterator] === "function") {
-									for await (const _event of response) { /* stream life */ }
+									for await (const event of response) {
+										// Mirror the real agent-loop: a provider failure inside a lazy
+										// stream (pi-ai auth resolution) ends the stream as an error event
+										// event carrying the assistant message — the SDK stores its
+										// errorMessage on state instead of rejecting prompt().
+										if (event?.type === "error" && event.error?.errorMessage) {
+											this.state.errorMessage = event.error.errorMessage;
+										}
+									}
 								}
 								if (response && typeof response.result === "function") await response.result();
 							}
+							// applyToolStepCap binds this (private on the SDK Agent but present at
+							// runtime) per-instance. The stub just needs it to exist.
+							createLoopConfig() { return {}; }
 						}
 						export const DEFAULT_COMPACTION_SETTINGS = {};
 						export const convertToLlm = (x) => x;
@@ -138,12 +149,18 @@ function fakeOAuthProvider() {
 		getModels: () => [fakeModel("anthropic")],
 		// result() is called twice (rawStreamFn's cleanup hook + the caller); the
 		// stream must record + resolve ONCE and stay memoized for later callers.
+		// The return value must be a REAL stream shape: pi-ai's forwardStream
+		// iterates it for events, THEN takes result() for the final message — a
+		// bare {result} would surface "source is not async iterable".
 		streamSimple: (model, context, options) => {
 			const promise = (async () => {
 				calls.push({ model, options });
 				return { role: "assistant", content: [{ type: "text", text: "OK" }], stopReason: "stop" };
 			})();
-			return { result: () => promise };
+			return {
+				async *[Symbol.asyncIterator]() { /* no intermediate events */ },
+				result: () => promise,
+			};
 		},
 	};
 }
@@ -165,7 +182,36 @@ function fakeZaiCnOAuthProvider() {
 			},
 		},
 		getModels: () => [{ ...fakeModel("zai-coding-cn"), baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4" }],
-		streamSimple: () => ({ result: async () => ({ role: "assistant", content: [], stopReason: "stop" }) }),
+		streamSimple: () => ({
+			async *[Symbol.asyncIterator]() { /* no intermediate events */ },
+			result: async () => ({ role: "assistant", content: [], stopReason: "stop" }),
+		}),
+	};
+}
+
+/** Anthropic-OAuth provider whose refresh always fails — pi-ai wraps the
+ * thrown error into ModelsError("oauth", "OAuth refresh failed for anthropic").
+ * Used to prove login-shaped failures surface Chinese re-login guidance in
+ * the conversation reply (review H4). */
+function expiringOAuthProvider() {
+	const base = fakeOAuthProvider();
+	return {
+		...base,
+		auth: { ...base.auth, oauth: { ...base.auth.oauth, refresh: async () => { throw new Error("boom from provider"); } } },
+	};
+}
+
+/** zai provider whose toAuth returns provider headers WITHOUT Authorization
+ * (a null entry) — proves the bearer-key fallback fires whenever the headers
+ * carry no explicit Authorization, not merely when headers are absent (review L2). */
+function fakeZaiHeaderOnlyProvider() {
+	const base = fakeZaiCnOAuthProvider();
+	return {
+		...base,
+		id: "zai",
+		name: "Fake Zai (header-only)",
+		baseUrl: "https://api.z.ai",
+		auth: { ...base.auth, oauth: { ...base.auth.oauth, toAuth: async (credential) => ({ apiKey: credential.access, baseUrl: "https://api.z.ai", headers: { "X-Trace": "t1", Authorization: null } }) } },
 	};
 }
 
@@ -207,9 +253,14 @@ function makeEngine(t, { extraProviders = [], opts = {} } = {}) {
 	const history = new HistoryStore(db);
 	const authPath = join(dir, `auth-${Math.random().toString(36).slice(2, 8)}.json`);
 	const store = new FileCredentialStore({ authPath });
+	// Stub services: inert everywhere except where engine.send() reaches into
+	// them (e.g. promptPartsFor asks knowledge for the memory index). Providing
+	// the few no-op hooks keeps the real send() path usable in this harness
+	// without standing up KB/browser/scheduler services.
+	const knowledgeStub = { listMemoryIndex: () => [] };
 	const streamCalls = [];
 	const stub = {};
-	const engine = new EmployeeEngine(config, history, stub, stub, stub, stub, stub, stub, stub, {
+	const engine = new EmployeeEngine(config, history, knowledgeStub, stub, stub, stub, stub, stub, stub, {
 		builtinSkillsDir: dir,
 		userSkillsDir: dir,
 	}, {
@@ -455,8 +506,15 @@ test("relay supplier WITHOUT authProvider keeps the borrowed-provider path (regr
 });
 
 test("testModelConnection: authProvider supplier needs no pasted key", async (t) => {
-	const { engine, config } = makeEngine(t, { extraProviders: [fakeOAuthProvider()] });
+	const { engine, config, store } = makeEngine(t, { extraProviders: [fakeOAuthProvider()] });
 	config.update({ model: { suppliers: [accountSupplier()], defaultSupplierId: "acct", defaultModelId: "fake-model" } });
+	// No stored credential → the honest answer is the login guidance (review
+	// H4), not a fake 连接成功 — the lazy-stream auth failure now surfaces.
+	await assert.rejects(
+		() => engine.testModelConnection(accountSupplier(), "fake-model"),
+		/账号尚未登录，请到 设置 → 账号登录 完成登录/,
+	);
+	await store.modify("anthropic", async () => ({ type: "oauth", access: "access-live", refresh: "rt", expires: Date.now() + 3_600_000 }));
 	const reply = await engine.testModelConnection(accountSupplier(), "fake-model");
 	assert.equal(reply, "连接成功");
 	await assert.rejects(
@@ -577,4 +635,64 @@ test("authQuota refreshes an expired OAuth token through the store lock", async 
 	assert.equal(calls[0].init.headers.Authorization, "Bearer cn-access-r2");
 	// The refreshed credential was persisted, not just used once.
 	assert.equal((await store.read("zai-coding-cn")).access, "cn-access-r2");
+});
+
+// ── review H3: authProvider supplier baseUrl injection (OAuth token exfiltration) ──
+
+test("authProvider supplier ignores an injected baseUrl — registry endpoint kept, hostile fields dropped (review H3)", async (t) => {
+	const fake = fakeOAuthProvider();
+	const { engine, config, store } = makeEngine(t, { extraProviders: [fake], opts: { streamFn: undefined } });
+	await store.modify("anthropic", async () => ({ type: "oauth", access: "access-live", refresh: "rt", expires: Date.now() + 3_600_000 }));
+	// Attacker-injected baseUrl/apiKey: model:test passes the RENDERER draft
+	// straight through (no normalize), and a hand-edited DB row / imported config
+	// could carry one too. The OAuth access token rides streamSimple's auth —
+	// it must land on the REGISTRY endpoint, never on the injected host.
+	const hostile = accountSupplier({ baseUrl: "https://evil.example/v1", apiKey: "sk-attacker" });
+	await engine.testModelConnection(hostile, "fake-model");
+	assert.equal(fake.calls.length, 1);
+	assert.equal(fake.calls[0].model.baseUrl, FAKE_BASE, "must keep the registry endpoint, not the injected host");
+	assert.equal(fake.calls[0].model.provider, "anthropic");
+	assert.equal(fake.calls[0].options.apiKey, "access-live", "account credential still resolves inside streamSimple");
+	// Defense in depth: every normalize path (ConfigStore.update) drops
+	// baseUrl/apiKey on authProvider suppliers outright.
+	config.update({ model: { suppliers: [hostile], defaultSupplierId: "acct", defaultModelId: "fake-model" } });
+	const stored = config.all().model.suppliers.find((s) => s.id === "acct");
+	assert.equal(stored.baseUrl, "", "normalize must clear an authProvider supplier's injected baseUrl");
+	assert.equal(stored.apiKey, "", "normalize must clear an authProvider supplier's injected apiKey");
+	assert.equal(stored.authProvider, "anthropic");
+});
+
+// ── review H4: login-shaped failures surface Chinese self-service guidance ──
+
+test("expired OAuth surfaces re-login guidance in the conversation reply; unconfigured provider tells the user to log in (review H4)", async (t) => {
+	// (1) Expired access token → pi-ai refreshes → scripted refresh fails →
+	//     ModelsError("oauth", "OAuth refresh failed for anthropic").
+	const { engine, config, store } = makeEngine(t, { extraProviders: [expiringOAuthProvider()], opts: { streamFn: undefined } });
+	await store.modify("anthropic", async () => ({ type: "oauth", access: "a", refresh: "r", expires: Date.now() - 1_000 }));
+	config.update({ model: { suppliers: [accountSupplier()], defaultSupplierId: "acct", defaultModelId: "fake-model" } });
+	const agent = engine.getOrCreateSession("conv-guidance-1");
+	const result = await engine.send(agent, "hi");
+	assert.match(result.reply, /授权已过期，请到 设置 → 账号登录 重新登录/);
+	assert.match(result.error ?? "", /授权已过期/);
+
+	// (2) No stored credential at all → resolveProviderAuth returns undefined →
+	//     ModelsError("auth", "Provider is not configured: anthropic").
+	const fresh = makeEngine(t, { extraProviders: [expiringOAuthProvider()], opts: { streamFn: undefined } });
+	fresh.config.update({ model: { suppliers: [accountSupplier()], defaultSupplierId: "acct", defaultModelId: "fake-model" } });
+	const agent2 = fresh.engine.getOrCreateSession("conv-guidance-2");
+	const result2 = await fresh.engine.send(agent2, "hi");
+	assert.match(result2.reply, /账号尚未登录，请到 设置 → 账号登录 完成登录/);
+	assert.match(result2.error ?? "", /账号尚未登录/);
+});
+
+// ── review L2: quota Bearer-key fallback when headers lack Authorization ──
+
+test("authQuota adds the Bearer key when provider headers exist but carry no Authorization (review L2)", async (t) => {
+	const { engine, store } = makeEngine(t, { extraProviders: [fakeZaiHeaderOnlyProvider()] });
+	await store.modify("zai", async () => ({ type: "oauth", access: "zk-header", refresh: "r", expires: Date.now() + 3_600_000 }));
+	const calls = stubFetch(t, () => jsonResponse(200, { data: { usage_quota_limits: [{ name: "GLM Plan", percentage: 25 }] } }));
+	await engine.authQuota("zai");
+	const headers = calls[0].init.headers;
+	assert.equal(headers["X-Trace"], "t1", "provider header preserved");
+	assert.equal(headers.Authorization, "Bearer zk-header", "Bearer key fills the Authorization gap left by the null entry");
 });

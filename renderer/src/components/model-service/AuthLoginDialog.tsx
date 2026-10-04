@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { AUTH_PROVIDER_LABELS } from "../../../../src/shared/auth";
 import type { AuthCatalogEntry, AuthLoginState, AuthPromptView } from "../../../../src/shared/auth";
+import { api } from "../../lib/ipc";
 
 interface AuthLoginDialogProps {
 	state: AuthLoginState;
@@ -153,11 +154,10 @@ export function AuthLoginDialog(props: AuthLoginDialogProps) {
 	const waiting = state.status === "waiting";
 
 	const openUrl = (url: string) => {
-		// FOLLOW-UP: preload exposes no generic openExternal channel (main-process
-		// files are off-limits for this change), so window.open is the stopgap —
-		// without a setWindowOpenHandler in main it hosts the OAuth page in an
-		// in-app child window. Replace once main ships a shell.openExternal IPC.
-		window.open(url, "_blank", "noopener");
+		// Hand the OAuth page to the SYSTEM browser over the main-process channel
+		// (review H5): main enforces https + main-window origin, and
+		// setWindowOpenHandler denies any in-app child window.
+		void api.openExternal(url).catch(() => {});
 	};
 
 	const submitAnswer = async (promptId: string, value: string) => {
@@ -200,14 +200,14 @@ export function AuthLoginDialog(props: AuthLoginDialogProps) {
 					<div className="py-1 text-center">
 						<div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-emerald-50 text-2xl text-emerald-500">✓</div>
 						<p className="mt-3 text-sm font-medium text-slate-800">{state.message || "登录成功，凭证已保存"}</p>
-						{props.entry && props.entry.models.length > 0 && props.onCreateSupplier ? (
+						{props.entry && props.entry.modelsAll.length > 0 && props.onCreateSupplier ? (
 							<>
 								<button
 									type="button"
 									onClick={() => props.onCreateSupplier?.(props.entry!)}
 									className="mt-4 w-full rounded-xl bg-[#1d1d1f] px-5 py-2.5 text-sm font-medium text-white shadow-sm transition hover:bg-[#3f3f43]"
 								>
-									添加为模型供应商（预填 {props.entry.models.length} 个模型）
+									添加为模型供应商（预填 {props.entry.modelsAll.length} 个模型）
 								</button>
 								<p className="mt-2 text-xs leading-relaxed text-slate-400">
 									将在「自定义供应商」中创建 {props.entry.name}：模型列表已预填，鉴权走本次登录凭证，无需 API Key / Base URL。
@@ -224,7 +224,7 @@ export function AuthLoginDialog(props: AuthLoginDialogProps) {
 				{state.status === "error" && (
 					<div className="py-1">
 						<p className="break-all rounded-xl border border-rose-100 bg-rose-50 px-4 py-3 text-sm leading-relaxed text-rose-600">
-							{state.error || state.message || "登录失败，请重试"}
+							{state.message || "登录失败，请重试"}
 						</p>
 						<p className="mt-2 text-xs text-slate-400">可重试；若反复失败，请检查网络或账号订阅状态。</p>
 					</div>
