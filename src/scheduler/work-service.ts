@@ -4,7 +4,7 @@
  * Abort requests never release the dispatch lock until send actually settles.
  */
 import type { WorkItemRow, WorkItemStore } from "../db/work-item-store.js";
-import { buildWorkWindowPrefix, DEFAULT_NEXT_CHECK_MS, DEFAULT_WINDOW_BUDGET, nextRoutineStreak, parseWindowReply, REMIND_FIRST_MS, REMIND_INTERVAL_MS } from "./work.js";
+import { buildWorkWindowPrefix, DEFAULT_NEXT_CHECK_MS, DEFAULT_WINDOW_BUDGET, nextRoutineStreak, parseWindowReply, REMIND_DEFAULT_MS, REMIND_MAX_MS, REMIND_MIN_MS } from "./work.js";
 import { hasMiningSecrets } from "./mining.js";
 
 interface WorkSession { abort(): void; }
@@ -25,7 +25,7 @@ interface ActiveWindow<Session> {
 	deadline?: ReturnType<typeof setTimeout>;
 	settled: Promise<void>;
 }
-type Store = Pick<WorkItemStore, "get" | "listDue" | "listByStatus" | "nextWakeAt" | "claim" | "recoverWorking" | "subscribe" | "setStatus" | "setField" | "clearAnswer" | "setFixedStreak" | "setFallbackStreak" | "markReminded">;
+type Store = Pick<WorkItemStore, "get" | "listDue" | "listByStatus" | "nextWakeAt" | "claim" | "recoverWorking" | "subscribe" | "setStatus" | "setField" | "clearAnswer" | "setFixedStreak" | "setFallbackStreak" | "markReminded" | "setCadence">;
 interface Clock {
 	now(): number;
 	setTimeout(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
@@ -125,10 +125,18 @@ export class WorkService<Session extends WorkSession> {
 		this.active.deadline = undefined;
 		try { this.active.session?.abort(); } catch (err) { this.opts.onError?.(err); }
 	}
+	/** Reminder interval for a waiting_human row: the item's OWN rhythm
+	 * (EMA of its declared NEXT_CHECK gaps), clamped. A 2h-rhythm task that
+	 * stalls must not go quieter than its normal cadence — that is exactly
+	 * the "high-frequency task loses a whole day" failure mode. */
+	private remindInterval(row: WorkItemRow): number {
+		const raw = row.cadence_ms ?? REMIND_DEFAULT_MS;
+		return Math.min(REMIND_MAX_MS, Math.max(REMIND_MIN_MS, raw));
+	}
 	/** Reminder deadline for a waiting_human row: entry-time (updated_at) +
-	 * FIRST, afterwards last_remind_at + INTERVAL. */
+	 * interval, afterwards last_remind_at + interval. */
 	private remindDeadline(row: WorkItemRow): number {
-		return (row.last_remind_at ?? row.updated_at) + (row.last_remind_at !== null ? REMIND_INTERVAL_MS : REMIND_FIRST_MS);
+		return (row.last_remind_at ?? row.updated_at) + this.remindInterval(row);
 	}
 	private remindDeadlines(): number[] {
 		return this.opts.store.listByStatus("waiting_human").map(r => this.remindDeadline(r));
@@ -148,11 +156,16 @@ export class WorkService<Session extends WorkSession> {
 			const cid = row.origin_conversation;
 			if (!cid) continue;
 			const waitedText = waited >= 24 * 3_600_000 ? `${Math.floor(waited / 24 / 3_600_000)} 天` : `${Math.max(1, Math.floor(waited / 3_600_000))} 小时`;
+			// Copy shows the CLAMPED interval (what reminders actually do), not the
+			// raw cadence — a 36h rhythm reminds every 24h and the text must agree.
+			const rhythm = row.cadence_ms !== null && row.cadence_ms !== undefined
+				? `（原节奏约每 ${(() => { const iv = this.remindInterval(row); return iv >= 24 * 3_600_000 ? `${Math.round(iv / 24 / 3_600_000)} 天` : iv >= 3_600_000 ? `${Math.round(iv / 3_600_000)} 小时` : `${Math.max(1, Math.round(iv / 60_000))} 分钟`; })()}一次，期间的观察点都在错过）`
+				: "";
 			const question = (row.question ?? "").trim().slice(0, 300);
 			const tail = n >= 3
 				? `\n\n这已经是第 ${n} 次提醒：如果这件工作已经不需要了，请回复取消它；仍需要则直接回复答复内容让它继续。`
 				: "\n\n直接回复答复内容（如验证码、预计解决时间）即可继续；如果已经不需要了，可以取消这个任务。";
-			const text = `⏸️ 自主任务仍在等待人工：${row.title.slice(0, 200)}\n\n已等待约 ${waitedText}${question ? `。上次的问题：${question}` : ""}${tail}`;
+			const text = `⏸️ 自主任务仍在等待人工：${row.title.slice(0, 200)}\n\n已等待约 ${waitedText}${rhythm}${question ? `。上次的问题：${question}` : ""}${tail}`;
 			try { void Promise.resolve(this.opts.push(cid, text)).catch((err) => this.opts.onError?.(err)); } catch (err) { this.opts.onError?.(err); }
 		}
 	}
@@ -296,6 +309,7 @@ export class WorkService<Session extends WorkSession> {
 						break;
 					}
 					outcome = "scheduled"; nextCheckAt = decision.nextCheckAt; nextReason = decision.nextCheckReason;
+					store.setCadence(item.id, decision.nextCheckAt - this.clock.now());
 					if ((active.prevFallback ?? 0) > 0) store.setFallbackStreak(item.id, 0);
 					// Deterministic cron-degeneration meter: consecutive same-daily-slot
 					// follow-ups accumulate; anything else resets. Manual resume (no dueAt)

@@ -576,6 +576,87 @@ test("re-entering waiting_human starts a fresh reminder episode (setSchedule pat
 	assert.doesNotMatch(h.pushes.at(-1).text, /第 \d+ 次提醒/, "copy does not escalate on a fresh episode");
 });
 
+test("reminder cadence follows the task's own rhythm (high-frequency task is not left silent for a day)", async t => {
+	// Window 1 declares a 2h rhythm and keeps scheduling; window 3 stalls.
+	let stalled = false;
+	const h = fixture(t, { send: h => {
+		if (stalled) return { reply: "卡住了\n[[NEED_HUMAN]]: 等数据源恢复" };
+		return h.sends.length === 1
+			? { reply: "首查完成\n[[NEXT_CHECK]]: 2小时 | 下一批数据" }
+			: { reply: "进展\n[[NEXT_CHECK]]: 2小时 | 继续" };
+	} });
+	const item = h.create(); h.service.start(); await flush();
+	// Ride one 2h cycle so the cadence is recorded, then stall.
+	await h.clock.advance(2 * 3_600_000); await flush();
+	stalled = true;
+	await h.clock.advance(2 * 3_600_000); await flush();
+	const row = h.store.get(item.id);
+	assert.equal(row.status, "waiting_human");
+	assert.ok(row.cadence_ms !== null && row.cadence_ms > 1.5 * 3_600_000 && row.cadence_ms <= 2 * 3_600_000, `EMA cadence ~2h, got ${row.cadence_ms}`);
+	// Pin the stall entry to the fake clock (setStatus stamps real Date.now())
+	// and re-arm, so the reminder deadline is reachable via advance().
+	h.db.prepare("UPDATE work_items SET updated_at = ? WHERE id = ?").run(h.clock.now(), item.id);
+	await h.service.stop(); h.service.start(); await flush();
+	// First reminder after ~2h, NOT 24h.
+	await h.clock.advance(1 * 3_600_000); await flush();
+	assert.equal(h.pushes.filter(p => /仍在等待人工/.test(p.text)).length, 0, "no reminder before one rhythm interval");
+	await h.clock.advance(1 * 3_600_000); await flush();
+	const reminders = h.pushes.filter(p => /仍在等待人工/.test(p.text));
+	assert.equal(reminders.length, 1, "first reminder at the task's own 2h rhythm");
+	assert.match(reminders[0].text, /原节奏约每 2 小时一次/);
+	assert.match(reminders[0].text, /观察点都在错过/);
+	// EMA damping: a single outlier declaration does not collapse the rhythm.
+});
+
+test("cadence floor: a 30-minute rhythm task gets 30-minute reminders; EMA damps outliers", async t => {
+	let stall = false;
+	const h = fixture(t, { send: h => {
+		if (stall) return { reply: "卡\n[[NEED_HUMAN]]: 等权限" };
+		return { reply: "进展\n[[NEXT_CHECK]]: 30分钟 | 快节奏" };
+	} });
+	const item = h.create(); h.service.start(); await flush();
+	// Two 30min cycles → EMA converges to exactly 30min.
+	for (let i = 0; i < 2; i++) { await h.clock.advance(30 * 60_000); await flush(); }
+	stall = true;
+	await h.clock.advance(30 * 60_000); await flush();
+	assert.equal(h.store.get(item.id).status, "waiting_human");
+	assert.equal(h.store.get(item.id).cadence_ms, 30 * 60_000, "EMA converged on the 30min rhythm");
+	// Pin the stall entry to the fake clock (setStatus stamps real time) + re-arm.
+	h.db.prepare("UPDATE work_items SET updated_at = ? WHERE id = ?").run(h.clock.now(), item.id);
+	await h.service.stop(); h.service.start(); await flush();
+	await h.clock.advance(29 * 60_000); await flush();
+	assert.equal(h.pushes.filter(p => /仍在等待人工/.test(p.text)).length, 0, "no reminder before one 30min interval");
+	await h.clock.advance(1 * 60_000); await flush();
+	assert.ok(h.pushes.filter(p => /仍在等待人工/.test(p.text)).length >= 1, "reminder at the task's own 30min rhythm");
+
+	// EMA damping is a property of the store: one 25h outlier moves a 30min
+	// rhythm to only ~8.5h, not 25h.
+	h.store.setCadence(item.id, 25 * 3_600_000);
+	const damped = h.store.get(item.id).cadence_ms;
+	assert.ok(damped > 4 * 3_600_000 && damped < 12 * 3_600_000, `one outlier damped, got ${damped}`);
+});
+
+test("sub-floor cadence clamps to the 30min reminder floor", async t => {
+	let stall = false;
+	const h = fixture(t, { send: h => {
+		if (stall) return { reply: "卡\n[[NEED_HUMAN]]: 等资源" };
+		return { reply: "进展\n[[NEXT_CHECK]]: 16分钟 | 极快节奏" };
+	} });
+	const item = h.create(); h.service.start(); await flush();
+	for (let i = 0; i < 2; i++) { await h.clock.advance(16 * 60_000); await flush(); }
+	stall = true;
+	await h.clock.advance(16 * 60_000); await flush();
+	// EMA of all-16min declarations is below the 30min floor → clamped.
+	const cadence = h.store.get(item.id).cadence_ms;
+	assert.ok(cadence !== null && cadence < 30 * 60_000, `sub-floor cadence kept raw (${cadence})`);
+	h.db.prepare("UPDATE work_items SET updated_at = ? WHERE id = ?").run(h.clock.now(), item.id);
+	await h.service.stop(); h.service.start(); await flush();
+	await h.clock.advance(29 * 60_000); await flush();
+	assert.equal(h.pushes.filter(p => /仍在等待人工/.test(p.text)).length, 0, "floor holds: no reminder before 30min");
+	await h.clock.advance(1 * 60_000); await flush();
+	assert.ok(h.pushes.filter(p => /仍在等待人工/.test(p.text)).length >= 1, "reminder at the 30min floor");
+});
+
 test("a pause landing during release suppresses the stale scheduled push (L4)", async t => {
 	// The runner decides scheduled; while release() is still awaited, an admin
 	// pause flips the row to waiting_human. The post-finally capture must see it
