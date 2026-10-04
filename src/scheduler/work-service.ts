@@ -152,7 +152,7 @@ export class WorkService<Session extends WorkSession> {
 			const tail = n >= 3
 				? `\n\n这已经是第 ${n} 次提醒：如果这件工作已经不需要了，请回复取消它；仍需要则直接回复答复内容让它继续。`
 				: "\n\n直接回复答复内容（如验证码、预计解决时间）即可继续；如果已经不需要了，可以取消这个任务。";
-			const text = `⏸️ 自主任务仍在等待人工：${row.title}\n\n已等待约 ${waitedText}${question ? `。上次的问题：${question}` : ""}${tail}`;
+			const text = `⏸️ 自主任务仍在等待人工：${row.title.slice(0, 200)}\n\n已等待约 ${waitedText}${question ? `。上次的问题：${question}` : ""}${tail}`;
 			try { void Promise.resolve(this.opts.push(cid, text)).catch((err) => this.opts.onError?.(err)); } catch (err) { this.opts.onError?.(err); }
 		}
 	}

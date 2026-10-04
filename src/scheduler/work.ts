@@ -292,7 +292,7 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 	// A repeated fixed daily slot means the item has degenerated into a cron.
 	// Confront the model with the measured streak — do NOT rely on its judgement.
 	const lateNote = ctx.lateByMs !== undefined && ctx.lateByMs >= LATE_AWARE_MS
-		? `\n【延迟说明】本次跟进比原定时间晚了约 ${ctx.lateByMs < 3_600_000 ? `${Math.max(1, Math.round(ctx.lateByMs / 60_000))} 分钟` : `${Math.round(ctx.lateByMs / 3_600_000)} 小时`}（原定 ${ctx.lastCheck ? new Date(ctx.lastCheck.at).toLocaleString("zh-CN", { hour12: false }) : "未知"}）——应用当时可能未运行或正忙，中间的观察点可能已经错过。先快速核查这段时间是否已有新进展或新数据，再决定本次怎么查，不要把现在当成原定的跟进时刻。\n`
+		? `\n【延迟说明】本次跟进比原定时间晚了约 ${ctx.lateByMs < 3_600_000 ? `${Math.max(1, Math.round(ctx.lateByMs / 60_000))} 分钟` : `${Math.floor(ctx.lateByMs / 3_600_000)} 小时`}（原定 ${ctx.lastCheck ? new Date(ctx.lastCheck.at).toLocaleString("zh-CN", { hour12: false }) : "未知"}）——应用当时可能未运行或正忙，中间的观察点可能已经错过。先快速核查这段时间是否已有新进展或新数据，再决定本次怎么查，不要把现在当成原定的跟进时刻。\n`
 		: "";
 	const cadenceWarning = (ctx.lastCheck?.streak ?? 0) >= 2
 		? `\n【节奏提示】你已连续 ${ctx.lastCheck!.streak} 次把这个观察点安排在相近的固定时间。如果这是因为该时刻确有新信息可查（如「09:00 前历史对账已生成」），写明依据后可以维持；但请确认你覆盖了今天所有的观察点（如 12:30/15:00），不要只查这一个。若这件工作每天只在这一处固定点查、且查了也不需要判断动作，可以考虑建议管理员转成定时任务，工作项留给需要判断力的跟进。\n`

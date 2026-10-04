@@ -545,6 +545,37 @@ test("third-plus reminders escalate the copy toward cancel-or-resume; admin-paus
 	assert.match(reminders[3].text, /回复取消/);
 });
 
+test("re-entering waiting_human starts a fresh reminder episode (setSchedule path)", async t => {
+	// Interval > 24h: a stale last_remind_at would push an expired reminder
+	// instantly after the fresh NEED_HUMAN push (review-reproduced).
+	const h = fixture(t, { send: () => ({ reply: "还缺数据\n[[NEED_HUMAN]]: 等财务给数字" }) });
+	const item = h.create(); h.service.start(); await flush();
+	const afterStall = h.store.get(item.id);
+	assert.equal(afterStall.status, "waiting_human");
+	// Age the stall, take one reminder, then admin reschedules 8 days out.
+	h.db.prepare("UPDATE work_items SET updated_at = ? WHERE id = ?").run(h.clock.now() - 24 * 3_600_000, item.id);
+	await h.service.stop(); h.service.start(); await flush();
+	assert.equal(h.pushes.filter(p => /仍在等待人工/.test(p.text)).length, 1);
+	h.store.setSchedule(item.id, h.clock.now() + 192 * 3_600_000, "8 天后复查");
+	const rescheduled = h.store.get(item.id);
+	assert.equal(rescheduled.remind_count, 0, "setSchedule clears the meter");
+	assert.equal(rescheduled.last_remind_at, null);
+
+	// New window stalls again -> fresh episode (setStatus cleared the meters).
+	await h.clock.advance(192 * 3_600_000); await flush();
+	assert.equal(h.store.get(item.id).status, "waiting_human");
+	// Store writes stamp real Date.now() (ahead of the fake clock), so align
+	// the fresh entry to the fake clock before observing the cadence.
+	h.db.prepare("UPDATE work_items SET updated_at = ?, last_remind_at = NULL, remind_count = 0 WHERE id = ?").run(h.clock.now(), item.id);
+	await h.service.stop(); h.service.start(); await flush();
+	await h.clock.advance(23 * 3_600_000); await flush();
+	const before = h.pushes.filter(p => /仍在等待人工/.test(p.text)).length;
+	await h.clock.advance(1 * 3_600_000); await flush();
+	const after = h.pushes.filter(p => /仍在等待人工/.test(p.text)).length;
+	assert.equal(after - before, 1, "fresh episode: first reminder exactly 24h after re-entry");
+	assert.doesNotMatch(h.pushes.at(-1).text, /第 \d+ 次提醒/, "copy does not escalate on a fresh episode");
+});
+
 test("a pause landing during release suppresses the stale scheduled push (L4)", async t => {
 	// The runner decides scheduled; while release() is still awaited, an admin
 	// pause flips the row to waiting_human. The post-finally capture must see it

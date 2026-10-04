@@ -107,7 +107,7 @@ export class WorkItemStore {
 	}
 	/** A crash may have applied external effects. Never blindly retry these items. */
 	recoverWorking(): void {
-		this.db.prepare(`UPDATE work_items SET status = 'waiting_human', question = ?, next_check_at = NULL, updated_at = ? WHERE status = 'working'`)
+		this.db.prepare(`UPDATE work_items SET status = 'waiting_human', question = ?, next_check_at = NULL, last_remind_at = NULL, remind_count = 0, updated_at = ? WHERE status = 'working'`)
 			.run("应用曾在执行中退出；请管理员核查已发生的操作，再明确恢复。", Date.now());
 		this.changed();
 	}
@@ -118,7 +118,11 @@ export class WorkItemStore {
 		const guard = status === "cancelled" ? "status NOT IN ('done', 'cancelled')" : "status = 'working'";
 		// Reason is always overwritten: stale reasons must not survive into states
 		// where next_check_at was cleared (waiting_human/done/cancelled).
-		this.db.prepare(`UPDATE work_items SET status = ?, question = ?, next_check_at = ?, next_check_reason = ?, updated_at = ? WHERE id = ? AND ${guard}`)
+		// Reminder bookkeeping cleared on EVERY transition: re-entering
+		// waiting_human is a fresh stall — a stale count/last_remind_at would
+		// push an expired reminder instantly (interval > 24h reschedules) and
+		// escalate the copy prematurely (same lesson as fallback_streak).
+		this.db.prepare(`UPDATE work_items SET status = ?, question = ?, next_check_at = ?, next_check_reason = ?, last_remind_at = NULL, remind_count = 0, updated_at = ? WHERE id = ? AND ${guard}`)
 			.run(status, question, nextCheckAt, nextCheckReason ?? null, Date.now(), id);
 		this.changed(id);
 		return this.get(id);
@@ -169,7 +173,7 @@ export class WorkItemStore {
 	 * update path). */
 	setSchedule(id: string, nextCheckAt: number, reason?: string): WorkItemRow | undefined {
 		const result = this.db.prepare(`UPDATE work_items SET status = 'scheduled', question = NULL, next_check_at = ?,
-			next_check_reason = COALESCE(?, next_check_reason), fixed_streak = 0, fallback_streak = 0, updated_at = ? WHERE id = ? AND status IN ('queued', 'waiting_human', 'scheduled')`)
+			next_check_reason = COALESCE(?, next_check_reason), fixed_streak = 0, fallback_streak = 0, last_remind_at = NULL, remind_count = 0, updated_at = ? WHERE id = ? AND status IN ('queued', 'waiting_human', 'scheduled')`)
 			.run(nextCheckAt, reason === undefined ? null : reason, Date.now(), id);
 		if (!result.changes) return undefined;
 		this.changed(id);
@@ -181,7 +185,7 @@ export class WorkItemStore {
 	 * the in-flight window instead of waiting for the next turn checkpoint. */
 	pause(id: string, reason?: string): WorkItemRow | undefined {
 		const question = `管理员暂停：${reason || "管理员主动暂停"}`.slice(0, 500);
-		const result = this.db.prepare(`UPDATE work_items SET status = 'waiting_human', question = ?, next_check_at = NULL, next_check_reason = NULL, updated_at = ?
+		const result = this.db.prepare(`UPDATE work_items SET status = 'waiting_human', question = ?, next_check_at = NULL, next_check_reason = NULL, last_remind_at = NULL, remind_count = 0, updated_at = ?
 			WHERE id = ? AND status IN ('queued', 'scheduled', 'working')`)
 			.run(question, Date.now(), id);
 		if (!result.changes) return undefined;
