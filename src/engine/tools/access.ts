@@ -358,7 +358,7 @@ export function createManageAccessTool(deps: AccessToolDeps): AgentTool {
 					Type.Literal("remove_conversation"),
 					Type.Literal("set_full_access"),
 				],
-				{ description: "list=查看策略；list_people=已记录人员；list_members=某会话实际出现过的人；set_role/remove_person=单人角色；set_conversation_roles=按会话批量授权；set_default_role=默认角色；set_conversation/remove_conversation=会话门槛；set_full_access=管理员完全访问模式开关（person=on/off，开启后管理操作免「确认」口令）" },
+				{ description: "list=查看策略；list_people=已记录人员；list_members=某会话实际出现过的人；set_role/remove_person=单人角色；set_conversation_roles=按会话批量授权；set_default_role=默认角色；set_conversation/remove_conversation=会话门槛；set_full_access=管理员完全访问模式开关（value=on/off，开启后管理操作免「确认」口令）" },
 			),
 			person: Type.Optional(
 				Type.String({
@@ -534,7 +534,7 @@ export function createManageAccessTool(deps: AccessToolDeps): AgentTool {
 				deps.config.update({ security: { ...deps.config.all().security, adminFullAccess: enable } });
 				return {
 					content: [{ type: "text", text: enable
-						? "✅ 完全访问模式已开启：管理员的管理操作（改配置、改身份、启停命令等）不再需要「确认」口令，管理员身份即授权。身份/白名单/单聊校验保持不变。随时可用 action=set_full_access person=off 关闭。"
+						? "✅ 完全访问模式已开启：管理员的管理操作（改配置、改身份、启停命令等）不再需要「确认」口令，管理员身份即授权。身份/白名单/单聊校验保持不变。随时可用 action=set_full_access value=off 关闭。"
 						: "✅ 完全访问模式已关闭：管理操作恢复需要「确认」口令。" }],
 					details: { action, adminFullAccess: enable },
 				};

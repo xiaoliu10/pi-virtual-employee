@@ -280,6 +280,13 @@ test("admin full access mode: gates skip the confirmation phrase; the switch its
 	res = await tool.execute("f7", { action: "set_full_access", value: "maybe" });
 	assert.equal(res.details.refused, true);
 	assert.match(res.content[0].text, /value=on\|off/);
+
+	// Regression: the older wrong field name `person` must NOT toggle (the tool
+	// hints once said person=off by mistake; that path now refuses cleanly).
+	res = await tool.execute("f8", { action: "set_full_access", person: "off" });
+	assert.equal(res.details.refused, true);
+	assert.match(res.content[0].text, /value=on\|off/);
+	assert.equal(config.all().security.adminFullAccess, false, "person=off did not silently disable");
 });
 
 test("the last admin cannot be demoted or removed through manage_access", async (t) => {
