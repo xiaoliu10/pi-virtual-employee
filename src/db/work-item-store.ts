@@ -23,6 +23,9 @@ export interface WorkItemRow {
 	fixed_streak: number;
 	/** Consecutive windows whose NEXT_CHECK was unusable (soft-fallback meter). */
 	fallback_streak: number;
+	/** waiting_human re-reminder bookkeeping (updated_at is the entry time). */
+	last_remind_at: number | null;
+	remind_count: number;
 	/** Set by claim() on the first window; durable kickoff-vs-resume marker. */
 	kicked_off: number;
 	/** Verified confirming admin, not the conversation's proposer. */
@@ -62,13 +65,13 @@ export class WorkItemStore {
 			conditions: null, progress: null, lessons: null,
 			origin_conversation: input.originConversation ?? null,
 			origin_note: input.originNote ?? null, status: input.status ?? "proposed",
-			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0, fallback_streak: 0, kicked_off: 0,
+			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0, fallback_streak: 0, last_remind_at: null, remind_count: 0, kicked_off: 0,
 			created_by: input.createdBy ?? null,
 			answer: null, created_at: now, updated_at: now,
 		};
 		this.db.prepare(`INSERT INTO work_items
-			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, kicked_off, created_by, answer, created_at, updated_at)
-			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @kicked_off, @created_by, @answer, @created_at, @updated_at)`).run(row);
+			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, last_remind_at, remind_count, kicked_off, created_by, answer, created_at, updated_at)
+			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @last_remind_at, @remind_count, @kicked_off, @created_by, @answer, @created_at, @updated_at)`).run(row);
 		this.changed(row.id);
 		return row;
 	}
@@ -137,6 +140,18 @@ export class WorkItemStore {
 		return row;
 	}
 	/** Notebook and admin-rewrite edits must not mutate terminal items, including late aborted tools. */
+	/** Record a reminder attempt (attempt-based: push failures must not spin
+	 * the tick). Guarded to waiting_human so a racing resume is not counted. */
+	markReminded(id: string, at: number): WorkItemRow | undefined {
+		// updated_at deliberately untouched: it stays the waiting_human ENTRY
+		// time, the "已等待 X" reference for every future reminder.
+		const result = this.db.prepare(`UPDATE work_items SET last_remind_at = ?, remind_count = remind_count + 1 WHERE id = ? AND status = 'waiting_human'`)
+			.run(at, id);
+		if (!result.changes) return undefined;
+		const row = this.get(id);
+		this.changed(id);
+		return row;
+	}
 	setField(id: string, field: "title" | "goal" | "conditions" | "progress" | "set_conditions" | "set_progress", value: string): WorkItemRow | undefined {
 		const column = field === "set_conditions" ? "conditions" : field === "set_progress" ? "progress" : field;
 		if (column !== "title" && column !== "goal" && column !== "conditions" && column !== "progress") return undefined;
@@ -205,7 +220,7 @@ export class WorkItemStore {
 	/** Single atomic transition: only explicit resume may queue waiting_human. */
 	resume(id: string, answer?: string): WorkItemRow | undefined {
 		const result = this.db.prepare(`UPDATE work_items SET status = 'queued', question = NULL, next_check_at = NULL, fallback_streak = 0,
-			answer = COALESCE(?, answer), updated_at = ? WHERE id = ? AND status = 'waiting_human'`)
+			last_remind_at = NULL, remind_count = 0, answer = COALESCE(?, answer), updated_at = ? WHERE id = ? AND status = 'waiting_human'`)
 			.run(answer === undefined ? null : answer.slice(0, 2000), Date.now(), id);
 		if (!result.changes) return undefined;
 		this.changed(id);

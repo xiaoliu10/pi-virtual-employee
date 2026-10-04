@@ -35,6 +35,14 @@ export const MIN_NEXT_CHECK_MS = 15 * 60_000;
  * (field 2026-10-03). Three consecutive soft-fallbacks escalate to a human.
  * The window prompt hardcodes 「1 小时」 — keep the wording in sync. */
 export const DEFAULT_NEXT_CHECK_MS = 60 * 60_000;
+/** waiting_human re-reminder cadence (field 2026-10-04: a paused task pushed
+ * ONCE then went silent forever — admins miss pushes, and silence = death).
+ * No auto-resume (non-idempotent ops); just never let it be silent. */
+export const REMIND_FIRST_MS = 24 * 3_600_000;
+export const REMIND_INTERVAL_MS = 24 * 3_600_000;
+/** When a scheduled window fires this much late (app was closed/busy), tell
+ * the model it is catching up so it re-checks what happened in between. */
+export const LATE_AWARE_MS = 30 * 60_000;
 
 /**
  * True when two follow-up times are essentially "the same time tomorrow": a
@@ -258,6 +266,10 @@ export interface WorkItemWindowContext {
 	 * a short follow-up plan before starting (field feedback 2026-10-02: the
 	 * first window executed immediately without a plan). */
 	firstWindow?: boolean;
+	/** How late this window started vs the self-declared follow-up time
+	 * (app closed/busy past the point). The prefix tells the model to
+	 * re-check what happened in between instead of trusting the timeline. */
+	lateByMs?: number;
 }
 
 // A true kickoff must plan before acting — and the plan must justify its own
@@ -279,6 +291,9 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 		: "";
 	// A repeated fixed daily slot means the item has degenerated into a cron.
 	// Confront the model with the measured streak — do NOT rely on its judgement.
+	const lateNote = ctx.lateByMs !== undefined && ctx.lateByMs >= LATE_AWARE_MS
+		? `\n【延迟说明】本次跟进比原定时间晚了约 ${ctx.lateByMs < 3_600_000 ? `${Math.max(1, Math.round(ctx.lateByMs / 60_000))} 分钟` : `${Math.round(ctx.lateByMs / 3_600_000)} 小时`}（原定 ${ctx.lastCheck ? new Date(ctx.lastCheck.at).toLocaleString("zh-CN", { hour12: false }) : "未知"}）——应用当时可能未运行或正忙，中间的观察点可能已经错过。先快速核查这段时间是否已有新进展或新数据，再决定本次怎么查，不要把现在当成原定的跟进时刻。\n`
+		: "";
 	const cadenceWarning = (ctx.lastCheck?.streak ?? 0) >= 2
 		? `\n【节奏提示】你已连续 ${ctx.lastCheck!.streak} 次把这个观察点安排在相近的固定时间。如果这是因为该时刻确有新信息可查（如「09:00 前历史对账已生成」），写明依据后可以维持；但请确认你覆盖了今天所有的观察点（如 12:30/15:00），不要只查这一个。若这件工作每天只在这一处固定点查、且查了也不需要判断动作，可以考虑建议管理员转成定时任务，工作项留给需要判断力的跟进。\n`
 		: "";
@@ -293,5 +308,5 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 		`- 踩过的坑（登录态、页面路径、接口 quirks）→ 用 manage_work 记录，别指望下次还记得。`,
 		`- 无人值守：先检测登录状态再操作，登录过期直接 ${AUTONOMOUS_HUMAN_MARK} 说明，不要索要验证码。`,
 	].join("\n");
-	return `${head}\n【工作项】${ctx.title}\n【目标】${ctx.goal}\n${[...memory, protocol].join("\n\n")}\n${answerBlock}${lastCheck}${cadenceWarning}\n`;
+	return `${head}\n【工作项】${ctx.title}\n【目标】${ctx.goal}\n${[...memory, protocol].join("\n\n")}\n${answerBlock}${lastCheck}${lateNote}${cadenceWarning}\n`;
 }

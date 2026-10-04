@@ -87,8 +87,8 @@ test("human always wins, never wakes without explicit resume, answer appears onc
 	assert.equal(h.service.fireItem(item.id), false);
 	assert.equal(h.learned.length, 0);
 	await h.clock.advance(7 * 86_400_000);
-	assert.equal(h.sends.length, 1);
-	assert.equal(h.clock.timers.size, 0);
+	assert.equal(h.sends.length, 1, "reminders push but never SEND/resume");
+	assert.equal(h.clock.timers.size, 1, "reminder timer re-arms (no auto-resume though)");
 	h.store.resume(item.id, "财务审批已通过"); await flush();
 	assert.match(h.sends[1].message, /财务审批已通过/);
 	assert.doesNotMatch(h.sends[2].message, /财务审批已通过/);
@@ -121,7 +121,7 @@ test("markerless exhausted budget waits for humans; ANY declared time (even unus
 	const bare = fixture(t, { send: () => ({ reply: "进行中" }) });
 	const bareItem = bare.create(); bare.service.start(); await flush();
 	assert.equal(bare.store.get(bareItem.id).status, "waiting_human", "markerless exhausted budget");
-	assert.equal(bare.clock.timers.size, 0);
+	assert.equal(bare.clock.timers.size, 1, "only the reminder timer — no auto-retry");
 	assert.equal(bare.learned.length, 0);
 });
 
@@ -153,7 +153,7 @@ test("setup throws are inside the full lifecycle try/finally", async t => {
 	assert.equal(h.store.get(item.id).status, "waiting_human");
 	assert.equal(h.sends.length, 0);
 	assert.equal(h.released.length, 1);
-	assert.equal(h.clock.timers.size, 0);
+	assert.equal(h.clock.timers.size, 1, "reminder timer armed for the stalled item");
 });
 
 test("restart recovery never repeats working effects; queued and due survive and run FIFO", async t => {
@@ -490,6 +490,61 @@ test("admin update-reschedule (setSchedule) resets the fallback meter — the es
 	assert.equal(row.fallback_streak, 0, "setSchedule clears the meter");
 });
 
+test("waiting_human items are re-reminded every 24h instead of dying silently", async t => {
+	const h = fixture(t, { send: () => {
+		if (h.sends.length === 1) throw new Error("boom");
+		return { reply: "已完成\n[[TASK_DONE]]" };
+	} });
+	const item = h.create(); h.service.start(); await flush();
+	assert.equal(h.store.get(item.id).status, "waiting_human");
+	// store writes stamp real Date.now(); pin AFTER the transition so the
+	// reminder deadline (updated_at + 24h) is reachable via advance().
+	h.db.prepare("UPDATE work_items SET updated_at = ? WHERE id = ?").run(h.clock.now(), item.id);
+	// The wake timer was armed against the pre-pin (real) updated_at; restart
+	// the service so it re-arms on the pinned deadline (test-only skew: in
+	// production updated_at and the clock are both real time).
+	await h.service.stop(); h.service.start(); await flush();
+	assert.equal(h.pushes.length, 1, "the entry push");
+	// A reminder wake timer EXISTS even though nothing is scheduled.
+	assert.ok(h.clock.timers.size >= 1, "all-waiting_human board still has a timer");
+	assert.equal(h.store.get(item.id).remind_count, 0);
+
+	await h.clock.advance(23 * 3_600_000); await flush();
+	assert.equal(h.pushes.length, 1, "no reminder before 24h");
+	await h.clock.advance(1 * 3_600_000); await flush();
+	assert.equal(h.pushes.length, 2, "first reminder at 24h");
+	assert.match(h.pushes[1].text, /仍在等待人工/);
+	assert.match(h.pushes[1].text, /已等待约 1 天/);
+	assert.match(h.pushes[1].text, /执行出错/);
+	assert.equal(h.store.get(item.id).remind_count, 1);
+
+	await h.clock.advance(24 * 3_600_000); await flush();
+	assert.equal(h.pushes.length, 3, "second reminder at 48h");
+	assert.match(h.pushes[2].text, /已等待约 2 天/);
+
+	// Resume detaches from the reminder loop.
+	h.store.resume(item.id, "继续");
+	await flush();
+	await h.clock.advance(72 * 3_600_000); await flush();
+	assert.equal(h.pushes.filter(p => /仍在等待人工/.test(p.text)).length, 2, "no reminders after resume");
+	assert.equal(h.store.get(item.id).status, "done", "resumed window completed");
+});
+
+test("third-plus reminders escalate the copy toward cancel-or-resume; admin-paused items are reminded too", async t => {
+	const h = fixture(t, {});
+	const item = h.create();
+	h.store.pause(item.id, "管理员主动暂停");
+	h.db.prepare("UPDATE work_items SET updated_at = ? WHERE id = ?").run(h.clock.now(), item.id);
+	h.service.start(); await flush();
+	// Fast-forward four reminder cycles.
+	for (let i = 0; i < 4; i++) { await h.clock.advance(24 * 3_600_000); await flush(); }
+	const reminders = h.pushes.filter(p => /仍在等待人工/.test(p.text));
+	assert.equal(reminders.length, 4, "admin-paused items are reminded on the same cadence");
+	assert.doesNotMatch(reminders[0].text, /第 \d+ 次提醒/);
+	assert.match(reminders[3].text, /第 4 次提醒/);
+	assert.match(reminders[3].text, /回复取消/);
+});
+
 test("a pause landing during release suppresses the stale scheduled push (L4)", async t => {
 	// The runner decides scheduled; while release() is still awaited, an admin
 	// pause flips the row to waiting_human. The post-finally capture must see it
@@ -510,6 +565,24 @@ test("a pause landing during release suppresses the stale scheduled push (L4)", 
 	assert.ok(h.pushes.every(p => !/下次跟进/.test(p.text)), "no stale scheduled push after a concurrent pause");
 	assert.equal(h.store.get(item.id).status, "waiting_human");
 	assert.match(h.store.get(item.id).question, /管理员先停一下/);
+});
+
+test("a late-firing scheduled window tells the model it is catching up (delay awareness)", async t => {
+	const h = fixture(t, { send: h => ({ reply: "查过了，无新异常\n[[TASK_DONE]]" }) });
+	const item = h.create("scheduled");
+	// Originally due 3h ago; the app was offline.
+	h.db.prepare("UPDATE work_items SET next_check_at = ?, next_check_reason = ? WHERE id = ?")
+		.run(h.clock.now() - 3 * 3_600_000, "下午观察点", item.id);
+	h.service.start(); await flush();
+	assert.match(h.sends[0].message, /【延迟说明】/);
+	assert.match(h.sends[0].message, /晚了约 3 小时/);
+	assert.match(h.sends[0].message, /下午观察点/);
+	// On-time windows carry no delay note.
+	const h2 = fixture(t, { send: () => ({ reply: "ok\n[[TASK_DONE]]" }) });
+	const item2 = h2.create("scheduled");
+	h2.db.prepare("UPDATE work_items SET next_check_at = ? WHERE id = ?").run(h2.clock.now(), item2.id);
+	h2.service.start(); await h2.service.whenIdle();
+	assert.doesNotMatch(h2.sends[0].message, /【延迟说明】/);
 });
 
 test("an admin update-nextCheck landing during release wins over the run's stale schedule metadata (Copilot fast-follow)", async t => {
