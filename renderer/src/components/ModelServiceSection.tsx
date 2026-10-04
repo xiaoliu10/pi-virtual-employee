@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../lib/ipc";
 import type { ModelConfig, Supplier } from "../lib/types";
+import type { AuthCatalogEntry } from "../../../src/shared/auth";
 import { SupplierListPane } from "./model-service/SupplierListPane";
 import { SupplierDetailPane } from "./model-service/SupplierDetailPane";
+import { AccountLoginSection } from "./model-service/AccountLoginSection";
 
 interface Props {
 	model: ModelConfig;
@@ -23,7 +25,12 @@ function reconcileDefault(model: ModelConfig): ModelConfig {
 	};
 }
 
+/** The two sections inside the 自定义模型 page: hand-filled supplier list vs
+ *  account login. */
+type ModelView = "suppliers" | "account";
+
 export function ModelServiceSection({ model, onUpdate }: Props) {
+	const [view, setView] = useState<ModelView>("suppliers");
 	const [selectedId, setSelectedId] = useState<string | null>(model.suppliers[0]?.id ?? null);
 	const [search, setSearch] = useState("");
 	const [testing, setTesting] = useState(false);
@@ -66,6 +73,35 @@ export function ModelServiceSection({ model, onUpdate }: Props) {
 		const suppliers = model.suppliers.filter((supplier) => supplier.id !== id);
 		emit({ ...model, suppliers });
 		setSelectedId(suppliers[Math.min(index, suppliers.length - 1)]?.id ?? null);
+	};
+
+	/** 「添加为模型供应商」on the login-done page: create (or refresh an
+	 *  existing same-authProvider) supplier with the catalog's model list
+	 *  prefilled. Auth rides the stored account credential — apiKey/baseUrl
+	 *  stay empty. Preserves per-model overrides on refresh; switches back to
+	 *  the supplier list with the supplier selected. */
+	const addSupplierFromAuth = (entry: AuthCatalogEntry) => {
+		const existing = model.suppliers.find((supplier) => supplier.authProvider === entry.provider);
+		const supplier: Supplier = {
+			id: existing?.id ?? uid(),
+			name: entry.name,
+			enabled: true,
+			apiType: existing?.apiType ?? "openai",
+			baseUrl: "",
+			apiKey: "",
+			models: entry.models.map((m) => m.id),
+			...(existing?.modelImage ? { modelImage: existing.modelImage } : {}),
+			...(existing?.modelContextWindow ? { modelContextWindow: existing.modelContextWindow } : {}),
+			...(existing?.modelMaxTokens ? { modelMaxTokens: existing.modelMaxTokens } : {}),
+			authProvider: entry.provider,
+		};
+		const suppliers = existing
+			? model.suppliers.map((item) => (item.id === existing.id ? supplier : item))
+			: [...model.suppliers, supplier];
+		emit({ ...model, suppliers });
+		setSelectedId(supplier.id);
+		setSearch("");
+		setView("suppliers");
 	};
 
 	const addModel = (modelId: string) => {
@@ -131,31 +167,55 @@ export function ModelServiceSection({ model, onUpdate }: Props) {
 	};
 
 	return (
-		<div className="flex min-h-0 flex-1">
-			<SupplierListPane
-				model={model}
-				selectedId={selectedId}
-				search={search}
-				onSearchChange={setSearch}
-				onSelect={setSelectedId}
-				onToggle={(id, enabled) => updateSupplier(id, { enabled })}
-				onAdd={addSupplier}
-				onImport={() => void importConfig()}
-				onExport={() => void exportConfig()}
-			/>
-			<SupplierDetailPane
-				supplier={selected}
-				model={model}
-				testing={testing}
-				testResult={testResult}
-				onUpdate={(patch) => selected && updateSupplier(selected.id, patch)}
-				onToggle={(enabled) => selected && updateSupplier(selected.id, { enabled })}
-				onDelete={() => selected && removeSupplier(selected.id)}
-				onSetDefault={(modelId) => selected && onUpdate({ ...model, defaultSupplierId: selected.id, defaultModelId: modelId })}
-				onAddModel={addModel}
-				onRemoveModel={removeModel}
-				onTest={() => void testConnection()}
-			/>
+		<div className="flex min-h-0 flex-1 flex-col">
+			<div className="flex shrink-0 items-center border-b border-slate-100 px-7 py-2.5">
+				<div className="inline-flex rounded-xl border border-slate-200 bg-white p-1">
+					<button
+						type="button"
+						onClick={() => setView("suppliers")}
+						className={`rounded-lg px-4 py-1.5 text-sm font-medium transition ${view === "suppliers" ? "bg-black/[0.075] text-[#1d1d1f]" : "text-[#6e6e73] hover:text-[#1d1d1f]"}`}
+					>
+						自定义供应商
+					</button>
+					<button
+						type="button"
+						onClick={() => setView("account")}
+						className={`rounded-lg px-4 py-1.5 text-sm font-medium transition ${view === "account" ? "bg-black/[0.075] text-[#1d1d1f]" : "text-[#6e6e73] hover:text-[#1d1d1f]"}`}
+					>
+						账号登录
+					</button>
+				</div>
+			</div>
+			{view === "suppliers" ? (
+				<div className="flex min-h-0 flex-1">
+					<SupplierListPane
+						model={model}
+						selectedId={selectedId}
+						search={search}
+						onSearchChange={setSearch}
+						onSelect={setSelectedId}
+						onToggle={(id, enabled) => updateSupplier(id, { enabled })}
+						onAdd={addSupplier}
+						onImport={() => void importConfig()}
+						onExport={() => void exportConfig()}
+					/>
+					<SupplierDetailPane
+						supplier={selected}
+						model={model}
+						testing={testing}
+						testResult={testResult}
+						onUpdate={(patch) => selected && updateSupplier(selected.id, patch)}
+						onToggle={(enabled) => selected && updateSupplier(selected.id, { enabled })}
+						onDelete={() => selected && removeSupplier(selected.id)}
+						onSetDefault={(modelId) => selected && onUpdate({ ...model, defaultSupplierId: selected.id, defaultModelId: modelId })}
+						onAddModel={addModel}
+						onRemoveModel={removeModel}
+						onTest={() => void testConnection()}
+					/>
+				</div>
+			) : (
+				<AccountLoginSection onCreateSupplier={addSupplierFromAuth} />
+			)}
 		</div>
 	);
 }

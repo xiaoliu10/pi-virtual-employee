@@ -103,6 +103,7 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 							<h2 className="truncate text-xl font-semibold text-slate-950">{supplier.name} 提供商设置</h2>
 							{supplier.enabled && <span className="rounded-full bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-600">已开启</span>}
 							{isDefaultSupplier && <span className="rounded-full bg-blue-50 px-2 py-1 text-xs font-medium text-blue-600">全局默认</span>}
+							{supplier.authProvider && <span className="rounded-full bg-violet-50 px-2 py-1 text-xs font-medium text-violet-600">账号登录</span>}
 						</div>
 						<p className="mt-1 text-xs text-slate-400">配置会在保存后用于新对话；已有对话可单独切换模型。</p>
 					</div>
@@ -118,45 +119,56 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 						<input value={supplier.name} onChange={(event) => props.onUpdate({ name: event.target.value })} className={inputCls} placeholder="提供商名称" />
 					</label>
 
-					<label className="block">
-						<div className="mb-2 flex items-center justify-between">
-							<span className="text-sm font-medium text-slate-800">API Key <span className="text-rose-500">*</span></span>
-							<span className="text-xs text-blue-500">密钥仅保存在本机</span>
+					{supplier.authProvider ? (
+						<div className="rounded-2xl border border-blue-100 bg-blue-50/70 px-5 py-4">
+							<div className="text-sm font-medium text-slate-800">通过账号登录鉴权</div>
+							<p className="mt-1 text-xs leading-relaxed text-slate-600">
+								该供应商的模型请求使用「账号登录」中已保存的凭证（OAuth 自动刷新 / 已录入 Key），无需填写 API Key 与 Base URL；凭证保存在本机 auth.json，与 pi CLI 通用。登录过期时，请到「账号登录」分区重新登录。
+							</p>
 						</div>
-						<div className="relative">
-							<input type={showKey ? "text" : "password"} value={supplier.apiKey} onChange={(event) => props.onUpdate({ apiKey: event.target.value })} className={`${inputCls} pr-20 font-mono`} placeholder="sk-..." />
-							<div className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
-								{supplier.apiKey && <button type="button" onClick={() => props.onUpdate({ apiKey: "" })} className="rounded-full px-1.5 py-1 text-xs text-slate-400 hover:bg-slate-200">✕</button>}
-								<button type="button" onClick={() => setShowKey((value) => !value)} className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-200" title={showKey ? "隐藏 API Key" : "显示 API Key"}>
-									{showKey ? "隐藏" : "显示"}
-								</button>
-							</div>
-						</div>
-					</label>
+					) : (
+						<>
+							<label className="block">
+								<div className="mb-2 flex items-center justify-between">
+									<span className="text-sm font-medium text-slate-800">API Key <span className="text-rose-500">*</span></span>
+									<span className="text-xs text-blue-500">密钥仅保存在本机</span>
+								</div>
+								<div className="relative">
+									<input type={showKey ? "text" : "password"} value={supplier.apiKey} onChange={(event) => props.onUpdate({ apiKey: event.target.value })} className={`${inputCls} pr-20 font-mono`} placeholder="sk-..." />
+									<div className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
+										{supplier.apiKey && <button type="button" onClick={() => props.onUpdate({ apiKey: "" })} className="rounded-full px-1.5 py-1 text-xs text-slate-400 hover:bg-slate-200">✕</button>}
+										<button type="button" onClick={() => setShowKey((value) => !value)} className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-200" title={showKey ? "隐藏 API Key" : "显示 API Key"}>
+											{showKey ? "隐藏" : "显示"}
+										</button>
+									</div>
+								</div>
+							</label>
 
-					<label className="block">
-						<span className="mb-2 block text-sm font-medium text-slate-800">API Base URL</span>
-						<div className="relative">
-							<input value={supplier.baseUrl} onChange={(event) => props.onUpdate({ baseUrl: event.target.value })} className={`${inputCls} pr-10 font-mono text-xs`} placeholder={supplier.apiType === "openai" ? "https://api.example.com/v1" : "https://api.example.com"} />
-							{supplier.baseUrl && <button type="button" onClick={() => props.onUpdate({ baseUrl: "" })} className="absolute right-3 top-1/2 -translate-y-1/2 rounded-full px-1.5 py-1 text-xs text-slate-400 hover:bg-slate-200">✕</button>}
-						</div>
-					</label>
+							<label className="block">
+								<span className="mb-2 block text-sm font-medium text-slate-800">API Base URL</span>
+								<div className="relative">
+									<input value={supplier.baseUrl} onChange={(event) => props.onUpdate({ baseUrl: event.target.value })} className={`${inputCls} pr-10 font-mono text-xs`} placeholder={supplier.apiType === "openai" ? "https://api.example.com/v1" : "https://api.example.com"} />
+									{supplier.baseUrl && <button type="button" onClick={() => props.onUpdate({ baseUrl: "" })} className="absolute right-3 top-1/2 -translate-y-1/2 rounded-full px-1.5 py-1 text-xs text-slate-400 hover:bg-slate-200">✕</button>}
+								</div>
+							</label>
 
-					<fieldset>
-						<legend className="mb-2 text-sm font-medium text-slate-800">API 格式</legend>
-						<div className="flex items-center gap-6">
-							{(["anthropic", "openai"] as const).map((apiType) => (
-								<label key={apiType} className="flex cursor-pointer items-center gap-2 text-sm text-slate-700">
-									<input type="radio" name={`api-${supplier.id}`} checked={supplier.apiType === apiType} onChange={() => props.onUpdate({ apiType })} className="h-4 w-4 accent-blue-500" />
-									{apiType === "anthropic" ? "Anthropic 兼容" : "OpenAI 兼容"}
-								</label>
-							))}
-						</div>
-						<p className="mt-2 text-xs leading-relaxed text-slate-400">需与 Base URL 的接口协议一致，OpenAI 兼容地址通常以 /v1 结尾。</p>
-					</fieldset>
+							<fieldset>
+								<legend className="mb-2 text-sm font-medium text-slate-800">API 格式</legend>
+								<div className="flex items-center gap-6">
+									{(["anthropic", "openai"] as const).map((apiType) => (
+										<label key={apiType} className="flex cursor-pointer items-center gap-2 text-sm text-slate-700">
+											<input type="radio" name={`api-${supplier.id}`} checked={supplier.apiType === apiType} onChange={() => props.onUpdate({ apiType })} className="h-4 w-4 accent-blue-500" />
+											{apiType === "anthropic" ? "Anthropic 兼容" : "OpenAI 兼容"}
+										</label>
+									))}
+								</div>
+								<p className="mt-2 text-xs leading-relaxed text-slate-400">需与 Base URL 的接口协议一致，OpenAI 兼容地址通常以 /v1 结尾。</p>
+							</fieldset>
+						</>
+					)}
 
 					<div className="flex items-center gap-3">
-						<button type="button" onClick={props.onTest} disabled={props.testing || !supplier.models.length || !supplier.apiKey.trim()} className="rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50">
+						<button type="button" onClick={props.onTest} disabled={props.testing || !supplier.models.length || (!supplier.authProvider && !supplier.apiKey.trim())} className="rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50">
 							{props.testing ? "测试中..." : "⌁  测试连接"}
 						</button>
 						{props.testResult && <span className={`text-xs ${props.testResult.ok ? "text-emerald-600" : "text-rose-500"}`}>{props.testResult.text}</span>}

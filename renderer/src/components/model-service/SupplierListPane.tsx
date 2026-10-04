@@ -76,7 +76,11 @@ export function SupplierListPane(props: SupplierListPaneProps) {
 							<SupplierMark supplier={supplier} />
 							<div className="min-w-0 flex-1">
 								<div className={`truncate text-sm font-medium ${selected ? "text-blue-600" : "text-slate-800"}`}>{supplier.name}</div>
-								<div className="mt-0.5 text-[11px] text-slate-400">{supplier.apiType === "anthropic" ? "Anthropic 兼容" : "OpenAI 兼容"} · {supplier.models.length} 个模型</div>
+								<div className="mt-0.5 text-[11px] text-slate-400">
+								{supplier.authProvider
+									? `账号登录 · ${supplier.models.length} 个模型`
+									: `${supplier.apiType === "anthropic" ? "Anthropic 兼容" : "OpenAI 兼容"} · ${supplier.models.length} 个模型`}
+							</div>
 							</div>
 							<Toggle checked={supplier.enabled} onChange={(enabled) => props.onToggle(supplier.id, enabled)} label={`${supplier.name} 启用状态`} />
 						</button>
