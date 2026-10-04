@@ -45,7 +45,7 @@ import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
 import { createMcpManager, type McpManager } from "./tools/mcp.js";
-import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, substantialAnchorOf, SUMMARIZER_RETRY, truncateToFit, usableContextWindow } from "./context.js";
+import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, substantialAnchorOf, lastAssistantTailOf, SUMMARIZER_RETRY, truncateToFit, usableContextWindow } from "./context.js";
 import { fetchModelInfo, resolveEffectiveLimits, type RemoteModelInfo } from "./model-info.js";
 
 /** Default single-reply output cap for relay (custom baseUrl) models without an explicit per-model override. */
@@ -1934,11 +1934,19 @@ export class EmployeeEngine implements EmployeeRuntime {
 		const summary = heartbeatGoalOf(agent.state.messages);
 		const request = substantialAnchorOf(agent.state.messages);
 		const goal = (summary || request).replace(/\s+/g, " ").trim();
-		const snippet = goal.length > 60 ? goal.slice(0, 60) + "…" : goal;
-		const label = summary ? "任务" : "当前请求";
-		return snippet
-			? `⏳ 任务仍在进行中（已耗时较长）。${label}：${snippet}。完成后会立即回复结果，请稍候。`
-			: "⏳ 任务仍在进行中（已耗时较长），请稍候，完成后会立即回复结果。";
+		const goalSnippet = goal.length > 60 ? goal.slice(0, 60) + "…" : goal;
+		const goalLabel = summary ? "任务" : "当前请求";
+		// Real progress narration from the last completed assistant turn — the
+		// side-channel LLM summary is the primary source, but when it fails the
+		// fallback must still say what is happening, not just what was asked
+		// (field 2026-10-05: "没有汇报具体的进度或者卡点"). Labeled "最近" so it
+		// is never mistaken for the task name (field 2026-09-23's leak).
+		const recent = lastAssistantTailOf(agent.state.messages, 80);
+		const parts: string[] = [];
+		if (goalSnippet) parts.push(`${goalLabel}：${goalSnippet}`);
+		if (recent) parts.push(`最近：${recent}`);
+		if (parts.length) return `⏳ 任务仍在进行中（已耗时较长）。${parts.join("，")}。完成后会立即回复结果，请稍候。`;
+		return "⏳ 任务仍在进行中（已耗时较长），请稍候，完成后会立即回复结果。";
 	}
 
 	/**

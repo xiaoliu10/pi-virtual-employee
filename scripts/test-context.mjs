@@ -25,7 +25,7 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 			contents: `
-				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix } from "./src/engine/context.ts";
+				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, lastAssistantTailOf } from "./src/engine/context.ts";
 				export { shouldCompact, DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-agent-core";
 				export { estimateTokens } from "@earendil-works/pi-agent-core";
 			`,
@@ -38,7 +38,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, lastAssistantTailOf } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -494,6 +494,29 @@ test("truncateToFit drop is honestly re-measured: stale usage floor must not sur
 // misquote 2026-09-24); the one remaining honest source is the chained
 // compaction summary. Pinned: the fallback quotes the curated summary — with
 // the "## Goal" template stripped and the truncateToFit discard-note excluded.
+test("lastAssistantTailOf returns the tail of the most recent assistant turn", () => {
+	// Normal: last assistant message tail, capped at 80 with a leading ellipsis.
+	assert.equal(lastAssistantTailOf([assistant("短回复")]), "短回复");
+	const longA = assistant("前段" + "中".repeat(200) + "队伍已回城调动到营帐三补兵");
+	const tail = lastAssistantTailOf([longA]);
+	assert.ok(tail.startsWith("…"), "long tail gets a leading ellipsis");
+	assert.ok(tail.endsWith("队伍已回城调动到营帐三补兵"), "tail preserves the meaningful ending");
+	assert.ok(tail.length <= 81, "cap 80 + ellipsis");
+	// Custom cap.
+	// cap 4 on an 8-char string: 8 > 4 → ellipsis + slice(-4).
+	assert.equal(lastAssistantTailOf([assistant("abcdefgh")], 4), "…efgh");
+	assert.equal(lastAssistantTailOf([assistant("abcdefgh")], 8), "abcdefgh", "exact-length is returned as-is");
+	// Skips non-assistant messages; picks the LATEST assistant turn.
+	assert.equal(lastAssistantTailOf([user("继续"), assistant("第一轮"), user("继续"), assistant("第二轮")]), "第二轮");
+	// A tool-only assistant turn (no text part) is skipped for the prior turn.
+	const toolOnly = { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "run_command", input: {} }] };
+	assert.equal(lastAssistantTailOf([toolOnly, assistant("真实文本回复")]), "真实文本回复");
+	assert.equal(lastAssistantTailOf([toolOnly]), "", "a tool-only turn with no prior text yields empty");
+	// Empty assistant content or no assistant → empty.
+	assert.equal(lastAssistantTailOf([user("继续")]), "");
+	assert.equal(lastAssistantTailOf([]), "");
+});
+
 test("heartbeat fallback goal comes from the compaction summary, never user messages", () => {
 	const realSummary = { role: "compactionSummary", summary: "## Goal 检查所有机器组心跳\n## Constraints 只读操作", tokensBefore: 50000, timestamp: Date.now() };
 	const discardNote = { role: "compactionSummary", summary: "（上下文超出模型上限，本次请求已丢弃更早的 3 条消息以继续；完整历史仍可在会话记录中查看。）", tokensBefore: 90000, timestamp: Date.now() };
