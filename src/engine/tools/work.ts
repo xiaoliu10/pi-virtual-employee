@@ -158,7 +158,7 @@ export function createWorkTools(deps: {
 		name: "manage_work_items",
 		label: "自主工作项",
 		description:
-			"管理从对话挖掘、由管理员确认的自主工作项。所有查询和变更均限任务来源会话（单聊或群聊），不得跨会话透露私有任务。" +
+			"管理从对话挖掘、由管理员确认的自主工作项。查询（list/get）：普通成员仅见本来源会话；管理员可跨会话读取全部工作项（跨会话条目标注「来源：其他会话」）。变更（confirm/resume/update/pause/cancel）只能在任务来源会话中进行，且需管理员身份。" +
 			"action=list：列出当前来源会话的工作项；action=get：查看完整目标、执行条件、进展、踩坑和待答问题；" +
 			"action=mine：管理员扫描近期对话并把待确认提案推送到各自来源会话；" +
 			"action=confirm：来源会话的管理员在当前消息明确「确认创建」后开工；可按管理员要求附带改写后的 title/goal/conditions（例如删掉「每天16:30」改为按需跟进），不必原样接受提案；" +
@@ -172,7 +172,7 @@ export function createWorkTools(deps: {
 				Type.Literal("confirm"), Type.Literal("resume"), Type.Literal("cancel"),
 				Type.Literal("update"), Type.Literal("pause"),
 			]),
-			id: Type.Optional(Type.String({ description: "工作项完整 id 或当前来源会话内唯一的短前缀（list 里取）" })),
+			id: Type.Optional(Type.String({ description: "工作项完整 id 或短前缀（list 里取；普通成员的前缀在本来源会话内唯一，管理员在全部会话内唯一）" })),
 			answer: Type.Optional(Type.String({ description: "resume 时对暂停问题的答复，先持久化再排队执行" })),
 			title: Type.Optional(Type.String({ description: "confirm/update 时按管理员要求改写的标题（≤80 字）；不修改则省略" })),
 			goal: Type.Optional(Type.String({ description: "confirm/update 时按管理员要求改写的目标（≤2000 字）；不修改则省略" })),
@@ -212,16 +212,24 @@ export function createWorkTools(deps: {
 			}
 
 			// Scope BEFORE prefix matching, limits, error messages and details.
-			const scoped = workItems.list().filter((item) => item.origin_conversation === conversationId);
+			// Reads are conversation-scoped for ordinary users (DM privacy — the
+			// mine path deliberately never echoes other conversations' content),
+			// but an ADMIN manages items across all of their conversations: field
+			// 2026-10-04, a paused group-owned item was undiagnosable from a DM
+			// because list/get couldn't see it. Mutations stay source-scoped and
+			// admin-gated below.
+			const admin = currentAdmin(config, actor.senderId);
+			const scoped = admin ? workItems.list() : workItems.list().filter((item) => item.origin_conversation === conversationId);
 			if (p.action === "list") {
 				const items = scoped.slice(0, 30);
 				const lines = items.map((item) => {
 					const next = item.status === "scheduled" && item.next_check_at ? `，下次跟进 ${fmtTime(item.next_check_at)}` : "";
 					const wait = item.status === "waiting_human" && item.question ? `，待答：${item.question.slice(0, 60)}` : "";
-					return `${item.id.slice(0, 8)} 「${item.title}」 [${STATUS_LABEL[item.status] ?? item.status}]${next}${wait}`;
+					const cross = admin && item.origin_conversation !== conversationId ? "（来源：其他会话）" : "";
+					return `${item.id.slice(0, 8)} 「${item.title}」 [${STATUS_LABEL[item.status] ?? item.status}]${next}${wait}${cross}`;
 				});
 				return {
-					content: [{ type: "text", text: lines.length ? `当前会话共 ${scoped.length} 个工作项${scoped.length > items.length ? "（显示前 30 个）" : ""}：\n${lines.join("\n")}\n用 action=get 查看完整目标和工作笔记；前缀歧义时使用完整 id。` : "当前来源会话还没有工作项。管理员可用 action=mine 挖掘待确认提案。" }],
+					content: [{ type: "text", text: lines.length ? `${admin ? "全部会话" : "当前会话"}共 ${scoped.length} 个工作项${scoped.length > items.length ? "（显示前 30 个）" : ""}：\n${lines.join("\n")}\n用 action=get 查看完整目标和工作笔记；前缀歧义时使用完整 id。` : `当前来源会话还没有工作项。管理员可用 action=mine 挖掘待确认提案。` }],
 					details: { ok: true, count: scoped.length, items: items.map((item) => ({ id: item.id, title: item.title, status: item.status })) },
 				};
 			}
@@ -233,6 +241,15 @@ export function createWorkTools(deps: {
 			if (matches.length > 1) return failure("id 前缀有歧义，请用 action=list 取得完整 id 后重试。");
 			const item = matches[0];
 			if (!item) return failure("当前来源会话未找到该工作项，请先用 action=list 确认 id。");
+
+			// Reads may cross conversations for an admin (see scoping above), but
+			// MUTATIONS stay bound to the source conversation — the admin对话 push
+			// design (confirm/resume land where the item was created) and the
+			// pre-2026-10-04 behavior both depend on this. The old conversation
+			// filter enforced it incidentally; now it must be explicit.
+			if (p.action !== "get" && item.origin_conversation !== conversationId) {
+				return failure("工作项只能在它的来源会话中变更；请到来源会话操作（此处仅可查看）。");
+			}
 
 			if (p.action === "get") {
 				const lessons = lessonsOf(item.lessons);

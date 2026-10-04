@@ -286,7 +286,7 @@ test("explicit role-assigned admin can confirm without legacy whitelist", async 
 	assert.equal((await f.items({ action: "confirm", id: ID })).details.ok, true);
 });
 
-for (const senderId of ["admin", "viewer", "operator"]) {
+for (const senderId of ["viewer", "operator"]) {
 	test(`list/get for ${senderId} never expose other source titles, questions or details`, async () => {
 		const hidden = row({ id: "private-item", title: "PRIVATE_TITLE", goal: "PRIVATE_GOAL", question: "PRIVATE_QUESTION", origin_conversation: "dt:someone-else", status: "waiting_human" });
 		const f = fixture({ actor: actor({ senderId }), rows: [hidden, row({ status: "waiting_human", question: "本来源问题" })] });
@@ -309,22 +309,53 @@ for (const senderId of ["admin", "viewer", "operator"]) {
 	});
 }
 
-test("scope filtering happens before the 30-item list limit; null origins are inaccessible", async () => {
-	const f = fixture({ rows: [
-		...Array.from({ length: 40 }, (_, n) => row({ id: `hidden-${n}`, title: "PRIVATE_TITLE", origin_conversation: n === 0 ? null : "dt:other" })),
-		row(),
-	] });
-	const result = await f.items({ action: "list" });
-	assert.equal(result.details.count, 1);
-	assert.equal(result.details.items[0].id, ID);
-	assert.doesNotMatch(JSON.stringify(result), /PRIVATE_TITLE/);
+test("admin list/get read across source conversations, labeled; mutations stay source-bound", async () => {
+	const hidden = row({ id: "private-item", title: "PRIVATE_TITLE", goal: "PRIVATE_GOAL", question: "PRIVATE_QUESTION", origin_conversation: "dt:someone-else", status: "waiting_human" });
+	const f = fixture({ rows: [hidden, row({ status: "waiting_human", question: "本来源问题" })] });
+	const list = await f.items({ action: "list" });
+	assert.equal(list.details.count, 2);
+	assert.match(list.content[0].text, /全部会话共 2 个工作项/);
+	assert.match(list.content[0].text, /来源：其他会话/);
+	assert.match(JSON.stringify(list), /PRIVATE_TITLE/);
+	const get = await f.items({ action: "get", id: "private-item" });
+	assert.equal(get.details.ok, true);
+	assert.equal(get.details.item.goal, "PRIVATE_GOAL");
+	const mutate = await f.items({ action: "resume", id: "private-item", answer: "x" });
+	refused(mutate, f);
+	assert.match(mutate.content[0].text, /来源会话/);
 });
 
-for (const action of ["confirm", "resume", "cancel"]) {
+test("scope filtering happens before the 30-item list limit; null origins are inaccessible", async () => {
+	const rows = [
+		...Array.from({ length: 40 }, (_, n) => row({ id: `hidden-${n}`, title: "PRIVATE_TITLE", origin_conversation: n === 0 ? null : "dt:other" })),
+		row(),
+	];
+	// Non-admin: scope filtering (including null origins) runs before the limit.
+	const viewer = fixture({ actor: actor({ senderId: "viewer" }), rows });
+	const vList = await viewer.items({ action: "list" });
+	assert.equal(vList.details.count, 1);
+	assert.equal(vList.details.items[0].id, ID);
+	assert.doesNotMatch(JSON.stringify(vList), /PRIVATE_TITLE/);
+	// Admin: the scope is global, so the limit applies to the whole set.
+	const aList = await fixture({ rows }).items({ action: "list" });
+	assert.equal(aList.details.count, 41);
+	assert.equal(aList.details.items.length, 30);
+	assert.match(aList.content[0].text, /显示前 30 个/);
+});
+
+const crossSource = {
+	confirm: { status: "proposed" },
+	resume: { status: "waiting_human" },
+	cancel: { status: "waiting_human" },
+	update: { status: "queued", params: { nextCheck: "30m", reason: "改期" } },
+	pause: { status: "working", params: { reason: "先停一下" } },
+};
+for (const [action, spec] of Object.entries(crossSource)) {
 	test(`${action} cannot mutate another source even for an admin`, async () => {
-		const f = fixture({ rows: [row({ origin_conversation: SINGLE, title: "PRIVATE_TITLE", status: action === "confirm" ? "proposed" : "waiting_human" })] });
-		const result = await f.items({ action, id: ID });
+		const f = fixture({ rows: [row({ origin_conversation: SINGLE, title: "PRIVATE_TITLE", status: spec.status })] });
+		const result = await f.items({ action, id: ID, ...spec.params });
 		refused(result, f);
+		assert.match(result.content[0].text, /来源会话/, "the refusal names the source-conversation rule");
 		assert.doesNotMatch(JSON.stringify(result), /PRIVATE_TITLE/);
 	});
 }
@@ -351,11 +382,13 @@ for (const action of ["get", "confirm", "resume", "cancel"]) {
 	});
 }
 
-test("prefix matching is source-limited and exact IDs win over longer matching IDs", async () => {
-	const f = fixture({ rows: [row(), row({ id: `${ID}-hidden`, origin_conversation: SINGLE })] });
-	assert.equal((await f.items({ action: "get", id: "a" })).details.item.id, ID);
-	const exact = fixture({ rows: [row({ id: "short" }), row({ id: "short-long" })] });
-	assert.equal((await exact.items({ action: "get", id: "short" })).details.item.id, "short");
+test("prefix matching is source-limited for users, admin-wide for admins; exact IDs win over longer matching IDs", async () => {
+	const rows = [row(), row({ id: `${ID}-hidden`, origin_conversation: SINGLE })];
+	const viewer = fixture({ actor: actor({ senderId: "viewer" }), rows });
+	assert.equal((await viewer.items({ action: "get", id: "a" })).details.item.id, ID, "the foreign longer id is invisible to a viewer");
+	const admin = fixture({ rows });
+	assert.match((await admin.items({ action: "get", id: "a" })).content[0].text, /歧义/, "both ids are visible to the admin, so the short prefix is ambiguous");
+	assert.equal((await admin.items({ action: "get", id: ID })).details.item.id, ID, "an exact ID wins over the longer matching ID across sources");
 });
 
 for (const action of ["confirm", "resume"]) {

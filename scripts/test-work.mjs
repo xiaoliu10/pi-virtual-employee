@@ -70,6 +70,76 @@ test("parseNextCheck understands relative minutes/hours, HH:MM, 明天HH:MM", ()
 	assert.equal(parseNextCheck("嘎嘎"), undefined);
 });
 
+// Field 2026-10-04: the daily-reconciliation item paused with 「下次跟进时间
+// 非法」 — the model writes spoken times the strict parser rejected, and the
+// pause carried no raw string (now fixed via nextCheckRaw). Pinned: the
+// spoken variants the field actually produces now parse, garbage still
+// rejects, and the raw string travels on the decision.
+test("parseNextCheck accepts spoken variants; parseWindowReply carries the raw time", () => {
+	const now = new Date("2026-10-07T14:00:00"); // Wednesday 14:00 local
+	const at = (s) => parseNextCheck(s, now);
+
+	// Period prefixes: 下午/晚上 hour<12 → +12; 上午9点 spoken in the
+	// afternoon already passed this morning → tomorrow morning.
+	assert.equal(new Date(at("下午3点")).getHours(), 15);
+	assert.equal(new Date(at("下午3点半")).getMinutes(), 30);
+	assert.equal(new Date(at("晚上8点")).getHours(), 20);
+	assert.equal(new Date(at("上午9点")).getDay(), (now.getDay() + 1) % 7, "14:00 → this morning is gone → tomorrow 09:00");
+	assert.equal(new Date(at("上午9点")).getHours(), 9);
+	assert.equal(new Date(at("明天上午9点")).getDate(), now.getDate() + 1);
+
+	// 半: 9点半 → 09:30 / 14:00 → today gone → tomorrow.
+	const half = new Date(at("9点半"));
+	assert.equal(half.getMinutes(), 30);
+	assert.equal(half.getHours(), 9);
+
+	// 半小时 relatives.
+	assert.equal(at("半小时"), now.getTime() + 30 * 60_000);
+	assert.equal(at("1个半小时"), now.getTime() + 90 * 60_000);
+
+	// Short dates with optional clock; past dates roll to next year.
+	const d1 = new Date(at("10月8日 9点"));
+	assert.equal(d1.getMonth(), 9);
+	assert.equal(d1.getDate(), 8);
+	assert.equal(d1.getHours(), 9);
+	assert.equal(new Date(at("10-08 09:40")).getMinutes(), 40);
+	const past = new Date(at("1月5日"));
+	assert.equal(past.getFullYear(), 2027, "a past short date rolls to next year");
+
+	// PM period on a short date must shift (+12): the anchored /^(下午|…)/ test
+	// used to silently parse 「10月8日 下午3点」 as 03:00 (code review 2026-10-04).
+	assert.equal(new Date(at("10月8日 下午3点")).getHours(), 15);
+	assert.equal(new Date(at("10月8日 晚上8点")).getHours(), 20);
+	// 「晚上12点」 is midnight, not noon.
+	assert.equal(new Date(at("晚上12点")).getHours(), 0);
+	// Overflow dates reject in their own month (Date would normalize 2/30 → 3/2).
+	assert.equal(parseNextCheck("2026-02-30T10:00:00", new Date("2026-02-25T10:00:00")), undefined);
+	assert.equal(parseNextCheck("2月30日", new Date("2026-02-25T10:00:00")), undefined);
+
+	// Weekdays: 周五 from Wednesday → +2 days.
+	const fri = new Date(at("周五 9:40"));
+	assert.equal(fri.getDay(), 5);
+	assert.equal(fri.getDate(), now.getDate() + 2);
+	assert.equal(new Date(at("星期天 下午3点半")).getHours(), 15);
+
+	// Date-only ISO parses LOCAL (spec would say UTC — trap); garbage rejects.
+	const isoDate = new Date(at("2026-10-08"));
+	assert.equal(isoDate.getHours(), 9, "date-only ISO → 09:00 local, not UTC midnight");
+	assert.equal(at("10月40日"), undefined);
+	assert.equal(at("25点"), undefined);
+	assert.equal(at(""), undefined);
+
+	// The raw string survives the decision for diagnosable pauses.
+	const decision = parseWindowReply("进展：已巡检一轮。\n[[NEXT_CHECK]] 明天上午9点 | 批次 08:30 跑完", now);
+	assert.equal(decision.kind, "next_check");
+	assert.equal(decision.nextCheckRaw, "明天上午9点");
+	assert.ok(decision.nextCheckAt && decision.nextCheckAt > now.getTime());
+	const bad = parseWindowReply("[[NEXT_CHECK]] | 等批次跑完再看", now);
+	assert.equal(bad.kind, "next_check");
+	assert.equal(bad.nextCheckAt, undefined, "empty time part is invalid");
+	assert.equal(bad.nextCheckRaw, "", "the raw string is carried even when empty");
+});
+
 test("buildWorkWindowPrefix carries conditions, progress, lessons and the protocol", () => {
 	const prefix = buildWorkWindowPrefix({
 		title: "月末对账",

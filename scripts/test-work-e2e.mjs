@@ -336,7 +336,7 @@ test("full lifecycle: seed → mine → confirm → 3 windows → done + learn",
 	assert.equal(h.errors.length, 0, `errors: ${JSON.stringify(h.errors)}`);
 });
 
-test("source scoping: the same admin in a DIFFERENT conversation cannot touch the item", async (t) => {
+test("source scoping: the same admin in a DIFFERENT conversation can READ but not MUTATE the item", async (t) => {
 	const h = harness(t);
 	h.history.ensureConversation(SOURCE, "Orders");
 	h.history.appendMessage(SOURCE, "user", "请每天核对昨日订单状态，异常单标记并汇报。");
@@ -354,13 +354,15 @@ test("source scoping: the same admin in a DIFFERENT conversation cannot touch th
 		conversationId: OTHER,
 	});
 	const otherItems = otherTools.find((tool) => tool.name === "manage_work_items");
-	// list in the foreign conversation must NOT see the source-scoped item.
+	// READS are admin-cross-conversation since 2026-10-04 (field: a paused
+	// group-owned item was undiagnosable from a DM — list/get couldn't see it).
+	// The item shows up, labeled as foreign.
 	const list = await otherItems.execute("call", { action: "list" });
-	assert.match(list.content[0].text, /还没有工作项|当前来源会话还没有工作项/);
-	// get with the same id must refuse (source scoping, not id mismatch).
+	assert.match(list.content[0].text, /全部会话共 1 个工作项/);
+	assert.match(list.content[0].text, /来源：其他会话/);
 	const get = await otherItems.execute("call", { action: "get", id: itemId });
-	assert.match(get.content[0].text, /未找到该工作项|来源会话/);
-	// confirm with the same id must refuse too.
+	assert.match(get.content[0].text, /每日订单巡检/, "admin can read the item cross-conversation");
+	// MUTATIONS remain source-scoped: confirm with the same id must refuse.
 	const confirm = await otherItems.execute("call", { action: "confirm", id: itemId, goal: "x" });
 	assert.match(confirm.content[0].text, /拒绝|未找到|来源会话/);
 	// The item is untouched.

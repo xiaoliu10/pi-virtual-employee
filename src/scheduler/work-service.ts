@@ -156,6 +156,7 @@ export class WorkService<Session extends WorkSession> {
 		let nextCheckAt: number | undefined;
 		let nextReason: string | undefined;
 		let nextStreak = 0;
+		let emptyReplies = 0;
 		let outcome: "done" | "waiting_human" | "scheduled" = "waiting_human";
 		try {
 			if (!this.running) return;
@@ -194,6 +195,21 @@ export class WorkService<Session extends WorkSession> {
 				});
 				const result = await this.opts.send(active.session, prefix + (turn === 0 ? "请按目标与执行条件推进工作。" : "继续。"), fresh.created_by);
 				if (result.error) throw new Error(result.error);
+				// A turn that produced NO text (field 2026-09-29: stopReason=length with
+				// thinking-only output burned the whole output budget) has no closure and
+				// no marker — parsing it yields "continue" and the next turn re-prompts
+				// into the same wall, silently burning the budget. Count consecutive
+				// empty replies and pause honestly instead.
+				if (!(result.reply ?? "").trim()) {
+					emptyReplies += 1;
+					console.warn(`[work] ${item.id.slice(0, 8)} turn ${turn + 1}: empty reply (stopReason-less turn, ${emptyReplies} consecutive)`);
+					if (emptyReplies >= 2) {
+						question = "连续 2 轮模型没有产出任何文本（疑似输出长度截断：thinking 占满了输出额度）。请核查模型最大输出配置后明确恢复。";
+						break;
+					}
+					continue;
+				}
+				emptyReplies = 0;
 				const current = store.get(item.id);
 				// Cancellation wins even over a late DONE: stay silent, the admin already
 				// cancelled it. An admin PAUSE is different — the marker question is
@@ -208,10 +224,17 @@ export class WorkService<Session extends WorkSession> {
 				}
 				const decision = parseWindowReply(result.reply ?? "", new Date(this.clock.now()));
 				lastText = decision.text;
+				console.log(`[work] ${item.id.slice(0, 8)} turn ${turn + 1} → ${decision.kind}${decision.kind === "next_check" ? ` raw="${(decision.nextCheckRaw ?? "").slice(0, 120)}" at=${decision.nextCheckAt ?? "invalid"}` : ""}`);
 				if (decision.kind === "human") { question = decision.question || lastText || "需要管理员协助并明确恢复。"; break; }
 				if (decision.kind === "done") { outcome = "done"; break; }
 				if (decision.kind === "next_check") {
-					if (decision.nextCheckAt === undefined) { question = "下次跟进时间非法、已过去或不足 15 分钟；请管理员明确恢复并指定合理时间。"; break; }
+					if (decision.nextCheckAt === undefined) {
+						// Surface the raw string the model wrote: without it the pause is
+						// undiagnosable from logs alone (field 2026-10-04 — the invalid
+						// format had to be inferred from indirect evidence).
+						question = `下次跟进时间非法（原文「${(decision.nextCheckRaw ?? "").slice(0, 200)}」）：只接受「30分钟」「2026-10-05 09:40」「明天 9:40」三种写法，且至少距现在 15 分钟。请管理员明确恢复并指定合理时间。`;
+						break;
+					}
 					outcome = "scheduled"; nextCheckAt = decision.nextCheckAt; nextReason = decision.nextCheckReason;
 					// Deterministic cron-degeneration meter: consecutive same-daily-slot
 					// follow-ups accumulate; anything else resets. Manual resume (no dueAt)

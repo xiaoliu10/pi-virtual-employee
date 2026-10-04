@@ -55,6 +55,11 @@ export interface WorkWindowDecision {
 	/** Parsed epoch ms for next_check decisions; undefined when unparseable. */
 	nextCheckAt?: number;
 	nextCheckReason?: string;
+	/** The raw time string as the model wrote it — surfaced in pause questions
+	 * so a malformed format is diagnosable without archaeology (field
+	 * 2026-10-04: the invalid-time pause lost the original string, and the
+	 * box-side log had no [work] line either; the format had to be inferred). */
+	nextCheckRaw?: string;
 	text: string;
 }
 
@@ -92,9 +97,17 @@ function stripMarkerLines(text: string, marks: string[]): string {
 const ALL_MARKS = [AUTONOMOUS_DONE_MARK, AUTONOMOUS_HUMAN_MARK, AUTONOMOUS_NEXT_CHECK_MARK];
 
 /**
- * Parse "HH:MM" (next occurrence), "<n>m"/"<n>h" relative, "明天HH:MM", or an
- * ISO-ish datetime. Explicit 明天 ALWAYS means tomorrow. Reject malformed,
- * impossible, past or <15-minute times (rather than silently scheduling them).
+ * Parse a follow-up time. Accepted forms, strictest first:
+ *   relative   「30分钟」「2小时」「半小时」「1个半小时」
+ *   ISO        「2026-10-05 09:40[:ss]」 (year REQUIRED; no zone = local)
+ *   clock      「9:40」「9点30」「明天 9:40」+ spoken variants the field actually
+ *              produced (2026-10-04 pause: 「上午9点」「9点半」 were rejected):
+ *              明天/后天 prefix, 早上/上午/中午/下午/傍晚/晚上 period prefix
+ *              (下午/傍晚/晚上 hour<12 → +12), 「X点半」 → :30
+ *   short date 「10月8日」「10-08」「10/8」 optional clock → this year, or next
+ *              year once past; weekday 「周五」「星期五 9:40」 → next occurrence
+ * Explicit 明天/后天 ALWAYS means that day. Reject malformed, impossible, past
+ * or <15-minute times (rather than silently scheduling them).
  */
 export function parseNextCheck(raw: string, now = new Date()): number | undefined {
 	const s = raw.trim();
@@ -105,22 +118,89 @@ export function parseNextCheck(raw: string, now = new Date()): number | undefine
 		const minutes = Number(rel[1]) * (unit === "h" || unit === "小时" || unit === "时" ? 60 : 1);
 		return valid(now.getTime() + minutes * 60_000);
 	}
-	const iso = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})?$/.exec(s);
+	// 半小时 / N个半小时 — common spoken relatives the strict regex rejected.
+	const halfRel = /^(?:(\d+)\s*个\s*)?半小时$/.exec(s);
+	if (halfRel) return valid(now.getTime() + ((halfRel[1] ? Number(halfRel[1]) * 60 : 0) + 30) * 60_000);
+	// ISO datetime; time part OPTIONAL (date-only → 09:00 local). Without a zone
+	// suffix the parts are constructed as LOCAL time — Date.parse would treat a
+	// date-only string as UTC (spec), silently shifting the day half the planet.
+	const iso = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?)?(Z|[+-]\d{2}:\d{2})?$/.exec(s);
 	if (iso) {
-		const [, y, m, d, h, min, sec] = iso;
-		const days = new Date(Date.UTC(Number(y), Number(m), 0)).getUTCDate();
-		if (Number(m) < 1 || Number(m) > 12 || Number(d) < 1 || Number(d) > days || Number(h) > 23 || Number(min) > 59 || Number(sec ?? 0) > 59) return undefined;
-		return valid(Date.parse(s));
+		const [, y, m, d, h, min, sec, zone] = iso;
+		const month = Number(m);
+		const day = Number(d);
+		const hour = Number(h ?? 9);
+		const minute = Number(min ?? 0);
+		const second = Number(sec ?? 0);
+		if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) return undefined;
+		if (zone) return valid(Date.parse(s));
+		const target = new Date(Number(y), month - 1, day, hour, minute, second);
+		// Date normalizes overflow (2026-02-30 → Mar 2); the round-trip rejects it.
+		if (target.getDate() !== day || target.getMonth() !== month - 1) return undefined;
+		return valid(target.getTime());
 	}
-	const time = /^(明天\s*)?(\d{1,2})(?:[:：](\d{2})|点(?:(\d{2})分?)?)$/.exec(s);
-	if (!time) return undefined;
-	const hour = Number(time[2]);
-	const minute = Number(time[3] ?? time[4] ?? 0);
-	if (hour > 23 || minute > 59) return undefined;
-	const target = new Date(now);
-	target.setHours(hour, minute, 0, 0);
-	if (time[1] || target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
-	return valid(target.getTime());
+
+	const time = /^(明天|后天|大后天)?\s*(早上|上午|中午|下午|傍晚|晚上)?\s*(\d{1,2})(?:[:：](\d{2})|点(?:(半)|(\d{1,2})分?)?)?$/.exec(s);
+	if (time) {
+		let hour = Number(time[3]);
+		const minute = time[4] !== undefined ? Number(time[4]) : time[5] === "半" ? 30 : time[6] !== undefined ? Number(time[6]) : 0;
+		if (hour > 23 || minute > 59) return undefined;
+		if ((time[2] === "下午" || time[2] === "傍晚" || time[2] === "晚上") && hour < 12) hour += 12;
+		// 「晚上12点」口语上是午夜而非正午。
+		if (hour === 12 && (time[2] === "傍晚" || time[2] === "晚上")) hour = 0;
+		const target = new Date(now);
+		target.setHours(hour, minute, 0, 0);
+		const dayOffset = time[1] === "明天" ? 1 : time[1] === "后天" ? 2 : time[1] === "大后天" ? 3 : 0;
+		if (dayOffset > 0) target.setDate(target.getDate() + dayOffset);
+		// A period prefix pins half of the day: 「上午9点」 at 14:00 already
+		// passed this morning → tomorrow morning, not tonight 21:00.
+		if (dayOffset === 0 && (time[2] === "早上" || time[2] === "上午") && now.getHours() >= 12 && target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
+		if (target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
+		return valid(target.getTime());
+	}
+
+	// Short date, optional clock: 「10月8日」「10-08 09:40」「10/8 14:30」.
+	// Dash goes LAST in the class: `[月-/.]` would parse 月-/ as a range
+	// (U+6708 > U+002F) and throw SyntaxError at first call.
+	const shortDate = /^(\d{1,2})[月./-](\d{1,2})[日号]?(?:\s*(?:早上|上午|中午|下午|傍晚|晚上)?\s*(\d{1,2})(?:[:：](\d{2})|点(?:(半)|(\d{1,2})分?)?)?)?$/.exec(s);
+	if (shortDate) {
+		const month = Number(shortDate[1]);
+		const day = Number(shortDate[2]);
+		if (month < 1 || month > 12 || day < 1 || day > 31) return undefined;
+		let hour = shortDate[3] !== undefined ? Number(shortDate[3]) : 9;
+		const minute = shortDate[4] !== undefined ? Number(shortDate[4]) : shortDate[5] === "半" ? 30 : shortDate[6] !== undefined ? Number(shortDate[6]) : 0;
+		if (hour > 23 || minute > 59) return undefined;
+		// The period word sits mid-string (「10月8日 下午3点」), so the PM test
+		// must be unanchored — /^(下午|…)/ can never match a digit-led string,
+		// which silently parsed 「下午3点」 as 03:00 (code review 2026-10-04).
+		if (shortDate[3] !== undefined && /(下午|傍晚|晚上)/.test(s)) {
+			if (hour < 12) hour += 12;
+			else if (hour === 12) hour = 0;
+		}
+		const target = new Date(now.getFullYear(), month - 1, day, hour, minute, 0, 0);
+		// Date normalizes overflow (2月30日 → 3月2日); the round-trip rejects it.
+		if (target.getDate() !== day || target.getMonth() !== month - 1) return undefined;
+		if (target.getTime() <= now.getTime()) target.setFullYear(target.getFullYear() + 1);
+		return valid(target.getTime());
+	}
+
+	// Weekday: 「周五」「星期五 9:40」「礼拜天 下午3点半」 → next occurrence.
+	const weekday = /^(?:周|星期|礼拜)([一二三四五六日天])\s*(?:(早上|上午|中午|下午|傍晚|晚上)?\s*(\d{1,2})(?:[:：](\d{2})|点(?:(半)|(\d{1,2})分?)?)?)?$/.exec(s);
+	if (weekday) {
+		const names = ["日", "一", "二", "三", "四", "五", "六"];
+		const target = new Date(now);
+		let hour = weekday[3] !== undefined ? Number(weekday[3]) : 9;
+		const minute = weekday[4] !== undefined ? Number(weekday[4]) : weekday[5] === "半" ? 30 : weekday[6] !== undefined ? Number(weekday[6]) : 0;
+		if (hour > 23 || minute > 59) return undefined;
+		if ((weekday[2] === "下午" || weekday[2] === "傍晚" || weekday[2] === "晚上") && hour < 12) hour += 12;
+		if (hour === 12 && (weekday[2] === "傍晚" || weekday[2] === "晚上")) hour = 0;
+		target.setHours(hour, minute, 0, 0);
+		const delta = (names.indexOf(weekday[1]) - target.getDay() + 7) % 7;
+		target.setDate(target.getDate() + delta);
+		if (target.getTime() <= now.getTime()) target.setDate(target.getDate() + 7);
+		return valid(target.getTime());
+	}
+	return undefined;
 }
 
 /** Classify a window's final reply (markers stripped from the pushed text). */
@@ -146,6 +226,7 @@ export function parseWindowReply(reply: string, now = new Date()): WorkWindowDec
 			kind: "next_check",
 			nextCheckAt,
 			nextCheckReason: reasonParts.join("|").trim() || undefined,
+			nextCheckRaw: (timePart ?? "").trim(),
 			text: stripMarkerLines(reply, ALL_MARKS),
 		};
 	}
@@ -196,9 +277,10 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 	const protocol = [
 		`窗口规则：`,
 		`- 本窗口最多 ${ctx.budget.maxTurns} 轮 / ${ctx.budget.maxMinutes} 分钟，请优先推进关键路径，并把重要发现写入进展/踩坑。超时、执行出错或到限仍无安全结束声明会暂停等管理员明确恢复，不自动重试。`,
+		`- 收尾顺序：先写完所有正文（进展、发现、汇报），最后一行才是结束标记（${AUTONOMOUS_DONE_MARK} / ${AUTONOMOUS_HUMAN_MARK} / ${AUTONOMOUS_NEXT_CHECK_MARK}）。标记行被输出截断等于没有收尾，窗口会空转到预算耗尽。`,
 		`- 目标全部完成 → 最后一行单独写 ${AUTONOMOUS_DONE_MARK}，上方给出成果总结。`,
 		`- 需要人参与 / 需其他单位配合资源 / 权限不足 → 最后一行单独写 ${AUTONOMOUS_HUMAN_MARK}: 具体需要谁做什么。任务会暂停等人，不要空转。`,
-		`- 本轮告一段落但目标未完成 → 最后一行单独写 ${AUTONOMOUS_NEXT_CHECK_MARK}: 下次跟进时间 | 原因。时间支持 30m/2h/14:30/明天09:40 等；至少距现在 15 分钟。下次时间完全由本次执行结果决定，不约定固定频率，一天可多次也可隔天：\n  · 有卡点（等第三方补数据、等对方处理、等资源）→ 不要盲目定时重试：如果不确定卡点何时解决，先写 ${AUTONOMOUS_HUMAN_MARK} 把问题抛出来问清楚（如「这个卡点大概什么时候能解决？」），按答复定下次时间；\n  · 时间常识：深夜/非工作时间对接方通常不会处理，把跟进推到对方可能处理的时间，不要空查；\n  · 按「观察点」安排：一天里哪些时刻会有新信息（数据生成、批次跑完、出结果）就在那些时刻查，一天可以多次（如 09:00 查昨日、12:30 查今日上午、15:00 查今日下午）；\n  · 发现异常可缩短间隔、提前再查；连续多轮全无异常且无新信息才拉长。时间必须写明依据，不要不加思考地默认「明天同一时间」。非法/过去/过近时间会暂停等管理员明确恢复。`,
+		`- 本轮告一段落但目标未完成 → 最后一行单独写 ${AUTONOMOUS_NEXT_CHECK_MARK}: 下次跟进时间 | 原因。时间用以下三种写法之一：①「30分钟」「2小时」相对时间；②「2026-10-05 09:40」带年份的完整时间；③「9:40」「9点30」「明天 9:40」钟点。口语变体（「9点半」「上午9点」等）会尽量兼容，但解析不了就判非法并暂停；时间部分不能为空（先时间再「| 原因」）；至少距现在 15 分钟。下次时间完全由本次执行结果决定，不约定固定频率，一天可多次也可隔天：\n  · 有卡点（等第三方补数据、等对方处理、等资源）→ 不要盲目定时重试：如果不确定卡点何时解决，先写 ${AUTONOMOUS_HUMAN_MARK} 把问题抛出来问清楚（如「这个卡点大概什么时候能解决？」），按答复定下次时间；\n  · 时间常识：深夜/非工作时间对接方通常不会处理，把跟进推到对方可能处理的时间，不要空查；\n  · 按「观察点」安排：一天里哪些时刻会有新信息（数据生成、批次跑完、出结果）就在那些时刻查，一天可以多次（如 09:00 查昨日、12:30 查今日上午、15:00 查今日下午）；\n  · 发现异常可缩短间隔、提前再查；连续多轮全无异常且无新信息才拉长。时间必须写明依据，不要不加思考地默认「明天同一时间」。非法/过去/过近时间会暂停等管理员明确恢复。`,
 		`- 工作过程中了解到执行条件（如「系统对账 08:00-09:30 自动跑，此时段勿手动对账」、依赖的单位/资源、账号权限边界）→ 立即用 manage_work 记录到条件里，后续窗口会带着这些条件工作。`,
 		`- 踩过的坑（登录态、页面路径、接口 quirks）→ 用 manage_work 记录，别指望下次还记得。`,
 		`- 无人值守：先检测登录状态再操作，登录过期直接 ${AUTONOMOUS_HUMAN_MARK} 说明，不要索要验证码。`,
