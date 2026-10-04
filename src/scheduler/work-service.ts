@@ -4,7 +4,7 @@
  * Abort requests never release the dispatch lock until send actually settles.
  */
 import type { WorkItemRow, WorkItemStore } from "../db/work-item-store.js";
-import { buildWorkWindowPrefix, DEFAULT_WINDOW_BUDGET, nextRoutineStreak, parseWindowReply } from "./work.js";
+import { buildWorkWindowPrefix, DEFAULT_NEXT_CHECK_MS, DEFAULT_WINDOW_BUDGET, nextRoutineStreak, parseWindowReply } from "./work.js";
 import { hasMiningSecrets } from "./mining.js";
 
 interface WorkSession { abort(): void; }
@@ -15,6 +15,8 @@ interface ActiveWindow<Session> {
 	dueAt?: number | null;
 	prevReason?: string | null;
 	prevStreak?: number;
+	/** Pre-claim soft-fallback meter (consecutive unusable NEXT_CHECK windows). */
+	prevFallback?: number;
 	/** Pre-claim kickoff marker: claim() flips the row, so the FIRST-window
 	 * decision must read this snapshot, not the post-claim row. */
 	prevKicked?: number;
@@ -23,7 +25,7 @@ interface ActiveWindow<Session> {
 	deadline?: ReturnType<typeof setTimeout>;
 	settled: Promise<void>;
 }
-type Store = Pick<WorkItemStore, "get" | "listDue" | "nextWakeAt" | "claim" | "recoverWorking" | "subscribe" | "setStatus" | "setField" | "clearAnswer" | "setFixedStreak">;
+type Store = Pick<WorkItemStore, "get" | "listDue" | "nextWakeAt" | "claim" | "recoverWorking" | "subscribe" | "setStatus" | "setField" | "clearAnswer" | "setFixedStreak" | "setFallbackStreak">;
 interface Clock {
 	now(): number;
 	setTimeout(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
@@ -137,6 +139,7 @@ export class WorkService<Session extends WorkSession> {
 			const active: ActiveWindow<Session> = {
 				id: due.id, settled: Promise.resolve(),
 				dueAt: due.next_check_at, prevReason: due.next_check_reason, prevStreak: due.fixed_streak ?? 0,
+				prevFallback: due.fallback_streak ?? 0,
 				prevKicked: due.kicked_off ?? 0,
 			};
 			this.active = active;
@@ -229,13 +232,33 @@ export class WorkService<Session extends WorkSession> {
 				if (decision.kind === "done") { outcome = "done"; break; }
 				if (decision.kind === "next_check") {
 					if (decision.nextCheckAt === undefined) {
-						// Surface the raw string the model wrote: without it the pause is
-						// undiagnosable from logs alone (field 2026-10-04 — the invalid
-						// format had to be inferred from indirect evidence).
-						question = `下次跟进时间非法（原文「${(decision.nextCheckRaw ?? "").slice(0, 200)}」）：只接受「30分钟」「2026-10-05 09:40」「明天 9:40」三种写法，且至少距现在 15 分钟。请管理员明确恢复并指定合理时间。`;
+						// The model clearly WANTED a follow-up but the declared time was
+						// unparseable or unusable. Halting here killed the whole chain on a
+						// mere format slip (field 2026-10-03: 「今天的执行时间已经过去了，
+						// 没有生成下次执行时间，这个任务是不是就死了」). Soft-fallback
+						// instead: the chain stays alive on the default re-check, the next
+						// window gets another chance to declare a valid time, and the push
+						// surfaces the raw slip so the admin can `update` a proper time.
+						// Three strikes: a model that cannot produce a usable time across
+						// consecutive windows would loop hourly windows + pushes forever
+						// (budget/streak/lock none constrain this). Escalate to a human;
+						// a manual resume resets the meter.
+						const fallbackStreak = (active.prevFallback ?? 0) + 1;
+						if (fallbackStreak >= 3) {
+							store.setFallbackStreak(item.id, fallbackStreak);
+							question = `连续 ${fallbackStreak} 次声明的下次跟进时间都无法解析或已过期（最近一次「${(decision.nextCheckRaw ?? "").slice(0, 60)}」）。请管理员核查任务进展后明确恢复，或用 update 直接指定下次跟进时间。`;
+							break;
+						}
+						outcome = "scheduled";
+						nextCheckAt = this.clock.now() + DEFAULT_NEXT_CHECK_MS;
+						const raw = (decision.nextCheckRaw ?? "").slice(0, 60);
+						nextReason = `原声明时间「${raw || "空"}」无法解析或已过期，按默认节奏（1 小时后）顺延${decision.nextCheckReason ? `；原依据：${decision.nextCheckReason}` : ""}`;
+						nextStreak = 0;
+						store.setFallbackStreak(item.id, fallbackStreak);
 						break;
 					}
 					outcome = "scheduled"; nextCheckAt = decision.nextCheckAt; nextReason = decision.nextCheckReason;
+					if ((active.prevFallback ?? 0) > 0) store.setFallbackStreak(item.id, 0);
 					// Deterministic cron-degeneration meter: consecutive same-daily-slot
 					// follow-ups accumulate; anything else resets. Manual resume (no dueAt)
 					// also resets — conservative by design.

@@ -108,14 +108,28 @@ test("model-selected 30m follow-up uses one exact timer, not periodic polling", 
 	assert.equal(h.store.get(item.id).status, "done");
 });
 
-test("invalid/too-near NEXT_CHECK and markerless exhausted budget wait for humans", async t => {
-	for (const reply of ["[[NEXT_CHECK]]: 1m | 空跑", "[[NEXT_CHECK]]: 垃圾", "进行中"]) {
+test("markerless exhausted budget waits for humans; ANY declared time (even unusable) soft-falls-back", async t => {
+	// Field 2026-10-03: an unusable/unparseable declared time used to pause the
+	// item with NO next time at all — the chain died on a format slip. Both must
+	// keep the chain alive now; only a markerless exhausted budget waits.
+	for (const reply of ["[[NEXT_CHECK]]: 1m | 空跑", "[[NEXT_CHECK]]: 嘎嘎"]) {
 		const h = fixture(t, { send: () => ({ reply }) });
 		const item = h.create(); h.service.start(); await flush();
-		assert.equal(h.store.get(item.id).status, "waiting_human", reply);
-		assert.equal(h.clock.timers.size, 0);
-		assert.equal(h.learned.length, 0);
+		assert.equal(h.store.get(item.id).status, "scheduled", reply);
+		assert.ok(h.clock.timers.size >= 1, reply);
 	}
+	const bare = fixture(t, { send: () => ({ reply: "进行中" }) });
+	const bareItem = bare.create(); bare.service.start(); await flush();
+	assert.equal(bare.store.get(bareItem.id).status, "waiting_human", "markerless exhausted budget");
+	assert.equal(bare.clock.timers.size, 0);
+	assert.equal(bare.learned.length, 0);
+});
+
+test("unparseable NEXT_CHECK no longer kills the chain (soft 1h fallback) — field 2026-10-03", async t => {
+	const h = fixture(t, { send: () => ({ reply: "[[NEXT_CHECK]]: 嘎嘎 09:00!! | 批次后检查" }) });
+	const item = h.create(); h.service.start(); await flush();
+	assert.equal(h.store.get(item.id).status, "scheduled", "chain stays alive");
+	assert.ok(h.clock.timers.size >= 1, "a re-check timer exists");
 });
 
 test("throws and returned errors retain staged answers, settle cleanup and wait (no unsafe retries)", async t => {
@@ -402,6 +416,78 @@ test("a different follow-up slot resets the streak; no conversion suggestion pus
 	assert.equal(row.fixed_streak, 0, "a 2h gap is not a daily slot");
 	assert.equal(row.next_check_reason, "等新批次");
 	assert.doesNotMatch(h.pushes[0].text, /定时任务/);
+});
+
+test("an invalid NEXT_CHECK soft-falls-back to the default re-check instead of killing the chain", async t => {
+	// Field 2026-10-03: an unparseable/past declared time used to pause the item
+	// with no next time at all — the chain died on a format slip. Now it must
+	// stay scheduled on the default 1h re-check, with the raw slip surfaced.
+	const h = fixture(t, { send: () => ({ reply: "进展正常\n[[NEXT_CHECK]]: 嘎嘎 09:00!! | 批次后检查" }) });
+	const item = h.create("scheduled");
+	h.db.prepare("UPDATE work_items SET next_check_at = ? WHERE id = ?").run(h.clock.now(), item.id);
+	h.service.start(); await h.service.whenIdle();
+	const row = h.store.get(item.id);
+	assert.equal(row.status, "scheduled", "chain stays alive, no waiting_human");
+	assert.ok(row.next_check_at !== null && row.next_check_at >= h.clock.now() + 55 * 60_000, "default ~1h re-check");
+	assert.match(row.next_check_reason, /无法解析或已过期/);
+	assert.match(row.next_check_reason, /嘎嘎/);
+	assert.match(h.pushes[0].text, /顺延/);
+});
+
+test("empty and past NEXT_CHECK times soft-fall-back too (「空」 branch, expired branch)", async t => {
+	for (const reply of ["[[NEXT_CHECK]] | 只写了原因", "完成今日部分\n[[NEXT_CHECK]]: 2020-01-01 09:00 | 早该查的"]) {
+		const h = fixture(t, { send: () => ({ reply }) });
+		const item = h.create(); h.service.start(); await flush();
+		const row = h.store.get(item.id);
+		assert.equal(row.status, "scheduled", reply);
+		assert.match(row.next_check_reason, /无法解析或已过期/, reply);
+		assert.equal(row.fallback_streak, 1, reply);
+	}
+});
+
+test("three consecutive unusable NEXT_CHECKs escalate to a human; valid schedule and resume reset the meter", async t => {
+	let bad = 0;
+	const h = fixture(t, { send: () => ++bad <= 3
+		? { reply: "[[NEXT_CHECK]]: 嘎嘎 | 等批次" }
+		: { reply: "这轮有进展\n[[NEXT_CHECK]]: 2小时 | 等新批次" } });
+	const item = h.create(); h.service.start(); await flush();
+	let row = h.store.get(item.id);
+	assert.equal(row.status, "scheduled");
+	assert.equal(row.fallback_streak, 1, "first soft fallback recorded");
+
+	// One advance runs the chained re-checks (w2 at +1h, w3 at +2h): both
+	// unusable. Third one escalates instead of looping hourly forever.
+	await h.clock.advance(2 * 3_600_000); await flush();
+	row = h.store.get(item.id);
+	assert.equal(row.status, "waiting_human");
+	assert.match(row.question, /连续 3 次/);
+	assert.match(row.question, /嘎嘎/);
+
+	// Manual resume resets the meter; a valid schedule keeps it at zero.
+	h.store.resume(item.id, "直接开始对账"); await flush();
+	assert.equal(h.store.get(item.id).fallback_streak, 0, "resume clears the meter");
+	row = h.store.get(item.id);
+	assert.equal(row.status, "scheduled");
+	assert.equal(row.fallback_streak, 0, "valid NEXT_CHECK keeps the meter at zero");
+	assert.match(row.next_check_reason, /等新批次/);
+});
+
+test("admin update-reschedule (setSchedule) resets the fallback meter — the escalation's own suggested path", async t => {
+	const h = fixture(t, { send: () => ({ reply: "[[NEXT_CHECK]]: 嘎嘎 | 等批次" }) });
+	const item = h.create(); h.service.start(); await flush();
+	await h.clock.advance(2 * 3_600_000); await flush(); // w2 → fb 2
+	// One advance runs the chained re-checks (w2 at +1h, w3 at +2h): all three
+	// unusable → third one escalates to waiting_human.
+	await h.clock.advance(2 * 3_600_000); await flush();
+	let row = h.store.get(item.id);
+	assert.equal(row.status, "waiting_human");
+	assert.match(row.question, /连续 3 次/);
+	// Admin intervenes via update nextCheck (setSchedule) → meter must reset,
+	// else one more slip escalates instantly at "4 ≥ 3".
+	h.store.setSchedule(item.id, h.clock.now() + 3_600_000, "管理员指定时间");
+	row = h.store.get(item.id);
+	assert.equal(row.status, "scheduled");
+	assert.equal(row.fallback_streak, 0, "setSchedule clears the meter");
 });
 
 test("a pause landing during release suppresses the stale scheduled push (L4)", async t => {

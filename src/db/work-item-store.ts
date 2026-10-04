@@ -21,6 +21,8 @@ export interface WorkItemRow {
 	next_check_reason: string | null;
 	/** Consecutive windows that picked the same daily slot (cron degeneration meter). */
 	fixed_streak: number;
+	/** Consecutive windows whose NEXT_CHECK was unusable (soft-fallback meter). */
+	fallback_streak: number;
 	/** Set by claim() on the first window; durable kickoff-vs-resume marker. */
 	kicked_off: number;
 	/** Verified confirming admin, not the conversation's proposer. */
@@ -60,13 +62,13 @@ export class WorkItemStore {
 			conditions: null, progress: null, lessons: null,
 			origin_conversation: input.originConversation ?? null,
 			origin_note: input.originNote ?? null, status: input.status ?? "proposed",
-			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0, kicked_off: 0,
+			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0, fallback_streak: 0, kicked_off: 0,
 			created_by: input.createdBy ?? null,
 			answer: null, created_at: now, updated_at: now,
 		};
 		this.db.prepare(`INSERT INTO work_items
-			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, kicked_off, created_by, answer, created_at, updated_at)
-			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @kicked_off, @created_by, @answer, @created_at, @updated_at)`).run(row);
+			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, kicked_off, created_by, answer, created_at, updated_at)
+			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @kicked_off, @created_by, @answer, @created_at, @updated_at)`).run(row);
 		this.changed(row.id);
 		return row;
 	}
@@ -125,6 +127,15 @@ export class WorkItemStore {
 			.run(Math.max(0, Math.floor(streak)), id);
 	}
 
+	/** Soft-fallback meter: consecutive unusable NEXT_CHECK declarations.
+	 * Deliberately unguarded by status: it is written mid-window (status
+	 * 'working') from the window decision, unlike the notebook edits below. */
+	setFallbackStreak(id: string, streak: number): WorkItemRow | undefined {
+		this.db.prepare("UPDATE work_items SET fallback_streak = ?, updated_at = ? WHERE id = ?").run(streak, Date.now(), id);
+		const row = this.get(id);
+		this.changed(id);
+		return row;
+	}
 	/** Notebook and admin-rewrite edits must not mutate terminal items, including late aborted tools. */
 	setField(id: string, field: "title" | "goal" | "conditions" | "progress" | "set_conditions" | "set_progress", value: string): WorkItemRow | undefined {
 		const column = field === "set_conditions" ? "conditions" : field === "set_progress" ? "progress" : field;
@@ -134,14 +145,16 @@ export class WorkItemStore {
 	}
 
 	/** Admin reschedule: only states that are not mid-window or ended. Keeps the
-	 * previous reason when none is given, and RESETS fixed_streak: an admin
-	 * replacing the schedule breaks the measured cadence, so the meter must
-	 * count only the new consecutive cadence — otherwise a stale streak plus one
-	 * follow-up at the admin's new time fires a false routine warning
-	 * (Copilot review 2026-10-02). */
+	 * previous reason when none is given, and RESETS fixed_streak and
+	 * fallback_streak: an admin replacing the schedule breaks both meters, so
+	 * they must count only the new consecutive cadence — otherwise a stale
+	 * streak plus one follow-up at the admin's new time fires a false routine
+	 * warning (Copilot review 2026-10-02) or an instant re-escalation right
+	 * after the admin's update (the escalation message itself recommends this
+	 * update path). */
 	setSchedule(id: string, nextCheckAt: number, reason?: string): WorkItemRow | undefined {
 		const result = this.db.prepare(`UPDATE work_items SET status = 'scheduled', question = NULL, next_check_at = ?,
-			next_check_reason = COALESCE(?, next_check_reason), fixed_streak = 0, updated_at = ? WHERE id = ? AND status IN ('queued', 'waiting_human', 'scheduled')`)
+			next_check_reason = COALESCE(?, next_check_reason), fixed_streak = 0, fallback_streak = 0, updated_at = ? WHERE id = ? AND status IN ('queued', 'waiting_human', 'scheduled')`)
 			.run(nextCheckAt, reason === undefined ? null : reason, Date.now(), id);
 		if (!result.changes) return undefined;
 		this.changed(id);
@@ -191,7 +204,7 @@ export class WorkItemStore {
 	}
 	/** Single atomic transition: only explicit resume may queue waiting_human. */
 	resume(id: string, answer?: string): WorkItemRow | undefined {
-		const result = this.db.prepare(`UPDATE work_items SET status = 'queued', question = NULL, next_check_at = NULL,
+		const result = this.db.prepare(`UPDATE work_items SET status = 'queued', question = NULL, next_check_at = NULL, fallback_streak = 0,
 			answer = COALESCE(?, answer), updated_at = ? WHERE id = ? AND status = 'waiting_human'`)
 			.run(answer === undefined ? null : answer.slice(0, 2000), Date.now(), id);
 		if (!result.changes) return undefined;
