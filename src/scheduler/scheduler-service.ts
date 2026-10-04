@@ -172,7 +172,11 @@ export class SchedulerService {
 				// chain's conversation carries all its progress.
 				if (task.autonomous && parseChainState(task.chain_state)?.pending) {
 					const next = this.safeNext(task.cron);
-					this.store.markRun(task.id, task.chain_state?.includes('"budget"') ? "paused:预算耗尽，等待续跑（跳过本次触发）" : "paused:等待人工回复（跳过本次触发）", next);
+					const pending = parseChainState(task.chain_state)?.pending;
+					const pauseLabel = pending === "budget" ? "paused:预算耗尽，等待续跑（跳过本次触发）"
+						: pending === "stalled" ? "paused:模型无返回，等待处理（跳过本次触发）"
+						: "paused:等待人工回复（跳过本次触发）";
+					this.store.markRun(task.id, pauseLabel, next);
 					continue;
 				}
 				this.inFlight.add(task.id);

@@ -60,7 +60,7 @@ export function parseChainState(raw: string | null | undefined): AutonomousChain
 			convId: v.convId,
 			turns: Number.isFinite(v.turns) ? Math.max(0, Math.floor(v.turns as number)) : 0,
 			startedAt: Number.isFinite(v.startedAt) ? (v.startedAt as number) : Date.now(),
-			pending: v.pending === "human" || v.pending === "budget" ? v.pending : undefined,
+			pending: v.pending === "human" || v.pending === "budget" || v.pending === "stalled" ? v.pending : undefined,
 			question: typeof v.question === "string" ? v.question : undefined,
 			answer: typeof v.answer === "string" ? v.answer : undefined,
 		};
