@@ -14,10 +14,13 @@ import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/conte
 import { randomUUID } from "node:crypto";
 import { Agent, convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "@earendil-works/pi-agent-core";
 import type { AgentEvent, AgentMessage, Skill, StreamFn } from "@earendil-works/pi-agent-core";
-import { createModels, InMemoryCredentialStore } from "@earendil-works/pi-ai";
+import { createModels } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
-import type { Api, ImageContent, Model, MutableModels, TextContent } from "@earendil-works/pi-ai";
+import type { Api, AuthInteraction, AuthPrompt, AuthEvent, CredentialStore, ImageContent, Model, MutableModels, TextContent } from "@earendil-works/pi-ai";
 import type { ConfigStore, Supplier } from "../db/config-store.js";
+import { AUTH_CATALOG_PROVIDER_IDS, AUTH_PROVIDER_LABELS, type AuthCatalogEntry, type AuthCatalogProviderId, type AuthCatalogResponse, type AuthLoginState, type AuthPromptView, type AuthQuotaResponse } from "../shared/auth.js";
+import { FileCredentialStore, resolveAuthPath } from "./credential-store.js";
+import { parseZaiQuota, zaiQuotaUrl } from "./auth-quota.js";
 import type { HistoryStore } from "../db/history-store.js";
 import { inferConversationOrigin } from "../db/history-store.js";
 import type { WorkItemStore } from "../db/work-item-store.js";
@@ -139,6 +142,33 @@ export interface EngineOptions {
 	streamFn?: StreamFn;
 	/** Per-LLM-call timeout (ms). 0 = no timeout. */
 	timeoutMs?: number;
+	/** Credential store backing the Models registry. Default: FileCredentialStore
+	 * on the shared pi agent dir (auth.json). Injectable for tests. */
+	credentialStore?: CredentialStore;
+}
+
+/**
+ * Bridge the engine pushes auth-login flow state through. The main process
+ * binds it to the settings window (webContents.send of AUTH_IPC.loginEvent);
+ * prompts ride INSIDE the AuthLoginState (`.prompt`) and are answered via
+ * `authLoginAnswer(promptId, value)` — tokens never cross this bridge.
+ */
+export interface AuthLoginEventBridge {
+	onEvent(state: AuthLoginState): void;
+}
+
+/** Engine-side state of one in-flight login flow. */
+interface ActiveAuthLogin {
+	provider: AuthCatalogProviderId;
+	controller: AbortController;
+	/** Latest snapshot pushed to the bridge. */
+	state: AuthLoginState;
+	/** Outstanding prompt: id → resolver fed by authLoginAnswer. */
+	pending?: { id: string; resolve: (value: string) => void };
+	/** Monotonic prompt counter (prompt ids are per-login UUIDs, so stale
+	 * renderer answers can never match a NEWER login's prompt). */
+	promptSeq: number;
+	finished: boolean;
 }
 
 export class EmployeeEngine implements EmployeeRuntime {
@@ -147,10 +177,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** Per-conversation abort timers bounding side LLM calls (compaction). */
 	private readonly sideCallTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly models: MutableModels;
-	/** Engine-owned credential store handed to the Models registry — lets us
-	 * write supplier keys for providers the SDK resolves auth against. */
-	private readonly credentialStore = new InMemoryCredentialStore();
-	private readonly opts: Required<Omit<EngineOptions, "streamFn">> & { streamFn?: StreamFn };
+	/** Engine-owned credential store handed to the Models registry. Persists to
+	 * the pi agent dir's auth.json (shared with the pi CLI), so account logins
+	 * work everywhere; injectable for tests. */
+	private readonly credentialStore: CredentialStore;
+	private readonly opts: { timeoutMs: number; streamFn?: StreamFn };
 	private readonly skillLoader: SkillLoader;
 	/** Authoring surface for declarative skills (save_to_skill). */
 	private readonly skillWriter: SkillWriter;
@@ -202,6 +233,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		options: EngineOptions = {},
 	) {
 		this.opts = { timeoutMs: options.timeoutMs ?? 0, streamFn: options.streamFn };
+		this.credentialStore = options.credentialStore ?? new FileCredentialStore();
 		this.models = createModels({ credentials: this.credentialStore });
 		for (const provider of builtinProviders()) this.models.setProvider(provider);
 		this.syncProviderCredentials();
@@ -418,8 +450,29 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 
+	/**
+	 * Per-call API key for an Agent. authProvider suppliers resolve auth INSIDE
+	 * models.streamSimple from the stored credential (with locked OAuth
+	 * refresh); an explicit key there would override the account, so this path
+	 * always returns undefined.
+	 */
+	private apiKeyFor(supplier: Supplier): string | undefined {
+		return supplier.authProvider ? undefined : supplier.apiKey || undefined;
+	}
+
 	/** Build a runnable Model from a supplier + model id (alias models supported). */
 	private buildModel(supplier: Supplier, modelId: string): Model<Api> {
+		// Account-login bypass: the supplier's models ARE pi-ai registry models of
+		// the logged-in provider — they already carry provider/baseUrl/headers, and
+		// streamSimple resolves auth + refreshes tokens automatically. No relay
+		// cloning, and supplier.apiKey/baseUrl are irrelevant on this path.
+		if (supplier.authProvider) {
+			const registered = this.models.getModel(supplier.authProvider, modelId);
+			if (!registered) {
+				throw new Error(`模型 "${modelId}" 不可用：请先在账号登录中完成 ${supplier.authProvider} 登录或刷新模型列表`);
+			}
+			return this.withIdentity(registered, supplier, modelId);
+		}
 		const preferredApi = supplier.apiType === "openai" ? "openai-completions" : "anthropic-messages";
 		// For openai we prefer a completions-api provider (groq/openrouter/...) since
 		// relays overwhelmingly speak chat/completions, whereas the built-in "openai"
@@ -659,7 +712,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		const agent = new Agent({
 			initialState: { systemPrompt, model: this.buildModel(supplier, modelId), tools: [] },
 			streamFn: this.rawStreamFn,
-			getApiKey: () => supplier.apiKey || undefined,
+			getApiKey: () => this.apiKeyFor(supplier),
 		});
 		let reply = "";
 		const unsubscribe = agent.subscribe((event: AgentEvent) => {
@@ -746,7 +799,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			convertToLlm,
 			sessionId: conversationId,
 			streamFn: this.makeStreamFn(conversationId),
-			getApiKey: () => supplier.apiKey || undefined,
+			getApiKey: () => this.apiKeyFor(supplier),
 		});
 
 		this.applyToolStepCap(agent);
@@ -952,13 +1005,22 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * provider share one stored credential (last write wins). That is safe for
 	 * the main loop (explicit key always wins) and only affects keyless internal
 	 * calls on non-default suppliers — acceptable; this deployment has one.
+	 *
+	 * Persistence note: the store now survives restarts (auth.json shared with
+	 * the pi CLI), so a blind overwrite could silently destroy a user's real
+	 * account login on the borrowed provider (e.g. an anthropic-relay supplier
+	 * clobbering an OAuth Claude login). When the stored credential is OAuth we
+	 * leave it untouched — an OAuth subscription is the more valuable artifact,
+	 * and main-loop calls still carry the relay key explicitly.
 	 */
 	private syncProviderCredentials(): void {
 		try {
 			const cfg = this.config.all().model;
 			const byProvider = new Map<string, string>();
 			for (const supplier of cfg.suppliers) {
-				if (!supplier.enabled || !supplier.apiKey.trim()) continue;
+				// Account-login suppliers don't borrow relay providers; their auth is
+				// the stored credential itself.
+				if (supplier.authProvider || !supplier.enabled || !supplier.apiKey.trim()) continue;
 				for (const modelId of supplier.models) {
 					try {
 						const m = this.buildModel(supplier, modelId);
@@ -970,12 +1032,294 @@ export class EmployeeEngine implements EmployeeRuntime {
 			}
 			for (const [providerId, key] of byProvider) {
 				this.credentialStore
-					.modify(providerId, async () => ({ type: "api_key" as const, key }))
+					.modify(providerId, async (current) => (current?.type === "oauth" ? undefined : { type: "api_key" as const, key }))
 					.catch((err: unknown) => console.warn(`[engine] credential sync failed for ${providerId}:`, err instanceof Error ? err.message : err));
 			}
 		} catch (err) {
 			console.warn("[engine] provider credential sync failed:", err instanceof Error ? err.message : err);
 		}
+	}
+
+	// ── Provider account login (auth.json-backed) ──
+
+	/** Cap on catalog model ids surfaced per provider (display only). */
+	private static readonly AUTH_CATALOG_MODEL_CAP = 12;
+
+	/** Currently active login flow, if any. One at a time by design: OAuth
+	 * flows open browsers / device codes, and two parallel flows would fight
+	 * over the UI and the stored credential. */
+	private activeAuthLogin?: ActiveAuthLogin;
+
+	/** Validate an untrusted provider id against the shared catalog contract. */
+	private assertCatalogProvider(provider: unknown): AuthCatalogProviderId {
+		if (typeof provider !== "string" || !(AUTH_CATALOG_PROVIDER_IDS as readonly string[]).includes(provider)) {
+			throw new Error(`未知的账号提供商：${String(provider).slice(0, 50)}`);
+		}
+		return provider as AuthCatalogProviderId;
+	}
+
+	/** Where the credential file lives (UI hint). */
+	authStorePath(): string {
+		return this.credentialStore instanceof FileCredentialStore ? this.credentialStore.authPath : resolveAuthPath();
+	}
+
+	/**
+	 * Catalog of login-capable providers for the settings UI: display metadata
+	 * from the shared contract, live configured/authType from pi-ai checkAuth
+	 * (falling back to the raw stored credential), and the provider's registry
+	 * models for prefilling supplier forms. Never throws for individual
+	 * providers — a broken one just reports unconfigured.
+	 */
+	async authCatalog(): Promise<AuthCatalogResponse> {
+		const entries: AuthCatalogEntry[] = [];
+		for (const provider of AUTH_CATALOG_PROVIDER_IDS) {
+			const label = AUTH_PROVIDER_LABELS[provider];
+			let configured = false;
+			let authType: AuthCatalogEntry["authType"];
+			try {
+				const check = await this.models.checkAuth(provider);
+				if (check) {
+					configured = true;
+					authType = check.type;
+				}
+			} catch (err) {
+				console.warn(`[engine] auth check failed for ${provider}:`, err instanceof Error ? err.message : err);
+			}
+			if (!configured) {
+				// checkAuth consults provider auth semantics; a stored credential it
+				// cannot classify (e.g. the provider id is not registered in this
+				// build) is still proof that an account exists.
+				const credential = await this.credentialStore.read(provider).catch(() => undefined);
+				if (credential) {
+					configured = true;
+					authType = credential.type;
+				}
+			}
+			const models = (this.models.getProvider(provider)?.getModels() ?? [])
+				.slice(0, EmployeeEngine.AUTH_CATALOG_MODEL_CAP)
+				.map((m) => ({ id: m.id, name: m.name }));
+			entries.push({
+				provider,
+				name: label.name,
+				description: label.description,
+				kind: label.kind,
+				configured,
+				...(authType ? { authType } : {}),
+				models,
+			});
+		}
+		return { providers: entries, authPath: this.authStorePath() };
+	}
+
+	/**
+	 * Start a login flow for a catalog provider. Returns the initial state
+	 * immediately; all further progress (OAuth url, device code, prompts,
+	 * done/error/cancelled) arrives as AuthLoginState snapshots through the
+	 * bridge. oauth providers run pi-ai's own flow; api_key providers (Z.ai)
+	 * have no OAuth in pi-ai, so the engine asks for the key via a `secret`
+	 * prompt and persists it through the store directly.
+	 */
+	authLogin(provider: string, bridge: AuthLoginEventBridge): AuthLoginState {
+		const providerId = this.assertCatalogProvider(provider);
+		if (this.activeAuthLogin) throw new Error("已有登录流程正在进行，请先取消或等待完成");
+		const kind = AUTH_PROVIDER_LABELS[providerId].kind;
+		const controller = new AbortController();
+		const active: ActiveAuthLogin = {
+			provider: providerId,
+			controller,
+			promptSeq: 0,
+			finished: false,
+			state: {
+				id: randomUUID(),
+				provider: providerId,
+				status: "waiting",
+				message: kind === "oauth" ? "正在启动登录…" : "请在下方粘贴 API Key",
+			},
+		};
+		this.activeAuthLogin = active;
+
+		const push = (): void => {
+			if (!active.finished) bridge.onEvent({ ...active.state, ...(active.state.prompt ? { prompt: { ...active.state.prompt } } : {}) });
+		};
+		const finish = (status: AuthLoginState["status"], message: string): void => {
+			if (active.finished) return;
+			active.finished = true;
+			if (this.activeAuthLogin === active) this.activeAuthLogin = undefined;
+			active.state = { ...active.state, status, message, prompt: undefined, url: undefined, deviceCode: undefined };
+			bridge.onEvent({ ...active.state });
+		};
+
+		const safeUrl = (value: string): string | undefined => {
+			try {
+				const u = new URL(value);
+				return u.protocol === "https:" ? u.href : undefined;
+			} catch {
+				return undefined;
+			}
+		};
+
+		const interaction: AuthInteraction = {
+			signal: controller.signal,
+			notify: (event: AuthEvent): void => {
+				if (active.finished || controller.signal.aborted) return;
+				if (event.type === "auth_url") {
+					active.state = {
+						...active.state,
+						url: safeUrl(event.url),
+						message: event.instructions || "在浏览器完成授权。",
+					};
+				} else if (event.type === "device_code") {
+					active.state = {
+						...active.state,
+						url: safeUrl(event.verificationUri),
+						deviceCode: event.userCode,
+						message: "打开登录页面并输入设备码。",
+					};
+				} else {
+					active.state = { ...active.state, message: event.message };
+				}
+				push();
+			},
+			prompt: (p: AuthPrompt): Promise<string> =>
+				new Promise<string>((resolve, reject) => {
+					const promptId = randomUUID();
+					let settled = false;
+					const settle = (value: string | Error): void => {
+						if (settled) return;
+						settled = true;
+						cleanup();
+						if (active.pending?.id === promptId) {
+							active.pending = undefined;
+							active.state = { ...active.state, prompt: undefined };
+							push();
+						}
+						if (typeof value === "string") resolve(value);
+						else reject(value);
+					};
+					const onAbort = (): void => settle(new Error("登录已取消"));
+					const cleanup = (): void => {
+						p.signal?.removeEventListener("abort", onAbort);
+						controller.signal.removeEventListener("abort", onAbort);
+					};
+					if (p.signal?.aborted || controller.signal.aborted) {
+						settle(new Error("登录已取消"));
+						return;
+					}
+					const view: AuthPromptView = {
+						id: promptId,
+						type: p.type,
+						message: p.message,
+						// `placeholder` exists on every variant except `select`.
+						...("placeholder" in p && p.placeholder ? { placeholder: p.placeholder } : {}),
+						...(p.type === "select" ? { options: p.options.map((o) => ({ ...o })) } : {}),
+					};
+					active.pending = {
+						id: promptId,
+						resolve: (value) => settle(value),
+					};
+					active.state = { ...active.state, prompt: view };
+					p.signal?.addEventListener("abort", onAbort, { once: true });
+					controller.signal.addEventListener("abort", onAbort, { once: true });
+					push();
+				}),
+		};
+
+		void (async () => {
+			try {
+				if (kind === "oauth") {
+					await this.models.login(providerId, "oauth", interaction);
+				} else {
+					// api_key provider (Z.ai): no OAuth flow exists in pi-ai. Ask via
+					// the bridge, persist through the store — same write path as a
+					// pi-ai login would take.
+					const raw = await interaction.prompt({
+						type: "secret",
+						message: `请粘贴 ${AUTH_PROVIDER_LABELS[providerId].name} 的 API Key`,
+						placeholder: "粘贴 API Key",
+					});
+					const key = raw.trim();
+					if (!key) throw new Error("API Key 不能为空");
+					await this.credentialStore.modify(providerId, async () => ({ type: "api_key" as const, key }));
+				}
+				finish("done", "登录成功，凭证已保存");
+			} catch (err) {
+				if (controller.signal.aborted) {
+					finish("cancelled", "登录已取消");
+				} else {
+					const message = err instanceof Error ? err.message : String(err);
+					console.warn(`[engine] auth login failed for ${providerId}: ${message.slice(0, 200)}`);
+					finish("error", message.slice(0, 200) || "登录失败，请重试");
+				}
+			}
+		})();
+		return { ...active.state, ...(active.state.prompt ? { prompt: { ...active.state.prompt } } : {}) };
+	}
+
+	/** Current login state snapshot (renderer re-sync after reload); null when idle. */
+	authLoginStatus(): AuthLoginState | null {
+		const active = this.activeAuthLogin;
+		return active && !active.finished ? { ...active.state, ...(active.state.prompt ? { prompt: { ...active.state.prompt } } : {}) } : null;
+	}
+
+	/** Renderer submitted an answer to the active login's prompt. */
+	authLoginAnswer(promptId: string, value: string): void {
+		const active = this.activeAuthLogin;
+		if (!active || active.finished) throw new Error("登录请求已失效");
+		const pending = active.pending;
+		if (!pending || pending.id !== promptId) throw new Error("登录问题已失效");
+		if (typeof value !== "string" || value.length > 16_384) throw new Error("输入无效");
+		const view = active.state.prompt;
+		if (view?.type === "select" && !view.options?.some((o) => o.id === value)) throw new Error("选项无效");
+		pending.resolve(value);
+	}
+
+	/** Abort the active login flow (renderer closed/cancelled). Tolerant no-op
+	 * when nothing is running — callers fire it on window close too. */
+	authLoginCancel(): boolean {
+		const active = this.activeAuthLogin;
+		if (!active || active.finished) {
+			this.activeAuthLogin = undefined;
+			return false;
+		}
+		active.controller.abort(new Error("登录已取消"));
+		return true;
+	}
+
+	/** Remove the stored credential for a provider (logout). */
+	async authLogout(provider: string): Promise<void> {
+		const providerId = this.assertCatalogProvider(provider);
+		await this.models.logout(providerId);
+	}
+
+	/**
+	 * Z.ai Coding Plan quota (zai / zai-coding-cn). Resolves the live auth
+	 * (refreshing OAuth if needed), pins the endpoint to the official Z.ai /
+	 * BigModel origin derived from the provider's actual base (see auth-quota.ts),
+	 * and normalizes the response for the UI. Credentials only ever ride the
+	 * request — never logs.
+	 */
+	async authQuota(provider: string): Promise<AuthQuotaResponse> {
+		const providerId = this.assertCatalogProvider(provider);
+		const auth = await this.models.getAuth(providerId);
+		if (!auth) throw new Error(`尚未配置 ${AUTH_PROVIDER_LABELS[providerId].name} 的凭证，请先完成账号登录`);
+		const base = auth.auth.baseUrl || this.models.getProvider(providerId)?.baseUrl;
+		const url = zaiQuotaUrl(base);
+		// ProviderHeaders allows null entries; fetch HeadersInit does not.
+		const resolvedHeaders = auth.auth.headers
+			? Object.fromEntries(
+					Object.entries(auth.auth.headers).filter((entry): entry is [string, string] => entry[1] !== null),
+				)
+			: undefined;
+		const headers = resolvedHeaders ?? (auth.auth.apiKey ? { Authorization: `Bearer ${auth.auth.apiKey}` } : undefined);
+		const response = await fetch(url, { headers, signal: AbortSignal.timeout(10_000) });
+		if (response.status === 401) throw new Error("登录已过期，请重新完成账号登录");
+		if (!response.ok) throw new Error(`套餐接口返回 ${response.status}`);
+		const payload: unknown = await response.json().catch(() => {
+			throw new Error("套餐接口返回格式无效");
+		});
+		const limits = parseZaiQuota(payload);
+		if (!limits.length) throw new Error("套餐返回中没有可用额度字段");
+		return { provider: providerId, limits, fetchedAt: Date.now() };
 	}
 
 	/**
@@ -1112,7 +1456,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 	async testModelConnection(supplier: Supplier, modelId: string): Promise<string> {
 		const normalizedModelId = modelId.trim();
 		if (!normalizedModelId) throw new Error("请先添加一个模型");
-		if (!supplier.apiKey.trim()) throw new Error("请填写 API Key");
+		// Account-login suppliers authenticate through the stored credential, not
+		// a pasted key — the「请填写 API Key」requirement does not apply to them.
+		if (!supplier.authProvider && !supplier.apiKey.trim()) throw new Error("请填写 API Key");
 
 		const agent = new Agent({
 			initialState: {
@@ -1122,7 +1468,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			},
 			streamFn: (model, context, options) =>
 				this.models.streamSimple(model, context, { ...options, timeoutMs: 30_000 }),
-			getApiKey: () => supplier.apiKey || undefined,
+			getApiKey: () => this.apiKeyFor(supplier),
 		});
 
 		let reply = "";
@@ -1151,7 +1497,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		}
 		const agent = this.getOrCreateSession(conversationId);
 		agent.state.model = this.buildModel(supplier, modelId);
-		agent.getApiKey = () => supplier.apiKey || undefined;
+		agent.getApiKey = () => this.apiKeyFor(supplier);
 		this.history.ensureConversation(conversationId, null);
 		this.history.setModelOverride(conversationId, supplierId, modelId);
 	}

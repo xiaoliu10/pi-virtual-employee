@@ -33,6 +33,8 @@
 		"test:scheduler-detail": "node --test scripts/test-scheduler-detail.mjs",
 		"test:inbound": "node --test scripts/test-inbound-dir.mjs",
 		"test:time": "node --test scripts/test-time.mjs",
+		"test:credential-store": "node --test scripts/test-credential-store.mjs",
+		"test:engine-auth": "node --test scripts/test-engine-auth.mjs",
 		"test:skills": "node --test scripts/test-skills.mjs",
 		"prepare:native:win": "node scripts/prepare-win-native.mjs",
 		"prepare:native:mac": "node scripts/prepare-mac-native.mjs",

@@ -4,6 +4,8 @@
  * `window.api.*`, which maps to ipcRenderer.invoke.
  */
 import { contextBridge, ipcRenderer } from "electron";
+import { AUTH_IPC } from "../src/shared/auth.js";
+import type { AuthCatalogResponse, AuthLoginState, AuthQuotaResponse } from "../src/shared/auth.js";
 
 const api = {
 	getServerPort: (): Promise<number> => ipcRenderer.invoke("server:port"),
@@ -52,6 +54,23 @@ const api = {
 	exportModelConfig: (model: unknown): Promise<boolean> => ipcRenderer.invoke("model:export", model),
 	setConversationModel: (conversationId: string, supplierId: string, modelId: string): Promise<boolean> =>
 		ipcRenderer.invoke("model:setForConversation", conversationId, supplierId, modelId),
+
+	// Provider account login (settings page). Login progress arrives as pushed
+	// AuthLoginState snapshots (onAuthLoginEvent); answers go through
+	// authLoginAnswer(promptId, value); authLoginCancel aborts the flow.
+	authCatalog: (): Promise<AuthCatalogResponse> => ipcRenderer.invoke(AUTH_IPC.catalog),
+	authLogin: (provider: string): Promise<AuthLoginState> => ipcRenderer.invoke(AUTH_IPC.login, provider),
+	authLoginStatus: (): Promise<AuthLoginState | null> => ipcRenderer.invoke(AUTH_IPC.loginStatus),
+	authLoginAnswer: (promptId: string, value: string): Promise<boolean> => ipcRenderer.invoke(AUTH_IPC.loginAnswer, promptId, value),
+	authLoginCancel: (): Promise<boolean> => ipcRenderer.invoke(AUTH_IPC.loginCancel),
+	authLogout: (provider: string): Promise<void> => ipcRenderer.invoke(AUTH_IPC.logout, provider),
+	authQuota: (provider: string): Promise<AuthQuotaResponse> => ipcRenderer.invoke(AUTH_IPC.quota, provider),
+	/** Subscribe to login flow state pushes (main → renderer). Returns an unsubscribe. */
+	onAuthLoginEvent: (cb: (state: AuthLoginState) => void): (() => void) => {
+		const listener = (_e: unknown, state: AuthLoginState) => cb(state);
+		ipcRenderer.on(AUTH_IPC.loginEvent, listener);
+		return () => ipcRenderer.removeListener(AUTH_IPC.loginEvent, listener);
+	},
 	exportEmployee: (opts?: unknown): Promise<{ path: string; size: number } | null> =>
 		ipcRenderer.invoke("employee:export", opts),
 	importEmployee: (args: { mode: "new" | "overwrite"; profileName?: string }): Promise<unknown> =>
