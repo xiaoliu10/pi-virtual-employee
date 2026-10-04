@@ -508,6 +508,10 @@ test("lastAssistantTailOf returns the tail of the most recent assistant turn", (
 	assert.equal(lastAssistantTailOf([assistant("abcdefgh")], 8), "abcdefgh", "exact-length is returned as-is");
 	// Skips non-assistant messages; picks the LATEST assistant turn.
 	assert.equal(lastAssistantTailOf([user("继续"), assistant("第一轮"), user("继续"), assistant("第二轮")]), "第二轮");
+	// A tool-only assistant turn (no text part) is skipped for the prior turn.
+	const toolOnly = { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "run_command", input: {} }] };
+	assert.equal(lastAssistantTailOf([toolOnly, assistant("真实文本回复")]), "真实文本回复");
+	assert.equal(lastAssistantTailOf([toolOnly]), "", "a tool-only turn with no prior text yields empty");
 	// Empty assistant content or no assistant → empty.
 	assert.equal(lastAssistantTailOf([user("继续")]), "");
 	assert.equal(lastAssistantTailOf([]), "");
