@@ -110,3 +110,13 @@ test("autonomous chain protocol: KB-first on stalls and login expiry (field 2026
 	assert.doesNotMatch(noKb, /search_knowledge_base/);
 	assert.match(noKb, /登录过期直接/);
 });
+
+test("autonomous chain protocol: KB write-back after a blocker is resolved (field 2026-10-05)", () => {
+	const prefix = buildAutonomousTurnPrefix({ turn: 0, budget: { maxTurns: 30, maxMinutes: 90 } });
+	assert.match(prefix, /卡点解决后若沉淀出了可复用的信息/);
+	assert.match(prefix, /save_to_knowledge 存进知识库/);
+	assert.match(prefix, /服务异常的规避办法/);
+	// KB off → no ghost tool reference.
+	const noKb = buildAutonomousTurnPrefix({ turn: 0, budget: { maxTurns: 30, maxMinutes: 90 }, kbEnabled: false });
+	assert.doesNotMatch(noKb, /save_to_knowledge/);
+});
