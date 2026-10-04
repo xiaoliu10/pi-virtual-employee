@@ -30,6 +30,12 @@ export interface Supplier {
 	modelContextWindow?: Record<string, number>;
 	/** Per-model max output tokens override (absent → inherit base). */
 	modelMaxTokens?: Record<string, number>;
+	/** Account-login supplier (pi-ai registry + shared auth.json). When set, the
+ *  supplier's models resolve from the provider's registered catalog and
+ *  authenticate via the stored credential (OAuth refresh included) —
+ *  apiKey/baseUrl are unused on this path. Catalog ids only (mirrors
+ *  src/db/config-store.ts). */
+	authProvider?: string;
 }
 
 export interface ModelOption {

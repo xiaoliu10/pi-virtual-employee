@@ -5,6 +5,7 @@
  */
 import { randomUUID } from "node:crypto";
 import type { DB } from "./sqlite.js";
+import { AUTH_CATALOG_PROVIDER_IDS } from "../shared/auth.js";
 import { normalizeTimeoutSec } from "../shared/timeouts.js";
 import { normalizeMcpServers, type McpServerConfig } from "../shared/mcp.js";
 import { DEFAULT_COMPUTER_CONFIG, normalizeComputerConfig, type ComputerConfig } from "../shared/computer.js";
@@ -79,6 +80,13 @@ export interface Supplier {
 	 * base model's cap, which can silently truncate long answers/reports.
 	 */
 	modelMaxTokens?: Record<string, number>;
+	/**
+	 * Account-login provider (pi-ai registry + shared auth.json). When set, this
+	 * supplier's models resolve from the provider's registered catalog and
+	 * authenticate via the stored credential (OAuth refresh included) —
+	 * apiKey/baseUrl are unused on this path. Only catalog ids are accepted.
+	 */
+	authProvider?: string;
 }
 
 export interface ModelConfig {
@@ -587,17 +595,26 @@ function normalizeCapabilities(merged: AppConfig): AppConfig["capabilities"] {
 }
 
 export function newSupplier(partial: Partial<Supplier> = {}): Supplier {
+	const authProvider = normalizedAuthProvider(partial.authProvider);
 	return {
 		id: partial.id?.trim() || randomUUID(),
 		name: partial.name?.trim() || "新供应商",
 		enabled: partial.enabled ?? true,
 		apiType: partial.apiType === "openai" ? "openai" : "anthropic",
-		baseUrl: partial.baseUrl?.trim() ?? "",
-		apiKey: partial.apiKey ?? "",
+		// Account-login suppliers carry NO baseUrl/apiKey of their own (review
+		// H3, defense in depth): their auth resolves from auth.json inside pi-ai
+		// and their endpoints come from the provider registry. A hand-edited or
+		// imported baseUrl must never redirect OAuth access tokens to another
+		// host, and a per-supplier key would shadow the account. Cleared on
+		// EVERY normalize path (config read/update/import), not just in the
+		// engine's model builder.
+		baseUrl: authProvider ? "" : partial.baseUrl?.trim() ?? "",
+		apiKey: authProvider ? "" : partial.apiKey ?? "",
 		models: normalizedModels(partial.models),
 		modelImage: normalizedModelImage(partial.modelImage),
 		modelContextWindow: normalizedModelContextWindow(partial.modelContextWindow),
 		modelMaxTokens: normalizedModelContextWindow(partial.modelMaxTokens),
+		authProvider,
 	};
 }
 
@@ -621,6 +638,12 @@ function normalizedModelContextWindow(value: unknown): Record<string, number> | 
 	return Object.keys(out).length ? out : undefined;
 }
 
+/** Coerce an untrusted authProvider into a known catalog id; drop junk. */
+function normalizedAuthProvider(value: unknown): string | undefined {
+	const id = typeof value === "string" ? value.trim() : "";
+	return (AUTH_CATALOG_PROVIDER_IDS as readonly string[]).includes(id) ? id : undefined;
+}
+
 /** Normalize untrusted/legacy model config and reconcile its global default. */
 export function normalizeModelConfig(value: unknown): ModelConfig {
 	const raw = value && typeof value === "object" ? value as Record<string, unknown> : {};
@@ -638,6 +661,7 @@ export function normalizeModelConfig(value: unknown): ModelConfig {
 				modelImage: normalizedModelImage(entry.modelImage),
 				modelContextWindow: normalizedModelContextWindow(entry.modelContextWindow),
 				modelMaxTokens: normalizedModelContextWindow(entry.modelMaxTokens),
+				authProvider: normalizedAuthProvider(entry.authProvider),
 			}))
 		: [];
 

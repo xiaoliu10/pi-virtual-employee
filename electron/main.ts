@@ -6,7 +6,7 @@
  * streams chat through it), the IM adapter manager, and autostart. All
  * GUI-facing state (config, tasks, autostart) flows over IPC.
  */
-import { app, BrowserWindow, clipboard, dialog, ipcMain } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from "electron";
 import { mkdir, readFile, writeFile, copyFile, readdir, rm } from "node:fs/promises";
 import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -39,11 +39,13 @@ import { ArtifactStore } from "../src/db/artifact-store.js";
 import { ReportService } from "../src/reports/report-service.js";
 import { DownloadStore } from "../src/downloads/download-store.js";
 import { DownloadService } from "../src/downloads/download-service.js";
-import { EmployeeEngine } from "../src/engine/engine.js";
+import { EmployeeEngine, type AuthLoginEventBridge } from "../src/engine/engine.js";
 import { disposeShellCommands } from "../src/engine/tools/shell.js";
 import { replyHasReportLink } from "../src/engine/tools/reports.js";
 import { scheduledTimePrefix } from "../src/engine/tools/time.js";
 import { buildSystemPrompt, defaultCoreRules } from "../src/engine/prompt.js";
+import { AUTH_IPC } from "../src/shared/auth.js";
+import type { AuthLoginState } from "../src/shared/auth.js";
 import { startHttpTransport } from "../src/transport/http.js";
 import { setupAutoUpdater, getUpdateState, lastCheckTime, checkNow, downloadNow, quitAndInstall, installNow as installNowUpdate, stopUpdater, setupUnattended, updateCapability, requestUpdateAndInstall, type UpdateState } from "./updater.js";
 import type { UpdateToolStatus } from "../src/engine/tools/update.js";
@@ -145,6 +147,9 @@ app.on("will-quit", () => {
 });
 
 let mainWindow: BrowserWindow | null = null;
+/** Invoked when the main window closes — used to abort a pending account login
+ * (the renderer can no longer answer its prompts). Assigned in main(). */
+let onMainWindowClosed: () => void = () => {};
 
 function createWindow(): void {
 	mainWindow = new BrowserWindow({
@@ -171,7 +176,24 @@ function createWindow(): void {
 		mainWindow.loadFile(path.join(__dirname, "../renderer/dist/index.html"));
 	}
 
+	// No renderer-initiated child windows (review H5): every window.open is
+	// denied in-app; https URLs are handed to the SYSTEM browser instead, so an
+	// OAuth page can never render inside a window we do not control.
+	mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+		try {
+			if (new URL(url).protocol === "https:") void shell.openExternal(url);
+		} catch {
+			/* unparsable → just deny */
+		}
+		return { action: "deny" };
+	});
+
 	if (activeProfile !== "default") mainWindow.setTitle(`虚拟员工 — ${activeProfile}`);
+
+	mainWindow.on("closed", () => {
+		mainWindow = null;
+		onMainWindowClosed();
+	});
 
 	// Forward renderer console (incl. React errors) to the main-process log.
 	mainWindow.webContents.on("console-message", (_e, level: number, message: string) => {
@@ -1006,6 +1028,71 @@ async function main(): Promise<void> {
 	ipcMain.handle("model:setForConversation", (_e, conversationId: string, supplierId: string, modelId: string) => {
 		engine.setConversationModel(conversationId, supplierId, modelId);
 		return true;
+	});
+
+	// ── Provider account login (auth.json-backed; tokens never leave the main process) ──
+	// Login flow state is PUSHED to the renderer (AUTH_IPC.loginEvent carries the
+	// full AuthLoginState snapshot, prompts included); the renderer answers via
+	// AUTH_IPC.loginAnswer and aborts via AUTH_IPC.loginCancel. The bridge holds
+	// no credentials — only display state.
+	const authBridge: AuthLoginEventBridge = {
+		onEvent: (state: AuthLoginState) => {
+			const wc = mainWindow?.webContents;
+			if (wc && !wc.isDestroyed()) wc.send(AUTH_IPC.loginEvent, state);
+		},
+	};
+	onMainWindowClosed = () => engine.authLoginCancel();
+	// Settings-page-only surface: reject events not originating from the main
+	// window's top frame (same guard as computer:manage).
+	const fromMainWindow = (event: Electron.IpcMainInvokeEvent): boolean =>
+		!!mainWindow && event.sender === mainWindow.webContents && event.senderFrame === mainWindow.webContents.mainFrame;
+	const authFromSettings = (event: Electron.IpcMainInvokeEvent): void => {
+		if (!fromMainWindow(event)) {
+			throw new Error("账号登录只能由本应用设置页管理。");
+		}
+	};
+	ipcMain.handle(AUTH_IPC.catalog, (e) => {
+		authFromSettings(e);
+		return engine.authCatalog();
+	});
+	ipcMain.handle(AUTH_IPC.login, (e, provider: string) => {
+		authFromSettings(e);
+		return engine.authLogin(provider, authBridge);
+	});
+	ipcMain.handle(AUTH_IPC.loginStatus, (e) => {
+		authFromSettings(e);
+		return engine.authLoginStatus();
+	});
+	ipcMain.handle(AUTH_IPC.loginAnswer, (e, promptId: string, value: string) => {
+		authFromSettings(e);
+		engine.authLoginAnswer(promptId, value);
+		return true;
+	});
+	ipcMain.handle(AUTH_IPC.loginCancel, (e) => {
+		authFromSettings(e);
+		engine.authLoginCancel();
+		return true;
+	});
+	ipcMain.handle(AUTH_IPC.logout, (e, provider: string) => {
+		authFromSettings(e);
+		return engine.authLogout(provider);
+	});
+	ipcMain.handle(AUTH_IPC.quota, (e, provider: string) => {
+		authFromSettings(e);
+		return engine.authQuota(provider);
+	});
+	//「打开授权页面」: https-only hand-off to the system browser (review H5) —
+	// no in-app child window (setWindowOpenHandler denies), no other schemes.
+	ipcMain.handle(AUTH_IPC.openExternal, (e, url: string) => {
+		authFromSettings(e);
+		let parsed: URL;
+		try {
+			parsed = new URL(String(url));
+		} catch {
+			throw new Error("无效的链接");
+		}
+		if (parsed.protocol !== "https:") throw new Error("仅允许打开 https 链接");
+		return shell.openExternal(parsed.href);
 	});
 
 	// --- Prompt management (editable built-in rules + live preview) ---

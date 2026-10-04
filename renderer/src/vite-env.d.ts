@@ -39,6 +39,19 @@ testOss(): Promise<{ ok: boolean; detail: string }>;
 	importModelConfig(): Promise<ModelConfig | null>;
 	exportModelConfig(model: ModelConfig): Promise<boolean>;
 	setConversationModel(conversationId: string, supplierId: string, modelId: string): Promise<boolean>;
+	// 供应商账号登录（electron/preload.ts 同步维护）。登录进度由主进程推送
+	// 全量 AuthLoginState 快照（onAuthLoginEvent）；答复经 authLoginAnswer。
+	authCatalog(): Promise<import("../../src/shared/auth").AuthCatalogResponse>;
+	authLogin(provider: string): Promise<import("../../src/shared/auth").AuthLoginState>;
+	authLoginStatus(): Promise<import("../../src/shared/auth").AuthLoginState | null>;
+	authLoginAnswer(promptId: string, value: string): Promise<boolean>;
+	authLoginCancel(): Promise<boolean>;
+	authLogout(provider: string): Promise<void>;
+	authQuota(provider: string): Promise<import("../../src/shared/auth").AuthQuotaResponse>;
+	onAuthLoginEvent(cb: (state: import("../../src/shared/auth").AuthLoginState) => void): () => void;
+	/** 在系统浏览器打开 https 链接（登录弹窗「打开授权页面」）。
+	 * 主进程强制 https + 来源主窗口；不开应用内子窗口。 */
+	openExternal(url: string): Promise<void>;
 	exportEmployee(opts?: { includeSecrets?: boolean; scope?: { history?: boolean; knowledge?: boolean; skills?: boolean } }): Promise<{ path: string; size: number } | null>;
 	importEmployee(args: { mode: "new" | "overwrite"; profileName?: string }): Promise<{ done: boolean; mode?: string; profileName?: string; summary?: unknown; canceled?: boolean }>;
 	kbStatus(): Promise<{ fts: boolean; chunks: number }>;
