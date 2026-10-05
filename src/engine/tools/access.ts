@@ -532,6 +532,7 @@ export function createManageAccessTool(deps: AccessToolDeps): AgentTool {
 					return { content: [{ type: "text", text: `完全访问模式已经是${current ? "开启" : "关闭"}状态，无需变更。` }], details: { action, unchanged: true } };
 				}
 				deps.config.update({ security: { ...deps.config.all().security, adminFullAccess: enable } });
+				deps.onConfigChanged?.(); // bump engine revision so rebuilt sessions pick up the mirrored prompt
 				return {
 					content: [{ type: "text", text: enable
 						? "✅ 完全访问模式已开启：管理员的管理操作（改配置、改身份、启停命令等）不再需要「确认」口令，管理员身份即授权。身份/白名单/单聊校验保持不变。随时可用 action=set_full_access value=off 关闭。"

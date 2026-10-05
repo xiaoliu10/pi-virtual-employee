@@ -26,10 +26,9 @@ await build({
 			export { HistoryStore } from "./src/db/history-store.ts";
 			export { checkPermission, resolveRole, hasAnyAdmin, isAdmin, describeAccess, CAPABILITY_LABEL } from "./src/security/permissions.ts";
 			export { createManageAccessTool, createCheckMyAccessTool } from "./src/engine/tools/access.ts";
-			export { createManageSettingsTool } from "./src/engine/tools/settings.ts";
+			export { createManageSettingsTool, ROOT_CATALOG } from "./src/engine/tools/settings.ts";
 			export { createComputerTools } from "./src/engine/tools/computer.ts";
 			export { createManageCapabilitiesTool } from "./src/engine/tools/capabilities.ts";
-			export { createAdminTools } from "./src/engine/tools/admin.ts";
 		`,
 		resolveDir: root,
 		loader: "ts",
@@ -53,6 +52,7 @@ const {
 	createManageSettingsTool,
 	createComputerTools,
 	createManageCapabilitiesTool,
+	ROOT_CATALOG,
 } = await import(pathToFileURL(bundle).href);
 
 /** Fresh in-memory config store with the tables ConfigStore touches. */
@@ -685,25 +685,42 @@ test("set_conversation_roles grants the whole observed roster, but spares the la
 // (field 2026-10-06: with full access ON the model still asked for「确认」because
 // the static description kept teaching it to; hard gate was already short-circuited.)
 
-test("tool descriptions mirror adminFullAccess: full access ON drops the confirmation demand", (t) => {
-	// Seed the flag through the real config store so the branch reads production shape.
+const SETTINGS_OFF_DESCRIPTION =
+	`读取或修改本系统的任意配置项（仅限 IM 单聊；写入需管理员并在当前消息包含「确认」）。` +
+	"action=list 列出全部可配置的根块；action=get 按 path 读单个值（如 general.longTaskProgressMin、kb.local.topK、browser.headless、filesystem.allowedDirs）；" +
+	"action=set 按 path 写入 value（数值段访问数组元素，如 im.channels.0.enabled）。" +
+	"run_command 同步命令超时用 capabilities.shell.timeoutSec（秒，默认 60，0=不限制）；后台命令时限用 capabilities.shell.backgroundTimeoutSec（默认 0=不限时）；单次轮询等待用 capabilities.shell.pollTimeoutSec（默认 30 秒，0=立即返回，等待结束不杀进程）；模型请求超时用 general.requestTimeoutMin（分钟）。" +
+	"自主提案后台挖掘：capabilities.autonomousMining.enabled（默认 false）与 capabilities.autonomousMining.intervalHours（默认 4，1-24 小时）；管理员单聊确认 set enabled=true 开启、false 关闭。manage_work_items action=mine 可随时按需扫描当前来源会话近 24 小时；提案需在来源会话「确认创建 <id/标题>」；任务等待人工时，管理员直接回复答复内容即可恢复（无需口令）。" +
+	`path 根块：${Object.keys(ROOT_CATALOG).join("、")}。` +
+	"安全边界：security 块不可通过本工具修改（用 manage_admin/update_identity）；apiKey/appSecret/Token 等可设置但回显自动打码。" +
+	"注意修改 model 块（供应商/默认模型）有失联风险——配错将无法再通过对话恢复，请谨慎核对。";
+
+test("tool descriptions mirror adminFullAccess: full access ON drops the confirmation demand entirely", (t) => {
 	const { config } = store(t);
 	config.update({ security: { adminFullAccess: true } });
 	const deps = { config };
 	const settingsOn = createManageSettingsTool(deps);
 	const manageComputer = createComputerTools(deps).find((tool) => tool.name === "manage_computer");
 	const capsOn = createManageCapabilitiesTool(deps);
-	assert.match(settingsOn.description, /无需再索要「确认」/);
-	assert.doesNotMatch(settingsOn.description, /在当前消息包含「确认」/);
-	assert.match(manageComputer.description, /管理员明确指示即可执行/);
-	assert.doesNotMatch(manageComputer.description, /含确认/);
-	assert.match(capsOn.description, /无需消息确认/);
-	assert.doesNotMatch(capsOn.description, /明确包含「确认」/);
+	// No gate-teach wording may survive anywhere (regression: the static text kept
+	// the model asking even after the hard gate was short-circuited). The ONE allowed
+	// mention is manage_work_items' business confirmation (提案需「确认创建」), which
+	// is a proposal protocol, not the admin gate.
+	const stripProposal = (desc) => desc.replace(/manage_work_items[\s\S]*?（无需口令）。/, "");
+	for (const desc of [stripProposal(settingsOn.description), manageComputer.description, capsOn.description]) {
+		assert.doesNotMatch(desc, /确认/, "full access ON must not teach gate confirmation");
+		assert.doesNotMatch(desc, /NaN/, "description concatenation must stay sane");
+	}
+	assert.match(settingsOn.description, /无需额外口令/);
+	assert.match(settingsOn.description, /管理员明确指示即可直接执行/);
+	assert.match(settingsOn.description, /有失联风险/, "risk hint must survive the ON branch");
 });
 
-test("tool descriptions mirror adminFullAccess: default (OFF) keeps demanding confirmation", (t) => {
+test("tool descriptions mirror adminFullAccess: default (OFF) is byte-identical to the pre-mirror text", (t) => {
 	const deps = store(t);
-	assert.match(createManageSettingsTool(deps).description, /在当前消息包含「确认」/);
+	const settingsOff = createManageSettingsTool(deps);
+	assert.equal(settingsOff.description, SETTINGS_OFF_DESCRIPTION, "OFF branch must not drift from the original wording");
+	assert.match(settingsOff.description, /在当前消息包含「确认」/);
 	assert.match(createComputerTools(deps).find((tool) => tool.name === "manage_computer").description, /需管理员当前消息含确认/);
 	assert.match(createManageCapabilitiesTool(deps).description, /明确包含「确认」/);
 });

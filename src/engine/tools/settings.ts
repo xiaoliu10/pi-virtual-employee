@@ -43,7 +43,7 @@ const SENSITIVE_RE = /(api_?key|secret|token|password)/i;
 const MAX_VALUE_CHARS = 20_000;
 
 /** Root-block catalog for the list action (also the discovery surface for the model). */
-const ROOT_CATALOG: Record<string, string> = {
+export const ROOT_CATALOG: Record<string, string> = {
 	model: "模型供应商与默认模型（suppliers/defaultSupplierId/defaultModelId；每个 supplier 条目内还有 per-model 覆盖：modelImage/modelContextWindow/modelMaxTokens，按 modelId 键值写入，如 model.suppliers.0.modelMaxTokens = {\"模型ID\": 32768}（单次输出上限：输出与输入共享上下文窗口，网关报 ContextWindowExceeded 且要求的 output 很大时就把它调小；不配时先查网关 model-info 接口（litellm /model/info），查不到才回退默认 32768）；改动错误会导致员工失联）",
 	identity: "员工身份（name/role/duty/serviceHours）",
 	im: "IM 渠道（im.enabled/channels[].appId/appSecret 等）",
@@ -150,17 +150,20 @@ export function createManageSettingsTool(deps: SettingsToolDeps): AgentTool {
 	// otherwise the model keeps politely asking for a confirmation it no longer needs.
 	const fullAccess = deps.config.all().security.adminFullAccess === true;
 	const writeRule = fullAccess
-		? "已开启管理员完全访问：写入仅需管理员身份，管理员明确指示即可直接执行，无需再索要「确认」。"
-		: "写入需管理员并在当前消息包含「确认」。";
+		? "已开启管理员完全访问：写入仅需管理员身份，管理员明确指示即可直接执行，无需额外口令"
+		: "写入需管理员并在当前消息包含「确认」";
 	return {
 		name: "manage_settings",
 		label: "系统配置管理",
 		description:
-			`读取或修改本系统的任意配置项（仅限 IM 单聊；${writeRule}）。` + +
+			`读取或修改本系统的任意配置项（仅限 IM 单聊；${writeRule}）。` +
 			"action=list 列出全部可配置的根块；action=get 按 path 读单个值（如 general.longTaskProgressMin、kb.local.topK、browser.headless、filesystem.allowedDirs）；" +
 			"action=set 按 path 写入 value（数值段访问数组元素，如 im.channels.0.enabled）。" +
 			"run_command 同步命令超时用 capabilities.shell.timeoutSec（秒，默认 60，0=不限制）；后台命令时限用 capabilities.shell.backgroundTimeoutSec（默认 0=不限时）；单次轮询等待用 capabilities.shell.pollTimeoutSec（默认 30 秒，0=立即返回，等待结束不杀进程）；模型请求超时用 general.requestTimeoutMin（分钟）。" +
-			"自主提案后台挖掘：capabilities.autonomousMining.enabled（默认 false）与 capabilities.autonomousMining.intervalHours（默认 4，1-24 小时）；管理员单聊确认 set enabled=true 开启、false 关闭。manage_work_items action=mine 可随时按需扫描当前来源会话近 24 小时；提案需在来源会话「确认创建 <id/标题>」；任务等待人工时，管理员直接回复答复内容即可恢复（无需口令）。" +
+			(fullAccess
+			? "自主提案后台挖掘：capabilities.autonomousMining.enabled（默认 false）与 capabilities.autonomousMining.intervalHours（默认 4，1-24 小时）；管理员单聊 set enabled=true 开启、false 关闭。"
+			: "自主提案后台挖掘：capabilities.autonomousMining.enabled（默认 false）与 capabilities.autonomousMining.intervalHours（默认 4，1-24 小时）；管理员单聊确认 set enabled=true 开启、false 关闭。") +
+			"manage_work_items action=mine 可随时按需扫描当前来源会话近 24 小时；提案需在来源会话「确认创建 <id/标题>」；任务等待人工时，管理员直接回复答复内容即可恢复（无需口令）。" +
 			"path 根块：" + Object.keys(ROOT_CATALOG).join("、") + "。" +
 			"安全边界：security 块不可通过本工具修改（用 manage_admin/update_identity）；apiKey/appSecret/Token 等可设置但回显自动打码。" +
 			(fullAccess
@@ -168,7 +171,7 @@ export function createManageSettingsTool(deps: SettingsToolDeps): AgentTool {
 				: "注意修改 model 块（供应商/默认模型）有失联风险——配错将无法再通过对话恢复，请谨慎核对。"),
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("list"), Type.Literal("get"), Type.Literal("set")], {
-				description: "list=列出可配置块；get=读配置；set=写配置（需确认）",
+				description: fullAccess ? "list=列出可配置块；get=读配置；set=写配置（完全访问开启，直接执行）" : "list=列出可配置块；get=读配置；set=写配置（需确认）",
 			}),
 			path: Type.Optional(Type.String({ description: "get/set 必填：点分路径，如 general.maxToolSteps、kb.local.topK、im.channels.0.enabled" })),
 			value: Type.Optional(
@@ -186,7 +189,7 @@ export function createManageSettingsTool(deps: SettingsToolDeps): AgentTool {
 				const lines = Object.entries(ROOT_CATALOG).map(([root, desc]) => `- ${root}：${desc}`);
 				lines.push("- security：管理员名单（请用 manage_admin / update_identity 管理，本工具不可触碰）");
 				return {
-					content: [{ type: "text", text: `可配置的配置块：\n${lines.join("\n")}\n\n用 get <path> 查看具体项，set <path> <value> 修改（需「确认」）。` }],
+					content: [{ type: "text", text: `可配置的配置块：\n${lines.join("\n")}\n\n用 get <path> 查看具体项，set <path> <value> 修改${fullAccess ? "（完全访问开启，直接执行）" : "（需「确认」）"}。` }],
 					details: { action },
 				};
 			}

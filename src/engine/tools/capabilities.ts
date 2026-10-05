@@ -52,7 +52,7 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 	// Mirror the adminFullAccess short-circuit in requireConfirmedAdmin (admin.ts).
 	const fullAccess = deps.config.all().security.adminFullAccess === true;
 	const confirmRule = fullAccess
-		? "set 和 setup_browser 由管理员执行即可（已开启管理员完全访问，无需消息确认）"
+		? "set 和 setup_browser 由管理员执行即可（已开启管理员完全访问，无需额外口令）"
 		: "set 和 setup_browser 必须由管理员在当前消息中明确包含「确认」（或同义明确肯定语）";
 	return {
 		name: "manage_capabilities",
