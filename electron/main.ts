@@ -686,7 +686,7 @@ async function main(): Promise<void> {
 		// Deliver the outcome to the target chat (markers stripped by the parser).
 		if (task.conversation_id) {
 			const resumeHint = `\n\n回复「继续 ${task.title}」重置预算继续；不回复则保持暂停。`;
-			const stalledHint = `\n\n通常是模型服务或中转临时不可用，不是任务本身的问题。已暂停等待处理：\n① 检查模型服务状态，或在 设置 → 模型 切换供应商/模型；\n② 处理后恢复任务（resume_scheduled_task 或回复「继续 ${task.title}」），我会原地重试；\n③ 恢复成功后我会把现象与解法沉淀进知识库，下次自动规避。`;
+			const stalledHint = `\n\n通常是模型服务或中转临时不可用，不是任务本身的问题。已暂停等待处理：\n① 检查模型服务状态，或在 设置 → 自定义模型 顶部把其他供应商的模型「设为默认」；\n② 处理后恢复任务（resume_scheduled_task 或回复「继续 ${task.title}」），我会原地重试；\n③ 恢复成功后我会把现象与解法沉淀进知识库，下次自动规避。`;
 			const pushText =
 				outcome === "done"
 					? `✅ **自主任务完成：${task.title}**（共 ${chain.turns} 轮）\n\n${lastText}`

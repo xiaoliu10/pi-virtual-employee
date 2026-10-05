@@ -204,7 +204,7 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 											{isDefault && <span className="rounded-md bg-blue-100 px-1.5 py-0.5 text-[11px] font-medium text-blue-600">默认</span>}
 										</button>
 										{!isDefault && supplier.enabled && (
-											<button type="button" onClick={() => props.onSetDefault(modelId)} title="设为默认模型" className="hidden rounded-full px-1.5 py-0.5 text-[11px] text-blue-500 hover:bg-blue-50 group-hover:block">★</button>
+											<button type="button" onClick={() => props.onSetDefault(modelId)} title="设为默认模型" className="rounded-full border border-blue-200 px-2 py-0.5 text-[11px] font-medium text-blue-600 hover:bg-blue-50">★ 设为默认</button>
 										)}
 										<button type="button" onClick={() => props.onRemoveModel(modelId)} title="删除模型" className="rounded-full px-1.5 py-0.5 text-xs text-[#6e6e73] hover:bg-rose-50 hover:text-rose-500">✕</button>
 									</div>
