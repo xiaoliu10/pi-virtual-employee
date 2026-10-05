@@ -1546,6 +1546,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.history.setModelOverride(conversationId, supplierId, modelId);
 	}
 
+	/** Drop a conversation's model pin so it follows the global default again (live, keeps transcript). */
+	clearConversationModel(conversationId: string): void {
+		const agent = this.getOrCreateSession(conversationId);
+		this.history.ensureConversation(conversationId, null);
+		this.history.clearModelOverride(conversationId);
+		// Resolve AFTER clearing so the override no longer wins; apply to the live
+		// session so the very next send already uses the global default.
+		const resolved = this.resolveForConversation(conversationId);
+		agent.state.model = this.buildModel(resolved.supplier, resolved.modelId);
+		agent.getApiKey = () => this.apiKeyFor(resolved.supplier);
+	}
+
 	async send(agent: Agent, message: string, ctx?: SendCtx): Promise<SendResult> {
 		const conversationId = agent.sessionId ?? "default";
 

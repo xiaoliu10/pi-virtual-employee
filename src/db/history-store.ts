@@ -178,6 +178,13 @@ export class HistoryStore {
 			.run(supplierId, modelId, Date.now(), conversationId);
 	}
 
+	/** Drop the per-conversation model pin so the conversation follows the global default again. */
+	clearModelOverride(conversationId: string): void {
+		this.db
+			.prepare("UPDATE conversations SET model_supplier_id = NULL, model_model_id = NULL WHERE id = ?")
+			.run(conversationId);
+	}
+
 	appendMessage(
 		conversationId: string,
 		role: "user" | "assistant",

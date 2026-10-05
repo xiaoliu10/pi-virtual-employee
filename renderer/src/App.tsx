@@ -95,6 +95,12 @@ export default function App() {
 							? { supplierId: config.model.defaultSupplierId, modelId: config.model.defaultModelId }
 							: null;
 					})()}
+					modelOverride={(() => {
+						const conv = conversations.find((c) => c.id === activeId);
+						return conv?.model_supplier_id && conv?.model_model_id
+							? { supplierId: conv.model_supplier_id, modelId: conv.model_model_id }
+							: null;
+					})()}
 					onActivated={setActiveId}
 					onTasksChanged={refreshTasks}
 				/>

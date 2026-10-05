@@ -39,6 +39,8 @@ testOss(): Promise<{ ok: boolean; detail: string }>;
 	importModelConfig(): Promise<ModelConfig | null>;
 	exportModelConfig(model: ModelConfig): Promise<boolean>;
 	setConversationModel(conversationId: string, supplierId: string, modelId: string): Promise<boolean>;
+	/** Empty supplierId/modelId clears the pin (conversation follows the global default). */
+	clearConversationModel(conversationId: string): Promise<boolean>;
 	// 供应商账号登录（electron/preload.ts 同步维护）。登录进度由主进程推送
 	// 全量 AuthLoginState 快照（onAuthLoginEvent）；答复经 authLoginAnswer。
 	authCatalog(): Promise<import("../../src/shared/auth").AuthCatalogResponse>;

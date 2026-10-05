@@ -54,6 +54,9 @@ const api = {
 	exportModelConfig: (model: unknown): Promise<boolean> => ipcRenderer.invoke("model:export", model),
 	setConversationModel: (conversationId: string, supplierId: string, modelId: string): Promise<boolean> =>
 		ipcRenderer.invoke("model:setForConversation", conversationId, supplierId, modelId),
+	// Empty supplierId/modelId clears the pin (conversation follows the global default).
+	clearConversationModel: (conversationId: string): Promise<boolean> =>
+		ipcRenderer.invoke("model:setForConversation", conversationId, "", ""),
 
 	// Provider account login (settings page). Login progress arrives as pushed
 	// AuthLoginState snapshots (onAuthLoginEvent); answers go through

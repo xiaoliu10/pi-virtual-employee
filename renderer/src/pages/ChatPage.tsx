@@ -30,10 +30,15 @@ interface ChatPageProps {
 	readOnly?: boolean;
 	agentName: string;
 	currentModel: { supplierId: string; modelId: string } | null;
+	/** Per-conversation model pin (null = follows global default). */
+	modelOverride: { supplierId: string; modelId: string } | null;
 	modelRevision: string;
 	onActivated: (id: string) => void;
 	onTasksChanged: () => void;
 }
+
+/** Select sentinel: conversation has no model pin and follows the global default. */
+const FOLLOW_VALUE = "@@follow";
 
 let seq = 0;
 const nextId = () => `m${Date.now()}-${seq++}`;
@@ -46,6 +51,7 @@ export function ChatPage({
 	readOnly = false,
 	agentName,
 	currentModel,
+	modelOverride,
 	modelRevision,
 	onActivated,
 	onTasksChanged,
@@ -194,13 +200,33 @@ export function ChatPage({
 		[conversationId, activeId, onTasksChanged],
 	);
 
-	const requestedValue = currentModel ? `${currentModel.supplierId}/${currentModel.modelId}` : "";
+	// Clear the per-conversation pin so the conversation follows the global default again.
+	const onModelFollow = useCallback(
+		async () => {
+			const convId = conversationId ?? activeId;
+			if (!convId) return;
+			try {
+				await api.clearConversationModel(convId);
+				setError(null);
+				onTasksChanged();
+			} catch (err) {
+				setError(`恢复跟随默认失败：${err instanceof Error ? err.message : String(err)}`);
+			}
+		},
+		[conversationId, activeId, onTasksChanged],
+	);
+
 	const defaultOption = modelOptions.find((option) => option.isDefault);
-	const selectedValue = modelOptions.some((option) => `${option.supplierId}/${option.modelId}` === requestedValue)
-		? requestedValue
-		: defaultOption
-			? `${defaultOption.supplierId}/${defaultOption.modelId}`
-			: "";
+	// Override is only "active" while it still points at a valid option; the engine
+	// self-heals stale pins to the global default, and the UI mirrors that here.
+	const activeOverride =
+		modelOverride &&
+		modelOptions.some(
+			(o) => `${o.supplierId}/${o.modelId}` === `${modelOverride.supplierId}/${modelOverride.modelId}`,
+		)
+			? modelOverride
+			: null;
+	const selectedValue = activeOverride ? `${activeOverride.supplierId}/${activeOverride.modelId}` : FOLLOW_VALUE;
 
 	return (
 		<div className="flex min-h-0 flex-1 flex-col">
@@ -215,6 +241,10 @@ export function ChatPage({
 					value={selectedValue}
 					disabled={!conversationId || modelOptions.length === 0 || readOnly}
 					onChange={(e) => {
+						if (e.target.value === FOLLOW_VALUE) {
+							void onModelFollow();
+							return;
+						}
 						const [supplierId, modelId] = e.target.value.split("/");
 						if (supplierId && modelId) void onModelChange(supplierId, modelId);
 					}}
@@ -227,6 +257,12 @@ export function ChatPage({
 								: "切换本对话的模型"}
 				>
 					{modelOptions.length === 0 && <option value="">未配置模型</option>}
+					{modelOptions.length > 0 && (
+						<option value={FOLLOW_VALUE}>
+							跟随全局默认{defaultOption ? `（${defaultOption.supplierName} / ${defaultOption.modelId}）` : ""}
+							{activeOverride ? " ← 点击取消本对话固定" : ""}
+						</option>
+					)}
 					{modelOptions.map((o) => (
 						<option key={`${o.supplierId}/${o.modelId}`} value={`${o.supplierId}/${o.modelId}`}>
 							{o.supplierName} / {o.modelId}
