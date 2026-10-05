@@ -29,7 +29,6 @@ interface ChatPageProps {
 	/** Read-only when viewing an IM-channel conversation (send happens in the IM, not here). */
 	readOnly?: boolean;
 	agentName: string;
-	currentModel: { supplierId: string; modelId: string } | null;
 	/** Per-conversation model pin (null = follows global default). */
 	modelOverride: { supplierId: string; modelId: string } | null;
 	modelRevision: string;
@@ -50,7 +49,6 @@ export function ChatPage({
 	imTick = 0,
 	readOnly = false,
 	agentName,
-	currentModel,
 	modelOverride,
 	modelRevision,
 	onActivated,

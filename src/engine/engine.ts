@@ -1549,12 +1549,15 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** Drop a conversation's model pin so it follows the global default again (live, keeps transcript). */
 	clearConversationModel(conversationId: string): void {
 		const agent = this.getOrCreateSession(conversationId);
+		// Validate/build BEFORE the DB write (same discipline as setConversationModel):
+		// after clearing, the pin no longer wins, so this is exactly resolveDefaultModel.
+		// resolveModel (not buildModel) to match the rebuild path's info-cache enrichment.
+		const resolved = this.resolveDefaultModel();
+		const model = this.resolveModel(resolved.supplier, resolved.modelId);
 		this.history.ensureConversation(conversationId, null);
 		this.history.clearModelOverride(conversationId);
-		// Resolve AFTER clearing so the override no longer wins; apply to the live
-		// session so the very next send already uses the global default.
-		const resolved = this.resolveForConversation(conversationId);
-		agent.state.model = this.buildModel(resolved.supplier, resolved.modelId);
+		// Apply to the live session so the very next send already uses the global default.
+		agent.state.model = model;
 		agent.getApiKey = () => this.apiKeyFor(resolved.supplier);
 	}
 

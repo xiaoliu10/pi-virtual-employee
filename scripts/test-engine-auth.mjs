@@ -734,6 +734,9 @@ test("clearConversationModel drops the per-conversation pin so it follows the gl
 	engine.setConversationModel("conv-pin", "b", "pin-model");
 	assert.equal(history.getModelOverride("conv-pin")?.supplierId, "b", "pin persisted");
 	assert.equal(engine.getOrCreateSession("conv-pin").state.model?.id, "pin-model", "pinned session uses the override");
+	// Rebuild path: a non-cached session would first be created WITH the pin (read
+	// from DB), then patched to the default — must not leave the pin alive.
+	engine.dropSession("conv-pin");
 	engine.clearConversationModel("conv-pin");
 	assert.equal(history.getModelOverride("conv-pin"), null, "pin cleared in DB");
 	assert.equal(
