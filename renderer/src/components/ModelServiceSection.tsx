@@ -49,7 +49,6 @@ export function ModelServiceSection({ model, onUpdate }: Props) {
 	);
 
 	const emit = (next: ModelConfig) => onUpdate(reconcileDefault(next));
-	const defaultSupplier = model.suppliers.find((s) => s.id === model.defaultSupplierId) ?? null;
 	const setDefault = (supplierId: string, modelId: string) => emit({ ...model, defaultSupplierId: supplierId, defaultModelId: modelId });
 	const updateSupplier = (id: string, patch: Partial<Supplier>) => {
 		emit({ ...model, suppliers: model.suppliers.map((supplier) => supplier.id === id ? { ...supplier, ...patch } : supplier) });
@@ -191,7 +190,7 @@ export function ModelServiceSection({ model, onUpdate }: Props) {
 					<span className="text-sm font-medium text-slate-800">当前默认</span>
 					<select
 						value={`${model.defaultSupplierId}::${model.defaultModelId}`}
-						onChange={(e) => { const [sid, mid] = e.target.value.split("::"); setDefault(sid, mid); }}
+						onChange={(e) => { const raw = e.target.value; const sep = raw.indexOf("::"); if (sep <= 0) return; setDefault(raw.slice(0, sep), raw.slice(sep + 2)); }}
 						className="max-w-[280px] rounded-lg border border-slate-300 bg-white px-2 py-1 text-sm text-slate-800"
 					>
 						{model.suppliers.filter((s) => s.enabled).flatMap((s) => s.models.map((m) => (
