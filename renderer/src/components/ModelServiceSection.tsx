@@ -49,6 +49,7 @@ export function ModelServiceSection({ model, onUpdate }: Props) {
 	);
 
 	const emit = (next: ModelConfig) => onUpdate(reconcileDefault(next));
+	const setDefault = (supplierId: string, modelId: string) => emit({ ...model, defaultSupplierId: supplierId, defaultModelId: modelId });
 	const updateSupplier = (id: string, patch: Partial<Supplier>) => {
 		emit({ ...model, suppliers: model.suppliers.map((supplier) => supplier.id === id ? { ...supplier, ...patch } : supplier) });
 	};
@@ -184,6 +185,20 @@ export function ModelServiceSection({ model, onUpdate }: Props) {
 					>
 						账号登录
 					</button>
+				</div>
+				<div className="ml-3 flex min-w-0 flex-wrap items-center gap-2">
+					<span className="text-sm font-medium text-slate-800">当前默认</span>
+					<select
+						value={`${model.defaultSupplierId}::${model.defaultModelId}`}
+						onChange={(e) => { const raw = e.target.value; const sep = raw.indexOf("::"); if (sep <= 0) return; setDefault(raw.slice(0, sep), raw.slice(sep + 2)); }}
+						className="max-w-[280px] rounded-lg border border-slate-300 bg-white px-2 py-1 text-sm text-slate-800"
+					>
+						{model.suppliers.filter((s) => s.enabled).flatMap((s) => s.models.map((m) => (
+							<option key={`${s.id}::${m}`} value={`${s.id}::${m}`}>{s.name} / {m}</option>
+						)))}
+						{model.suppliers.filter((s) => s.enabled).every((s) => s.models.length === 0) && <option value="::">（无可用模型）</option>}
+					</select>
+					<span className="text-xs text-slate-400">员工对话与自主任务都使用这里选中的模型；或点开供应商把模型 ★ 设为默认</span>
 				</div>
 			</div>
 			{view === "suppliers" ? (
