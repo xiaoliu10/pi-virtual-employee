@@ -86,13 +86,10 @@ export default function App() {
 					readOnly={conversations.find((c) => c.id === activeId)?.origin === "im"}
 					agentName={config?.identity.name ?? "客服小派"}
 					modelRevision={config ? JSON.stringify(config.model) : ""}
-					currentModel={(() => {
+					modelOverride={(() => {
 						const conv = conversations.find((c) => c.id === activeId);
-						if (conv?.model_supplier_id && conv?.model_model_id) {
-							return { supplierId: conv.model_supplier_id, modelId: conv.model_model_id };
-						}
-						return config?.model.defaultSupplierId && config.model.defaultModelId
-							? { supplierId: config.model.defaultSupplierId, modelId: config.model.defaultModelId }
+						return conv?.model_supplier_id && conv?.model_model_id
+							? { supplierId: conv.model_supplier_id, modelId: conv.model_model_id }
 							: null;
 					})()}
 					onActivated={setActiveId}

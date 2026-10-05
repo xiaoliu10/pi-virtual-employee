@@ -713,3 +713,35 @@ test("authQuota adds the Bearer key when provider headers exist but carry no Aut
 	assert.equal(headers["X-Trace"], "t1", "provider header preserved");
 	assert.equal(headers.Authorization, "Bearer zk-header", "Bearer key fills the Authorization gap left by the null entry");
 });
+
+// ── conversation model pin: invisible override blocked switching (field 2026-10-05) ──
+
+test("clearConversationModel drops the per-conversation pin so it follows the global default again", (t) => {
+	const { engine, config, history } = makeEngine(t);
+	// Plain API-key suppliers (no authProvider) so buildModel needs no stored credential.
+	config.update({
+		model: {
+			suppliers: [
+				accountSupplier({ authProvider: undefined, apiKey: "k" }),
+				accountSupplier({ id: "b", name: "B", apiKey: "k2", authProvider: undefined, models: ["pin-model"] }),
+			],
+			defaultSupplierId: "acct",
+			defaultModelId: "fake-model",
+		},
+	});
+	// Pin the conversation to supplier b, then flip the global default back and forth —
+	// the pin wins regardless.
+	engine.setConversationModel("conv-pin", "b", "pin-model");
+	assert.equal(history.getModelOverride("conv-pin")?.supplierId, "b", "pin persisted");
+	assert.equal(engine.getOrCreateSession("conv-pin").state.model?.id, "pin-model", "pinned session uses the override");
+	// Rebuild path: a non-cached session would first be created WITH the pin (read
+	// from DB), then patched to the default — must not leave the pin alive.
+	engine.dropSession("conv-pin");
+	engine.clearConversationModel("conv-pin");
+	assert.equal(history.getModelOverride("conv-pin"), null, "pin cleared in DB");
+	assert.equal(
+		engine.getOrCreateSession("conv-pin").state.model?.id,
+		"fake-model",
+		"live session re-resolved to the global default without a rebuild",
+	);
+});

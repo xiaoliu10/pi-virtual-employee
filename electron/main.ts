@@ -1052,7 +1052,12 @@ async function main(): Promise<void> {
 		return true;
 	});
 	ipcMain.handle("model:setForConversation", (_e, conversationId: string, supplierId: string, modelId: string) => {
-		engine.setConversationModel(conversationId, supplierId, modelId);
+		// Empty both = "follow global default": clear the per-conversation pin.
+		if (!supplierId && !modelId) {
+			engine.clearConversationModel(conversationId);
+		} else {
+			engine.setConversationModel(conversationId, supplierId, modelId);
+		}
 		return true;
 	});
 
