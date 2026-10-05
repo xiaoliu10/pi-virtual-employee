@@ -181,8 +181,15 @@ export function ChatPage({
 		async (supplierId: string, modelId: string) => {
 			const convId = conversationId ?? activeId;
 			if (!convId) return; // new conversation: default applies until first message
-			await api.setConversationModel(convId, supplierId, modelId);
-			onTasksChanged();
+			try {
+				await api.setConversationModel(convId, supplierId, modelId);
+				setError(null);
+				onTasksChanged();
+			} catch (err) {
+				// Silent failures here read as "点击没反应" — surface the real reason
+				// (supplier disabled / model removed / identity revoked).
+				setError(`切换模型失败：${err instanceof Error ? err.message : String(err)}`);
+			}
 		},
 		[conversationId, activeId, onTasksChanged],
 	);
@@ -204,14 +211,20 @@ export function ChatPage({
 					<span className="shrink-0">{readOnly ? "IM 会话 · 只读" : "多轮对话"}</span>
 				</div>
 				<select
-					className="titlebar-nodrag h-[30px] max-w-[240px] shrink-0 cursor-pointer rounded-full border-0 bg-transparent px-2.5 text-[12.5px] text-[#6e6e73] outline-none transition-colors hover:bg-black/[0.045] hover:text-[#1d1d1f] disabled:opacity-50"
+					className="titlebar-nodrag h-[30px] max-w-[240px] shrink-0 cursor-pointer rounded-full border-0 bg-transparent px-2.5 text-[12.5px] text-[#6e6e73] outline-none transition-colors hover:bg-black/[0.045] hover:text-[#1d1d1f] disabled:cursor-not-allowed disabled:opacity-50"
 					value={selectedValue}
 					disabled={!conversationId || modelOptions.length === 0 || readOnly}
 					onChange={(e) => {
 						const [supplierId, modelId] = e.target.value.split("/");
 						if (supplierId && modelId) void onModelChange(supplierId, modelId);
 					}}
-					title={conversationId ? "切换本对话的模型" : "发送首条消息后可切换模型"}
+					title={readOnly
+						? "IM 会话为只读：模型由员工配置决定，可在 设置 → 自定义模型 修改默认模型"
+						: !conversationId
+							? "发送首条消息后可切换本对话的模型"
+							: modelOptions.length === 0
+								? "尚未配置模型：请在 设置 → 自定义模型 添加"
+								: "切换本对话的模型"}
 				>
 					{modelOptions.length === 0 && <option value="">未配置模型</option>}
 					{modelOptions.map((o) => (
