@@ -49,6 +49,11 @@ const CONFIRM_HINT =
  * effect from the next message without a restart.
  */
 export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentTool {
+	// Mirror the adminFullAccess short-circuit in requireConfirmedAdmin (admin.ts).
+	const fullAccess = deps.config.all().security.adminFullAccess === true;
+	const confirmRule = fullAccess
+		? "set 和 setup_browser 由管理员执行即可（已开启管理员完全访问，无需消息确认）"
+		: "set 和 setup_browser 必须由管理员在当前消息中明确包含「确认」（或同义明确肯定语）";
 	return {
 		name: "manage_capabilities",
 		label: "能力开关管理",
@@ -57,7 +62,7 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 			"action=set 开启或关闭某项能力（传 capability 和 enabled）；设置 shell 时可同时传 allowedCommands 更新命令白名单；action=setup_browser 安装/检查浏览器内核（Chromium）。" +
 			"可管理能力：browser（浏览器自动化）、computer（Cua 桌面控制）、documents（文档资源）、filesystem（本地文件访问）、" +
 			"reports（报告中心）、downloads（浏览器下载工作区）、shell（受限命令执行）。" +
-			"安全规则：list 需单聊；set 和 setup_browser 必须由管理员在当前消息中明确包含「确认」（或同义明确肯定语），群聊一律拒绝。" +
+			`安全规则：list 需单聊；${confirmRule}，群聊一律拒绝。` +
 			"setup_browser 已装则直接报告已安装；未装则后台下载（约 150MB，需几分钟），用 status 查询进度。下载源由 browser.downloadHost 决定（留空 = 国内默认走 npmmirror 镜像；如需改用 manage_settings 设置 browser.downloadHost）。",
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("list"), Type.Literal("set"), Type.Literal("setup_browser"), Type.Literal("status")], {

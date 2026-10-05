@@ -38,7 +38,7 @@ const manifestPath = join(root, "docs", "immutable.manifest.json");
  * including "just updating a hash" — fails the check until this constant is
  * updated too, which is the most conspicuous diff possible.
  */
-const MANIFEST_SHA256 = "35f6f511bdd0fe36d36038fd59eaa22692a8a4867b40cd7febb013f72d3cd9c2";
+const MANIFEST_SHA256 = "985d19122ff56244f7aeffeaa27e7f9e1632e43d9f2d3ee4cc57d4c7ef2b86f7";
 
 const sha256 = (text) => createHash("sha256").update(text, "utf8").digest("hex");
 

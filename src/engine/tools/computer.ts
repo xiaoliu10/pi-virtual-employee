@@ -14,9 +14,14 @@ interface ComputerToolDeps extends AdminToolDeps {
 }
 
 export function createComputerTools(deps: ComputerToolDeps): AgentTool<any>[] {
+	// Mirror the adminFullAccess short-circuit in requireConfirmedAdmin (admin.ts).
+	const fullAccess = deps.config.all().security.adminFullAccess === true;
+	const installRule = fullAccess
+		? "已开启管理员完全访问，管理员明确指示即可执行"
+		: "需管理员当前消息含确认";
 	const manage: AgentTool = {
 		name: "manage_computer", label: "桌面控制管理",
-		description: "管理 Cua Driver 桌面控制。status 查看驱动安装/连接/任务状态；install 后台安装固定版本的官方驱动并校验哈希（Windows/Linux，需管理员当前消息含确认）；connect 连接驱动；disconnect 停止当前桌面控制或安装；tools 查询当前平台可用的桌面动作及实际参数。仅管理员 IM 单聊。相关设置均支持对话修改：manage_capabilities set computer 开关桌面控制；manage_settings computer.* 设置 enabled、driverPath、allowedApps、allowForeground、allowScheduled、connectTimeoutSec、actionTimeoutSec、sessionTimeoutSec。不要只引导管理员去 GUI 设置页。",
+		description: `管理 Cua Driver 桌面控制。status 查看驱动安装/连接/任务状态；install 后台安装固定版本的官方驱动并校验哈希（Windows/Linux，${installRule}）；connect 连接驱动；disconnect 停止当前桌面控制或安装；tools 查询当前平台可用的桌面动作及实际参数。仅管理员 IM 单聊。相关设置均支持对话修改：manage_capabilities set computer 开关桌面控制；manage_settings computer.* 设置 enabled、driverPath、allowedApps、allowForeground、allowScheduled、connectTimeoutSec、actionTimeoutSec、sessionTimeoutSec。不要只引导管理员去 GUI 设置页。`,
 		parameters: Type.Object({ action: Type.Union(["status", "install", "connect", "disconnect", "tools"].map(v => Type.Literal(v))),
 			tool: Type.Optional(Type.Union(COMPUTER_ACTIONS.map(v => Type.Literal(v)), { description: "tools 时可选：只查询指定动作的参数，减少输出" })) }),
 		async execute(_id, params) {

@@ -145,18 +145,27 @@ function present(value: unknown): string {
 }
 
 export function createManageSettingsTool(deps: SettingsToolDeps): AgentTool {
+	// Prompt mirrors the gate: with security.adminFullAccess on, requireConfirmedAdmin
+	// short-circuits (admin.ts), so the description must stop demanding「确认」—
+	// otherwise the model keeps politely asking for a confirmation it no longer needs.
+	const fullAccess = deps.config.all().security.adminFullAccess === true;
+	const writeRule = fullAccess
+		? "已开启管理员完全访问：写入仅需管理员身份，管理员明确指示即可直接执行，无需再索要「确认」。"
+		: "写入需管理员并在当前消息包含「确认」。";
 	return {
 		name: "manage_settings",
 		label: "系统配置管理",
 		description:
-			"读取或修改本系统的任意配置项（仅限 IM 单聊；写入需管理员并在当前消息包含「确认」）。" +
+			`读取或修改本系统的任意配置项（仅限 IM 单聊；${writeRule}）。` + +
 			"action=list 列出全部可配置的根块；action=get 按 path 读单个值（如 general.longTaskProgressMin、kb.local.topK、browser.headless、filesystem.allowedDirs）；" +
 			"action=set 按 path 写入 value（数值段访问数组元素，如 im.channels.0.enabled）。" +
 			"run_command 同步命令超时用 capabilities.shell.timeoutSec（秒，默认 60，0=不限制）；后台命令时限用 capabilities.shell.backgroundTimeoutSec（默认 0=不限时）；单次轮询等待用 capabilities.shell.pollTimeoutSec（默认 30 秒，0=立即返回，等待结束不杀进程）；模型请求超时用 general.requestTimeoutMin（分钟）。" +
 			"自主提案后台挖掘：capabilities.autonomousMining.enabled（默认 false）与 capabilities.autonomousMining.intervalHours（默认 4，1-24 小时）；管理员单聊确认 set enabled=true 开启、false 关闭。manage_work_items action=mine 可随时按需扫描当前来源会话近 24 小时；提案需在来源会话「确认创建 <id/标题>」；任务等待人工时，管理员直接回复答复内容即可恢复（无需口令）。" +
 			"path 根块：" + Object.keys(ROOT_CATALOG).join("、") + "。" +
 			"安全边界：security 块不可通过本工具修改（用 manage_admin/update_identity）；apiKey/appSecret/Token 等可设置但回显自动打码。" +
-			"注意修改 model 块（供应商/默认模型）有失联风险——配错将无法再通过对话恢复，请谨慎核对。",
+			(fullAccess
+				? "注意修改 model 块（供应商/默认模型）有失联风险——配错将无法再通过对话恢复；切换前先核对该模型确在目标供应商 models 列表，核对无误且管理员已明确指示即可直接执行。"
+				: "注意修改 model 块（供应商/默认模型）有失联风险——配错将无法再通过对话恢复，请谨慎核对。"),
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("list"), Type.Literal("get"), Type.Literal("set")], {
 				description: "list=列出可配置块；get=读配置；set=写配置（需确认）",

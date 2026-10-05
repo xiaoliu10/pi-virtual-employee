@@ -26,6 +26,10 @@ await build({
 			export { HistoryStore } from "./src/db/history-store.ts";
 			export { checkPermission, resolveRole, hasAnyAdmin, isAdmin, describeAccess, CAPABILITY_LABEL } from "./src/security/permissions.ts";
 			export { createManageAccessTool, createCheckMyAccessTool } from "./src/engine/tools/access.ts";
+			export { createManageSettingsTool } from "./src/engine/tools/settings.ts";
+			export { createComputerTools } from "./src/engine/tools/computer.ts";
+			export { createManageCapabilitiesTool } from "./src/engine/tools/capabilities.ts";
+			export { createAdminTools } from "./src/engine/tools/admin.ts";
 		`,
 		resolveDir: root,
 		loader: "ts",
@@ -46,6 +50,9 @@ const {
 	describeAccess,
 	createManageAccessTool,
 	createCheckMyAccessTool,
+	createManageSettingsTool,
+	createComputerTools,
+	createManageCapabilitiesTool,
 } = await import(pathToFileURL(bundle).href);
 
 /** Fresh in-memory config store with the tables ConfigStore touches. */
@@ -671,4 +678,32 @@ test("set_conversation_roles grants the whole observed roster, but spares the la
 	res = await tool.execute("b6", { action: "set_conversation_roles", conversationName: "内部群", role: "root" });
 	assert.equal(res.details.refused, true);
 	assert.deepEqual(config.all().security.people, beforeRefused);
+});
+
+
+// ── prompt mirrors gate: tool descriptions reflect security.adminFullAccess ──
+// (field 2026-10-06: with full access ON the model still asked for「确认」because
+// the static description kept teaching it to; hard gate was already short-circuited.)
+
+test("tool descriptions mirror adminFullAccess: full access ON drops the confirmation demand", (t) => {
+	// Seed the flag through the real config store so the branch reads production shape.
+	const { config } = store(t);
+	config.update({ security: { adminFullAccess: true } });
+	const deps = { config };
+	const settingsOn = createManageSettingsTool(deps);
+	const manageComputer = createComputerTools(deps).find((tool) => tool.name === "manage_computer");
+	const capsOn = createManageCapabilitiesTool(deps);
+	assert.match(settingsOn.description, /无需再索要「确认」/);
+	assert.doesNotMatch(settingsOn.description, /在当前消息包含「确认」/);
+	assert.match(manageComputer.description, /管理员明确指示即可执行/);
+	assert.doesNotMatch(manageComputer.description, /含确认/);
+	assert.match(capsOn.description, /无需消息确认/);
+	assert.doesNotMatch(capsOn.description, /明确包含「确认」/);
+});
+
+test("tool descriptions mirror adminFullAccess: default (OFF) keeps demanding confirmation", (t) => {
+	const deps = store(t);
+	assert.match(createManageSettingsTool(deps).description, /在当前消息包含「确认」/);
+	assert.match(createComputerTools(deps).find((tool) => tool.name === "manage_computer").description, /需管理员当前消息含确认/);
+	assert.match(createManageCapabilitiesTool(deps).description, /明确包含「确认」/);
 });
