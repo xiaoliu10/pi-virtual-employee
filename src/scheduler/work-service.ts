@@ -47,6 +47,10 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	budget?: { maxTurns: number; maxMinutes: number };
 	clock?: Clock;
 	onError?(error: unknown): void;
+	/** Latest inbound (user) message time in a conversation since a timestamp —
+	 * reminder staleness guard: if the human already replied after the pause,
+	 * the sweep stays quiet instead of nagging about an answered question. */
+	lastInboundAt?(conversationId: string, sinceTs: number): number | null;
 }
 
 export function workLessons(raw: string | null): string[] {
@@ -153,6 +157,23 @@ export class WorkService<Session extends WorkSession> {
 		const now = this.clock.now();
 		for (const row of this.opts.store.listByStatus("waiting_human")) {
 			if (this.remindDeadline(row) > now) continue;
+			// The human may have ALREADY replied in the origin conversation after the
+			// pause (field 2026-10-06: the answer was given, the task ran to
+			// completion, and a stale reminder still nagged 9h later). If any inbound
+			// message landed after this pause began, skip the reminder — the resume
+			// path owns the follow-up; nagging again just erodes trust.
+			if (this.opts.lastInboundAt && row.origin_conversation) {
+				const inbound = this.opts.lastInboundAt(row.origin_conversation, row.updated_at);
+				if (inbound !== null && inbound >= row.updated_at) {
+					// Bookkeeping MUST still advance (last_remind_at out), otherwise the
+					// deadline stays in the past and the wake timer tight-loops on skips.
+					const suppressed = (row.remind_count ?? 0) + 1;
+					if (this.opts.store.markReminded(row.id, now)) {
+						this.opts.onError?.(new Error(`[work] reminder suppressed for ${row.id.slice(0, 8)} (attempt ${suppressed}): origin conversation has inbound activity after the pause`));
+					}
+					continue;
+				}
+			}
 			const waited = now - row.updated_at;
 			const n = (row.remind_count ?? 0) + 1;
 			if (!this.opts.store.markReminded(row.id, now)) continue;

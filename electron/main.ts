@@ -827,6 +827,7 @@ async function main(): Promise<void> {
 		}),
 		release: (convId) => browser.releasePage(convId),
 		push: (cid, text) => im.pushToConversation(cid, text),
+		lastInboundAt: (cid, sinceTs) => history.lastInboundAt(cid, sinceTs),
 		canLearn: () => {
 			const kb = config.all().kb;
 			return kb.enabled && kb.learn.enabled;

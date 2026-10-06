@@ -44,6 +44,7 @@ function fixture(t, overrides = {}) {
 		push: async (cid, text) => { h.pushes.push({ cid, text }); if (overrides.push) await overrides.push(h); },
 		learn: (item, result) => { h.learned.push({ item, result }); },
 		onError: err => h.errors.push(err),
+		lastInboundAt: overrides.lastInboundAt ? (cid, sinceTs) => overrides.lastInboundAt(cid, sinceTs) : undefined,
 		...overrides.options,
 	});
 	h.create = (status = "queued", extra = {}) => h.store.create({ title: "月末对账", goal: "完成月末核对", status, createdBy: "admin", originConversation: "dt:source", ...extra });
@@ -528,6 +529,37 @@ test("waiting_human items are re-reminded every 24h instead of dying silently", 
 	await h.clock.advance(72 * 3_600_000); await flush();
 	assert.equal(h.pushes.filter(p => /仍在等待人工/.test(p.text)).length, 2, "no reminders after resume");
 	assert.equal(h.store.get(item.id).status, "done", "resumed window completed");
+});
+
+test("reminder staleness guard: inbound reply after the pause keeps the sweep quiet (field 2026-10-06)", async t => {
+	// Fixture: lastInboundAt reports activity in the origin conversation AFTER the
+	// pause — the human already answered (the resume path may have failed or the
+	// answer is being processed); the sweep must NOT nag about the answered question.
+	let inbound = null;
+	const h = fixture(t, {
+		send: () => ({ reply: "需要验证码\n[[NEED_HUMAN]]: 请提供验证码" }),
+		lastInboundAt: (cid, sinceTs) => inbound,
+	});
+	const item = h.create(); h.service.start(); await flush();
+	assert.equal(h.store.get(item.id).status, "waiting_human");
+	h.db.prepare("UPDATE work_items SET updated_at = ? WHERE id = ?").run(h.clock.now(), item.id);
+	await h.service.stop(); h.service.start(); await flush();
+	assert.equal(h.pushes.length, 1, "the entry push");
+
+	// Human replied in the group AFTER the pause → sweep stays quiet forever.
+	inbound = h.clock.now() + 1000;
+	await h.clock.advance(30 * 3_600_000); await flush();
+	await h.clock.advance(30 * 3_600_000); await flush();
+	assert.equal(h.pushes.length, 1, "no reminders once the human has replied");
+	// The skip is observable (not a silent swallow) and the bookkeeping advanced.
+	assert.ok(h.errors.some((e) => String(e).includes("reminder suppressed")), "skip is surfaced via onError");
+	assert.ok(h.store.get(item.id).remind_count >= 1, "suppressed reminders still count (two 30h windows → suppressed twice)");
+
+	// Control: no inbound after the pause → reminders proceed as before.
+	inbound = null;
+	await h.clock.advance(30 * 3_600_000); await flush();
+	assert.equal(h.pushes.length, 2, "reminder resumes when no inbound activity");
+	assert.match(h.pushes[1].text, /仍在等待人工/);
 });
 
 test("third-plus reminders escalate the copy toward cancel-or-resume; admin-paused items are reminded too", async t => {
