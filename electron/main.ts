@@ -1051,6 +1051,8 @@ async function main(): Promise<void> {
 		await writeFile(result.filePath, JSON.stringify({ model: safe }, null, 2), "utf8");
 		return true;
 	});
+	// Lightweight global-default switch: no invalidate (in-flight streams keep running).
+	ipcMain.handle("model:setDefault", (_e, supplierId: string, modelId: string) => engine.setDefaultModel(supplierId, modelId));
 	ipcMain.handle("model:setForConversation", (_e, conversationId: string, supplierId: string, modelId: string) => {
 		// Empty both = "follow global default": clear the per-conversation pin.
 		if (!supplierId && !modelId) {

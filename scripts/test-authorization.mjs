@@ -135,6 +135,33 @@ test("legacy kb.research {false, duckduckgo} migrates to {true, bing}; explicit 
 	assert.equal(config.all().kb.research.engine, "duckduckgo", "true+duckduckgo is explicit — untouched");
 });
 
+test("normalizeModelConfig keeps authProvider non-empty defaults; resets invalid non-auth ones", (t) => {
+	const db = new DatabaseSync(":memory:");
+	db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+	t.after(() => db.close());
+	const config = new ConfigStore(db);
+	// auth supplier with EMPTY models array (registry lives elsewhere): non-empty default sticks.
+	config.replaceAll({
+		model: {
+			suppliers: [{ id: "acct", name: "A", enabled: true, apiType: "anthropic", baseUrl: "", apiKey: "", models: [], authProvider: "anthropic" }],
+			defaultSupplierId: "acct",
+			defaultModelId: "claude-x",
+		},
+	});
+	assert.equal(config.all().model.defaultSupplierId, "acct", "auth non-empty default survives normalize");
+	assert.equal(config.all().model.defaultModelId, "claude-x");
+
+	// non-auth supplier with a model NOT in its list: self-heal reset still applies.
+	config.replaceAll({
+		model: {
+			suppliers: [{ id: "plain", name: "P", enabled: true, apiType: "openai", baseUrl: "https://x", apiKey: "k", models: ["gpt-x"] }],
+			defaultSupplierId: "plain",
+			defaultModelId: "not-in-list",
+		},
+	});
+	assert.equal(config.all().model.defaultModelId, "gpt-x", "invalid non-auth default resets to first model");
+});
+
 test("all() read path keeps normalizing legacy kb.external shapes (guard against regression)", (t) => {
 	const db = new DatabaseSync(":memory:");
 	db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");

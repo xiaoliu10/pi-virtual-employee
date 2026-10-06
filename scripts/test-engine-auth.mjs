@@ -745,3 +745,34 @@ test("clearConversationModel drops the per-conversation pin so it follows the gl
 		"live session re-resolved to the global default without a rebuild",
 	);
 });
+
+// ── account-login suppliers: registry models must be selectable everywhere (field 2026-10-06) ──
+
+test("availableModels surfaces registry models for auth suppliers; pin/default accept them", (t) => {
+	const { engine, config, history } = makeEngine(t, { extraProviders: [fakeOAuthProvider()] });
+	// Account-login supplier: config models array is EMPTY — models live in the registry.
+	config.update({
+		model: {
+			suppliers: [accountSupplier({ id: "acct2", authProvider: "anthropic", models: [] })],
+			defaultSupplierId: "acct2",
+			defaultModelId: "fake-model",
+		},
+	});
+	const listed = engine.availableModels().filter((o) => o.supplierId === "acct2");
+	assert.ok(listed.some((o) => o.modelId === "fake-model"), "registry models listed for auth supplier");
+	assert.ok(listed.some((o) => o.isDefault), "registry default marked");
+
+	// Pin a conversation to the registry model — validation must accept it.
+	engine.setConversationModel("conv-auth", "acct2", "fake-model");
+	assert.equal(history.getModelOverride("conv-auth")?.modelId, "fake-model");
+	assert.equal(engine.getOrCreateSession("conv-auth").state.model?.id, "fake-model");
+
+	// Default resolution uses the same supplierHasModel path.
+	assert.equal(engine.getOrCreateSession("conv-fresh").state.model?.id, "fake-model", "default resolves via registry");
+
+	// setDefaultModel live-patches unpinned cached sessions without invalidate.
+	const before = engine.activeSessionCount();
+	engine.setDefaultModel("acct2", "fake-model");
+	assert.equal(engine.getOrCreateSession("conv-fresh").state.model?.id, "fake-model");
+	assert.ok(engine.activeSessionCount() >= before, "no sessions dropped by the lightweight default switch");
+});

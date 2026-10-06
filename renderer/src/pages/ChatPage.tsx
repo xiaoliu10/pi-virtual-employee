@@ -31,6 +31,9 @@ interface ChatPageProps {
 	agentName: string;
 	/** Per-conversation model pin (null = follows global default). */
 	modelOverride: { supplierId: string; modelId: string } | null;
+	onConfigChanged: (patch: unknown) => Promise<unknown>;
+	/** Receives the full updated config after a lightweight default-model switch. */
+	onConfigReplaced: (config: unknown) => void;
 	modelRevision: string;
 	onActivated: (id: string) => void;
 	onTasksChanged: () => void;
@@ -50,6 +53,8 @@ export function ChatPage({
 	readOnly = false,
 	agentName,
 	modelOverride,
+	onConfigChanged,
+	onConfigReplaced,
 	modelRevision,
 	onActivated,
 	onTasksChanged,
@@ -184,8 +189,16 @@ export function ChatPage({
 	const onModelChange = useCallback(
 		async (supplierId: string, modelId: string) => {
 			const convId = conversationId ?? activeId;
-			if (!convId) return; // new conversation: default applies until first message
 			try {
+				if (!convId) {
+					// New conversation: nothing to pin yet — choosing a model here sets
+					// the global default (lightweight: no invalidate, in-flight turns
+					// in other conversations keep streaming).
+					const updated = await api.setDefaultModel(supplierId, modelId);
+					onConfigReplaced(updated);
+					setError(null);
+					return;
+				}
 				await api.setConversationModel(convId, supplierId, modelId);
 				setError(null);
 				onTasksChanged();
@@ -195,14 +208,14 @@ export function ChatPage({
 				setError(`切换模型失败：${err instanceof Error ? err.message : String(err)}`);
 			}
 		},
-		[conversationId, activeId, onTasksChanged],
+		[conversationId, activeId, onTasksChanged, onConfigChanged],
 	);
 
 	// Clear the per-conversation pin so the conversation follows the global default again.
 	const onModelFollow = useCallback(
 		async () => {
 			const convId = conversationId ?? activeId;
-			if (!convId) return;
+			if (!convId) return; // new conversation has no pin
 			try {
 				await api.clearConversationModel(convId);
 				setError(null);
@@ -237,7 +250,7 @@ export function ChatPage({
 				<select
 					className="titlebar-nodrag h-[30px] max-w-[240px] shrink-0 cursor-pointer rounded-full border-0 bg-transparent px-2.5 text-[12.5px] text-[#6e6e73] outline-none transition-colors hover:bg-black/[0.045] hover:text-[#1d1d1f] disabled:cursor-not-allowed disabled:opacity-50"
 					value={selectedValue}
-					disabled={!conversationId || modelOptions.length === 0 || readOnly}
+					disabled={modelOptions.length === 0}
 					onChange={(e) => {
 						if (e.target.value === FOLLOW_VALUE) {
 							void onModelFollow();
@@ -246,12 +259,12 @@ export function ChatPage({
 						const [supplierId, modelId] = e.target.value.split("/");
 						if (supplierId && modelId) void onModelChange(supplierId, modelId);
 					}}
-					title={readOnly
-						? "IM 会话为只读：模型由员工配置决定，可在 设置 → 自定义模型 修改默认模型"
-						: !conversationId
-							? "发送首条消息后可切换本对话的模型"
-							: modelOptions.length === 0
-								? "尚未配置模型：请在 设置 → 自定义模型 添加"
+					title={modelOptions.length === 0
+						? "尚未配置模型：请在 设置 → 自定义模型 添加"
+						: !conversationId && !activeId
+							? "选择新对话使用的模型（将更新全局默认）"
+							: readOnly
+								? "切换本 IM 会话使用的模型"
 								: "切换本对话的模型"}
 				>
 					{modelOptions.length === 0 && <option value="">未配置模型</option>}
