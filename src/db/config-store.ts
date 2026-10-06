@@ -397,6 +397,8 @@ export interface AppConfig {
 	skills: {
 		/** Disabled skill names (built-in or user); everything else is active. */
 		disabled: string[];
+		/** Skill-market index URL (empty = the project's own curated list). */
+		marketUrl: string;
 	};
 	/**
 	 * Security: conversation-side admin gate. `adminStaffIds` is the whitelist of
@@ -481,7 +483,7 @@ const DEFAULTS: AppConfig = {
 		},
 	},
 	downloads: { enabled: true, dir: "", maxSizeMb: 200, retainDays: 30 },
-	skills: { disabled: [] },
+	skills: { disabled: [], marketUrl: "" },
 	security: { adminStaffIds: [], people: [], defaultRole: "viewer", conversations: [] },
 	kb: {
 		enabled: true,
