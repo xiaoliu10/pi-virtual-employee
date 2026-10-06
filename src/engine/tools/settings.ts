@@ -57,7 +57,7 @@ export const ROOT_CATALOG: Record<string, string> = {
 	filesystem: "本地文件访问（filesystem.enabled/filesystem.allowedDirs[]）",
 	capabilities: "命令执行（capabilities.shell.enabled/allowedCommands/timeoutSec/backgroundTimeoutSec/pollTimeoutSec；时限单位秒：同步默认 60，后台默认 0=不限时，单次轮询等待默认 30）；MCP 外部工具（capabilities.mcp.enabled 开关 + capabilities.mcp.servers 服务器列表：[{name, command, args, env, cwd} 或 {name, url, headers, timeoutSec}]，env/headers 支持 ${环境变量}，name 仅字母数字_-，工具暴露为 mcp__<服务器>__<工具>）；自主工作提案挖掘（capabilities.autonomousMining.enabled 默认 false；intervalHours 默认 4，范围 1-24 小时；只生成待确认提案，不自动开工；无需新 UI，可用本工具在管理员 IM 单聊确认修改）",
 	reports: "报告中心与发布目标（reports.enabled/reports.target/gitee.*/oss.*）",
-	skills: "已禁用技能列表（skills.disabled[]）",
+	skills: "技能（skills.disabled[] 禁用名单；skills.marketUrl 技能市场索引 URL，manage_skills 换源用）",
 };
 
 type Json = string | number | boolean | null | Json[] | { [k: string]: Json };

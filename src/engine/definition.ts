@@ -30,6 +30,7 @@ import { createSaveToKnowledgeTool, createRememberTool } from "./tools/save-know
 import { createManageKnowledgeTool } from "./tools/manage-knowledge.js";
 import { createSaveToSkillTool } from "./tools/save-skill.js";
 import { createRefreshSkillsTool } from "./tools/refresh-skills.js";
+import { createManageSkillsTool } from "./tools/skills-market.js";
 import { createCurrentTimeTool } from "./tools/time.js";
 import { createReadSkillAssetTool } from "./tools/read-skill-asset.js";
 import { createResearchWebTool } from "./tools/research-web.js";
@@ -272,6 +273,18 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 	// Conversation-side skill reload — the "刷新" button's IM equivalent, so a
 	// remote employee can pick up imported/edited skills without the admin UI.
 	tools.push(createRefreshSkillsTool(options.listSkills, options.onSkillsChanged));
+	// Skill market: admin-gated install/remove of SKILL.md packages (market list or
+	// direct https URL). Confirmation mirrors adminFullAccess via requireConfirmedAdmin.
+	tools.push(createManageSkillsTool({
+		config: options.config,
+		resolveActor: options.resolveActor,
+		onConfigChanged: options.onConfigChanged,
+		conversationId: options.conversationId,
+		skillWriter: options.skillWriter,
+		userSkillsDir: options.userSkillsDir,
+		listSkills: options.listSkills,
+		onSkillsChanged: options.onSkillsChanged,
+	}));
 	// Always-on real clock: date-sensitive tasks must read the true date, never
 	// guess it (field 2026-09-18: a daily report was titled one day off).
 	tools.push(createCurrentTimeTool());
