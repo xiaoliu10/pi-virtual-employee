@@ -1,6 +1,6 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import { rm, stat } from "node:fs/promises";
+import { readdir, readFile, rm } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import type { ConfigStore } from "../../db/config-store.js";
 import { parseSkillFile } from "../skills/skill-parser.js";
@@ -28,12 +28,67 @@ const FETCH_LIMIT = 512 * 1024;
 /** Same shape as the loader/writer name rule: no separators, no traversal. */
 const SKILL_NAME = /^[\p{Script=Han}a-z0-9]+(-[\p{Script=Han}a-z0-9]+)*$/u;
 
+const MAX_REDIRECTS = 3;
+
+function isPrivateHost(host: string): boolean {
+	if (host === "localhost" || host.endsWith(".local") || host.endsWith(".internal")) return true;
+	// Hostname form of an IPv4/IPv6 literal: reject loopback/private/link-local.
+	if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return true;
+	const m = host.match(/^172\.(\d+)\./);
+	if (m && Number(m[1]) >= 16 && Number(m[1]) <= 31) return true;
+	if (host === "::1" || host === "[::1]" || host.startsWith("fd") || host.startsWith("fe80")) return true;
+	return false;
+}
+
+/**
+ * Fetch with hard transport guarantees: every hop must be https, no redirects
+ * into private/loopback hosts (SSRF), no silent https→http downgrade, and the
+ * body is streamed with a hard byte cap (a hostile server must not be able to
+ * buffer unbounded memory into the employee process).
+ */
 async function fetchText(url: string): Promise<string> {
-	const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
-	if (!res.ok) throw new Error(`下载失败 HTTP ${res.status}`);
-	const text = await res.text();
-	if (text.length > FETCH_LIMIT) throw new Error(`内容超过 ${FETCH_LIMIT / 1024}KB 上限，拒绝安装`);
-	return text;
+	let current = url;
+	for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+		if (!/^https:\/\//.test(current)) throw new Error("仅允许 https 来源（检测到降级或非 https 跳转）");
+		const host = new URL(current).hostname;
+		if (isPrivateHost(host)) throw new Error(`拒绝访问内网地址（${host}）`);
+		const res = await fetch(current, { redirect: "manual", signal: AbortSignal.timeout(15_000) });
+		if (res.status >= 300 && res.status < 400) {
+			const location = res.headers.get("location");
+			if (!location) throw new Error(`重定向缺少 Location（HTTP ${res.status}）`);
+			current = new URL(location, current).toString();
+			continue;
+		}
+		if (!res.ok) throw new Error(`下载失败 HTTP ${res.status}`);
+		if (res.body) {
+			const declared = Number(res.headers.get("content-length") ?? "");
+			if (Number.isFinite(declared) && declared > FETCH_LIMIT) {
+				throw new Error(`内容超过 ${FETCH_LIMIT / 1024}KB 上限，拒绝安装`);
+			}
+			const reader = res.body.getReader();
+			const chunks: Uint8Array[] = [];
+			let received = 0;
+			for (;;) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				received += value.byteLength;
+				if (received > FETCH_LIMIT) {
+					await reader.cancel().catch(() => {});
+					throw new Error(`内容超过 ${FETCH_LIMIT / 1024}KB 上限，拒绝安装`);
+				}
+				chunks.push(value);
+			}
+			const merged = new Uint8Array(received);
+			let offset = 0;
+			for (const chunk of chunks) {
+				merged.set(chunk, offset);
+				offset += chunk.byteLength;
+			}
+			return new TextDecoder().decode(merged);
+		}
+		return res.text();
+	}
+	throw new Error(`重定向超过 ${MAX_REDIRECTS} 跳，拒绝安装`);
 }
 
 function marketIndexUrl(config: ConfigStore): string {
@@ -57,6 +112,36 @@ function assertInsideUserDir(filePath: string, userSkillsDir: string): boolean {
 }
 
 /**
+ * All user-side skill files whose PARSED name matches, mirroring the loader's
+ * acceptance (dir/SKILL.md plus top-level *.md in any case). The builtin dir is
+ * never scanned — builtins are not removable.
+ */
+async function findUserSkillPathsByName(userSkillsDir: string, wanted: string): Promise<string[]> {
+	const out: string[] = [];
+	let entries;
+	try {
+		entries = await readdir(userSkillsDir, { withFileTypes: true });
+	} catch {
+		return out;
+	}
+	for (const entry of entries) {
+		const candidates: string[] = [];
+		if (entry.isDirectory()) candidates.push(join(userSkillsDir, entry.name, "SKILL.md"));
+		else if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) candidates.push(join(userSkillsDir, entry.name));
+		for (const candidate of candidates) {
+			try {
+				const raw = await readFile(candidate, "utf8");
+				const { skill } = parseSkillFile(candidate, raw);
+				if (skill?.name === wanted) out.push(candidate);
+			} catch {
+				/* unreadable/foreign file — the loader skips it too */
+			}
+		}
+	}
+	return out;
+}
+
+/**
  * Build the manage_skills tool: an admin-gated bridge to the skill market.
  *
  * install/remove run through requireConfirmedAdmin, so the「确认」demand is
@@ -66,6 +151,7 @@ function assertInsideUserDir(filePath: string, userSkillsDir: string): boolean {
  * built-in protection + path containment + round-trip validation.
  */
 export function createManageSkillsTool(deps: SkillsMarketDeps): AgentTool {
+	const fullAccess = () => deps.config.all().security.adminFullAccess === true;
 	return {
 		name: "manage_skills",
 		label: "技能市场",
@@ -114,8 +200,8 @@ export function createManageSkillsTool(deps: SkillsMarketDeps): AgentTool {
 					if (entries.length === 0) {
 						return { content: [{ type: "text", text: "技能市场当前为空。也可以用 action=install 传 url 直接安装任意 SKILL.md 直链。" }], details: { action, count: 0 } };
 					}
-					const lines = entries.map((e) => `- ${e.name}${e.description ? `：${e.description}` : ""}`);
-					return { content: [{ type: "text", text: `技能市场共 ${entries.length} 个技能：\n${lines.join("\n")}\n用 action=install 安装。` }], details: { action, count: entries.length } };
+					const lines = entries.map((e) => `- ${e.name}${e.description ? `：${e.description}` : ""}\n  来源：${e.url}`);
+					return { content: [{ type: "text", text: `技能市场共 ${entries.length} 个技能：\n${lines.join("\n")}\n安装前请核对来源可信；用 action=install 安装。` }], details: { action, count: entries.length } };
 				} catch (err) {
 					return { content: [{ type: "text", text: `技能市场暂不可用：${err instanceof Error ? err.message : String(err)}` }], details: { action, failed: true } };
 				}
@@ -162,8 +248,11 @@ export function createManageSkillsTool(deps: SkillsMarketDeps): AgentTool {
 						mode: overwrite ? "replace" : "create",
 					});
 					if (result.outcome === "needs-confirm") {
+						const overwriteHint = fullAccess()
+							? `若对方明确同意覆盖，携带 overwrite=true 重新安装即可。`
+							: `若对方明确同意覆盖，请回复「确认覆盖」后携带 overwrite=true 重新安装。`;
 						return {
-							content: [{ type: "text", text: `技能「${skill.name}」已存在。若对方明确同意覆盖，请回复确认后携带 overwrite=true 重新安装。` }],
+							content: [{ type: "text", text: `技能「${skill.name}」已存在（来源：${sourceUrl}）。${overwriteHint}` }],
 							details: { action, needsConfirm: true },
 						};
 					}
@@ -172,8 +261,8 @@ export function createManageSkillsTool(deps: SkillsMarketDeps): AgentTool {
 					}
 					await deps.onSkillsChanged();
 					return {
-						content: [{ type: "text", text: `✅ 技能「${skill.name}」已${result.outcome === "updated" ? "更新" : "安装"}并重新加载，从下一条消息起生效。${skill.description}` }],
-						details: { action, name: skill.name, outcome: result.outcome },
+						content: [{ type: "text", text: `✅ 技能「${skill.name}」已${result.outcome === "updated" ? "更新" : "安装"}（来源：${sourceUrl}）并重新加载，从下一条消息起生效。${skill.description}` }],
+						details: { action, name: skill.name, outcome: result.outcome, sourceUrl },
 					};
 				} catch (err) {
 					return { content: [{ type: "text", text: `安装失败：${err instanceof Error ? err.message : String(err)}` }], details: { action, failed: true } };
@@ -185,23 +274,24 @@ export function createManageSkillsTool(deps: SkillsMarketDeps): AgentTool {
 				if (!wanted || !SKILL_NAME.test(wanted)) {
 					return { content: [{ type: "text", text: "remove 需要提供合法的技能名（中文/小写字母/数字/连字符）。" }], details: { action } };
 				}
-				// The name regex already forbids separators/traversal; probe the two
-				// canonical layouts the loader supports.
-				const dirForm = join(deps.userSkillsDir, wanted, "SKILL.md");
-				const fileForm = join(deps.userSkillsDir, `${wanted}.md`);
-				const target = await stat(dirForm).then(() => dirForm).catch(async () => (await stat(fileForm).then(() => fileForm).catch(() => null)));
-				if (!target) {
+				// Locate by PARSED FRONTMATTER NAME (the loader's semantics), not by
+				// file name: `Foo.MD` with frontmatter name excel-pivot loads as
+				// excel-pivot, so a filename probe would miss it.
+				const targets = await findUserSkillPathsByName(deps.userSkillsDir, wanted);
+				if (targets.length === 0) {
 					return { content: [{ type: "text", text: `本机没有名为「${wanted}」的用户技能。内置技能不可移除；用 action=list 查看已加载列表。` }], details: { action, name: wanted } };
 				}
-				if (!assertInsideUserDir(target, deps.userSkillsDir)) {
+				if (targets.some((t) => !assertInsideUserDir(t, deps.userSkillsDir))) {
 					return { content: [{ type: "text", text: "目标路径越界，移除被拒绝。" }], details: { action } };
 				}
 				try {
-					await rm(target);
-					// Only directory-form skills have a removable parent — never touch
-					// the user dir itself when the skill was a top-level <name>.md.
-					if (target === dirForm) {
-						await rm(dirname(target), { recursive: true, force: true }).catch(() => {});
+					for (const target of targets) {
+						await rm(target);
+						// Only directory-form skills have a removable parent — never
+						// touch the user dir itself for top-level <file>.md skills.
+						if (target.endsWith(sep + "SKILL.md") && dirname(target) !== resolve(deps.userSkillsDir)) {
+							await rm(dirname(target), { recursive: true, force: true }).catch(() => {});
+						}
 					}
 					await deps.onSkillsChanged();
 					return {
