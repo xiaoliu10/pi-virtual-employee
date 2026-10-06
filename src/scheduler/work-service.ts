@@ -159,17 +159,22 @@ export class WorkService<Session extends WorkSession> {
 			if (this.remindDeadline(row) > now) continue;
 			// The human may have ALREADY replied in the origin conversation after the
 			// pause (field 2026-10-06: the answer was given, the task ran to
-			// completion, and a stale reminder still nagged 9h later). If any inbound
-			// message landed after this pause began, skip the reminder — the resume
-			// path owns the follow-up; nagging again just erodes trust.
+			// completion, and a stale reminder still nagged 9h later). Suppress the
+			// reminder when inbound arrived after the LAST reminder watermark
+			// (entry time, else last_remind_at) — per-cycle suppression only: a
+			// chatty group must not mute an item forever (silence = death), but an
+			// answered question never nags again on the very next cycle either.
+			// Note: setField/addLesson during waiting_human refresh updated_at —
+			// the watermark moves with it, matching the "已等待 X" entry-time base.
 			if (this.opts.lastInboundAt && row.origin_conversation) {
-				const inbound = this.opts.lastInboundAt(row.origin_conversation, row.updated_at);
-				if (inbound !== null && inbound >= row.updated_at) {
+				const watermark = Math.max(row.updated_at, row.last_remind_at ?? 0);
+				const inbound = this.opts.lastInboundAt(row.origin_conversation, watermark);
+				if (inbound !== null && inbound >= watermark) {
 					// Bookkeeping MUST still advance (last_remind_at out), otherwise the
 					// deadline stays in the past and the wake timer tight-loops on skips.
 					const suppressed = (row.remind_count ?? 0) + 1;
 					if (this.opts.store.markReminded(row.id, now)) {
-						this.opts.onError?.(new Error(`[work] reminder suppressed for ${row.id.slice(0, 8)} (attempt ${suppressed}): origin conversation has inbound activity after the pause`));
+						this.opts.onError?.(new Error(`[work] reminder suppressed for ${row.id.slice(0, 8)} (attempt ${suppressed}): origin conversation has inbound activity after the last reminder watermark`));
 					}
 					continue;
 				}

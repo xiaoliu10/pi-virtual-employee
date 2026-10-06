@@ -840,7 +840,7 @@ async function main(): Promise<void> {
 			const input = buildWorkLearning(item, result);
 			if (input) knowledge.saveLearned(input);
 		},
-		onError: () => console.warn("[work] lifecycle operation failed; inspect local work history before resuming"),
+		onError: (err) => console.warn(`[work] lifecycle operation failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 200)}`),
 	});
 	const fireWorkItem = (id: string): boolean => workService.fireItem(id);
 	let workMiningTimer: ReturnType<typeof setInterval> | undefined;

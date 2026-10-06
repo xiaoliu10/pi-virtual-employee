@@ -546,19 +546,19 @@ test("reminder staleness guard: inbound reply after the pause keeps the sweep qu
 	await h.service.stop(); h.service.start(); await flush();
 	assert.equal(h.pushes.length, 1, "the entry push");
 
-	// Human replied in the group AFTER the pause → sweep stays quiet forever.
+	// Human replied in the group AFTER the pause → the FIRST reminder cycle is
+	// suppressed (the answer landed; the resume path owns the follow-up).
 	inbound = h.clock.now() + 1000;
 	await h.clock.advance(30 * 3_600_000); await flush();
-	await h.clock.advance(30 * 3_600_000); await flush();
-	assert.equal(h.pushes.length, 1, "no reminders once the human has replied");
-	// The skip is observable (not a silent swallow) and the bookkeeping advanced.
+	assert.equal(h.pushes.length, 1, "answered question does not nag on the next cycle");
 	assert.ok(h.errors.some((e) => String(e).includes("reminder suppressed")), "skip is surfaced via onError");
-	assert.ok(h.store.get(item.id).remind_count >= 1, "suppressed reminders still count (two 30h windows → suppressed twice)");
+	assert.equal(h.store.get(item.id).remind_count, 1, "suppressed attempt still counts");
 
-	// Control: no inbound after the pause → reminders proceed as before.
-	inbound = null;
+	// Watermark advanced with the suppression: a chatty group does NOT mute the
+	// item forever — with no NEW inbound since the suppressed cycle, the next
+	// cycle reminds again (silence = death is the failure mode this sweep exists for).
 	await h.clock.advance(30 * 3_600_000); await flush();
-	assert.equal(h.pushes.length, 2, "reminder resumes when no inbound activity");
+	assert.equal(h.pushes.length, 2, "reminders resume when no NEW inbound since the watermark");
 	assert.match(h.pushes[1].text, /仍在等待人工/);
 });
 
