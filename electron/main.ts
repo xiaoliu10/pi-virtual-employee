@@ -29,6 +29,8 @@ import {
 	normalizeBudget,
 	parseChainReply,
 	parseChainState,
+	nextStallStep,
+	STALL_QUIET_RETRIES,
 } from "../src/scheduler/autonomous.js";
 import { TelemetryStore } from "../src/db/telemetry-store.js";
 import { ProposalStore } from "../src/engine/proposals.js";
@@ -542,13 +544,25 @@ async function main(): Promise<void> {
 	 * fresh budget window. Chain state persists per turn so a crash or restart
 	 * leaves a resumable record. See docs/research/autonomous-work.md.
 	 */
+	// Persistent failure log (field 2026-10-06: "报错的日志能不能拉一下" — nothing
+	// was on disk). Console output is invisible in a packaged app; scheduler
+	// failures, stall retries and escalations go to the standard logs dir.
+	const appendAppLog = (message: string) => {
+		try {
+			const logsDir = app.getPath("logs");
+			mkdirSync(logsDir, { recursive: true });
+			appendFileSync(path.join(logsDir, "pi-virtual-employee.log"), `${new Date().toISOString()} ${message}\n`);
+		} catch {
+			/* logging must never break the run */
+		}
+	};
 	const runAutonomousTask = async (task: ScheduledTaskRow): Promise<{ status: string }> => {
 		const budget = normalizeBudget(task.max_turns, task.max_minutes);
 		const prior = parseChainState(task.chain_state);
 		// Resume reuses the SAME conversation but resets the budget window; a
 		// fresh chain gets a unique conversation (no bleed between chains).
 		const chain: AutonomousChainState = prior
-			? { ...prior, turns: 0, startedAt: Date.now(), pending: undefined }
+			? { ...prior, turns: 0, startedAt: Date.now(), pending: undefined, stallCount: 0 }
 			: { convId: `sched:${task.id}:${Date.now()}`, turns: 0, startedAt: Date.now() };
 		// A staged reply (resume after a human question) is consumed on turn 0 and
 		// then dropped from the persisted state.
@@ -623,17 +637,25 @@ async function main(): Promise<void> {
 					break;
 				}
 				if (send.deterministic) {
-					// Model service stalled (no content after retries): PAUSE the chain
-					// and wait for an admin instead of dead-ending or burning the rest
-					// of the budget on turns that will fail the same way (field
-					// 2026-10-05). Resumes like human/budget pauses via
-					// resume_scheduled_task — the conversation history is intact, so the
-					// next turn continues from where it stopped. Precedence note: a turn
-					// that THREW (hardError, e.g. login revoked) takes the error branch
-					// above; deterministic covers the no-throw/no-content stall.
+					// Model service stall (no content after the engine's in-turn
+					// retries). Field 2026-10-06 policy: an occasional stall that a
+					// retry absorbs must not ping the human — stay SILENT, back off,
+					// retry the same turn (the failed attempt doesn't consume a turn).
+					// Only persistent stalls escalate to paused-and-notify.
+					chain.stallCount = (chain.stallCount ?? 0) + 1;
+					const step = nextStallStep(chain.stallCount);
+					if (step.action === "retry") {
+						persistChain();
+						console.warn(`[sched] task ${task.id} turn ${chain.turns} stalled (attempt ${chain.stallCount}/${STALL_QUIET_RETRIES + 1}); silent retry in ${Math.round(step.backoffMs / 1000)}s`);
+						appendAppLog(`[sched] task ${task.id} (${task.title}) turn ${chain.turns} model stall attempt ${chain.stallCount}; silent retry in ${Math.round(step.backoffMs / 1000)}s`);
+						await new Promise((resolve) => setTimeout(resolve, step.backoffMs));
+						chain.turns -= 1; // the failed attempt must not consume budget turns
+						continue;
+					}
+					// Escalate: the task is genuinely interrupted.
 					outcome = "stalled";
 					chain.pending = "stalled";
-					chain.question = "模型服务连续未返回内容，已暂停等待处理";
+					chain.question = "模型服务连续未返回内容，任务已中断暂停";
 					persistChain();
 					break;
 				}
@@ -659,6 +681,7 @@ async function main(): Promise<void> {
 				}
 				// Still working: persist progress, then push a turn-boundary note so
 				// the target chat sees the chain is alive without reading the console.
+				chain.stallCount = 0; // a successful turn clears the stall streak
 				persistChain();
 				if (task.conversation_id) {
 					await im.pushToConversation(
@@ -683,10 +706,11 @@ async function main(): Promise<void> {
 			error: outcome === "error" ? lastText || null : null,
 		});
 
+		appendAppLog(`[sched] autonomous task ${task.id} (${task.title}) outcome=${outcome} turns=${chain.turns} stallCount=${chain.stallCount ?? 0}${lastText ? ` last=${lastText.slice(0, 160).replace(/\s+/g, " ")}` : ""}`);
 		// Deliver the outcome to the target chat (markers stripped by the parser).
 		if (task.conversation_id) {
 			const resumeHint = `\n\n回复「继续 ${task.title}」重置预算继续；不回复则保持暂停。`;
-			const stalledHint = `\n\n通常是模型服务或中转临时不可用，不是任务本身的问题。已暂停等待处理：\n① 检查模型服务状态，或在 设置 → 自定义模型 顶部把其他模型「设为默认」并保存；\n② 处理后恢复任务（resume_scheduled_task 或回复「继续 ${task.title}」），我会原地重试；\n③ 恢复成功后我会把现象与解法沉淀进知识库，下次自动规避。`;
+			const stalledHint = `\n\n通常是模型服务或中转临时不可用，不是任务内容的问题。排查并处理后任务可从断点原地继续：\n① 检查模型服务状态，或在 设置 → 自定义模型 顶部把其他模型「设为默认」并保存；\n② 恢复任务（resume_scheduled_task 或回复「继续 ${task.title}」）；\n③ 恢复成功后我会把现象与解法沉淀进知识库，下次自动规避。`;
 			const pushText =
 				outcome === "done"
 					? `✅ **自主任务完成：${task.title}**（共 ${chain.turns} 轮）\n\n${lastText}`
@@ -695,7 +719,7 @@ async function main(): Promise<void> {
 						: outcome === "budget"
 							? `⏸️ **自主任务已达预算：${task.title}**（${chain.turns}/${budget.maxTurns} 轮）\n\n${tailForProgress(lastText, 400)}${resumeHint}`
 							: outcome === "stalled"
-								? `⏸️ **自主任务卡住：${task.title}**（第 ${chain.turns} 轮模型连续未返回内容）${stalledHint}`
+								? `⏸️ **自主任务已中断暂停：${task.title}**（模型服务连续 ${STALL_QUIET_RETRIES + 1} 次未返回内容，任务在第 ${chain.turns} 轮中断，不会自动继续）${stalledHint}`
 								: `⚠️ **自主任务出错停止：${task.title}**\n\n${lastText}`;
 			const pushed = await im.pushToConversation(task.conversation_id, pushText);
 			if (!pushed.ok) console.warn(`[sched] autonomous push failed for ${task.conversation_id}: ${pushed.error}`);
@@ -845,6 +869,7 @@ async function main(): Promise<void> {
 					console.warn(`[sched] push result failed for ${task.conversation_id}: ${pushError}`);
 				}
 			}
+			appendAppLog(`[sched] task ${task.id} (${task.title}) ${error ? `error=${error.slice(0, 160).replace(/\s+/g, " ")}` : pushError ? `ok;push_error=${pushError}` : "ok"}`);
 			if (error) return { status: "error:" + error.slice(0, 200) };
 			return { status: pushError ? "ok;push_error:" + pushError.slice(0, 180) : "ok" };
 		},

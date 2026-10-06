@@ -36,6 +36,9 @@ const {
 	normalizeBudget,
 	parseChainReply,
 	parseChainState,
+	nextStallStep,
+	STALL_QUIET_RETRIES,
+	STALL_RETRY_BASE_MS,
 } = await import(pathToFileURL(bundle).href);
 
 test("parseChainReply detects the done marker and strips it from the pushed text", () => {
@@ -81,7 +84,7 @@ test("normalizeBudget clamps to sane bounds and falls back on garbage", () => {
 test("parseChainState round-trips and rejects corrupt payloads", () => {
 	const state = { convId: "sched:t1:123", turns: 4, startedAt: 1700000000000, pending: "human", question: "账号?" };
 	const parsed = parseChainState(JSON.stringify(state));
-	assert.deepEqual(parsed, { ...state, answer: undefined });
+	assert.deepEqual(parsed, { ...state, answer: undefined, stallCount: 0 });
 	assert.equal(parseChainState(null), null);
 	assert.equal(parseChainState("{not json"), null);
 	assert.equal(parseChainState(JSON.stringify({ turns: 3 })), null, "missing convId is not a chain");
@@ -133,4 +136,21 @@ test("parseChainState round-trips the stalled pending kind (field 2026-10-05)", 
 	assert.equal(parsed?.question, "模型服务连续未返回内容");
 	// Unknown pending kinds still drop (existing contract).
 	assert.equal(parseChainState(JSON.stringify({ ...chain, pending: "weird" }))?.pending, undefined);
+});
+
+// ── stall escalation policy (field 2026-10-06: occasional stalls must not ping the human) ──
+
+test("nextStallStep: quiet retries first (with backoff), then escalate; parse keeps stallCount", async () => {
+
+	assert.equal(STALL_QUIET_RETRIES, 2);
+	// First two stalls: silent retry with linear backoff.
+	assert.deepEqual(nextStallStep(1), { action: "retry", backoffMs: STALL_RETRY_BASE_MS });
+	assert.deepEqual(nextStallStep(2), { action: "retry", backoffMs: STALL_RETRY_BASE_MS * 2 });
+	// Third consecutive stall: the task is genuinely interrupted.
+	assert.deepEqual(nextStallStep(3), { action: "escalate" });
+	assert.deepEqual(nextStallStep(9), { action: "escalate" });
+	// stallCount round-trips through chain-state persistence.
+	const state = parseChainState(JSON.stringify({ convId: "sched:1:1", turns: 3, stallCount: 2 }));
+	assert.equal(state?.stallCount, 2, "stallCount persists across fires");
+	assert.equal(parseChainState(JSON.stringify({ convId: "sched:1:1", turns: 1 }))?.stallCount, 0, "absent count defaults to 0");
 });

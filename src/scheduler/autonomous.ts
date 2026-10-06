@@ -28,6 +28,8 @@ export interface AutonomousChainState {
 	/** Why the chain last paused, waiting for a human. "stalled" = model
 	 * service returned no content after retries; resumes identically. */
 	pending?: "human" | "budget" | "stalled";
+	/** Consecutive deterministic (no-content) stalls in the current run. Silent-retry budget. */
+	stallCount?: number;
 	/** The question asked, when pending === "human" (echoed on resume pushes). */
 	question?: string;
 	/** The user's reply, staged by resume and consumed on the next turn 0. */
@@ -61,12 +63,29 @@ export function parseChainState(raw: string | null | undefined): AutonomousChain
 			turns: Number.isFinite(v.turns) ? Math.max(0, Math.floor(v.turns as number)) : 0,
 			startedAt: Number.isFinite(v.startedAt) ? (v.startedAt as number) : Date.now(),
 			pending: v.pending === "human" || v.pending === "budget" || v.pending === "stalled" ? v.pending : undefined,
+			stallCount: Number.isFinite(v.stallCount) ? Math.max(0, Math.floor(v.stallCount as number)) : 0,
 			question: typeof v.question === "string" ? v.question : undefined,
 			answer: typeof v.answer === "string" ? v.answer : undefined,
 		};
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * Field 2026-10-06: an occasional mid-task stall that a retry absorbs must NOT
+ * ping the human — stay silent and back off. Only when stalls persist past the
+ * quiet-retry budget does the runner escalate to a paused-and-notify state.
+ * Pure so the escalation policy is unit-testable without the electron harness.
+ */
+export const STALL_QUIET_RETRIES = 2;
+export const STALL_RETRY_BASE_MS = 60_000;
+
+export function nextStallStep(stallCount: number): { action: "retry"; backoffMs: number } | { action: "escalate" } {
+	if (stallCount <= STALL_QUIET_RETRIES) {
+		return { action: "retry", backoffMs: STALL_RETRY_BASE_MS * stallCount };
+	}
+	return { action: "escalate" };
 }
 
 /** Strip markdown emphasis/bullet prefixes so "**[[NEED_HUMAN]]: …" still leads. */
