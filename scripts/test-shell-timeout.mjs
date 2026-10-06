@@ -18,7 +18,7 @@ await build({
 	stdin: {
 		contents: `
 			export { ConfigStore } from "./src/db/config-store.ts";
-			export { createRunCommandTool, createManageProcessTool, disposeShellCommands, hasActiveShellCommands } from "./src/engine/tools/shell.ts";
+			export { createRunCommandTool, createManageProcessTool, disposeShellCommands, hasActiveShellCommands, wrapWindowsShellCommand } from "./src/engine/tools/shell.ts";
 			export { createManageSettingsTool } from "./src/engine/tools/settings.ts";
 		`,
 		resolveDir: root,
@@ -30,7 +30,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { ConfigStore, createRunCommandTool, createManageProcessTool, createManageSettingsTool, disposeShellCommands, hasActiveShellCommands } = await import(pathToFileURL(bundle).href);
+const { ConfigStore, createRunCommandTool, createManageProcessTool, createManageSettingsTool, disposeShellCommands, hasActiveShellCommands, wrapWindowsShellCommand } = await import(pathToFileURL(bundle).href);
 await writeFile(join(workDir, "command.cjs"), `
 const { spawn } = require("node:child_process");
 const { writeFileSync } = require("node:fs");
@@ -365,4 +365,12 @@ test("run_command from a group chat: admin runs without confirmation, operator s
 	const denied = await tool.execute("g5", { command: "node command.cjs 10", workingDir: workDir });
 	assert.equal(denied.details.refused, true);
 	assert.match(denied.content[0].text, /没有命令执行权限/);
+});
+
+// ── Windows shell composition forces UTF-8 code page (field 2026-10-06: GBK mojibake on CN systems) ──
+
+test("wrapWindowsShellCommand prepends chcp 65001 to the composed command", async () => {
+	const out = wrapWindowsShellCommand('dir /b /od "C:\\Users\\Administrator\\Documents\\MuMu共享文件夹\\Screenshots"');
+	assert.match(out, /^chcp 65001 >nul & /, "UTF-8 code page forced before the user command");
+	assert.match(out, /MuMu共享文件夹/, "the command itself passes through untouched");
 });

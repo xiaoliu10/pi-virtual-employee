@@ -320,6 +320,17 @@ function killProcessTree(pid: number | undefined): void {
 	}
 }
 
+/**
+ * Chinese Windows systems run cmd.exe in GBK (CP936) while our decoder is
+ * UTF-8 — any Chinese path/filename in the output turns to mojibake (field
+ * 2026-10-06: MuMu share folder listing was unreadable). Force the UTF-8 code
+ * page for the composed command. The `&` composition is internal: the user's
+ * command was already validated as a single command before we got here.
+ */
+export function wrapWindowsShellCommand(command: string): string {
+	return `chcp 65001 >nul & ${command}`;
+}
+
 /** Spawn once and retain supervision independently of any tool's wait. */
 function startCommand(command: string, timeoutSec: number, workingDir?: string): CommandSession {
 	const plan = planExecution(command);
@@ -336,7 +347,7 @@ function startCommand(command: string, timeoutSec: number, workingDir?: string):
 	};
 	let child: ChildProcess;
 	if (plan.mode === "direct") child = spawn(plan.file, plan.args, common);
-	else if (process.platform === "win32") child = spawn(`${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`, ["/d", "/s", "/c", plan.command], common);
+	else if (process.platform === "win32") child = spawn(`${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`, ["/d", "/s", "/c", wrapWindowsShellCommand(plan.command)], common);
 	else child = spawn("/bin/sh", ["-c", plan.command], common);
 	return new CommandSession(child, timeoutSec, killProcessTree);
 }
@@ -374,6 +385,7 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 			"权限分级：viewer 不可执行；operator 只能执行 capabilities.shell.allowedCommands 白名单内的可执行文件（* 表示全部），且串联、管道、重定向、变量展开、脚本扩展名和可执行文件路径均被拒绝，每次只跑一条独立命令；" +
 			"admin 不受白名单与组合语法限制（完整 shell：可用 powershell -Command 管道、重定向、脚本串联等），仅工作目录仍须为不含引号的绝对路径。" +
 			"默认用于运维诊断：tasklist 查看进程、taskkill 按单个 PID 结束进程、systeminfo/whoami/hostname/netstat/ping/ipconfig 查看本机状态。" +
+			"Windows 中文环境已强制 UTF-8 代码页（输出不会乱码）；含中文/空格的路径必须整体用双引号包住；列目录、查文件元数据优先用 list_directory（原生支持中文路径，无引号转义问题），run_command 留给真正需要执行程序的场景。" +
 			"长任务传 background=true：启动后立即返回 sessionId，用 manage_process poll 阻塞等待、log 增量读日志、kill 终止；等待超时只返回当前状态，不杀后台进程。同步命令运行时限用 capabilities.shell.timeoutSec（默认 60 秒）；后台进程时限用 backgroundTimeoutSec（默认 0=不限制），管理员可用 manage_settings 修改。" +
 			"采集逻辑先写入 .ps1/.py 脚本，命令只用 powershell -File xxx.ps1 或 python xxx.py，参数通过本地文件传递；脚本先输出 observer start 与时间戳，首次 poll/log 检查启动日志，不能把返回 sessionId 当成任务完成。会话由本应用托管，应用退出会终止进程，重启后不可续接；不要再用 nohup 或自制脱管 launcher。" +
 			"powershell/node/npx 等解释器需管理员显式加入白名单（admin 角色无需）；安装 Chromium 请改用 manage_capabilities setup_browser。" +
