@@ -39,7 +39,19 @@ export interface SettingsToolDeps {
 /** Blocks that must go through their dedicated tools instead of raw writes. */
 const BLOCKED_ROOTS = new Set(["security"]);
 
-const SENSITIVE_RE = /(api_?key|secret|token|password)/i;
+const SENSITIVE_RE = /(api[-_]?key|secret|token|password|authorization|credential|access[_-]?key)/i;
+/** Containers whose string leaves are credentials even when the key name is innocuous (mcp headers/env, query params). */
+const SENSITIVE_CONTAINER_RE = /(headers|env|query)/i;
+
+/** Uniform secret mask for get + dump: short secrets hide entirely, longer ones keep 2+2. */
+function maskSecret(value: string): string {
+	return value.length > 8 ? `${value.slice(0, 2)}***${value.slice(-2)}` : "***";
+}
+
+/** URLs can carry credentials in the query string (?key=…&token=…) — mask every query value. */
+function maskUrlQuery(value: string): string {
+	return value.includes("?") ? value.replace(/([?&][^=]+=)[^&]+/g, "$1***") : value;
+}
 const MAX_VALUE_CHARS = 20_000;
 
 /** Root-block catalog for the list action (also the discovery surface for the model). */
@@ -135,22 +147,35 @@ function nestValue(segs: string[], value: unknown): Record<string, unknown> {
 /** Mask secret-looking leaf values; structural values pass through shallowly. */
 const DUMP_DEPTH_LIMIT = 6;
 
-/** Deep-mask a config subtree for dump: sensitive leaves render as 前2***后2, long strings truncate. */
-function maskNode(value: unknown, path: string, depth: number): unknown {
-	if (depth > DUMP_DEPTH_LIMIT) return "…";
-	if (Array.isArray(value)) return value.slice(0, 50).map((item, i) => maskNode(item, `${path}.${i}`, depth + 1));
+/**
+ * Deep-mask a config subtree for dump. A string leaf is masked when its path
+ * names a credential OR it sits inside a credential container (headers/env)
+ * OR it is a URL carrying query credentials. Truncations are marked so the
+ * model can tell "exactly 50 items" from "cut off".
+ */
+function maskNode(value: unknown, path: string, depth: number, inheritedSensitive = false): unknown {
+	if (depth > DUMP_DEPTH_LIMIT) return "…（层级截断）";
+	if (Array.isArray(value)) {
+		const items = value.slice(0, 50).map((item, i) => maskNode(item, `${path}.${i}`, depth + 1, inheritedSensitive));
+		if (value.length > 50) items.push(`…（共 ${value.length} 项）`);
+		return items;
+	}
 	if (value && typeof value === "object") {
 		const out: Record<string, unknown> = {};
 		for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-			out[key] = maskNode(child, `${path}.${key}`, depth + 1);
+			const childPath = `${path}.${key}`;
+			if (child === undefined) continue; // stay valid JSON — no "(未设置)" sentinel inside dumps
+			const sensitive = inheritedSensitive || SENSITIVE_RE.test(childPath) || SENSITIVE_CONTAINER_RE.test(childPath);
+			out[key] = maskNode(child, childPath, depth + 1, sensitive);
 		}
 		return out;
 	}
-	if (typeof value === "string" && SENSITIVE_RE.test(path)) {
-		return value.length > 4 ? `${value.slice(0, 2)}***${value.slice(-2)}` : "***";
+	if (typeof value === "string") {
+		if (inheritedSensitive || SENSITIVE_RE.test(path)) return maskSecret(value);
+		if (/\?(?:[^=]+=)/.test(value)) return maskUrlQuery(value);
+		if (value.length > 400) return `${value.slice(0, 400)}…(${value.length} chars)`;
 	}
-	if (typeof value === "string" && value.length > 400) return `${value.slice(0, 400)}…(${value.length} chars)`;
-	return value === undefined ? "(未设置)" : value;
+	return value;
 }
 
 function present(value: unknown): string {
@@ -233,7 +258,7 @@ export function createManageSettingsTool(deps: SettingsToolDeps): AgentTool {
 				const result = getByPath(cfg, segments);
 				if (!result.ok) return refuse(`路径不存在：${rawPath}。可先用 action=list 查看可配置块，再逐级 get。`);
 				const masked = SENSITIVE_RE.test(rawPath) && typeof result.value === "string"
-					? `${result.value.slice(0, 2)}***${result.value.slice(-2)}`
+					? maskSecret(result.value)
 					: present(result.value);
 				return {
 					content: [{ type: "text", text: `${rawPath} = ${masked}` }],
@@ -248,13 +273,15 @@ export function createManageSettingsTool(deps: SettingsToolDeps): AgentTool {
 				// No path: a shallow key overview of every root block (values hidden —
 				// that's what dump/get are for). With a path: masked deep dump.
 				if (!rawPath) {
-					const overview = Object.entries(cfg).map(([root, value]) => {
-						const keys = value && typeof value === "object" ? Object.keys(value as Record<string, unknown>) : [];
-						return `- ${root}（${keys.length} 项）${keys.length ? `：${keys.join("、")}` : ""}`;
-					});
+					const overview = Object.entries(cfg)
+						.filter(([root]) => !BLOCKED_ROOTS.has(root))
+						.map(([root, value]) => {
+							const keys = value && typeof value === "object" ? Object.keys(value as Record<string, unknown>) : [];
+							return `- ${root}（${keys.length} 项）${keys.length ? `：${keys.join("、")}` : ""}`;
+						});
 					return {
-						content: [{ type: "text", text: `配置根块概览：\n${overview.join("\n")}\n用 dump <根块名> 查看具体值，get <path> 读单项。` }],
-						details: { action, blocks: Object.keys(cfg).length },
+						content: [{ type: "text", text: `配置根块概览（security 等受保护块不在此列）：\n${overview.join("\n")}\n用 dump <根块名> 查看具体值，get <path> 读单项。` }],
+						details: { action, blocks: overview.length },
 					};
 				}
 				const result = getByPath(cfg, segments);
@@ -262,7 +289,7 @@ export function createManageSettingsTool(deps: SettingsToolDeps): AgentTool {
 				const masked = maskNode(result.value, rawPath, 0);
 				const text = typeof masked === "string" ? masked : JSON.stringify(masked, null, 1);
 				return {
-					content: [{ type: "text", text: `${rawPath} = ${text.length > MAX_VALUE_CHARS ? `${text.slice(0, MAX_VALUE_CHARS)}…` : text}` }],
+					content: [{ type: "text", text: `${rawPath} = ${text.length > MAX_VALUE_CHARS ? `${text.slice(0, MAX_VALUE_CHARS)}…（已截断，用更小的 path 分次查看）` : text}` }],
 					details: { action, path: rawPath },
 				};
 			}

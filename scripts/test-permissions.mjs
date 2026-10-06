@@ -756,3 +756,55 @@ test("manage_settings dump: key overview without path; deep block dump masks sec
 	const missing = await tool.execute("t4", { action: "dump", path: "nope.missing" });
 	assert.match(missing.content[0].text, /路径不存在/);
 });
+
+test("manage_settings dump masks credential containers and URL query credentials (review M1)", async (t) => {
+	const { config } = store(t, {
+		capabilities: {
+			mcp: { servers: [{ name: "corp", url: "https://mcp.example.com/mcp", headers: { Authorization: "Basic dXNlcjpwYXNz", "X-Api-Key": "ak-777" }, env: { CORP_SESSION: "sess_live_9f8e7d6c" } }] },
+		},
+		kb: { external: { providers: [{ id: "rag", operations: { search: { url: "https://rag.example.com/q", headers: { Authorization: "Bearer ragbearerZZ" } } } }] } },
+		model: { suppliers: [{ id: "s1", name: "OSS", baseUrl: "https://oss.example.com?accessKeyId=LTAIKEY88&sig=x", apiKey: "short" }] },
+		reports: { oss: { accessKeyId: "LTAIKEY88", accessKeySecret: "osssecretZZ" } },
+	});
+	const tool = createManageSettingsTool({
+		config,
+		resolveActor: () => ({ senderId: "admin-1", chatType: "single", channel: "dingtalk", text: "" }),
+		conversationId: "c-dump2",
+		onConfigChanged: () => {},
+	});
+	const mcp = await tool.execute("t1", { action: "dump", path: "capabilities.mcp" });
+	const mcpText = mcp.content[0].text;
+	assert.doesNotMatch(mcpText, /dXNlcjpwYXNz/, "mcp headers masked (container rule)");
+	assert.doesNotMatch(mcpText, /ak-777/, "kebab-case X-Api-Key masked (extended regex)");
+	assert.match(mcpText, /\*\*\*/, "masked marker present");
+	assert.doesNotMatch(mcpText, /sess_live_9f8e7d6c/, "env values masked (container rule)");
+
+	const kb = await tool.execute("t2", { action: "dump", path: "kb.external" });
+	assert.doesNotMatch(kb.content[0].text, /ragbearerZZ/, "kb.external operations headers masked");
+
+	const model = await tool.execute("t3", { action: "dump", path: "model.suppliers" });
+	assert.doesNotMatch(model.content[0].text, /LTAIKEY88/, "URL query credentials masked");
+	assert.match(model.content[0].text, /accessKeyId=\*\*\*/, "query values replaced with ***");
+
+	const leaf = await tool.execute("t4", { action: "dump", path: "reports.oss.accessKeyId" });
+	assert.doesNotMatch(leaf.content[0].text, /LTAIKEY88/, "accessKey family masked (extended regex)");
+
+	// Overview skips the protected security block entirely.
+	const overview = await tool.execute("t5", { action: "dump" });
+	assert.doesNotMatch(overview.content[0].text, /- security（/, "protected block stays out of the overview listing");
+});
+
+test("short secrets hide entirely in get and dump (review L1)", async (t) => {
+	const { config } = store(t, { model: { suppliers: [{ id: "s1", name: "N", apiKey: "ab123", models: ["m1"] }] } });
+	const tool = createManageSettingsTool({
+		config,
+		resolveActor: () => ({ senderId: "a", chatType: "single", channel: "dingtalk", text: "" }),
+		conversationId: "c-short",
+		onConfigChanged: () => {},
+	});
+	const viaGet = await tool.execute("t1", { action: "get", path: "model.suppliers.0.apiKey" });
+	assert.doesNotMatch(viaGet.content[0].text, /ab123/, "short secret never leaks 4 of 5 chars");
+	assert.match(viaGet.content[0].text, /\*\*\*/);
+	const viaDump = await tool.execute("t2", { action: "dump", path: "model.suppliers" });
+	assert.doesNotMatch(viaDump.content[0].text, /"apiKey": "ab123"/);
+});
