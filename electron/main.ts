@@ -643,18 +643,22 @@ async function main(): Promise<void> {
 				chain.turns += 1;
 				lastText = send.reply ?? "";
 				const decision = parseChainReply(lastText);
-				if (decision.remember) {
+				if (decision.remember?.length && config.all().kb.enabled && config.all().kb.learn.enabled) {
 					// [[REMEMBER: …]] — the model found the path after exploration.
 					// Sediment immediately (compaction would wipe it); never stop the chain.
 					try {
-						const saved = knowledge.saveLearned({
-							title: `经验：${task.title}`,
-							content: decision.remember,
-							tags: "auto,探索发现",
-						});
-						appendAppLog(`[sched] chain ${task.id} remember saved (id=${saved.id}, merged=${saved.merged}): ${decision.remember.slice(0, 80)}`);
-						if (task.conversation_id) {
-							void im.pushToConversation(task.conversation_id, `📌 已沉淀经验到知识库：${decision.remember.slice(0, 120)}`);
+						for (const note of decision.remember) {
+							const saved = knowledge.saveLearned({
+								title: `经验：${task.title}`,
+								content: note,
+								tags: "auto,探索发现",
+							});
+							// No note text in the log — these entries are exactly the
+							// credential-prone kind (#41 masking standard).
+							appendAppLog(`[sched] chain ${task.id} remember saved (id=${saved.id}, merged=${saved.merged}, len=${note.length})`);
+							if (task.conversation_id) {
+								void im.pushToConversation(task.conversation_id, `📌 已沉淀经验到知识库：${note.slice(0, 120)}`);
+							}
 						}
 					} catch (learnErr) {
 						appendAppLog(`[sched] chain ${task.id} remember save failed: ${learnErr instanceof Error ? learnErr.message.slice(0, 120) : String(learnErr)}`);
@@ -750,12 +754,18 @@ async function main(): Promise<void> {
 					turn: chain.turns, budget,
 					kbEnabled: true, kbLearn: true,
 				});
-				await engine.send(agent, learnPrefix + `任务「${task.title}」已完成。收尾要求：把本次执行中值得沉淀的经验用 save_to_knowledge 写入知识库——重点是踩过的坑与解法、关键路径/目录/参数/坐标、下次可直接复用的做法；若确实没有值得沉淀的内容，直接回复完成即可。`, {
+				const learnSend = await engine.send(agent, learnPrefix + `任务「${task.title}」已完成。收尾要求：把本次执行中值得沉淀的经验用 save_to_knowledge 写入知识库——重点是踩过的坑与解法、关键路径/目录/参数/坐标、下次可直接复用的做法；若确实没有值得沉淀的内容，直接回复完成即可。`, {
 					...(task.created_by ? { actor: { senderId: task.created_by, channel: "scheduler" as const, chatType: "single" as const } } : {}),
 				});
-				appendAppLog(`[sched] chain ${task.id} (${task.title}) done; auto-learn turn ok`);
-				if (task.conversation_id) {
-					await im.pushToConversation(task.conversation_id, "📌 已把本次任务的经验沉淀到知识库，下次同类任务直接复用。");
+				// engine.send resolves (not throws) on model-service stalls — a failed
+				// learn turn must not be reported as success.
+				if (learnSend.deterministic || learnSend.error) {
+					appendAppLog(`[sched] chain ${task.id} auto-learn turn failed (deterministic=${!!learnSend.deterministic}, error=${learnSend.error?.slice(0, 80) ?? "none"}); skipped`);
+				} else {
+					appendAppLog(`[sched] chain ${task.id} (${task.title}) done; auto-learn turn ok`);
+					if (task.conversation_id) {
+						await im.pushToConversation(task.conversation_id, "📌 已把本次任务的经验沉淀到知识库，下次同类任务直接复用。");
+					}
 				}
 			} catch (err) {
 				appendAppLog(`[sched] chain ${task.id} auto-learn failed: ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`);

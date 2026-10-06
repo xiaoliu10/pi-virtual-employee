@@ -115,25 +115,28 @@ export function parseChainReply(reply: string): {
 	kind: "done" | "human" | "continue";
 	question?: string;
 	text: string;
-	/** Text after [[REMEMBER: …]] — the discovery to sediment immediately. */
-	remember?: string;
+	/** Contents of every [[REMEMBER: …]] line — discoveries to sediment immediately. */
+	remember?: string[];
 } {
 	const doneIdx = markerLineIndex(reply, AUTONOMOUS_DONE_MARK);
 	const humanIdx = markerLineIndex(reply, AUTONOMOUS_HUMAN_MARK);
-	const rememberIdx = markerLineIndex(reply, AUTONOMOUS_REMEMBER_MARK);
-	const remember = rememberIdx >= 0
-		? stripLineEmphasis(reply.split("\n")[rememberIdx]).trim().slice(AUTONOMOUS_REMEMBER_MARK.length).replace(/\]\]\s*$/, "").trim() || undefined
-		: undefined;
+	// A turn can carry several discoveries — extract ALL remember lines ("宁可多记").
+	const remembers = reply
+		.split("\n")
+		.map((line) => stripLineEmphasis(line))
+		.filter((t) => t.startsWith(AUTONOMOUS_REMEMBER_MARK))
+		.map((t) => t.slice(AUTONOMOUS_REMEMBER_MARK.length).replace(/\]\][*_\s]*$/, "").trim())
+		.filter((t) => t.length > 0);
 	// A turn can't be both; NEED_HUMAN wins — asking a human always stops the chain.
 	if (humanIdx >= 0 && (doneIdx < 0 || humanIdx > doneIdx)) {
 		const raw = stripLineEmphasis(reply.split("\n")[humanIdx]).trim();
 		const question = raw.startsWith(AUTONOMOUS_HUMAN_MARK)
 			? raw.slice(AUTONOMOUS_HUMAN_MARK.length).replace(/^[:：\s]+/, "").trim()
 			: "";
-		return { kind: "human", question, text: stripMarkerLines(reply), remember };
+		return { kind: "human", question, text: stripMarkerLines(reply), remember: remembers };
 	}
-	if (doneIdx >= 0) return { kind: "done", text: stripMarkerLines(reply), remember };
-	return { kind: "continue", text: stripMarkerLines(reply), remember };
+	if (doneIdx >= 0) return { kind: "done", text: stripMarkerLines(reply), remember: remembers };
+	return { kind: "continue", text: stripMarkerLines(reply), remember: remembers };
 }
 
 function stripMarkerLines(text: string): string {

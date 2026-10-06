@@ -130,9 +130,14 @@ test("legacy kb.research {false, duckduckgo} migrates to {true, bing}; explicit 
 	config.replaceAll({ kb: { research: { enabled: false, engine: "custom" } } });
 	assert.equal(config.all().kb.research.engine, "custom");
 
-	// Explicit ON with legacy engine (true + duckduckgo) is also a user choice — keep it.
+	// v0.2.129: ANY duckduckgo engine flips to bing (unreachable in CN — a config
+	// left there was silently broken, including enabled-via-toggle paths).
 	config.replaceAll({ kb: { research: { enabled: true, engine: "duckduckgo" } } });
-	assert.equal(config.all().kb.research.engine, "duckduckgo", "true+duckduckgo is explicit — untouched");
+	assert.equal(config.all().kb.research.engine, "bing", "true+duckduckgo flips to bing");
+	assert.equal(config.all().kb.research.enabled, true);
+	// enabled not explicitly set + duckduckgo also flips (capabilities toggle wrote only enabled).
+	config.replaceAll({ kb: { research: { engine: "duckduckgo" } } });
+	assert.equal(config.all().kb.research.engine, "bing");
 });
 
 test("normalizeModelConfig keeps authProvider non-empty defaults; resets invalid non-auth ones", (t) => {
