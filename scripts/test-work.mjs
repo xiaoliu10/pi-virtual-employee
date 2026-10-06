@@ -45,9 +45,13 @@ test("parseWindowReply classifies the four window outcomes", () => {
 	assert.equal(human.kind, "human");
 	assert.match(human.question, /财务总监/);
 
-	const self = parseWindowReply("上午批次已核对，晚上还有一批。\n[[NEXT_CHECK]]: 21:30 | 晚间批次 21:00 生成");
+	// Time-of-day neutral: pick a wall-clock time guaranteed to be in the future
+	// (current time + 2h, wrapped) so the test doesn't fail in specific hours.
+	const in2h = new Date(Date.now() + 2 * 3600_000);
+	const hhmm = `${String(in2h.getHours()).padStart(2, "0")}:${String(in2h.getMinutes()).padStart(2, "0")}`;
+	const self = parseWindowReply(`上午批次已核对，晚上还有一批。\n[[NEXT_CHECK]]: ${hhmm} | 晚间批次 21:00 生成`);
 	assert.equal(self.kind, "next_check");
-	assert.ok(self.nextCheckAt && self.nextCheckAt > Date.now(), "21:30 resolves to a future time");
+	assert.ok(self.nextCheckAt && self.nextCheckAt > Date.now(), "a later wall-clock time resolves to the future");
 	assert.match(self.nextCheckReason, /晚间批次/);
 	assert.equal(self.text, "上午批次已核对，晚上还有一批。");
 
