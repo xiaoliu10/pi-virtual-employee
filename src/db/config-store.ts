@@ -943,12 +943,13 @@ export class ConfigStore {
 		if (row?.value) {
 			try {
 				const parsed = JSON.parse(row.value) as DeepPartial<AppConfig>;
-				const merged = deepMerge(DEFAULTS, parsed);
+				// NOTE: kb.research legacy migration runs lazily on the next all() read — no need to duplicate it here.
+	const merged = deepMerge(DEFAULTS, parsed);
 				const normalized = {
 					...merged,
 					model: normalizeModelConfig(parsed.model ?? merged.model),
 					im: normalizeIm(merged.im),
-					kb: normalizeKbResearch(merged.kb),
+					kb: normalizeKbResearch({ ...merged.kb, external: normalizeExternalProviders(merged.kb.external) }),
 					security: normalizeSecurity(merged),
 					capabilities: normalizeCapabilities(merged),
 					computer: normalizeComputerConfig(merged.computer),
@@ -1015,7 +1016,8 @@ export class ConfigStore {
 	}
 
 	update(patch: DeepPartial<AppConfig>): AppConfig {
-		const merged = deepMerge(this.all(), patch);
+		// NOTE: kb.research legacy migration runs lazily on the next all() read — no need to duplicate it here.
+	const merged = deepMerge(this.all(), patch);
 		const normalized = {
 			...merged,
 			model: normalizeModelConfig(merged.model),
