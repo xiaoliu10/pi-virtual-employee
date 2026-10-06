@@ -25,11 +25,12 @@ let kernelInstall:
 	| null = null;
 
 /** Toggleable capabilities exposed to conversation-side admins. */
-const TOGGLEABLE = ["browser", "computer", "documents", "filesystem", "reports", "downloads", "shell"] as const;
+const TOGGLEABLE = ["browser", "computer", "documents", "filesystem", "reports", "downloads", "shell", "research"] as const;
 type ToggleKey = (typeof TOGGLEABLE)[number];
 
 const CAPABILITY_LABELS: Record<ToggleKey, string> = {
 	browser: "浏览器自动化（navigate/click/type/screenshot/read 等）",
+	research: "联网研究（知识库未命中时用 Bing 搜索公开网页，可沉淀知识）",
 	computer: "Cua 桌面控制（应用窗口、截图、点击与输入；驱动用 manage_computer 管理）",
 	documents: "文档资源（list/provide/save 文档）",
 	filesystem: "本地文件访问（受限目录列表与授权删除）",
@@ -169,7 +170,9 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 			const updated = deps.config.update(
 				capability === "shell"
 					? { capabilities: { shell: { enabled, ...(normalizedAllowed ? { allowedCommands: normalizedAllowed } : {}) } } }
-					: { [capability]: { enabled } },
+					: capability === "research"
+						? { kb: { research: { enabled } } }
+						: { [capability]: { enabled } },
 			);
 			deps.onConfigChanged();
 			return {
@@ -194,7 +197,9 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 }
 
 function readCapability(cfg: ReturnType<ConfigStore["all"]>, key: ToggleKey): boolean {
-	return key === "shell" ? cfg.capabilities.shell.enabled : cfg[key].enabled;
+	if (key === "shell") return cfg.capabilities.shell.enabled;
+	if (key === "research") return cfg.kb.research.enabled;
+	return cfg[key].enabled;
 }
 
 /** True when the Chromium binary this playwright version expects is on disk. */

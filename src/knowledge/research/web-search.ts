@@ -1,12 +1,14 @@
 /**
  * Web search for the auto-research loop.
  *
- * Two engines:
- *  - "duckduckgo" (default, zero-config): the DuckDuckGo Instant Answer JSON API.
- *    No API key required. Results are sparse vs a real search engine but always
- *    available, so auto-research works out of the box.
+ * Three engines:
+ *  - "bing" (default, zero-config): Bing HTML results, no API key, reachable from
+ *    mainland China (the DuckDuckGo API is not). Parsing is regex-based over the
+ *    stable b_algo block — best-effort by design, failures return [].
+ *  - "duckduckgo": the DuckDuckGo Instant Answer JSON API. No key, but unreachable
+ *    from mainland China — kept for existing configs and non-CN deployments.
  *  - "custom": a configurable HTTP endpoint (URL / body templates + response
- *    field mapping), for production setups fronting Bing / SerpAPI / SearXNG /
+ *    field mapping), for production setups fronting SerpAPI / SearXNG /
  *    a self-hosted search. Mirrors the external-retrieval HTTP adapter pattern.
  */
 export interface WebSearchHit {
@@ -29,7 +31,7 @@ export interface WebSearchCustomConfig {
 }
 
 export interface WebSearchOptions {
-	engine: "duckduckgo" | "custom";
+	engine: "bing" | "duckduckgo" | "custom";
 	custom?: WebSearchCustomConfig;
 	topK?: number;
 }
@@ -40,11 +42,54 @@ export async function webSearch(query: string, opts: WebSearchOptions): Promise<
 	const topK = opts.topK ?? DEFAULT_TOP_K;
 	try {
 		if (opts.engine === "custom" && opts.custom) return await customSearch(query, opts.custom, topK);
+		if (opts.engine === "bing") return await bingSearch(query, topK);
 		return await duckDuckGoSearch(query, topK);
 	} catch (err) {
 		console.warn("[knowledge] web search failed:", (err as Error).message);
 		return [];
 	}
+}
+
+/** Bing HTML results — no key, works from mainland China. Regex over b_algo blocks. */
+const BING_UA =
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+export async function bingSearch(query: string, topK: number): Promise<WebSearchHit[]> {
+	const url = `https://cn.bing.com/search?q=${encodeURIComponent(query)}&count=${Math.min(topK * 2, 20)}&mkt=zh-CN`;
+	const res = await fetch(url, {
+		headers: { "User-Agent": BING_UA, "Accept-Language": "zh-CN,zh;q=0.9" },
+		signal: AbortSignal.timeout(15_000),
+	});
+	if (!res.ok) throw new Error(`bing ${res.status}`);
+	const html = await res.text();
+	const hits: WebSearchHit[] = [];
+	for (const block of html.split('<li class="b_algo"').slice(1)) {
+		if (hits.length >= topK) break;
+		const link = block.match(/<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/);
+		if (!link) continue;
+		const para = block.match(/<p[^>]*>([\s\S]*?)<\/p>/);
+		const title = stripTags(link[2]);
+		const snippet = para ? stripTags(para[1]) : "";
+		if (!title || (!snippet && !link[1])) continue;
+		hits.push({ title, snippet, url: decodeEntities(link[1]) });
+	}
+	return hits.slice(0, topK);
+}
+
+function stripTags(html: string): string {
+	return decodeEntities(html.replace(/<[^>]*>/g, "")).replace(/\s+/g, " ").trim();
+}
+
+function decodeEntities(text: string): string {
+	return text
+		.replace(/&amp;/g, "&")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;/g, "'")
+		.replace(/&#x27;/gi, "'")
+		.replace(/&nbsp;/g, " ")
+		.replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)));
 }
 
 /** DuckDuckGo Instant Answer API — no key, JSON, best-effort. */
