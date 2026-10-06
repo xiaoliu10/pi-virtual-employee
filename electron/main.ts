@@ -139,6 +139,9 @@ if (activeProfile !== "default") {
 }
 // app.setPath doesn't create the dir; ensure it exists before writing the lock.
 mkdirSync(app.getPath("userData"), { recursive: true });
+// App logs live with the profile data (not the packaged app-name dir Electron
+// would pick) — one known place for field diagnostics like im.log.
+app.setPath("logs", path.join(app.getPath("userData"), "logs"));
 acquireProfileLock(app.getPath("userData"));
 app.on("will-quit", () => {
 	try {
@@ -547,11 +550,18 @@ async function main(): Promise<void> {
 	// Persistent failure log (field 2026-10-06: "报错的日志能不能拉一下" — nothing
 	// was on disk). Console output is invisible in a packaged app; scheduler
 	// failures, stall retries and escalations go to the standard logs dir.
+	const LOG_FILE = path.join(app.getPath("logs"), "pi-virtual-employee.log");
 	const appendAppLog = (message: string) => {
 		try {
-			const logsDir = app.getPath("logs");
-			mkdirSync(logsDir, { recursive: true });
-			appendFileSync(path.join(logsDir, "pi-virtual-employee.log"), `${new Date().toISOString()} ${message}\n`);
+			mkdirSync(app.getPath("logs"), { recursive: true });
+			// 5MB rotation: one .old generation, no unbounded growth.
+			try {
+				const stats = statSync(LOG_FILE);
+				if (stats.size > 5 * 1024 * 1024) renameSync(LOG_FILE, `${LOG_FILE}.old`);
+			} catch {
+				/* first write — nothing to rotate */
+			}
+			appendFileSync(LOG_FILE, `${new Date().toISOString()} ${message}\n`);
 		} catch {
 			/* logging must never break the run */
 		}
@@ -608,6 +618,9 @@ async function main(): Promise<void> {
 		let outcome: "done" | "human" | "budget" | "stalled" | "error" = "error";
 		let question: string | undefined;
 		try {
+			// True right after a silent stall-retry: the full prompt is already in
+			// history — resume with a short "继续。" instead of injecting it again.
+			let stallResumed = false;
 			for (;;) {
 				const prefix = buildAutonomousTurnPrefix({
 					turn: chain.turns, budget,
@@ -615,7 +628,7 @@ async function main(): Promise<void> {
 					kbLearn: config.all().kb.enabled && config.all().kb.learn.enabled,
 				});
 				const answerBlock = chain.turns === 0 && stagedAnswer ? `用户对你上一轮问题的回复：${stagedAnswer}\n\n` : "";
-				const message = chain.turns === 0 ? scheduledTimePrefix() + prefix + answerBlock + task.prompt : prefix + "继续。";
+				const message = chain.turns === 0 && !stallResumed ? scheduledTimePrefix() + prefix + answerBlock + task.prompt : prefix + "继续。";
 				const send = await engine.send(agent, message, {
 					// Same creator-identity re-attachment as single-turn runs: guarded
 					// tools authorize against the LIVE role on every turn.
@@ -645,6 +658,7 @@ async function main(): Promise<void> {
 					chain.stallCount = (chain.stallCount ?? 0) + 1;
 					const step = nextStallStep(chain.stallCount);
 					if (step.action === "retry") {
+						stallResumed = true;
 						persistChain();
 						console.warn(`[sched] task ${task.id} turn ${chain.turns} stalled (attempt ${chain.stallCount}/${STALL_QUIET_RETRIES + 1}); silent retry in ${Math.round(step.backoffMs / 1000)}s`);
 						appendAppLog(`[sched] task ${task.id} (${task.title}) turn ${chain.turns} model stall attempt ${chain.stallCount}; silent retry in ${Math.round(step.backoffMs / 1000)}s`);
@@ -706,7 +720,9 @@ async function main(): Promise<void> {
 			error: outcome === "error" ? lastText || null : null,
 		});
 
-		appendAppLog(`[sched] autonomous task ${task.id} (${task.title}) outcome=${outcome} turns=${chain.turns} stallCount=${chain.stallCount ?? 0}${lastText ? ` last=${lastText.slice(0, 160).replace(/\s+/g, " ")}` : ""}`);
+		// No reply content here: model replies may echo credentials the protocol
+		// taught it to look up — logs carry lengths, not text (#41 masking standard).
+		appendAppLog(`[sched] autonomous task ${task.id} (${task.title}) outcome=${outcome} turns=${chain.turns} stallCount=${chain.stallCount ?? 0} replyLen=${lastText.length}${outcome === "error" ? ` error=${lastText.slice(0, 120).replace(/\s+/g, " ")}` : ""}`);
 		// Deliver the outcome to the target chat (markers stripped by the parser).
 		if (task.conversation_id) {
 			const resumeHint = `\n\n回复「继续 ${task.title}」重置预算继续；不回复则保持暂停。`;
@@ -869,7 +885,7 @@ async function main(): Promise<void> {
 					console.warn(`[sched] push result failed for ${task.conversation_id}: ${pushError}`);
 				}
 			}
-			appendAppLog(`[sched] task ${task.id} (${task.title}) ${error ? `error=${error.slice(0, 160).replace(/\s+/g, " ")}` : pushError ? `ok;push_error=${pushError}` : "ok"}`);
+			appendAppLog(`[sched] task ${task.id} (${task.title}) ${error ? `error=${error.slice(0, 120).replace(/\s+/g, " ")}` : pushError ? `ok;push_error=${pushError}` : "ok"}`);
 			if (error) return { status: "error:" + error.slice(0, 200) };
 			return { status: pushError ? "ok;push_error:" + pushError.slice(0, 180) : "ok" };
 		},
