@@ -63,14 +63,18 @@ export async function bingSearch(query: string, topK: number): Promise<WebSearch
 	if (!res.ok) throw new Error(`bing ${res.status}`);
 	const html = await res.text();
 	const hits: WebSearchHit[] = [];
-	for (const block of html.split('<li class="b_algo"').slice(1)) {
+	for (const rawBlock of html.split('<li class="b_algo"').slice(1)) {
 		if (hits.length >= topK) break;
+		// The last block has no right boundary — cut at the next list item so
+		// footer/related-search markup can't leak into the snippet match.
+		const block = rawBlock.split("<li ")[0];
 		const link = block.match(/<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/);
 		if (!link) continue;
 		const para = block.match(/<p[^>]*>([\s\S]*?)<\/p>/);
 		const title = stripTags(link[2]);
 		const snippet = para ? stripTags(para[1]) : "";
-		if (!title || (!snippet && !link[1])) continue;
+		// href is guaranteed non-empty by the regex; the title alone gates the block.
+		if (!title) continue;
 		hits.push({ title, snippet, url: decodeEntities(link[1]) });
 	}
 	return hits.slice(0, topK);
@@ -81,15 +85,20 @@ function stripTags(html: string): string {
 }
 
 function decodeEntities(text: string): string {
+	const safeCodePoint = (code: string, radix: number) => {
+		const n = parseInt(code, radix);
+		// Out-of-range entities must not throw (a single bad entity killed the whole parse).
+		return Number.isFinite(n) && n >= 0 && n <= 0x10ffff ? String.fromCodePoint(n) : "";
+	};
 	return text
 		.replace(/&amp;/g, "&")
 		.replace(/&lt;/g, "<")
 		.replace(/&gt;/g, ">")
 		.replace(/&quot;/g, '"')
 		.replace(/&#39;/g, "'")
-		.replace(/&#x27;/gi, "'")
 		.replace(/&nbsp;/g, " ")
-		.replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)));
+		.replace(/&#x([0-9a-f]+);/gi, (_, code) => safeCodePoint(code, 16))
+		.replace(/&#(\d+);/g, (_, code) => safeCodePoint(code, 10));
 }
 
 /** DuckDuckGo Instant Answer API — no key, JSON, best-effort. */

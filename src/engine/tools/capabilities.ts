@@ -61,7 +61,7 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 		description:
 			"查看或变更本应用的能力开关（仅限 IM 单聊）。action=list 查看各项能力及其开关状态；" +
 			"action=set 开启或关闭某项能力（传 capability 和 enabled）；设置 shell 时可同时传 allowedCommands 更新命令白名单；action=setup_browser 安装/检查浏览器内核（Chromium）。" +
-			"可管理能力：browser（浏览器自动化）、computer（Cua 桌面控制）、documents（文档资源）、filesystem（本地文件访问）、" +
+			"可管理能力：browser（浏览器自动化）、computer（Cua 桌面控制）、documents（文档资源）、filesystem（本地文件访问）、research（联网研究，写 kb.research）、" +
 			"reports（报告中心）、downloads（浏览器下载工作区）、shell（受限命令执行）。" +
 			`安全规则：list 需单聊；${confirmRule}，群聊一律拒绝。` +
 			"setup_browser 已装则直接报告已安装；未装则后台下载（约 150MB，需几分钟），用 status 查询进度。下载源由 browser.downloadHost 决定（留空 = 国内默认走 npmmirror 镜像；如需改用 manage_settings 设置 browser.downloadHost）。",
@@ -79,6 +79,7 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 						Type.Literal("reports"),
 						Type.Literal("downloads"),
 						Type.Literal("shell"),
+						Type.Literal("research"),
 					],
 					{ description: "仅 set 必填：要开关的能力名" },
 				),
