@@ -133,6 +133,26 @@ function nestValue(segs: string[], value: unknown): Record<string, unknown> {
 }
 
 /** Mask secret-looking leaf values; structural values pass through shallowly. */
+const DUMP_DEPTH_LIMIT = 6;
+
+/** Deep-mask a config subtree for dump: sensitive leaves render as 前2***后2, long strings truncate. */
+function maskNode(value: unknown, path: string, depth: number): unknown {
+	if (depth > DUMP_DEPTH_LIMIT) return "…";
+	if (Array.isArray(value)) return value.slice(0, 50).map((item, i) => maskNode(item, `${path}.${i}`, depth + 1));
+	if (value && typeof value === "object") {
+		const out: Record<string, unknown> = {};
+		for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+			out[key] = maskNode(child, `${path}.${key}`, depth + 1);
+		}
+		return out;
+	}
+	if (typeof value === "string" && SENSITIVE_RE.test(path)) {
+		return value.length > 4 ? `${value.slice(0, 2)}***${value.slice(-2)}` : "***";
+	}
+	if (typeof value === "string" && value.length > 400) return `${value.slice(0, 400)}…(${value.length} chars)`;
+	return value === undefined ? "(未设置)" : value;
+}
+
 function present(value: unknown): string {
 	if (typeof value === "string") return value.length > 400 ? `${value.slice(0, 400)}…(${value.length} chars)` : value;
 	if (value === undefined) return "(未设置)";
@@ -158,6 +178,7 @@ export function createManageSettingsTool(deps: SettingsToolDeps): AgentTool {
 		description:
 			`读取或修改本系统的任意配置项（仅限 IM 单聊；${writeRule}）。` +
 			"action=list 列出全部可配置的根块；action=get 按 path 读单个值（如 general.longTaskProgressMin、kb.local.topK、browser.headless、filesystem.allowedDirs）；" +
+			"action=dump 按 path 列出一个块的全部配置项及当前值（密钥自动打码；不传 path 默认 dump 全部根块的键名概览）；" +
 			"action=set 按 path 写入 value（数值段访问数组元素，如 im.channels.0.enabled）。" +
 			"run_command 同步命令超时用 capabilities.shell.timeoutSec（秒，默认 60，0=不限制）；后台命令时限用 capabilities.shell.backgroundTimeoutSec（默认 0=不限时）；单次轮询等待用 capabilities.shell.pollTimeoutSec（默认 30 秒，0=立即返回，等待结束不杀进程）；模型请求超时用 general.requestTimeoutMin（分钟）。" +
 			(fullAccess
@@ -170,8 +191,10 @@ export function createManageSettingsTool(deps: SettingsToolDeps): AgentTool {
 				? "注意修改 model 块（供应商/默认模型）有失联风险——配错将无法再通过对话恢复；切换前先核对该模型确在目标供应商 models 列表，核对无误且管理员已明确指示即可直接执行。"
 				: "注意修改 model 块（供应商/默认模型）有失联风险——配错将无法再通过对话恢复，请谨慎核对。"),
 		parameters: Type.Object({
-			action: Type.Union([Type.Literal("list"), Type.Literal("get"), Type.Literal("set")], {
-				description: fullAccess ? "list=列出可配置块；get=读配置；set=写配置（完全访问开启，直接执行）" : "list=列出可配置块；get=读配置；set=写配置（需确认）",
+			action: Type.Union([Type.Literal("list"), Type.Literal("get"), Type.Literal("dump"), Type.Literal("set")], {
+				description: fullAccess
+					? "list=列出可配置块；get=读单个值；dump=按块列出全部配置项（敏感值自动打码）；set=写配置（完全访问开启，直接执行）"
+					: "list=列出可配置块；get=读单个值；dump=按块列出全部配置项（敏感值自动打码）；set=写配置（需确认）",
 			}),
 			path: Type.Optional(Type.String({ description: "get/set 必填：点分路径，如 general.maxToolSteps、kb.local.topK、im.channels.0.enabled" })),
 			value: Type.Optional(
@@ -181,7 +204,7 @@ export function createManageSettingsTool(deps: SettingsToolDeps): AgentTool {
 			),
 		}),
 		async execute(_toolCallId, params) {
-			const { action } = params as { action: "list" | "get" | "set"; path?: string; value?: unknown };
+			const { action } = params as { action: "list" | "get" | "dump" | "set"; path?: string; value?: unknown };
 
 			if (action === "list") {
 				const gate = requireSingleChatActor(deps);
@@ -195,7 +218,8 @@ export function createManageSettingsTool(deps: SettingsToolDeps): AgentTool {
 			}
 
 			const rawPath = (params as { path?: string }).path?.trim() ?? "";
-			if (!rawPath) return refuse("path 不能为空（如 general.longTaskProgressMin）。");
+			// dump works without a path (whole-config key overview); every other action needs one.
+			if (!rawPath && action !== "dump") return refuse("path 不能为空（如 general.longTaskProgressMin）。");
 			if (rawPath.length > 200 || /\s/.test(rawPath)) return refuse("path 格式非法（点分小写段，不含空格）。");
 			const segments = rawPath.split(".");
 			if (BLOCKED_ROOTS.has(segments[0])) {
@@ -214,6 +238,32 @@ export function createManageSettingsTool(deps: SettingsToolDeps): AgentTool {
 				return {
 					content: [{ type: "text", text: `${rawPath} = ${masked}` }],
 					details: { action, path: rawPath, sensitive: SENSITIVE_RE.test(rawPath) },
+				};
+			}
+
+			if (action === "dump") {
+				const gate = requireSingleChatActor(deps);
+				if ("content" in gate) return gate;
+				const cfg = deps.config.all() as unknown as Record<string, unknown>;
+				// No path: a shallow key overview of every root block (values hidden —
+				// that's what dump/get are for). With a path: masked deep dump.
+				if (!rawPath) {
+					const overview = Object.entries(cfg).map(([root, value]) => {
+						const keys = value && typeof value === "object" ? Object.keys(value as Record<string, unknown>) : [];
+						return `- ${root}（${keys.length} 项）${keys.length ? `：${keys.join("、")}` : ""}`;
+					});
+					return {
+						content: [{ type: "text", text: `配置根块概览：\n${overview.join("\n")}\n用 dump <根块名> 查看具体值，get <path> 读单项。` }],
+						details: { action, blocks: Object.keys(cfg).length },
+					};
+				}
+				const result = getByPath(cfg, segments);
+				if (!result.ok) return refuse(`路径不存在：${rawPath}。可先用 action=list 查看可配置块。`);
+				const masked = maskNode(result.value, rawPath, 0);
+				const text = typeof masked === "string" ? masked : JSON.stringify(masked, null, 1);
+				return {
+					content: [{ type: "text", text: `${rawPath} = ${text.length > MAX_VALUE_CHARS ? `${text.slice(0, MAX_VALUE_CHARS)}…` : text}` }],
+					details: { action, path: rawPath },
 				};
 			}
 

@@ -688,6 +688,7 @@ test("set_conversation_roles grants the whole observed roster, but spares the la
 const SETTINGS_OFF_DESCRIPTION =
 	`读取或修改本系统的任意配置项（仅限 IM 单聊；写入需管理员并在当前消息包含「确认」）。` +
 	"action=list 列出全部可配置的根块；action=get 按 path 读单个值（如 general.longTaskProgressMin、kb.local.topK、browser.headless、filesystem.allowedDirs）；" +
+	"action=dump 按 path 列出一个块的全部配置项及当前值（密钥自动打码；不传 path 默认 dump 全部根块的键名概览）；" +
 	"action=set 按 path 写入 value（数值段访问数组元素，如 im.channels.0.enabled）。" +
 	"run_command 同步命令超时用 capabilities.shell.timeoutSec（秒，默认 60，0=不限制）；后台命令时限用 capabilities.shell.backgroundTimeoutSec（默认 0=不限时）；单次轮询等待用 capabilities.shell.pollTimeoutSec（默认 30 秒，0=立即返回，等待结束不杀进程）；模型请求超时用 general.requestTimeoutMin（分钟）。" +
 	"自主提案后台挖掘：capabilities.autonomousMining.enabled（默认 false）与 capabilities.autonomousMining.intervalHours（默认 4，1-24 小时）；管理员单聊确认 set enabled=true 开启、false 关闭。manage_work_items action=mine 可随时按需扫描当前来源会话近 24 小时；提案需在来源会话「确认创建 <id/标题>」；任务等待人工时，管理员直接回复答复内容即可恢复（无需口令）。" +
@@ -723,4 +724,35 @@ test("tool descriptions mirror adminFullAccess: default (OFF) is byte-identical 
 	assert.match(settingsOff.description, /在当前消息包含「确认」/);
 	assert.match(createComputerTools(deps).find((tool) => tool.name === "manage_computer").description, /需管理员当前消息含确认/);
 	assert.match(createManageCapabilitiesTool(deps).description, /明确包含「确认」/);
+});
+
+// ── manage_settings dump: list a block's items with secrets masked (field 2026-10-06) ──
+
+test("manage_settings dump: key overview without path; deep block dump masks secrets", async (t) => {
+	const { config } = store(t, {
+		general: { maxToolSteps: 24 },
+		model: { suppliers: [{ id: "s1", name: "StepFun", apiKey: "sk-live-abcd1234", models: ["step-5-preview"] }], defaultSupplierId: "s1", defaultModelId: "step-5-preview" },
+	});
+	const tool = createManageSettingsTool({
+		config,
+		resolveActor: () => ({ senderId: "admin-1", chatType: "single", channel: "dingtalk", text: "" }),
+		conversationId: "c-dump",
+		onConfigChanged: () => {},
+	});
+	// No path → root-block key overview, values hidden.
+	const overview = await tool.execute("t1", { action: "dump" });
+	assert.match(overview.content[0].text, /model（\d+ 项）/);
+	assert.match(overview.content[0].text, /suppliers、defaultSupplierId/);
+	assert.doesNotMatch(overview.content[0].text, /sk-live/, "overview must not leak values");
+	// With path → masked deep dump.
+	const dump = await tool.execute("t2", { action: "dump", path: "model" });
+	const text = dump.content[0].text;
+	assert.match(text, /"apiKey": "sk\*\*\*34"/, "sensitive leaf masked but shape visible");
+	assert.match(text, /step-5-preview/, "non-sensitive values visible");
+	// Single leaf through dump masks too.
+	const leaf = await tool.execute("t3", { action: "dump", path: "model.suppliers.0.apiKey" });
+	assert.match(leaf.content[0].text, /sk\*\*\*34/);
+	// Missing path refuses.
+	const missing = await tool.execute("t4", { action: "dump", path: "nope.missing" });
+	assert.match(missing.content[0].text, /路径不存在/);
 });
