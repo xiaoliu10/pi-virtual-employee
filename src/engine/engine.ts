@@ -604,7 +604,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** Effective image-input capability for a configured model (override else base). For the settings UI. */
 	effectiveImageCapability(supplierId: string, modelId: string): boolean {
 		const supplier = this.findSupplier(supplierId);
-		if (!supplier || !supplier.models.includes(modelId)) return false;
+		if (!supplier || !this.supplierHasModel(supplier, modelId)) return false;
 		try {
 			return this.buildModel(supplier, modelId).input.includes("image");
 		} catch {
@@ -635,6 +635,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 		const config = this.config.all();
 		const defaultSupplier = this.findSupplier(config.model.defaultSupplierId);
 		if (!defaultSupplier?.enabled || !this.supplierHasModel(defaultSupplier, config.model.defaultModelId)) {
+			if (defaultSupplier?.authProvider) {
+				// Account-login default went stale (model renamed upstream / login
+				// missing) — mirror buildModel's actionable message, not the generic one.
+				throw new Error(`默认模型不可用：请先在账号登录中完成 ${defaultSupplier.authProvider} 登录或刷新模型列表，或在 设置 → 自定义模型 顶部换一个默认模型。`);
+			}
 			throw new Error("No enabled model configured. Add or enable one in Settings → 模型服务.");
 		}
 		return { supplier: defaultSupplier, modelId: config.model.defaultModelId };
@@ -1536,6 +1541,31 @@ export class EmployeeEngine implements EmployeeRuntime {
 			unsubscribe();
 			agent.abort();
 		}
+	}
+
+	/**
+	 * Set the global default model WITHOUT invalidating sessions: in-flight IM
+	 * streams and running tasks must not be aborted by a lightweight dropdown
+	 * gesture. Cached non-streaming sessions without a pin are live-patched so
+	 * the very next send uses the new default; everything else picks it up on
+	 * its natural rebuild (resolveForConversation re-reads config each build).
+	 */
+	setDefaultModel(supplierId: string, modelId: string): ReturnType<ConfigStore["all"]> {
+		const supplier = this.findSupplier(supplierId);
+		if (!supplier) throw new Error(`Unknown supplier "${supplierId}"`);
+		if (!supplier.enabled) throw new Error(`Supplier "${supplier.name}" is disabled`);
+		if (!this.supplierHasModel(supplier, modelId)) {
+			throw new Error(`Model "${modelId}" not in supplier "${supplier.name}"`);
+		}
+		this.config.update({ model: { defaultSupplierId: supplierId, defaultModelId: modelId } });
+		const model = this.resolveModel(supplier, modelId);
+		for (const [conversationId, agent] of this.sessions) {
+			if (agent.state.isStreaming) continue;
+			if (this.history.getModelOverride(conversationId)) continue; // pinned conversations keep their model
+			agent.state.model = model;
+			agent.getApiKey = () => this.apiKeyFor(supplier);
+		}
+		return this.config.all();
 	}
 
 	/** Switch a conversation's model (live, keeps transcript) and persist it. */

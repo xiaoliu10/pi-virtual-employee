@@ -52,6 +52,8 @@ const api = {
 	modelCapabilities: (supplier: unknown): Promise<Record<string, boolean>> => ipcRenderer.invoke("model:capabilities", supplier),
 	importModelConfig: () => ipcRenderer.invoke("model:import"),
 	exportModelConfig: (model: unknown): Promise<boolean> => ipcRenderer.invoke("model:export", model),
+	setDefaultModel: (supplierId: string, modelId: string): Promise<unknown> =>
+		ipcRenderer.invoke("model:setDefault", supplierId, modelId),
 	setConversationModel: (conversationId: string, supplierId: string, modelId: string): Promise<boolean> =>
 		ipcRenderer.invoke("model:setForConversation", conversationId, supplierId, modelId),
 	// Empty supplierId/modelId clears the pin (conversation follows the global default).

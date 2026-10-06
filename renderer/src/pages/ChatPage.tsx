@@ -32,6 +32,8 @@ interface ChatPageProps {
 	/** Per-conversation model pin (null = follows global default). */
 	modelOverride: { supplierId: string; modelId: string } | null;
 	onConfigChanged: (patch: unknown) => Promise<unknown>;
+	/** Receives the full updated config after a lightweight default-model switch. */
+	onConfigReplaced: (config: unknown) => void;
 	modelRevision: string;
 	onActivated: (id: string) => void;
 	onTasksChanged: () => void;
@@ -52,6 +54,7 @@ export function ChatPage({
 	agentName,
 	modelOverride,
 	onConfigChanged,
+	onConfigReplaced,
 	modelRevision,
 	onActivated,
 	onTasksChanged,
@@ -189,8 +192,10 @@ export function ChatPage({
 			try {
 				if (!convId) {
 					// New conversation: nothing to pin yet — choosing a model here sets
-					// the global default so the chat (and everything after) uses it.
-					await onConfigChanged({ model: { defaultSupplierId: supplierId, defaultModelId: modelId } });
+					// the global default (lightweight: no invalidate, in-flight turns
+					// in other conversations keep streaming).
+					const updated = await api.setDefaultModel(supplierId, modelId);
+					onConfigReplaced(updated);
 					setError(null);
 					return;
 				}

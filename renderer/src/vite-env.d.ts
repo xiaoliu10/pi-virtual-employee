@@ -38,6 +38,7 @@ testOss(): Promise<{ ok: boolean; detail: string }>;
 	modelCapabilities(supplier: Supplier): Promise<Record<string, boolean>>;
 	importModelConfig(): Promise<ModelConfig | null>;
 	exportModelConfig(model: ModelConfig): Promise<boolean>;
+	setDefaultModel(supplierId: string, modelId: string): Promise<AppConfig>;
 	setConversationModel(conversationId: string, supplierId: string, modelId: string): Promise<boolean>;
 	/** Empty supplierId/modelId clears the pin (conversation follows the global default). */
 	clearConversationModel(conversationId: string): Promise<boolean>;

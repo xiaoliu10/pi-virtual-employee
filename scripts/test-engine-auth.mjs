@@ -769,4 +769,10 @@ test("availableModels surfaces registry models for auth suppliers; pin/default a
 
 	// Default resolution uses the same supplierHasModel path.
 	assert.equal(engine.getOrCreateSession("conv-fresh").state.model?.id, "fake-model", "default resolves via registry");
+
+	// setDefaultModel live-patches unpinned cached sessions without invalidate.
+	const before = engine.activeSessionCount();
+	engine.setDefaultModel("acct2", "fake-model");
+	assert.equal(engine.getOrCreateSession("conv-fresh").state.model?.id, "fake-model");
+	assert.ok(engine.activeSessionCount() >= before, "no sessions dropped by the lightweight default switch");
 });
