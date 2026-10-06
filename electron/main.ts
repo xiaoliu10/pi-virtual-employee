@@ -643,6 +643,23 @@ async function main(): Promise<void> {
 				chain.turns += 1;
 				lastText = send.reply ?? "";
 				const decision = parseChainReply(lastText);
+				if (decision.remember) {
+					// [[REMEMBER: …]] — the model found the path after exploration.
+					// Sediment immediately (compaction would wipe it); never stop the chain.
+					try {
+						const saved = knowledge.saveLearned({
+							title: `经验：${task.title}`,
+							content: decision.remember,
+							tags: "auto,探索发现",
+						});
+						appendAppLog(`[sched] chain ${task.id} remember saved (id=${saved.id}, merged=${saved.merged}): ${decision.remember.slice(0, 80)}`);
+						if (task.conversation_id) {
+							void im.pushToConversation(task.conversation_id, `📌 已沉淀经验到知识库：${decision.remember.slice(0, 120)}`);
+						}
+					} catch (learnErr) {
+						appendAppLog(`[sched] chain ${task.id} remember save failed: ${learnErr instanceof Error ? learnErr.message.slice(0, 120) : String(learnErr)}`);
+					}
+				}
 				if (send.error) {
 					outcome = "error";
 					lastText = send.error;
@@ -723,6 +740,28 @@ async function main(): Promise<void> {
 		// No reply content here: model replies may echo credentials the protocol
 		// taught it to look up — logs carry lengths, not text (#41 masking standard).
 		appendAppLog(`[sched] autonomous task ${task.id} (${task.title}) outcome=${outcome} turns=${chain.turns} stallCount=${chain.stallCount ?? 0} replyLen=${lastText.length}${outcome === "error" ? ` error=${lastText.slice(0, 120).replace(/\s+/g, " ")}` : ""}`);
+		// Auto-sediment (field 2026-10-06: "已经处理过一次的事情为什么还会不知道" —
+		// the KB was empty because sedimentation was suggestion-level and the model
+		// skipped it). After a done outcome, run one dedicated turn that REQUIRES
+		// the KB write-back; silent and best-effort — must never break the run.
+		if (outcome === "done" && config.all().kb.enabled && config.all().kb.learn.enabled) {
+			try {
+				const learnPrefix = buildAutonomousTurnPrefix({
+					turn: chain.turns, budget,
+					kbEnabled: true, kbLearn: true,
+				});
+				await engine.send(agent, learnPrefix + `任务「${task.title}」已完成。收尾要求：把本次执行中值得沉淀的经验用 save_to_knowledge 写入知识库——重点是踩过的坑与解法、关键路径/目录/参数/坐标、下次可直接复用的做法；若确实没有值得沉淀的内容，直接回复完成即可。`, {
+					...(task.created_by ? { actor: { senderId: task.created_by, channel: "scheduler" as const, chatType: "single" as const } } : {}),
+				});
+				appendAppLog(`[sched] chain ${task.id} (${task.title}) done; auto-learn turn ok`);
+				if (task.conversation_id) {
+					await im.pushToConversation(task.conversation_id, "📌 已把本次任务的经验沉淀到知识库，下次同类任务直接复用。");
+				}
+			} catch (err) {
+				appendAppLog(`[sched] chain ${task.id} auto-learn failed: ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`);
+			}
+		}
+
 		// Deliver the outcome to the target chat (markers stripped by the parser).
 		if (task.conversation_id) {
 			const resumeHint = `\n\n回复「继续 ${task.title}」重置预算继续；不回复则保持暂停。`;

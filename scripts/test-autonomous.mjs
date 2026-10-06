@@ -90,6 +90,17 @@ test("parseChainState round-trips and rejects corrupt payloads", () => {
 	assert.equal(parseChainState(JSON.stringify({ turns: 3 })), null, "missing convId is not a chain");
 });
 
+test("parseChainReply extracts [[REMEMBER: …]] from any position and strips it from pushed text", () => {
+	const r = parseChainReply("试了三种方式后确认用 MuMuManager 截图可行\n[[REMEMBER: MuMu 截图用 MuMuManager api -v 0 screenshot <路径>；adb 端口 16384]]");
+	assert.equal(r.kind, "continue");
+	assert.equal(r.remember, "MuMu 截图用 MuMuManager api -v 0 screenshot <路径>；adb 端口 16384");
+	assert.doesNotMatch(r.text, /REMEMBER/, "marker stripped from pushed text");
+	const both = parseChainReply("搞定\n[[REMEMBER: 端口 16384]]\n[[TASK_DONE]]");
+	assert.equal(both.kind, "done");
+	assert.equal(both.remember, "端口 16384");
+	assert.equal(parseChainReply("正常进展").remember, undefined);
+});
+
 test("buildAutonomousTurnPrefix teaches the marker protocol on every turn", () => {
 	const first = buildAutonomousTurnPrefix({ turn: 0, budget: { maxTurns: 20, maxMinutes: 120 } });
 	const later = buildAutonomousTurnPrefix({ turn: 5, budget: { maxTurns: 20, maxMinutes: 120 } });
