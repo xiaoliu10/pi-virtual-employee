@@ -105,6 +105,50 @@ test("pending is per-conversation — no cross-chat leakage", () => {
 	assert.equal(store.peek("dt:single:B")?.message, "另一个会话的请求");
 });
 
+// ── 0.2.125: legacy kb.research state (nobody ever chose it) migrates to enabled+bing ──
+
+test("legacy kb.research {false, duckduckgo} migrates to {true, bing}; explicit choices survive", (t) => {
+	const db = new DatabaseSync(":memory:");
+	db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+	t.after(() => db.close());
+	const config = new ConfigStore(db);
+
+	// Legacy untouched state — written by pre-0.2.123 saves, never chosen by a user.
+	config.replaceAll({ kb: { research: { enabled: false, engine: "duckduckgo" } } });
+	let research = config.all().kb.research;
+	assert.equal(research.enabled, true, "legacy state flips on");
+	assert.equal(research.engine, "bing", "legacy engine moves to bing");
+	// The migration persists: a fresh instance over the same DB sees the flipped state.
+	const reopened = new ConfigStore(db);
+	assert.equal(reopened.all().kb.research.enabled, true);
+
+	// Explicit opt-out AFTER the flip (engine bing) is a user decision — keep it.
+	config.replaceAll({ kb: { research: { enabled: false, engine: "bing" } } });
+	assert.equal(config.all().kb.research.enabled, false, "explicit bing+false stays off");
+
+	// Custom engine stays wherever the user put it.
+	config.replaceAll({ kb: { research: { enabled: false, engine: "custom" } } });
+	assert.equal(config.all().kb.research.engine, "custom");
+
+	// Explicit ON with legacy engine (true + duckduckgo) is also a user choice — keep it.
+	config.replaceAll({ kb: { research: { enabled: true, engine: "duckduckgo" } } });
+	assert.equal(config.all().kb.research.engine, "duckduckgo", "true+duckduckgo is explicit — untouched");
+});
+
+test("all() read path keeps normalizing legacy kb.external shapes (guard against regression)", (t) => {
+	const db = new DatabaseSync(":memory:");
+	db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+	t.after(() => db.close());
+	const config = new ConfigStore(db);
+	// Raw legacy flat external shape — persisted by old builds, must self-heal on read.
+	db.prepare("INSERT INTO config (key, value) VALUES ('appconfig', ?)").run(JSON.stringify({
+		kb: { research: { enabled: false, engine: "duckduckgo" }, external: { url: "https://example.com", queryPath: "q" } },
+	}));
+	const cfg = config.all();
+	assert.ok(Array.isArray(cfg.kb.external?.providers), "legacy flat external normalizes to providers[]");
+	assert.equal(cfg.kb.research.enabled, true, "migration still applies in the same pass");
+});
+
 // The refusal the flow keys off: role shortfall must be distinguishable from
 // the other failure modes (a misconfigured floor must NOT open the voucher path).
 test("role refusals carry kind=role; misconfigurations carry kind=misconfig; grants carry none", () => {
