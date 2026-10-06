@@ -540,8 +540,13 @@ function normalizedAdminIds(value: unknown): string[] {
  */
 function normalizeKbResearch(kb: AppConfig["kb"]): AppConfig["kb"] {
 	const research = kb?.research;
-	if (research && research.enabled === false && research.engine === "duckduckgo") {
-		return { ...kb, research: { enabled: true, engine: "bing" } };
+	// v0.2.129: duckduckgo is unreachable from mainland China — any config still
+	// pointing at it (legacy default, or enabled later via the capabilities toggle
+	// which only writes `enabled`) silently yields empty research. Flip to bing.
+	if (research && research.engine === "duckduckgo") {
+		const flipped = { ...research, engine: "bing" as const };
+		if (flipped.enabled === false) flipped.enabled = true; // legacy never-chosen state
+		return { ...kb, research: flipped };
 	}
 	return kb;
 }

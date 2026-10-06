@@ -16,6 +16,11 @@
 
 export const AUTONOMOUS_DONE_MARK = "[[TASK_DONE]]";
 export const AUTONOMOUS_HUMAN_MARK = "[[NEED_HUMAN]]";
+/** Immediate-sedimentation marker: the model emits it the moment a path to the
+ * solution is found (after long exploration) — context compaction would
+ * otherwise wipe the discovery before the task ends. Parsed, saved to the KB,
+ * stripped from pushed text; never stops the chain. */
+export const AUTONOMOUS_REMEMBER_MARK = "[[REMEMBER:";
 
 /** Persisted between fires (scheduled_tasks.chain_state JSON). */
 export interface AutonomousChainState {
@@ -110,19 +115,28 @@ export function parseChainReply(reply: string): {
 	kind: "done" | "human" | "continue";
 	question?: string;
 	text: string;
+	/** Contents of every [[REMEMBER: …]] line — discoveries to sediment immediately. */
+	remember?: string[];
 } {
 	const doneIdx = markerLineIndex(reply, AUTONOMOUS_DONE_MARK);
 	const humanIdx = markerLineIndex(reply, AUTONOMOUS_HUMAN_MARK);
+	// A turn can carry several discoveries — extract ALL remember lines ("宁可多记").
+	const remembers = reply
+		.split("\n")
+		.map((line) => stripLineEmphasis(line))
+		.filter((t) => t.startsWith(AUTONOMOUS_REMEMBER_MARK))
+		.map((t) => t.slice(AUTONOMOUS_REMEMBER_MARK.length).replace(/\]\][*_\s]*$/, "").trim())
+		.filter((t) => t.length > 0);
 	// A turn can't be both; NEED_HUMAN wins — asking a human always stops the chain.
 	if (humanIdx >= 0 && (doneIdx < 0 || humanIdx > doneIdx)) {
 		const raw = stripLineEmphasis(reply.split("\n")[humanIdx]).trim();
 		const question = raw.startsWith(AUTONOMOUS_HUMAN_MARK)
 			? raw.slice(AUTONOMOUS_HUMAN_MARK.length).replace(/^[:：\s]+/, "").trim()
 			: "";
-		return { kind: "human", question, text: stripMarkerLines(reply) };
+		return { kind: "human", question, text: stripMarkerLines(reply), remember: remembers };
 	}
-	if (doneIdx >= 0) return { kind: "done", text: stripMarkerLines(reply) };
-	return { kind: "continue", text: reply };
+	if (doneIdx >= 0) return { kind: "done", text: stripMarkerLines(reply), remember: remembers };
+	return { kind: "continue", text: stripMarkerLines(reply), remember: remembers };
 }
 
 function stripMarkerLines(text: string): string {
@@ -130,7 +144,7 @@ function stripMarkerLines(text: string): string {
 		.split("\n")
 		.filter((line) => {
 			const t = stripLineEmphasis(line);
-			return !t.startsWith(AUTONOMOUS_DONE_MARK) && !t.startsWith(AUTONOMOUS_HUMAN_MARK);
+			return !t.startsWith(AUTONOMOUS_DONE_MARK) && !t.startsWith(AUTONOMOUS_HUMAN_MARK) && !t.startsWith(AUTONOMOUS_REMEMBER_MARK);
 		})
 		.join("\n")
 		.trimEnd();
@@ -171,6 +185,7 @@ export function buildAutonomousTurnPrefix(opts: {
 		`- 还没完成也不需要问人 → 正常输出进展即可，不要写任何标记，系统会让你继续。`,
 		`- 无人值守：先检测登录状态再操作。${kbSearch ? `登录过期/账号异常 → 先 search_knowledge_base 搜「系统名 + 登录/账号」找最新的账号密码或登录指引，找得到就自己重新登录继续干；知识库确实没有才 ` : `登录过期直接 `}${AUTONOMOUS_HUMAN_MARK} 说明${kbSearch ? "（注明已查知识库无果）" : ""}，不要尝试索要验证码。`,
 		...(kbSearch && kbLearn ? [`- 卡点解决后若沉淀出了可复用的信息（正确账号、新流程、报错根因、服务异常的规避办法），用 save_to_knowledge 存进知识库——下次同类卡点直接查库解决，不再问人。`] : []),
+		...(kbSearch && kbLearn ? [`- 【立刻沉淀】经过多轮尝试终于找到可行方案的那一刻，立即单独写一行 ${AUTONOMOUS_REMEMBER_MARK} 一句话经验——长对话会被上下文压缩，探索过程不及时记下来就会丢。系统会立即写入知识库（不停止任务，继续干）。宁可多记不可漏记。`] : []),
 	].join("\n");
 	return `${head}\n${budgetLine}\n${protocol}\n\n`;
 }
