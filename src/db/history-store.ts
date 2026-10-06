@@ -58,6 +58,15 @@ export class HistoryStore {
 		)`);
 	}
 
+	/** Latest inbound (user-role) message time in a conversation since `sinceTs` —
+	 * lets reminder sweeps notice "the human already replied" and stay quiet. */
+	lastInboundAt(conversationId: string, sinceTs: number): number | null {
+		const row = this.db
+			.prepare("SELECT MAX(created_at) AS t FROM messages WHERE conversation_id = ? AND role = 'user' AND created_at >= ?")
+			.get(conversationId, sinceTs) as { t: number | null };
+		return row?.t ?? null;
+	}
+
 	listConversations(): ConversationRow[] {
 		return this.db
 			.prepare("SELECT * FROM conversations ORDER BY updated_at DESC")
