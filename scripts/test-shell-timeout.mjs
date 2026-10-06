@@ -370,7 +370,7 @@ test("run_command from a group chat: admin runs without confirmation, operator s
 // ── Windows shell composition forces UTF-8 code page (field 2026-10-06: GBK mojibake on CN systems) ──
 
 test("wrapWindowsShellCommand prepends chcp 65001 to the composed command", async () => {
-	const out = wrapWindowsShellCommand('dir /b /od "C:\\Users\\Administrator\\Documents\\MuMu共享文件夹\\Screenshots"');
-	assert.match(out, /^chcp 65001 >nul & /, "UTF-8 code page forced before the user command");
-	assert.match(out, /MuMu共享文件夹/, "the command itself passes through untouched");
+	const cmd = 'dir /b /od "C:\\Users\\Administrator\\Documents\\MuMu共享文件夹\\Screenshots"';
+	// Identity: nothing but the prefix may be added (review L).
+	assert.equal(wrapWindowsShellCommand(cmd), `chcp 65001 >nul & ${cmd}`);
 });
