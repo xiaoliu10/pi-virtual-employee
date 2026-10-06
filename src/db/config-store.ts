@@ -698,8 +698,12 @@ export function normalizeModelConfig(value: unknown): ModelConfig {
 
 	let defaultSupplierId = stringValue(raw.defaultSupplierId);
 	let defaultModelId = stringValue(raw.defaultModelId).trim();
+	// authProvider (account-login) suppliers keep their models in the pi-ai registry,
+	// invisible here — a non-empty default pointing at one is accepted as-is; the
+	// engine validates it against the registry at resolve time.
 	const current = suppliers.find((supplier) =>
-		supplier.id === defaultSupplierId && supplier.enabled && supplier.models.includes(defaultModelId));
+		supplier.id === defaultSupplierId && supplier.enabled &&
+		(supplier.models.includes(defaultModelId) || (defaultModelId !== "" && supplier.authProvider !== undefined)));
 
 	if (!current) {
 		const firstSupplier = suppliers.find((supplier) => supplier.enabled && supplier.models.length > 0);

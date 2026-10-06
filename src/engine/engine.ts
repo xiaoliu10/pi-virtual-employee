@@ -624,7 +624,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	): { supplier: Supplier; modelId: string } {
 		const override = this.history.getModelOverride(conversationId);
 		const overrideSupplier = this.findSupplier(override?.supplierId);
-		if (override && overrideSupplier?.enabled && overrideSupplier.models.includes(override.modelId)) {
+		if (override && overrideSupplier?.enabled && this.supplierHasModel(overrideSupplier, override.modelId)) {
 			return { supplier: overrideSupplier, modelId: override.modelId };
 		}
 		return this.resolveDefaultModel();
@@ -634,7 +634,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	private resolveDefaultModel(): { supplier: Supplier; modelId: string } {
 		const config = this.config.all();
 		const defaultSupplier = this.findSupplier(config.model.defaultSupplierId);
-		if (!defaultSupplier?.enabled || !defaultSupplier.models.includes(config.model.defaultModelId)) {
+		if (!defaultSupplier?.enabled || !this.supplierHasModel(defaultSupplier, config.model.defaultModelId)) {
 			throw new Error("No enabled model configured. Add or enable one in Settings → 模型服务.");
 		}
 		return { supplier: defaultSupplier, modelId: config.model.defaultModelId };
@@ -794,15 +794,22 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** All supplier×model combos available for selection. */
 	availableModels(): ModelOption[] {
 		const c = this.config.all();
-		return c.model.suppliers.filter((supplier) => supplier.enabled).flatMap((s) =>
-			s.models.map((m) => ({
+		return c.model.suppliers.filter((supplier) => supplier.enabled).flatMap((s) => {
+			// authProvider (account-login) suppliers keep their models in the pi-ai
+			// registry, not in the config models array — enumerate both so account
+			// suppliers are selectable in the switcher and conversation dropdown.
+			const ids = new Set(s.models);
+			if (s.authProvider) {
+				for (const m of (this.models.getProvider(s.authProvider)?.getModels() ?? []) as Model<Api>[]) ids.add(m.id);
+			}
+			return [...ids].map((m) => ({
 				supplierId: s.id,
 				supplierName: s.name,
 				apiType: s.apiType,
 				modelId: m,
 				isDefault: s.id === c.model.defaultSupplierId && m === c.model.defaultModelId,
-			})),
-		);
+			}));
+		});
 	}
 
 	/** Live agent for a conversation, created on first use with its chosen model. */
@@ -1532,11 +1539,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/** Switch a conversation's model (live, keeps transcript) and persist it. */
+	/** Does this supplier offer modelId? Config array, or the registry for account-login suppliers. */
+	private supplierHasModel(supplier: Supplier, modelId: string): boolean {
+		if (supplier.models.includes(modelId)) return true;
+		if (supplier.authProvider) return this.models.getModel(supplier.authProvider, modelId) !== undefined;
+		return false;
+	}
+
 	setConversationModel(conversationId: string, supplierId: string, modelId: string): void {
 		const supplier = this.findSupplier(supplierId);
 		if (!supplier) throw new Error(`Unknown supplier "${supplierId}"`);
 		if (!supplier.enabled) throw new Error(`Supplier "${supplier.name}" is disabled`);
-		if (!supplier.models.includes(modelId)) {
+		if (!this.supplierHasModel(supplier, modelId)) {
 			throw new Error(`Model "${modelId}" not in supplier "${supplier.name}"`);
 		}
 		const agent = this.getOrCreateSession(conversationId);

@@ -86,6 +86,7 @@ export default function App() {
 					readOnly={conversations.find((c) => c.id === activeId)?.origin === "im"}
 					agentName={config?.identity.name ?? "客服小派"}
 					modelRevision={config ? JSON.stringify(config.model) : ""}
+					onConfigChanged={handleConfigChange}
 					modelOverride={(() => {
 						const conv = conversations.find((c) => c.id === activeId);
 						return conv?.model_supplier_id && conv?.model_model_id
