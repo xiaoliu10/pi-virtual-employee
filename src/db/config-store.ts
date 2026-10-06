@@ -531,6 +531,23 @@ function normalizedAdminIds(value: unknown): string[] {
 }
 
 /**
+ * 0.2.125 migration: configs written before 0.2.123 carry the then-default
+ * `kb.research: { enabled: false, engine: "duckduckgo" }` — a state nobody ever
+ * chose (the field simply didn't exist when they were saved). Flip exactly that
+ * legacy state to the new default (enabled + bing). Explicit choices survive:
+ * `enabled:false` with any other engine, or engine changed to custom/bing,
+ * are user decisions and stay untouched.
+ */
+function normalizeKbResearch(kb: AppConfig["kb"]): AppConfig["kb"] {
+	const research = kb?.research;
+	if (research && research.enabled === false && research.engine === "duckduckgo") {
+		return { ...kb, research: { enabled: true, engine: "bing" } };
+	}
+	return kb;
+}
+
+
+/**
  * Normalize the security block: admin whitelist + the RBAC policy (per-person
  * roles, default role, per-conversation capability floors). Hand-edited config
  * files are untrusted input, so unknown roles are dropped, ids are trimmed and
@@ -931,7 +948,7 @@ export class ConfigStore {
 					...merged,
 					model: normalizeModelConfig(parsed.model ?? merged.model),
 					im: normalizeIm(merged.im),
-					kb: { ...merged.kb, external: normalizeExternalProviders(merged.kb.external) },
+					kb: normalizeKbResearch(merged.kb),
 					security: normalizeSecurity(merged),
 					capabilities: normalizeCapabilities(merged),
 					computer: normalizeComputerConfig(merged.computer),
