@@ -221,7 +221,8 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 			tools.push(...guardAll("learn", [createSaveToKnowledgeTool(options.knowledge), createRememberTool(options.knowledge, options.onMemoryChanged)]));
 		}
 		if (options.manageEnabled) tools.push(guarded("knowledge_manage", createManageKnowledgeTool(options.knowledge)));
-		if (options.researchEnabled) tools.push(guarded("browser", createResearchWebTool(options.knowledge)));
+		// "knowledge" floor, not "browser": web research is part of the KB loop and must not require browser permission.
+		if (options.researchEnabled) tools.push(guarded("knowledge", createResearchWebTool(options.knowledge)));
 	}
 	if (options.browserEnabled)
 		tools.push(

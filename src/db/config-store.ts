@@ -193,7 +193,7 @@ export interface KbConfig {
 	/** Auto-research: when the KB misses, the employee may web-search and sediment findings (pending/low-confidence). */
 	research: {
 		enabled: boolean;
-		engine: "duckduckgo" | "custom";
+		engine: "bing" | "duckduckgo" | "custom";
 	};
 }
 
@@ -500,7 +500,10 @@ const DEFAULTS: AppConfig = {
 			consolidate: { enabled: false, intervalMinutes: 360, batch: 40 },
 		},
 		manage: { enabled: true },
-		research: { enabled: false, engine: "duckduckgo" },
+		// Web research on by default (field 2026-10-06: the employee reported having
+		// "no web tool"). Bing is the zero-config engine: no key, reachable from
+		// mainland China. Existing saved configs keep their explicit values.
+		research: { enabled: true, engine: "bing" },
 	},
 };
 

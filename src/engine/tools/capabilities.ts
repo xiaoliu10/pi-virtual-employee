@@ -25,11 +25,12 @@ let kernelInstall:
 	| null = null;
 
 /** Toggleable capabilities exposed to conversation-side admins. */
-const TOGGLEABLE = ["browser", "computer", "documents", "filesystem", "reports", "downloads", "shell"] as const;
+const TOGGLEABLE = ["browser", "computer", "documents", "filesystem", "reports", "downloads", "shell", "research"] as const;
 type ToggleKey = (typeof TOGGLEABLE)[number];
 
 const CAPABILITY_LABELS: Record<ToggleKey, string> = {
 	browser: "浏览器自动化（navigate/click/type/screenshot/read 等）",
+	research: "联网研究（知识库未命中时用 Bing 搜索公开网页，可沉淀知识）",
 	computer: "Cua 桌面控制（应用窗口、截图、点击与输入；驱动用 manage_computer 管理）",
 	documents: "文档资源（list/provide/save 文档）",
 	filesystem: "本地文件访问（受限目录列表与授权删除）",
@@ -60,7 +61,7 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 		description:
 			"查看或变更本应用的能力开关（仅限 IM 单聊）。action=list 查看各项能力及其开关状态；" +
 			"action=set 开启或关闭某项能力（传 capability 和 enabled）；设置 shell 时可同时传 allowedCommands 更新命令白名单；action=setup_browser 安装/检查浏览器内核（Chromium）。" +
-			"可管理能力：browser（浏览器自动化）、computer（Cua 桌面控制）、documents（文档资源）、filesystem（本地文件访问）、" +
+			"可管理能力：browser（浏览器自动化）、computer（Cua 桌面控制）、documents（文档资源）、filesystem（本地文件访问）、research（联网研究，写 kb.research）、" +
 			"reports（报告中心）、downloads（浏览器下载工作区）、shell（受限命令执行）。" +
 			`安全规则：list 需单聊；${confirmRule}，群聊一律拒绝。` +
 			"setup_browser 已装则直接报告已安装；未装则后台下载（约 150MB，需几分钟），用 status 查询进度。下载源由 browser.downloadHost 决定（留空 = 国内默认走 npmmirror 镜像；如需改用 manage_settings 设置 browser.downloadHost）。",
@@ -78,6 +79,7 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 						Type.Literal("reports"),
 						Type.Literal("downloads"),
 						Type.Literal("shell"),
+						Type.Literal("research"),
 					],
 					{ description: "仅 set 必填：要开关的能力名" },
 				),
@@ -169,7 +171,9 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 			const updated = deps.config.update(
 				capability === "shell"
 					? { capabilities: { shell: { enabled, ...(normalizedAllowed ? { allowedCommands: normalizedAllowed } : {}) } } }
-					: { [capability]: { enabled } },
+					: capability === "research"
+						? { kb: { research: { enabled } } }
+						: { [capability]: { enabled } },
 			);
 			deps.onConfigChanged();
 			return {
@@ -194,7 +198,9 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 }
 
 function readCapability(cfg: ReturnType<ConfigStore["all"]>, key: ToggleKey): boolean {
-	return key === "shell" ? cfg.capabilities.shell.enabled : cfg[key].enabled;
+	if (key === "shell") return cfg.capabilities.shell.enabled;
+	if (key === "research") return cfg.kb.research.enabled;
+	return cfg[key].enabled;
 }
 
 /** True when the Chromium binary this playwright version expects is on disk. */

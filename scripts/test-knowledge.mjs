@@ -28,6 +28,7 @@ await build({
 	stdin: {
 		contents: `
 			export { extractCriticalValues, ensureCriticalValuesPreserved, partitionMergeIds } from "./src/knowledge/consolidation.ts";
+			export { bingSearch } from "./src/knowledge/research/web-search.ts";
 		`,
 		resolveDir: root,
 		loader: "ts",
@@ -38,7 +39,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { extractCriticalValues, ensureCriticalValuesPreserved, partitionMergeIds } = await import(
+const { extractCriticalValues, ensureCriticalValuesPreserved, partitionMergeIds, bingSearch } = await import(
 	pathToFileURL(bundle).href
 );
 
@@ -82,4 +83,44 @@ test("ensureCriticalValuesPreserved still backstops ordinary merges verbatim", (
 	// Nothing to restore when the model kept the values.
 	const kept = ensureCriticalValuesPreserved(`联调环境：${source}`, [source]);
 	assert.equal(kept.restored.length, 0);
+});
+
+// ── bing engine: regex over b_algo blocks (field 2026-10-06: default engine reachable from CN) ──
+
+test("bingSearch parses b_algo blocks into hits; decodeEntities and stripTags behave", async (t) => {
+	const html = [
+		'<li class="b_algo">',
+		'  <h2><a href="https://example.com/a?q=1&amp;x=2" h="ID=SERP">快速<b>烹饪</b>指南</a></h2>',
+		'  <p class="b_lineclamp">如何&#24555;速入门…包含 &quot;要点&quot; 与&nbsp;细节。</p>',
+		"</li>",
+		'<li class="b_algo">',
+		'  <h2><a href="https://example.com/b">第二条</a></h2>',
+		"</li>",
+		'<li class="b_algo"><div>没有 h2 链接，应跳过</div></li>',
+	].join("\n");
+	const realFetch = globalThis.fetch;
+	t.after(() => { globalThis.fetch = realFetch; });
+	globalThis.fetch = async (url) => {
+		assert.match(String(url), /cn\.bing\.com\/search\?q=/, "bing engine hits cn.bing.com");
+		assert.match(String(url), /count=/, "topK passes as count");
+		return { ok: true, status: 200, text: async () => html };
+	};
+	const hits = await bingSearch("测试查询", 5);
+	assert.equal(hits.length, 2, "block without h2 link is skipped");
+	// topK truncation
+	const one = await bingSearch("测试查询", 1);
+	assert.deepEqual(one.map((h) => h.title), ["快速烹饪指南"], "topK truncates");
+	// last block truncates at the next <li>: footer markup stays out of snippets
+	const realFetch2 = globalThis.fetch;
+	t.after(() => { globalThis.fetch = realFetch2; });
+	globalThis.fetch = async () => ({
+		ok: true, status: 200,
+		text: async () => html + '<li class="b_algo"><h2><a href="https://example.com/tail">尾部块</a></h2><footer>相关搜索</footer>',
+	});
+	const tail = await bingSearch("测试查询", 3);
+	assert.ok(tail.every((h) => !h.snippet.includes("相关搜索")), "footer must not leak into snippets");
+	assert.equal(hits[0].title, "快速烹饪指南");
+	assert.equal(hits[0].url, "https://example.com/a?q=1&x=2", "entities decoded");
+	assert.equal(hits[0].snippet, "如何快速入门…包含 \"要点\" 与 细节。", "numeric entities + nbsp decoded, tags stripped");
+	assert.equal(hits[1].snippet, "", "missing paragraph degrades to empty snippet");
 });
