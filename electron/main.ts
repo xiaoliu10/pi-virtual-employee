@@ -763,7 +763,11 @@ async function main(): Promise<void> {
 					turn: chain.turns, budget,
 					kbEnabled: true, kbLearn: true,
 				});
+				// ephemeral: the learn Q/A must NOT enter the chain conversation
+				// history — otherwise a human-resume's "上一轮问题的回复" pairs
+				// against the learn turn instead of the actual question.
 				const learnSend = await engine.send(agent, learnPrefix + buildLearnTurnAsk(outcome, task.title), {
+					ephemeral: true,
 					...(task.created_by ? { actor: { senderId: task.created_by, channel: "scheduler" as const, chatType: "single" as const } } : {}),
 				});
 				// engine.send resolves (not throws) on model-service stalls — a failed
@@ -773,9 +777,12 @@ async function main(): Promise<void> {
 				} else {
 					appendAppLog(`[sched] chain ${task.id} (${task.title}) outcome=${outcome}; auto-learn turn ok`);
 					if (task.conversation_id) {
+						const stuckNote = outcome === "error"
+							? "📌 已把本次的卡点沉淀到知识库（卡在哪、已尝试什么、下次建议）。"
+							: "📌 已把本次的卡点沉淀到知识库（卡在哪、已尝试什么、下次建议），恢复后会先查经验再继续。";
 						await im.pushToConversation(task.conversation_id, outcome === "done"
 							? "📌 已把本次任务的经验沉淀到知识库，下次同类任务直接复用。"
-							: "📌 已把本次的卡点沉淀到知识库（卡在哪、已尝试什么、下次建议），恢复后会先查经验再继续。");
+							: stuckNote);
 					}
 				}
 			} catch (err) {
@@ -786,7 +793,7 @@ async function main(): Promise<void> {
 		// Deliver the outcome to the target chat (markers stripped by the parser).
 		if (task.conversation_id) {
 			const resumeHint = `\n\n回复「继续 ${task.title}」重置预算继续；不回复则保持暂停。`;
-			const stalledHint = `\n\n通常是模型服务或中转临时不可用，不是任务内容的问题。排查并处理后任务可从断点原地继续：\n① 检查模型服务状态，或在 设置 → 自定义模型 顶部把其他模型「设为默认」并保存；\n② 恢复任务（resume_scheduled_task 或回复「继续 ${task.title}」）；\n③ 恢复成功后我会把现象与解法沉淀进知识库，下次自动规避。`;
+			const stalledHint = `\n\n通常是模型服务或中转临时不可用，不是任务内容的问题。排查并处理后任务可从断点原地继续：\n① 检查模型服务状态，或在 设置 → 自定义模型 顶部把其他模型「设为默认」并保存；\n② 恢复任务（resume_scheduled_task 或回复「继续 ${task.title}」）；\n③ 恢复成功后会先检索知识库里的卡点记录再继续（本次卡点已自动沉淀）。`;
 			const pushText =
 				outcome === "done"
 					? `✅ **自主任务完成：${task.title}**（共 ${chain.turns} 轮）\n\n${lastText}`

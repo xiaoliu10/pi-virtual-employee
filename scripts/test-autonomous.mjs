@@ -151,6 +151,7 @@ test("buildLearnTurnAsk: done asks for wins; stuck outcomes record the blocker (
 	assert.match(done, /已完成/);
 	assert.match(done, /踩过的坑与解法/);
 	assert.match(done, /save_to_knowledge/);
+	const whyByOutcome = { stalled: "模型服务停滞", human: "人工输入", budget: "预算", error: "出错" };
 	for (const outcome of ["stalled", "human", "budget", "error"]) {
 		const ask = buildLearnTurnAsk(outcome, "月卡领取");
 		assert.match(ask, /卡点/);
@@ -158,6 +159,10 @@ test("buildLearnTurnAsk: done asks for wins; stuck outcomes record the blocker (
 		assert.match(ask, /避免重复无效尝试/);
 		assert.match(ask, /save_to_knowledge/, `${outcome} must still require the KB write`);
 		assert.doesNotMatch(ask, /已完成/);
+		assert.ok(ask.includes(whyByOutcome[outcome]), `${outcome} ask names its own reason`);
+		for (const [other, phrase] of Object.entries(whyByOutcome)) {
+			if (other !== outcome) assert.ok(!ask.includes(phrase), `${outcome} ask must not borrow ${other}'s reason`);
+		}
 	}
 });
 
