@@ -48,7 +48,6 @@ import { createManageCapabilitiesTool } from "./tools/capabilities.js";
 import { createRunCommandTool, createManageProcessTool, type ShellToolDeps } from "./tools/shell.js";
 import { createManageSettingsTool } from "./tools/settings.js";
 import { orderTool } from "./tools/orders.js";
-import { escalateTool } from "./tools/escalate.js";
 import { CAPABILITY_LABEL, checkPermission, permissionRefusal } from "../security/permissions.js";
 import { createCheckMyAccessTool, createManageAccessTool, type AccessToolDeps } from "./tools/access.js";
 
@@ -358,7 +357,7 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 			updates: options.updates,
 		}));
 	}
-	tools.push(orderTool, escalateTool);
+	tools.push(orderTool);
 	if (options.telemetry) tools.push(guarded("telemetry", createMyStatsTool({ ...accessDeps, telemetry: options.telemetry })));
 	// The proposal loop's output channel. Same capability as my_stats: a proposal
 	// is a review artifact, not an action — it changes nothing on its own.

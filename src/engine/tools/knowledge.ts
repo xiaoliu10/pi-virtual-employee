@@ -26,7 +26,7 @@ export function createKnowledgeTool(knowledge: KnowledgeService): AgentTool {
 					content: [
 						{
 							type: "text",
-							text: `知识库中未找到与「${query}」直接相关的条目。若已开启自动研究（auto-research），可调用 research_web 查询资料后再回答；若对方坚持或问题较复杂，请考虑 escalate_to_human。`,
+							text: `知识库中未找到与「${query}」直接相关的条目。若已开启自动研究（auto-research），可调用 research_web 查询资料后再回答；仍无法解答就如实告知对方知识库暂无相关内容。`,
 						},
 					],
 					details: { query, matched: false },
