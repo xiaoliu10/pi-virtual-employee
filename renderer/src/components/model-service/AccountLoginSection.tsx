@@ -77,7 +77,7 @@ export function AccountLoginSection({ onCreateSupplier }: AccountLoginSectionPro
 		// keeps at most one active flow).
 		void api
 			.authLoginStatus()
-			.then((state) => state && setLogin(state))
+			.then((state) => state && setLogin((prev) => prev ?? state))
 			.catch(() => {});
 	}, [refresh]);
 
