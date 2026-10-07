@@ -22,7 +22,7 @@ export function createResearchWebTool(knowledge: KnowledgeService): AgentTool {
 			const hits = await knowledge.researchWeb(query);
 			if (hits.length === 0) {
 				return {
-					content: [{ type: "text", text: `联网研究「${query}」未取得可用结果。请据实说明不确定，必要时转人工。` }],
+					content: [{ type: "text", text: `联网研究「${query}」未取得可用结果。请据实说明不确定，需要人工跟进时如实上报，不要虚构已转人工。` }],
 					details: { query, matched: false },
 				};
 			}

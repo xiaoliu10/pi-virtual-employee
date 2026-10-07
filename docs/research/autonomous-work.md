@@ -15,7 +15,7 @@
 | 心跳进度播报 | IM 回合内每 N 分钟经 `engine.progressBrief` 侧路推送 | 自主工作的「还在干、干到哪」直接复用 |
 | 看门狗 / 压缩 / 有界旁路调用 | 回合失速看门狗（IM 会话）、上下文预算门、compaction | 长任务的保命三件套已就绪 |
 | 汇报中心 | startRun/completeRun/publish → Gitee 链接 | 自主工作的交付物天然是一份可分享报告 |
-| 升级/请示通道 | `escalate_to_human`（工具结果 `terminate: true` 终止回合）、一次性授权确认 | 「卡住了就问人」的现成机制 |
+| 升级/请示通道 | `escalate_to_human（已于 0.2.137 移除）`（工具结果 `terminate: true` 终止回合）、一次性授权确认 | 「卡住了就问人」的现成机制 |
 | RBAC | admin/operator/viewer + 工具级 capability | 自主权限授予沿用创建者角色模型 |
 | 定时任务工具组 | LLM 可自建/改/停 cron 任务 | 自主工作项的创建入口可以同构 |
 
