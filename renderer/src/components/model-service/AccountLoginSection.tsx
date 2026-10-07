@@ -77,16 +77,19 @@ export function AccountLoginSection({ onCreateSupplier }: AccountLoginSectionPro
 		// keeps at most one active flow).
 		void api
 			.authLoginStatus()
-			.then((state) => state && setLogin(state))
+			.then((state) => state && setLogin((prev) => prev ?? state))
 			.catch(() => {});
 	}, [refresh]);
 
 	// Subscribe to the engine's pushed full-state snapshots; refresh the
-	// catalog on done so badges/quota buttons catch up.
+	// catalog on done so badges/quota buttons catch up. A push must NOT reopen
+	// a dismissed dialog: while login is null (user closed it), updates are
+	// ignored — otherwise the still-running flow's snapshots keep popping the
+	// dialog back open and it can never be closed (field 2026-10-06).
 	useEffect(() => {
 		const unsubscribe = api.onAuthLoginEvent((state) => {
-			setLogin(state);
 			if (state.status === "done") void refresh();
+			setLogin((prev) => (prev ? state : prev));
 		});
 		return unsubscribe;
 	}, [refresh]);
@@ -132,6 +135,12 @@ export function AccountLoginSection({ onCreateSupplier }: AccountLoginSectionPro
 		setLogin(null);
 		setActionError(null);
 		void refresh();
+	};
+	// ✕ / 关闭 while a flow is live: clear locally AND cancel the engine flow —
+	// otherwise its snapshots keep re-opening the dialog (关不掉).
+	const dismissLogin = () => {
+		closeLogin();
+		void api.authLoginCancel().catch(() => {});
 	};
 
 	const armLogout = (provider: AuthCatalogProviderId) => {
@@ -271,7 +280,7 @@ export function AccountLoginSection({ onCreateSupplier }: AccountLoginSectionPro
 					}}
 					onRetry={() => void startLogin(login.provider)}
 					onCancel={cancelLogin}
-					onClose={closeLogin}
+					onClose={dismissLogin}
 					onCreateSupplier={(entry) => {
 						onCreateSupplier(entry);
 						closeLogin();
