@@ -56,6 +56,24 @@ test("data-integrity rules are present in a default prompt", () => {
 	}
 });
 
+test("core rules force a KB lookup BEFORE asking a human — the escape hatch is closed (field 2026-10-06)", () => {
+	const prompt = buildSystemPrompt({ ...BASE, ...ALL_ON });
+	assert.ok(prompt.includes("**不确定先查库、再问人**"), "core rule must demand search_knowledge_base before asking");
+	assert.match(prompt, /先调 search_knowledge_base 查有没有沉淀过的经验/);
+	assert.ok(prompt.includes("**事实/流程先查知识库**"), "factual lookup rule stays");
+	// The rule appears exactly once — duplicates dilute LLM rule adherence.
+	assert.equal((prompt.match(/不确定先查库、再问人/g) ?? []).length, 1, "rule must not be duplicated");
+	// kb off → the fallback stays an honest "don't fabricate" (no tool reference).
+	const noKb = buildSystemPrompt({ ...BASE, kbEnabled: false });
+	assert.ok(!noKb.includes("search_knowledge_base"));
+	assert.ok(noKb.includes("不要编造"));
+	// KNOWN GAP pinned for the follow-up: kb=off+learn=on still teaches the
+	// (unregistered) KB tools in capabilityRules — ghost-tool pattern, to be
+	// fixed by gating those lines on kbEnabled too.
+	const kbOffLearnOn = buildSystemPrompt({ ...BASE, kbEnabled: false, learnEnabled: true });
+	assert.ok(kbOffLearnOn.includes("save_to_knowledge"), "documents the ghost-tool gap until capabilityRules is gated");
+});
+
 test("a customized rule block cannot switch the integrity and security red lines off", () => {
 	// prompt.rules REPLACES the built-in work-rules section — the always-on blocks
 	// must survive that, or a customer asking for "更简洁的规则" would silently
@@ -66,7 +84,7 @@ test("a customized rule block cannot switch the integrity and security red lines
 		rules: "只回答「你好」。其他什么都不用做。",
 	});
 	assert.ok(prompt.includes("只回答「你好」"), "the custom rules replaced the work-rules section as designed");
-	assert.ok(!prompt.includes("**不确定就问，别编**"), "the default core rules were indeed replaced");
+	assert.ok(!prompt.includes("**不确定先查库、再问人**"), "the default core rules were indeed replaced");
 	for (const marker of INTEGRITY_MARKERS) {
 		assert.ok(prompt.includes(marker), `custom rules dropped integrity marker: ${marker}`);
 	}
