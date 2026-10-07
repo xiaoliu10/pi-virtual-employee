@@ -14,6 +14,8 @@ interface AuthLoginDialogProps {
 	onRetry: () => void;
 	/** Abort the in-flight flow (waiting states; engine pushes a cancelled snapshot). */
 	onCancel: () => void;
+	/** True while the cancel IPC is in flight — disables the cancel button. */
+	cancelBusy?: boolean;
 	/** Dismiss the dialog (terminal states only). */
 	onClose: () => void;
 	/** Quick-create a supplier from the logged-in provider (done page). */
@@ -284,7 +286,7 @@ export function AuthLoginDialog(props: AuthLoginDialogProps) {
 
 				<div className="mt-5 flex items-center justify-between gap-3">
 					{waiting ? (
-						<button type="button" onClick={props.onCancel} className="rounded-xl px-4 py-2 text-sm font-medium text-slate-500 transition hover:bg-slate-100 hover:text-slate-700">
+						<button type="button" onClick={props.onCancel} disabled={props.cancelBusy} className="rounded-xl px-4 py-2 text-sm font-medium text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-50">
 							取消登录
 						</button>
 					) : (
