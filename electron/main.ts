@@ -1212,8 +1212,7 @@ async function main(): Promise<void> {
 	});
 	ipcMain.handle(AUTH_IPC.loginCancel, (e) => {
 		authFromSettings(e);
-		engine.authLoginCancel();
-		return true;
+		return engine.authLoginCancel();
 	});
 	ipcMain.handle(AUTH_IPC.logout, (e, provider: string) => {
 		authFromSettings(e);

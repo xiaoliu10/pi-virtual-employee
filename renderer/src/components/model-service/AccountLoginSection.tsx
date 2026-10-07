@@ -111,6 +111,8 @@ export function AccountLoginSection({ onCreateSupplier }: AccountLoginSectionPro
 	};
 
 	const cancelLogin = async () => {
+		if (cancelBusy) return;
+		setCancelBusy(true);
 		// Engine aborts a LIVE flow and answers with a pushed `cancelled`
 		// snapshot (the dialog switches to its terminal page). When nothing is
 		// active engine-side it returns false — close the dialog locally
@@ -120,9 +122,12 @@ export function AccountLoginSection({ onCreateSupplier }: AccountLoginSectionPro
 			if (!handled) closeLogin();
 		} catch {
 			closeLogin();
+		} finally {
+			setCancelBusy(false);
 		}
 	};
 
+	const [cancelBusy, setCancelBusy] = useState(false);
 	const closeLogin = () => {
 		setLogin(null);
 		setActionError(null);
@@ -259,6 +264,7 @@ export function AccountLoginSection({ onCreateSupplier }: AccountLoginSectionPro
 			{login && (
 				<AuthLoginDialog
 					state={login}
+					cancelBusy={cancelBusy}
 					entry={entryOf(login.provider)}
 					onAnswer={async (promptId, value) => {
 						await api.authLoginAnswer(promptId, value);
