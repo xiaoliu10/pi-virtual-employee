@@ -374,6 +374,68 @@ test("oauth login: url + prompts answered through the bridge, credential lands i
 	assert.equal(entry.authType, "oauth");
 });
 
+test("successful login ensures an authProvider supplier so registry models enter the dropdown (field: 账号登录后选不到模型)", async (t) => {
+	const { engine } = makeEngine(t, { extraProviders: [fakeOAuthProvider()] });
+	const before = engine.config.all().model.suppliers.filter((supplier) => supplier.authProvider === "anthropic");
+	assert.equal(before.length, 0, "precondition: no supplier for the provider yet");
+
+	const bridge = captureBridge();
+	engine.authLogin("anthropic", bridge);
+	const selectPrompt = await bridge.waitFor((s) => s.prompt?.type === "select");
+	engine.authLoginAnswer(selectPrompt.prompt.id, "acct-a");
+	const textPrompt = await bridge.waitFor((s) => s.prompt?.type === "text");
+	engine.authLoginAnswer(textPrompt.prompt.id, "c123");
+	await bridge.waitFor((s) => s.status === "done");
+
+	const suppliers = engine.config.all().model.suppliers.filter((supplier) => supplier.authProvider === "anthropic");
+	assert.equal(suppliers.length, 1);
+	assert.equal(suppliers[0].enabled, true);
+	assert.equal(suppliers[0].id, "auth-anthropic");
+	assert.deepEqual(suppliers[0].models, [], "registry stays the source of truth for auth suppliers");
+	// The dropdown chain (availableModels) now surfaces the provider's registry model.
+	const options = engine.availableModels().filter((option) => option.supplierId === "auth-anthropic");
+	assert.ok(options.some((option) => option.modelId === "fake-model"));
+});
+
+test("relogin while the auth supplier is already enabled keeps exactly one entry", async (t) => {
+	const { engine } = makeEngine(t, { extraProviders: [fakeOAuthProvider()] });
+	const login = async () => {
+		const bridge = captureBridge();
+		engine.authLogin("anthropic", bridge);
+		const selectPrompt = await bridge.waitFor((s) => s.prompt?.type === "select");
+		engine.authLoginAnswer(selectPrompt.prompt.id, "acct-a");
+		const textPrompt = await bridge.waitFor((s) => s.prompt?.type === "text");
+		engine.authLoginAnswer(textPrompt.prompt.id, "c123");
+		await bridge.waitFor((s) => s.status === "done");
+	};
+	await login();
+	await login();
+	const suppliers = engine.config.all().model.suppliers.filter((supplier) => supplier.authProvider === "anthropic");
+	assert.equal(suppliers.length, 1);
+	assert.equal(suppliers[0].enabled, true);
+});
+
+test("login supplier ensure is idempotent and re-enables a disabled supplier", async (t) => {
+	const { engine } = makeEngine(t, { extraProviders: [fakeOAuthProvider()] });
+	// Pre-seed a DISABLED supplier for the provider (as if the user disabled it earlier).
+	engine.config.update({ model: { suppliers: [
+		...engine.config.all().model.suppliers,
+		{ id: "auth-anthropic", name: "Anthropic（Claude Pro/Max）", enabled: false, apiType: "openai", baseUrl: "", apiKey: "", models: [], authProvider: "anthropic" },
+	] } });
+
+	const bridge = captureBridge();
+	engine.authLogin("anthropic", bridge);
+	const selectPrompt = await bridge.waitFor((s) => s.prompt?.type === "select");
+	engine.authLoginAnswer(selectPrompt.prompt.id, "acct-a");
+	const textPrompt = await bridge.waitFor((s) => s.prompt?.type === "text");
+	engine.authLoginAnswer(textPrompt.prompt.id, "c123");
+	await bridge.waitFor((s) => s.status === "done");
+
+	const suppliers = engine.config.all().model.suppliers.filter((supplier) => supplier.authProvider === "anthropic");
+	assert.equal(suppliers.length, 1, "no duplicate");
+	assert.equal(suppliers[0].enabled, true, "disabled supplier re-enabled on fresh login");
+});
+
 test("oauth login cancel: aborted flow reports cancelled and stores nothing", async (t) => {
 	const { engine, store } = makeEngine(t, { extraProviders: [fakeOAuthProvider()] });
 	const bridge = captureBridge();

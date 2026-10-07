@@ -25,6 +25,14 @@ export default function App() {
 		setConversations(await api.listTasks());
 	}, []);
 
+	// 账号登录成功后引擎会直接写入 config store（ensureAuthSupplier 建供应商
+	// 条目）——重拉 config，让设置页 draft（跟随 config prop）拿到新条目，
+	// 否则后续任意保存会用 stale draft 整体覆盖 suppliers、把条目静默丢掉。
+	useEffect(() => api.onAuthLoginEvent((state) => {
+		if (state.status !== "done") return;
+		void api.getConfig().then((cfg) => setConfig(cfg as AppConfig)).catch(() => {});
+	}), []);
+
 	useEffect(() => {
 		(async () => {
 			setPort(await api.getServerPort());
