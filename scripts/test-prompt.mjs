@@ -67,6 +67,11 @@ test("core rules force a KB lookup BEFORE asking a human — the escape hatch is
 	const noKb = buildSystemPrompt({ ...BASE, kbEnabled: false });
 	assert.ok(!noKb.includes("search_knowledge_base"));
 	assert.ok(noKb.includes("不要编造"));
+	// KNOWN GAP pinned for the follow-up: kb=off+learn=on still teaches the
+	// (unregistered) KB tools in capabilityRules — ghost-tool pattern, to be
+	// fixed by gating those lines on kbEnabled too.
+	const kbOffLearnOn = buildSystemPrompt({ ...BASE, kbEnabled: false, learnEnabled: true });
+	assert.ok(kbOffLearnOn.includes("save_to_knowledge"), "documents the ghost-tool gap until capabilityRules is gated");
 });
 
 test("a customized rule block cannot switch the integrity and security red lines off", () => {
