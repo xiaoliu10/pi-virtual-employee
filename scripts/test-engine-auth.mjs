@@ -314,11 +314,10 @@ test("authCatalog: contract order, labels, models; fake provider reported unconf
 	assert.equal(entry.configured, false);
 	assert.equal(entry.authType, undefined);
 	assert.deepEqual(entry.models, [{ id: "fake-model", name: "Fake Model" }]);
-	// Unregistered-but-cataloged providers degrade to empty models, unconfigured
-	// (openai-chatgpt is in the contract but has no builtin registration yet).
-	const legacy = catalog.providers.find((p) => p.provider === "openai-chatgpt");
-	assert.deepEqual(legacy.models, []);
-	assert.equal(legacy.configured, false);
+	// openai-chatgpt is deliberately ABSENT from the catalog: pi-ai registers no
+	// model provider for the legacy ChatGPT backend (login would throw Unknown
+	// provider) — field 2026-10-06: users could hit this dead-end entry.
+	assert.ok(!catalog.providers.some((p) => p.provider === "openai-chatgpt"));
 	// zai is a REAL builtin registry id with static models.
 	const zai = catalog.providers.find((p) => p.provider === "zai");
 	assert.ok(zai.models.length > 0, "builtin zai registry should list models");

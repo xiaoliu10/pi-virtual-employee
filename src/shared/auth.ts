@@ -12,7 +12,10 @@
 /** Providers exposed in the settings UI, in display order. */
 export const AUTH_CATALOG_PROVIDER_IDS = [
 	"openai-codex", // ChatGPT Plus/Pro (OAuth, PKCE browser flow)
-	"openai-chatgpt", // ChatGPT OAuth (legacy backend)
+	// "openai-chatgpt" is DELIBERATELY absent: pi-ai does not register a model
+	// provider for the legacy ChatGPT backend yet, so login errors out and the
+	// catalog entry can never yield models — a dead end. Re-add when pi-ai
+	// ships a registered openai-chatgpt provider.
 	"anthropic", // Claude Pro/Max (OAuth, PKCE browser flow)
 	"kimi-coding", // Kimi Coding Plan (OAuth device code)
 	"github-copilot", // GitHub Copilot (OAuth device flow)
@@ -28,7 +31,6 @@ export type AuthCatalogProviderId = (typeof AUTH_CATALOG_PROVIDER_IDS)[number];
 /** Static display metadata (pi-ai owns flows; we own labels/order). */
 export const AUTH_PROVIDER_LABELS: Record<AuthCatalogProviderId, { name: string; description: string; kind: "oauth" | "api_key" }> = {
 	"openai-codex": { name: "OpenAI（ChatGPT 账号）", description: "用 ChatGPT Plus/Pro 账号授权，浏览器完成登录", kind: "oauth" },
-	"openai-chatgpt": { name: "OpenAI（ChatGPT 后端）", description: "ChatGPT 网页后端方式登录", kind: "oauth" },
 	anthropic: { name: "Anthropic（Claude Pro/Max）", description: "用 Claude 订阅账号授权，浏览器完成登录", kind: "oauth" },
 	"kimi-coding": { name: "Kimi Coding Plan", description: "设备码登录：打开网页输入码即可", kind: "oauth" },
 	"github-copilot": { name: "GitHub Copilot", description: "GitHub 设备码登录", kind: "oauth" },
