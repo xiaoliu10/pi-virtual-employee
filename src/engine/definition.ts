@@ -294,7 +294,7 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 	tools.push(createSendImageTool(options.resolveImageSender, options.conversationId));
 	// Let the model actually SEE local screenshots (shell/adb captures land on
 	// disk only; without this the model can never analyze its own screenshots).
-	tools.push(createViewImageTool(options.isVisionModel));
+	tools.push(createViewImageTool(options.isVisionModel, options.shellAuditLogPath, options.conversationId));
 	// Guarded config tools — always registered; the tools themselves enforce
 	// sender identity (1:1 IM + admin whitelist / explicit confirmation).
 	const adminDeps: AdminToolDeps = {
