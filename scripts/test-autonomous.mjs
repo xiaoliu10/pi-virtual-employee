@@ -33,6 +33,7 @@ const {
 	AUTONOMOUS_HUMAN_MARK,
 	budgetExceeded,
 	buildAutonomousTurnPrefix,
+	buildLearnTurnAsk,
 	normalizeBudget,
 	parseChainReply,
 	parseChainState,
@@ -143,6 +144,21 @@ test("autonomous chain protocol: KB write-back after a blocker is resolved (fiel
 	const noLearn = buildAutonomousTurnPrefix({ turn: 0, budget: { maxTurns: 30, maxMinutes: 90 }, kbEnabled: true, kbLearn: false });
 	assert.match(noLearn, /search_knowledge_base/);
 	assert.doesNotMatch(noLearn, /save_to_knowledge/);
+});
+
+test("buildLearnTurnAsk: done asks for wins; stuck outcomes record the blocker (field 2026-10-06)", () => {
+	const done = buildLearnTurnAsk("done", "月卡领取");
+	assert.match(done, /已完成/);
+	assert.match(done, /踩过的坑与解法/);
+	assert.match(done, /save_to_knowledge/);
+	for (const outcome of ["stalled", "human", "budget", "error"]) {
+		const ask = buildLearnTurnAsk(outcome, "月卡领取");
+		assert.match(ask, /卡点/);
+		assert.match(ask, /已尝试过什么/);
+		assert.match(ask, /避免重复无效尝试/);
+		assert.match(ask, /save_to_knowledge/, `${outcome} must still require the KB write`);
+		assert.doesNotMatch(ask, /已完成/);
+	}
 });
 
 test("parseChainState round-trips the stalled pending kind (field 2026-10-05)", () => {
