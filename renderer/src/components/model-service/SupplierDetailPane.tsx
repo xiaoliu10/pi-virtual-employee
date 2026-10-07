@@ -3,6 +3,7 @@ import type { ModelConfig, Supplier } from "../../lib/types";
 import { api } from "../../lib/ipc";
 import { Toggle } from "./Toggle";
 import { EditModelDialog, contextBadge, type ModelOverridePatch } from "./EditModelDialog";
+import { ImageToggle } from "./ImageToggle";
 
 interface SupplierDetailPaneProps {
 	supplier: Supplier | null;
@@ -186,27 +187,33 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 							{supplier.models.map((modelId) => {
 								const isDefault = supplier.id === props.model.defaultSupplierId && modelId === props.model.defaultModelId;
 								const badge = contextBadge(supplier.modelContextWindow?.[modelId]);
-								const supportsImage = capabilities[modelId] ?? false;
+								// Draft-aware: an unsaved toggle must reflect immediately, not wait for save.
+								const supportsImage = supplier.modelImage?.[modelId] ?? (capabilities[modelId] ?? false);
 								return (
 									<div
 										key={modelId}
-										className={`group flex items-center gap-2 rounded-full border py-1.5 pl-3 pr-1.5 transition ${isDefault ? "border-blue-300 bg-blue-50/60" : "border-slate-200 bg-white hover:border-slate-300"}`}
+										className={`group flex max-w-full items-center gap-2 rounded-full border py-1.5 pl-3 pr-1.5 transition ${isDefault ? "border-blue-300 bg-blue-50/60" : "border-slate-200 bg-white hover:border-slate-300"}`}
 									>
 										<button
 											type="button"
 											onClick={() => setEditingModel(modelId)}
 											title="编辑模型配置（上下文窗口 / 最大输出 / 输入类型）"
-											className="flex items-center gap-2 text-sm font-medium text-slate-800"
+											className="flex min-w-0 items-center gap-2 text-sm font-medium text-slate-800"
 										>
-											{modelId}
+											<span className="truncate">{modelId}</span>
 											{badge && <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-[11px] font-semibold text-slate-500">{badge}</span>}
 											{supportsImage && <span title="支持图片输入" className="text-[11px]">🖼️</span>}
 											{isDefault && <span className="rounded-md bg-blue-100 px-1.5 py-0.5 text-[11px] font-medium text-blue-600">默认</span>}
 										</button>
+										<ImageToggle
+											explicit={supplier.modelImage?.[modelId]}
+											effective={supportsImage}
+											onChange={(val) => applyModelPatch(modelId, { image: val })}
+										/>
 										{!isDefault && supplier.enabled && (
-											<button type="button" onClick={() => props.onSetDefault(modelId)} title="设为默认模型" className="rounded-full border border-blue-200 px-2 py-0.5 text-[11px] font-medium text-blue-600 hover:bg-blue-50">★ 设为默认</button>
+											<button type="button" onClick={() => props.onSetDefault(modelId)} title="设为默认模型" className="shrink-0 rounded-full border border-blue-200 px-2 py-0.5 text-[11px] font-medium text-blue-600 hover:bg-blue-50">★ 设为默认</button>
 										)}
-										<button type="button" onClick={() => props.onRemoveModel(modelId)} title="删除模型" className="rounded-full px-1.5 py-0.5 text-xs text-[#6e6e73] hover:bg-rose-50 hover:text-rose-500">✕</button>
+										<button type="button" onClick={() => props.onRemoveModel(modelId)} title="删除模型" className="shrink-0 rounded-full px-1.5 py-0.5 text-xs text-[#6e6e73] hover:bg-rose-50 hover:text-rose-500">✕</button>
 									</div>
 								);
 							})}
