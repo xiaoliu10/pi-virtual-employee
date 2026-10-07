@@ -29,6 +29,7 @@ import {
 	normalizeBudget,
 	parseChainReply,
 	parseChainState,
+	buildLearnTurnAsk,
 	nextStallStep,
 	STALL_QUIET_RETRIES,
 } from "../src/scheduler/autonomous.js";
@@ -614,6 +615,7 @@ async function main(): Promise<void> {
 		});
 
 		const persistChain = () => scheduledTaskStore.setChainState(task.id, JSON.stringify(chain));
+		const kbLookupOn = config.all().kb.enabled;
 		let lastText = "";
 		let outcome: "done" | "human" | "budget" | "stalled" | "error" = "error";
 		let question: string | undefined;
@@ -628,7 +630,13 @@ async function main(): Promise<void> {
 					kbLearn: config.all().kb.enabled && config.all().kb.learn.enabled,
 				});
 				const answerBlock = chain.turns === 0 && stagedAnswer ? `用户对你上一轮问题的回复：${stagedAnswer}\n\n` : "";
-				const message = chain.turns === 0 && !stallResumed ? scheduledTimePrefix() + prefix + answerBlock + task.prompt : prefix + "继续。";
+				// Resuming a pending chain: force a KB lookup BEFORE retrying — the
+				// stuck-learn round (below) recorded what was already tried; repeated
+				// blockers must not replay the same dead end (field 2026-10-06).
+				const resumeKbHint = prior?.pending && chain.turns === 0 && !stallResumed && kbLookupOn
+					? "\n\n恢复前先 kb_search 本次卡点相关经验；已有解法直接应用，不要重复无效尝试。"
+					: "";
+				const message = chain.turns === 0 && !stallResumed ? scheduledTimePrefix() + prefix + answerBlock + task.prompt + resumeKbHint : prefix + "继续。";
 				const send = await engine.send(agent, message, {
 					// Same creator-identity re-attachment as single-turn runs: guarded
 					// tools authorize against the LIVE role on every turn.
@@ -748,13 +756,18 @@ async function main(): Promise<void> {
 		// the KB was empty because sedimentation was suggestion-level and the model
 		// skipped it). After a done outcome, run one dedicated turn that REQUIRES
 		// the KB write-back; silent and best-effort — must never break the run.
-		if (outcome === "done" && config.all().kb.enabled && config.all().kb.learn.enabled) {
+		const kbLearnOn = config.all().kb.enabled && config.all().kb.learn.enabled;
+		if (kbLearnOn && (outcome === "done" || outcome === "stalled" || outcome === "human" || outcome === "budget" || outcome === "error")) {
 			try {
 				const learnPrefix = buildAutonomousTurnPrefix({
 					turn: chain.turns, budget,
 					kbEnabled: true, kbLearn: true,
 				});
-				const learnSend = await engine.send(agent, learnPrefix + `任务「${task.title}」已完成。收尾要求：把本次执行中值得沉淀的经验用 save_to_knowledge 写入知识库——重点是踩过的坑与解法、关键路径/目录/参数/坐标、下次可直接复用的做法；若确实没有值得沉淀的内容，直接回复完成即可。`, {
+				// ephemeral: the learn Q/A must NOT enter the chain conversation
+				// history — otherwise a human-resume's "上一轮问题的回复" pairs
+				// against the learn turn instead of the actual question.
+				const learnSend = await engine.send(agent, learnPrefix + buildLearnTurnAsk(outcome, task.title), {
+					ephemeral: true,
 					...(task.created_by ? { actor: { senderId: task.created_by, channel: "scheduler" as const, chatType: "single" as const } } : {}),
 				});
 				// engine.send resolves (not throws) on model-service stalls — a failed
@@ -762,9 +775,14 @@ async function main(): Promise<void> {
 				if (learnSend.deterministic || learnSend.error) {
 					appendAppLog(`[sched] chain ${task.id} auto-learn turn failed (deterministic=${!!learnSend.deterministic}, error=${learnSend.error?.slice(0, 80) ?? "none"}); skipped`);
 				} else {
-					appendAppLog(`[sched] chain ${task.id} (${task.title}) done; auto-learn turn ok`);
+					appendAppLog(`[sched] chain ${task.id} (${task.title}) outcome=${outcome}; auto-learn turn ok`);
 					if (task.conversation_id) {
-						await im.pushToConversation(task.conversation_id, "📌 已把本次任务的经验沉淀到知识库，下次同类任务直接复用。");
+						const stuckNote = outcome === "error"
+							? "📌 已把本次的卡点沉淀到知识库（卡在哪、已尝试什么、下次建议）。"
+							: "📌 已把本次的卡点沉淀到知识库（卡在哪、已尝试什么、下次建议），恢复后会先查经验再继续。";
+						await im.pushToConversation(task.conversation_id, outcome === "done"
+							? "📌 已把本次任务的经验沉淀到知识库，下次同类任务直接复用。"
+							: stuckNote);
 					}
 				}
 			} catch (err) {
@@ -775,7 +793,7 @@ async function main(): Promise<void> {
 		// Deliver the outcome to the target chat (markers stripped by the parser).
 		if (task.conversation_id) {
 			const resumeHint = `\n\n回复「继续 ${task.title}」重置预算继续；不回复则保持暂停。`;
-			const stalledHint = `\n\n通常是模型服务或中转临时不可用，不是任务内容的问题。排查并处理后任务可从断点原地继续：\n① 检查模型服务状态，或在 设置 → 自定义模型 顶部把其他模型「设为默认」并保存；\n② 恢复任务（resume_scheduled_task 或回复「继续 ${task.title}」）；\n③ 恢复成功后我会把现象与解法沉淀进知识库，下次自动规避。`;
+			const stalledHint = `\n\n通常是模型服务或中转临时不可用，不是任务内容的问题。排查并处理后任务可从断点原地继续：\n① 检查模型服务状态，或在 设置 → 自定义模型 顶部把其他模型「设为默认」并保存；\n② 恢复任务（resume_scheduled_task 或回复「继续 ${task.title}」）；\n③ 恢复成功后会先检索知识库里的卡点记录再继续（本次卡点已自动沉淀）。`;
 			const pushText =
 				outcome === "done"
 					? `✅ **自主任务完成：${task.title}**（共 ${chain.turns} 轮）\n\n${lastText}`

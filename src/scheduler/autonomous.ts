@@ -86,6 +86,27 @@ export function parseChainState(raw: string | null | undefined): AutonomousChain
 export const STALL_QUIET_RETRIES = 2;
 export const STALL_RETRY_BASE_MS = 60_000;
 
+/**
+ * Closing-turn ask for the auto-sediment round. done summarizes reusable wins;
+ * EVERY other outcome (stalled/human/budget/error) records the blocker —
+ * tasks that keep dying at the same step never reach done, so without this
+ * the auto-sediment never fires for exactly the tasks that need it most
+ * (field 2026-10-06: game VE stalled at screenshots repeatedly, KB empty).
+ */
+export function buildLearnTurnAsk(outcome: "done" | "stalled" | "human" | "budget" | "error", title: string): string {
+	if (outcome === "done") {
+		return `任务「${title}」已完成。收尾要求：把本次执行中值得沉淀的经验用 save_to_knowledge 写入知识库——重点是踩过的坑与解法、关键路径/目录/参数/坐标、下次可直接复用的做法；若确实没有值得沉淀的内容，直接回复完成即可。`;
+	}
+	const why = outcome === "human"
+		? "暂停等待人工输入"
+		: outcome === "stalled"
+			? "因模型服务停滞而中断"
+			: outcome === "budget"
+				? "预算用尽而暂停"
+				: "出错终止";
+	return `任务「${title}」本轮${why}。收尾要求：把本次的卡点用 save_to_knowledge 写入知识库——卡在哪一步、已尝试过什么、报错或现象要点、下次恢复时的建议（先查已有经验，避免重复无效尝试）；若确实没有值得记录的内容，直接回复完成即可。`;
+}
+
 export function nextStallStep(stallCount: number): { action: "retry"; backoffMs: number } | { action: "escalate" } {
 	if (stallCount <= STALL_QUIET_RETRIES) {
 		return { action: "retry", backoffMs: STALL_RETRY_BASE_MS * stallCount };
