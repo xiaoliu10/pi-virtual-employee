@@ -41,6 +41,7 @@ import { createFilesystemTools } from "./tools/filesystem.js";
 import { createDownloadTools } from "./tools/downloads.js";
 import { createSaveReportTool } from "./tools/reports.js";
 import { createSendImageTool, type ImageSenderResolver } from "./tools/send-image.js";
+import { createViewImageTool } from "./tools/view-image.js";
 import { createManageAdminTool, createUpdateIdentityTool, type AdminToolDeps } from "./tools/admin.js";
 import { createManageUpdateTool, type UpdateOperations } from "./tools/update.js";
 import { createManageCapabilitiesTool } from "./tools/capabilities.js";
@@ -291,6 +292,9 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 	// Inline image delivery — degrades to a text notice when the channel can't send
 	// images, so it's safe to always register.
 	tools.push(createSendImageTool(options.resolveImageSender, options.conversationId));
+	// Let the model actually SEE local screenshots (shell/adb captures land on
+	// disk only; without this the model can never analyze its own screenshots).
+	tools.push(createViewImageTool(options.isVisionModel));
 	// Guarded config tools — always registered; the tools themselves enforce
 	// sender identity (1:1 IM + admin whitelist / explicit confirmation).
 	const adminDeps: AdminToolDeps = {
