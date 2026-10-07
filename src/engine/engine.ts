@@ -1161,6 +1161,44 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/**
+	 * After a successful account login, make sure a supplier handle exists for
+	 * the provider so its registry models show up in the switcher and the
+	 * conversation dropdown (availableModels enumerates suppliers, and the
+	 * AccountLoginSection login path writes only a credential — without this
+	 * the login would succeed yet the provider's models would never appear).
+	 * Idempotent: reuses an existing supplier for the provider (re-enabling it
+	 * if disabled); the config models array stays empty — the pi-ai registry
+	 * is the source of truth for authProvider suppliers.
+	 */
+	private ensureAuthSupplier(providerId: AuthCatalogProviderId): void {
+		try {
+			const suppliers = this.config.all().model.suppliers;
+			const existing = suppliers.find((supplier) => supplier.authProvider === providerId);
+			if (existing?.enabled) return;
+			const label = AUTH_PROVIDER_LABELS[providerId];
+			const next = existing
+				? suppliers.map((supplier) => (supplier.authProvider === providerId ? { ...supplier, enabled: true } : supplier))
+				: [...suppliers, {
+					id: `auth-${providerId}`,
+					name: label.name,
+					enabled: true,
+					apiType: "openai" as const,
+					baseUrl: "",
+					apiKey: "",
+					models: [] as string[],
+					authProvider: providerId,
+				}];
+			// Array patches replace wholesale (deepMerge assigns arrays directly).
+			this.config.update({ model: { suppliers: next } });
+			this.markConfigChanged();
+		} catch (err) {
+			// Never fail the login itself over the supplier handle; the user can
+			// still add it manually via the catalog in 设置 → 自定义模型.
+			console.warn(`[engine] ensureAuthSupplier(${providerId}) failed:`, err instanceof Error ? err.message : err);
+		}
+	}
+
+	/**
 	 * Start a login flow for a catalog provider. Returns the initial state
 	 * immediately; all further progress (OAuth url, device code, prompts,
 	 * done/error/cancelled) arrives as AuthLoginState snapshots through the
@@ -1290,6 +1328,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 					if (!key) throw new Error("API Key 不能为空");
 					await this.credentialStore.modify(providerId, async () => ({ type: "api_key" as const, key }));
 				}
+				this.ensureAuthSupplier(providerId);
 				finish("done", "登录成功，凭证已保存");
 			} catch (err) {
 				if (controller.signal.aborted) {
