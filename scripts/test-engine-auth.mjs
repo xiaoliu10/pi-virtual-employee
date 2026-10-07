@@ -397,6 +397,24 @@ test("successful login ensures an authProvider supplier so registry models enter
 	assert.ok(options.some((option) => option.modelId === "fake-model"));
 });
 
+test("relogin while the auth supplier is already enabled keeps exactly one entry", async (t) => {
+	const { engine } = makeEngine(t, { extraProviders: [fakeOAuthProvider()] });
+	const login = async () => {
+		const bridge = captureBridge();
+		engine.authLogin("anthropic", bridge);
+		const selectPrompt = await bridge.waitFor((s) => s.prompt?.type === "select");
+		engine.authLoginAnswer(selectPrompt.prompt.id, "acct-a");
+		const textPrompt = await bridge.waitFor((s) => s.prompt?.type === "text");
+		engine.authLoginAnswer(textPrompt.prompt.id, "c123");
+		await bridge.waitFor((s) => s.status === "done");
+	};
+	await login();
+	await login();
+	const suppliers = engine.config.all().model.suppliers.filter((supplier) => supplier.authProvider === "anthropic");
+	assert.equal(suppliers.length, 1);
+	assert.equal(suppliers[0].enabled, true);
+});
+
 test("login supplier ensure is idempotent and re-enables a disabled supplier", async (t) => {
 	const { engine } = makeEngine(t, { extraProviders: [fakeOAuthProvider()] });
 	// Pre-seed a DISABLED supplier for the provider (as if the user disabled it earlier).

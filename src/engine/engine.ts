@@ -1170,14 +1170,20 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * if disabled); the config models array stays empty — the pi-ai registry
 	 * is the source of truth for authProvider suppliers.
 	 */
-	private ensureAuthSupplier(providerId: AuthCatalogProviderId): void {
+	private ensureAuthSupplier(providerId: AuthCatalogProviderId): boolean {
 		try {
 			const suppliers = this.config.all().model.suppliers;
 			const existing = suppliers.find((supplier) => supplier.authProvider === providerId);
-			if (existing?.enabled) return;
+			if (existing?.enabled) return true;
 			const label = AUTH_PROVIDER_LABELS[providerId];
+			// Re-enable only the FIRST supplier for the provider (legacy duplicates stay as-is).
+			let reenabled = false;
 			const next = existing
-				? suppliers.map((supplier) => (supplier.authProvider === providerId ? { ...supplier, enabled: true } : supplier))
+				? suppliers.map((supplier) => {
+					if (supplier.authProvider !== providerId || reenabled) return supplier;
+					reenabled = true;
+					return { ...supplier, enabled: true };
+				})
 				: [...suppliers, {
 					id: `auth-${providerId}`,
 					name: label.name,
@@ -1191,10 +1197,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// Array patches replace wholesale (deepMerge assigns arrays directly).
 			this.config.update({ model: { suppliers: next } });
 			this.markConfigChanged();
+			return true;
 		} catch (err) {
 			// Never fail the login itself over the supplier handle; the user can
 			// still add it manually via the catalog in 设置 → 自定义模型.
 			console.warn(`[engine] ensureAuthSupplier(${providerId}) failed:`, err instanceof Error ? err.message : err);
+			return false;
 		}
 	}
 
@@ -1328,8 +1336,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 					if (!key) throw new Error("API Key 不能为空");
 					await this.credentialStore.modify(providerId, async () => ({ type: "api_key" as const, key }));
 				}
-				this.ensureAuthSupplier(providerId);
-				finish("done", "登录成功，凭证已保存");
+				const ensured = this.ensureAuthSupplier(providerId);
+				finish("done", ensured
+					? "登录成功，凭证已保存"
+					: "登录成功，凭证已保存（模型列表同步失败，请从 设置 → 自定义模型 目录手动添加）");
 			} catch (err) {
 				if (controller.signal.aborted) {
 					finish("cancelled", "登录已取消");
