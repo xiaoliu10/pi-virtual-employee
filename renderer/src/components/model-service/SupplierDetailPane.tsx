@@ -3,7 +3,7 @@ import type { ModelConfig, Supplier } from "../../lib/types";
 import { api } from "../../lib/ipc";
 import { Toggle } from "./Toggle";
 import { EditModelDialog, contextBadge, type ModelOverridePatch } from "./EditModelDialog";
-import { ImageToggle } from "./ImageToggle";
+import { ImageCheckboxChip } from "./ImageToggle";
 
 interface SupplierDetailPaneProps {
 	supplier: Supplier | null;
@@ -205,9 +205,9 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 											{supportsImage && <span title="支持图片输入" className="text-[11px]">🖼️</span>}
 											{isDefault && <span className="rounded-md bg-blue-100 px-1.5 py-0.5 text-[11px] font-medium text-blue-600">默认</span>}
 										</button>
-										<ImageToggle
-											explicit={supplier.modelImage?.[modelId]}
-											effective={supportsImage}
+										<ImageCheckboxChip
+											checked={supportsImage}
+											inherited={supplier.modelImage?.[modelId] === undefined}
 											onChange={(val) => applyModelPatch(modelId, { image: val })}
 										/>
 										{!isDefault && supplier.enabled && (
