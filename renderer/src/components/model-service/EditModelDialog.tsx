@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Supplier } from "../../lib/types";
 import { ImageCheckboxChip, TextInputChip } from "./ImageToggle";
+import { resolveImageChecked } from "../../lib/model-image";
 
 /** Format a token count the way the reference UI does: 1M / 200K / raw. */
 export function contextBadge(tokens: number | undefined): string | null {
@@ -89,8 +90,10 @@ export function EditModelDialog(props: EditModelDialogProps) {
 									<div className="flex items-center gap-2">
 										<TextInputChip />
 										<ImageCheckboxChip
-											checked={image === "inherit" ? props.effectiveImage : image}
+											checked={resolveImageChecked(image === "inherit" ? undefined : image, props.effectiveImage)}
 											inherited={image === "inherit"}
+											label={`${modelId} 图片输入`}
+											recoveryHint={image === "inherit" ? undefined : "点「恢复默认」回到继承"}
 											onChange={(val) => setImage(val)}
 										/>
 									</div>
@@ -104,6 +107,7 @@ export function EditModelDialog(props: EditModelDialogProps) {
 				<div className="mt-6 flex items-center justify-between">
 					<button
 						type="button"
+						title="把本表单恢复到打开时的值（图片能力回到继承）"
 						onClick={() => {
 							setContextWindow(String(supplier.modelContextWindow?.[modelId] ?? ""));
 							setMaxTokens(String(supplier.modelMaxTokens?.[modelId] ?? ""));

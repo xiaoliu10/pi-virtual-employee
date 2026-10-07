@@ -4,6 +4,7 @@ import { api } from "../../lib/ipc";
 import { Toggle } from "./Toggle";
 import { EditModelDialog, contextBadge, type ModelOverridePatch } from "./EditModelDialog";
 import { ImageCheckboxChip } from "./ImageToggle";
+import { nextModelImage, resolveImageChecked } from "../../lib/model-image";
 
 interface SupplierDetailPaneProps {
 	supplier: Supplier | null;
@@ -78,13 +79,9 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 			else next[modelId] = n;
 			return Object.keys(next).length ? next : undefined;
 		};
-		let imageMap = supplier.modelImage;
-		if (patch.image !== undefined) {
-			const next = { ...(supplier.modelImage ?? {}) };
-			if (patch.image === "inherit") delete next[modelId];
-			else next[modelId] = patch.image;
-			imageMap = Object.keys(next).length ? next : undefined;
-		}
+		const imageMap = patch.image === undefined
+			? supplier.modelImage
+			: nextModelImage(supplier.modelImage, modelId, patch.image);
 		props.onUpdate({
 			modelContextWindow: mergeTokens(supplier.modelContextWindow, patch.contextWindow),
 			modelMaxTokens: mergeTokens(supplier.modelMaxTokens, patch.maxTokens),
@@ -206,8 +203,10 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 											{isDefault && <span className="rounded-md bg-blue-100 px-1.5 py-0.5 text-[11px] font-medium text-blue-600">默认</span>}
 										</button>
 										<ImageCheckboxChip
-											checked={supportsImage}
+											checked={resolveImageChecked(supplier.modelImage?.[modelId], supportsImage)}
 											inherited={supplier.modelImage?.[modelId] === undefined}
+											label={`${modelId} 图片输入`}
+											recoveryHint={supplier.modelImage?.[modelId] === undefined ? undefined : "已强制指定；点模型名进对话框点「恢复默认」可回到继承"}
 											onChange={(val) => applyModelPatch(modelId, { image: val })}
 										/>
 										{!isDefault && supplier.enabled && (
@@ -219,7 +218,7 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 							})}
 							{supplier.models.length === 0 && <div className="w-full rounded-xl border border-dashed border-slate-200 px-4 py-7 text-center text-sm text-slate-400">还没有模型，请在下方添加模型 ID。</div>}
 						</div>
-						<p className="mt-2 text-xs text-slate-400">点击模型可编辑上下文窗口、最大输出与输入类型；徽标为该模型的上下文窗口（未设置则继承默认，不显示）。</p>
+						<p className="mt-2 text-xs text-slate-400">点击模型可编辑上下文窗口、最大输出与输入类型；徽标为该模型的上下文窗口（未设置则继承默认，不显示）。图片勾选 = 强制声明支持，取消 = 强制关闭；撤销强制指定（回到继承）请点模型名进对话框点「恢复默认」。</p>
 
 						<div className="mt-3 flex gap-2">
 							<input value={newModel} onChange={(event) => setNewModel(event.target.value)} onKeyDown={(event) => event.key === "Enter" && submitModel()} className={inputCls} placeholder="模型 ID，例如 claude-sonnet-4-5 / gpt-4o" />
