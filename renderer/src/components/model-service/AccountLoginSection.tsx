@@ -169,9 +169,9 @@ export function AccountLoginSection({ onCreateSupplier }: AccountLoginSectionPro
 
 				<section className="space-y-2.5">
 					{(catalog?.providers ?? []).map((entry) => {
-						// openai-chatgpt has no registered pi-ai implementation yet: keep it
-						// visible but greyed out (unconfigured + zero models = unavailable in
-						// this build). Recovers automatically once pi-ai registers it.
+						// A catalog id without a registered pi-ai provider (unconfigured +
+						// zero models) stays visible but greyed out — it recovers
+						// automatically once pi-ai registers it.
 						const unavailable = !entry.configured && entry.models.length === 0;
 						const badge = badgeOf(entry);
 						const busy = busyProvider === entry.provider;
