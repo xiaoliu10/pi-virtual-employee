@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Supplier } from "../../lib/types";
-import { ImageToggle } from "./ImageToggle";
+import { ImageCheckboxChip, TextInputChip } from "./ImageToggle";
+import { resolveImageChecked } from "../../lib/model-image";
 
 /** Format a token count the way the reference UI does: 1M / 200K / raw. */
 export function contextBadge(tokens: number | undefined): string | null {
@@ -84,21 +85,20 @@ export function EditModelDialog(props: EditModelDialogProps) {
 						</button>
 						{advanced && (
 							<div className="mt-3 space-y-4 rounded-xl border border-slate-100 bg-slate-50/60 p-4">
-								<div>
-									<span className="mb-2 block text-sm font-medium text-slate-800">输入类型</span>
+								<section>
+									<h4 className="mb-2 text-sm font-medium text-slate-800">输入类型</h4>
 									<div className="flex items-center gap-2">
-										<span className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600">✓ 文本</span>
-										<div className="flex items-center gap-2">
-											<span className="text-xs text-slate-500">图片</span>
-											<ImageToggle
-												explicit={supplier.modelImage?.[modelId]}
-												effective={props.effectiveImage}
-												onChange={(val) => setImage(val)}
-											/>
-										</div>
+										<TextInputChip />
+										<ImageCheckboxChip
+											checked={resolveImageChecked(image === "inherit" ? undefined : image, props.effectiveImage)}
+											inherited={image === "inherit"}
+											label={`${modelId} 图片输入`}
+											recoveryHint={image === "inherit" ? undefined : "点「恢复默认」回到继承"}
+											onChange={(val) => setImage(val)}
+										/>
 									</div>
-									<p className="mt-2 text-xs text-slate-400">当前生效：{props.effectiveImage ? "支持图片输入" : "仅文本"}（继承基础注册表，可在此强制指定）。</p>
-								</div>
+									<p className="mt-2 text-xs text-slate-400">能力声明应与服务商提供的模型一致；点「恢复默认」回到继承。</p>
+								</section>
 							</div>
 						)}
 					</div>
@@ -107,6 +107,7 @@ export function EditModelDialog(props: EditModelDialogProps) {
 				<div className="mt-6 flex items-center justify-between">
 					<button
 						type="button"
+						title="把本表单恢复到打开时的值（图片能力回到继承）"
 						onClick={() => {
 							setContextWindow(String(supplier.modelContextWindow?.[modelId] ?? ""));
 							setMaxTokens(String(supplier.modelMaxTokens?.[modelId] ?? ""));
@@ -114,7 +115,7 @@ export function EditModelDialog(props: EditModelDialogProps) {
 						}}
 						className="rounded-xl px-4 py-2.5 text-sm font-medium text-slate-500 hover:bg-slate-100"
 					>
-						重置表单
+						恢复默认
 					</button>
 					<div className="flex gap-3">
 						<button type="button" onClick={props.onClose} className="rounded-xl border border-slate-200 bg-white px-5 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50">取消</button>
