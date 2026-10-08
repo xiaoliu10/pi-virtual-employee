@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/ipc";
-import type { AppConfig, ImChannelConfig, IMChannel, ScheduledTaskRow, UpdateState } from "../lib/types";
+import type { AppConfig, ImChannelConfig, IMChannel, ScheduledTaskRow, UpdateState, WorkItemView } from "../lib/types";
 import { ModelServiceSection } from "../components/ModelServiceSection";
 import { KnowledgeSection } from "../components/KnowledgeSection";
 import { MigrationSection } from "../components/MigrationSection";
@@ -159,6 +159,17 @@ const SHELL_TIMEOUT_FIELDS = [
 	{ key: "pollTimeoutSec", label: "后台任务单次等待时间（秒）", fallback: 30, hint: "查询后台任务时，最多阻塞等待的默认秒数，0 = 立即返回。等待结束不会终止进程；长任务可调大以减少轮询次数。" },
 ] as const;
 
+/** 自主任务状态徽标（设置页 → 定时任务与自主任务 → 自主任务 tab）。 */
+const WORK_STATUS: Record<string, { label: string; cls: string }> = {
+	proposed: { label: "已提议", cls: "bg-slate-100 text-slate-500" },
+	queued: { label: "待执行", cls: "bg-slate-100 text-slate-600" },
+	working: { label: "执行中", cls: "bg-blue-50 text-blue-600" },
+	waiting_human: { label: "等待人工", cls: "bg-amber-50 text-amber-600" },
+	scheduled: { label: "已排期", cls: "bg-indigo-50 text-indigo-600" },
+	done: { label: "已完成", cls: "bg-emerald-50 text-emerald-600" },
+	cancelled: { label: "已取消", cls: "bg-rose-50 text-rose-500" },
+};
+
 export function SettingsPage({ config, onChange, updater, onClose }: SettingsPageProps) {
 	const [tab, setTab] = useState<Tab>("model");
 	const [contentTab, setContentTab] = useState<ContentTab>("resources");
@@ -170,8 +181,17 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 	const [promptPreview, setPromptPreview] = useState<string | null>(null);
 	const [schedTasks, setSchedTasks] = useState<ScheduledTaskRow[]>([]);
 	const refreshSched = () => api.listScheduledTasks().then(setSchedTasks).catch(() => {});
+	const [taskTab, setTaskTab] = useState<"scheduled" | "work">("scheduled");
+	const [workItems, setWorkItems] = useState<WorkItemView[]>([]);
+	const refreshWork = () => api.listWorkItems().then(setWorkItems).catch(() => {});
 	useEffect(() => {
-		if (tab === "tasks") void refreshSched();
+		if (tab !== "tasks") return;
+		void refreshSched();
+		void refreshWork();
+		// Work items change status from the IM side (resume answers, window
+		// pushes fire im:activity with the work: conversation id) — keep both
+		// lists live while the tab is open.
+		return api.onImActivity(() => { void refreshSched(); void refreshWork(); });
 	}, [tab]);
 	// Raw text for the allowed-domains editor — kept separate from the parsed
 	// array so the textarea can retain newlines while typing (a derived value
@@ -282,8 +302,8 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 				<div className="flex min-w-0 flex-1 flex-col bg-white">
 					<header className="flex h-[82px] shrink-0 items-center justify-between border-b border-slate-100 px-8">
 						<div>
-							<h1 className="text-2xl font-semibold tracking-tight text-[#1d1d1f]">{tab === "model" ? "自定义模型" : tab === "knowledge" ? "知识库" : tab === "content" ? "内容中心" : tab === "skills" ? "技能" : tab === "im" ? "IM 机器人" : tab === "prompt" ? "提示词" : tab === "tasks" ? "定时任务" : tab === "migrate" ? "迁移与复制" : "通用"}</h1>
-							{tab !== "model" && <p className="mt-1 text-xs text-[#a1a1a6]">{tab === "knowledge" ? "可配置、可插拔的知识库：内置混合检索 + 外接 RAG。" : tab === "content" ? "交付资料库（既有可复用资料）与任务产物（生成的带版本输出）统一在此管理。" : tab === "skills" ? "管理内置与导入的技能（SKILL.md），启停、导入、删除。技能以声明式指令注入提示词。" : tab === "im" ? "连接即时通讯渠道，让虚拟员工随时响应。" : tab === "prompt" ? "自定义员工的内置行为规则与追加指令，保存后新对话生效。" : tab === "tasks" ? "在对话中创建定时任务，系统到点自动执行；此处可查看与管理。" : tab === "migrate" ? "把当前员工打包导出（.pve），或导入员工包：克隆为新员工 / 覆盖当前员工，支持跨机器迁移。" : "管理员工身份与系统行为。"}</p>}
+							<h1 className="text-2xl font-semibold tracking-tight text-[#1d1d1f]">{tab === "model" ? "自定义模型" : tab === "knowledge" ? "知识库" : tab === "content" ? "内容中心" : tab === "skills" ? "技能" : tab === "im" ? "IM 机器人" : tab === "prompt" ? "提示词" : tab === "tasks" ? "定时任务与自主任务" : tab === "migrate" ? "迁移与复制" : "通用"}</h1>
+							{tab !== "model" && <p className="mt-1 text-xs text-[#a1a1a6]">{tab === "knowledge" ? "可配置、可插拔的知识库：内置混合检索 + 外接 RAG。" : tab === "content" ? "交付资料库（既有可复用资料）与任务产物（生成的带版本输出）统一在此管理。" : tab === "skills" ? "管理内置与导入的技能（SKILL.md），启停、导入、删除。技能以声明式指令注入提示词。" : tab === "im" ? "连接即时通讯渠道，让虚拟员工随时响应。" : tab === "prompt" ? "自定义员工的内置行为规则与追加指令，保存后新对话生效。" : tab === "tasks" ? "定时任务到点自动执行；自主任务由员工自行判断节奏持续跟进。两者均可在此查看与管理。" : tab === "migrate" ? "把当前员工打包导出（.pve），或导入员工包：克隆为新员工 / 覆盖当前员工，支持跨机器迁移。" : "管理员工身份与系统行为。"}</p>}
 						</div>
 						<button type="button" onClick={cancel} className="rounded-xl p-2 text-2xl leading-none text-[#a1a1a6] transition hover:bg-black/[0.045] hover:text-[#1d1d1f]" aria-label="关闭设置">×</button>
 					</header>
@@ -370,6 +390,51 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 						) : tab === "tasks" ? (
 							<div className="min-h-0 flex-1 overflow-y-auto bg-[#fafbfc] px-10 py-8">
 								<div className="mx-auto max-w-2xl space-y-5">
+									<div className="flex w-fit items-center gap-1 rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
+										{([["scheduled", "定时任务"], ["work", "自主任务"]] as const).map(([key, label]) => (
+											<button key={key} type="button" onClick={() => setTaskTab(key)}
+												className={`rounded-lg px-3.5 py-1.5 text-xs font-medium transition-colors ${taskTab === key ? "bg-slate-800 text-white" : "text-slate-500 hover:bg-slate-50"}`}>{label}</button>
+										))}
+									</div>
+									{taskTab === "work" ? (
+										<section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+											<div className="mb-3 flex items-center justify-between">
+												<div>
+													<h3 className="text-[15px] font-semibold text-slate-800">自主任务（{workItems.length}）</h3>
+													<p className="mt-1 text-xs text-slate-400">需要持续判断跟进的工作：员工自己决定观察点与节奏，卡住时暂停等人。恢复 / 回答在 IM 对话里进行。</p>
+												</div>
+												<button type="button" onClick={() => void refreshWork()} className="text-xs font-medium text-blue-600 hover:text-blue-700">刷新</button>
+											</div>
+											<div className="space-y-2">
+												{workItems.length === 0 && <div className="text-xs text-slate-400">暂无自主任务。可在 IM 对话里描述一个需要持续跟进的目标让员工创建，例如「每天盯着对账异常，发现问题直接在群里说」。</div>}
+												{workItems.map((w) => {
+													const badge = WORK_STATUS[w.status] ?? { label: w.status, cls: "bg-slate-100 text-slate-500" };
+													return (
+														<div key={w.id} className="rounded-xl border border-slate-200 bg-[#f7f8fa] px-4 py-3 text-sm">
+															<div className="flex items-center gap-2">
+																<span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${badge.cls}`}>{badge.label}</span>
+																<span className="truncate font-medium text-slate-700">{w.title}</span>
+																<span className="ml-auto shrink-0 text-[11px] text-slate-400">{new Date(w.updated_at).toLocaleString("zh-CN", { hour12: false })}</span>
+															</div>
+															{w.goal && <div className="mt-1 line-clamp-1 text-xs text-slate-500">目标：{w.goal}</div>}
+															{w.status === "waiting_human" && w.question && (
+																<div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-700">
+																	<span className="font-medium">等待人工：</span>{w.question}
+																</div>
+															)}
+															{w.progress && <div className="mt-1 line-clamp-2 text-xs text-slate-400">进展：{w.progress}</div>}
+															<div className="mt-1 text-[11px] text-slate-400">
+																{w.next_check_at ? `下次跟进 ${new Date(w.next_check_at).toLocaleString("zh-CN", { hour12: false })}` : "无排期"}
+																{w.remind_count > 0 ? ` · 已提醒 ${w.remind_count} 次` : ""}
+																{w.created_by ? ` · 发起 ${w.created_by}` : ""}
+															</div>
+														</div>
+													);
+												})}
+											</div>
+										</section>
+									) : (
+									<>
 									<label className="flex cursor-pointer items-center justify-between rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
 										<div><div className="text-sm font-medium text-slate-800">启用定时任务</div><div className="mt-1 text-xs text-slate-400">开启后，员工可在对话中创建定时任务；系统到点自动执行（每分钟检查一次）。</div></div>
 										<input type="checkbox" checked={draft.scheduler.enabled} onChange={(e) => setDraft((v) => v ? { ...v, scheduler: { enabled: e.target.checked } } : v)} className="h-5 w-5 accent-blue-500" />
@@ -397,6 +462,8 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 											))}
 										</div>
 									</section>
+									</>
+									)}
 								</div>
 							</div>
 						) : (

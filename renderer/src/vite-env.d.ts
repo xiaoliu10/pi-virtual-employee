@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 
-import type { AppConfig, ExternalDoc, ExternalProviderConfig, KbGap, KnowledgeDoc, KnowledgeEntry, ModelConfig, ResourceInput, ResourceRow, ScheduledTaskRow, SearchHit, SkillInfo, Supplier, UpdateState, VectorStatus } from "./lib/types";
+import type { AppConfig, ExternalDoc, ExternalProviderConfig, KbGap, KnowledgeDoc, KnowledgeEntry, ModelConfig, ResourceInput, ResourceRow, ScheduledTaskRow, SearchHit, SkillInfo, Supplier, UpdateState, VectorStatus, WorkItemView } from "./lib/types";
 import type { ConversationRow, MessageRow } from "./lib/types";
 
 /** Whitelisted API bridged by electron/preload.ts. Kept in sync manually. */
@@ -13,6 +13,7 @@ export interface RendererApi {
 	previewPrompt(): Promise<string>;
 	defaultPromptRules(): Promise<string>;
 	listScheduledTasks(): Promise<ScheduledTaskRow[]>;
+	listWorkItems(): Promise<WorkItemView[]>;
 	deleteScheduledTask(id: string): Promise<boolean>;
 	toggleScheduledTask(id: string, enabled: boolean): Promise<boolean>;
 	testReportTarget(): Promise<{ ok: boolean; detail: string }>;

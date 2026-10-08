@@ -1276,6 +1276,8 @@ async function main(): Promise<void> {
 
 	// --- Scheduled-task management (settings UI) ---
 	ipcMain.handle("tasks:schedList", () => scheduler.list());
+	// Autonomous work items (settings UI): the store orders by updated_at DESC.
+	ipcMain.handle("tasks:workList", () => engine.workItems?.list() ?? []);
 	ipcMain.handle("tasks:schedDelete", (_e, id: string) => {
 		scheduler.delete(id);
 		return true;
