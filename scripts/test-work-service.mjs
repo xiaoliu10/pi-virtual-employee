@@ -760,11 +760,18 @@ test("transient send failure is absorbed by quiet backoff retries — no executi
 	let calls = 0;
 	const h = fixture(t, { send: () => {
 		calls += 1;
-		if (calls <= 2) return { error: "Connection error." };
+		if (calls === 1) return { deterministic: true, reply: "很抱歉，刚才没有产出" };
+		if (calls === 2) return { error: "Connection error." };
 		return { reply: "核对全部完成\n[[TASK_DONE]]" };
 	} });
 	const item = h.create();
 	h.service.start(); await flush();
+	// L1 (review 2026-10-08): the backoff is REALLY waiting — a pending timer
+	// at ~+60s must exist before the clock advances.
+	assert.ok([...h.clock.timers.values()].some(timer => {
+		const due = timer.at - h.clock.time;
+		return due > 55_000 && due <= 60_000;
+	}), "first backoff timer armed at ~60s");
 	await h.clock.advance(10 * 60_000); await flush();
 	assert.equal(h.store.get(item.id).status, "done", "item completes after retries absorb the blip");
 	assert.equal(calls, 3, "2 quiet retries + the successful attempt");
@@ -772,7 +779,7 @@ test("transient send failure is absorbed by quiet backoff retries — no executi
 });
 
 test("persistent send failure escalates to the execution-error pause after graded retries", async t => {
-	const h = fixture(t, { send: () => ({ error: "Connection error." }) });
+	const h = fixture(t, { send: () => ({ deterministic: true, reply: "很抱歉，刚才没有产出" }) });
 	const item = h.create();
 	h.service.start(); await flush();
 	await h.clock.advance(10 * 60_000); await flush();
@@ -780,4 +787,17 @@ test("persistent send failure escalates to the execution-error pause after grade
 	assert.equal(h.store.get(item.id).status, "waiting_human");
 	assert.ok(h.pushes.some(p => /执行出错/.test(p.text)), "honest error pause after retries exhausted");
 	assert.ok(h.errors.length >= 1, "onError recorded for observability");
+});
+
+test("a stop landing during backoff does not fire another send (review H1)", async t => {
+	let calls = 0;
+	const h = fixture(t, { send: () => { calls += 1; return { error: "Connection error." }; } });
+	const item = h.create();
+	h.service.start(); await flush();
+	assert.equal(calls, 1, "first attempt made, now inside backoff");
+	const stopped = h.service.stop();
+	await h.clock.advance(10 * 60_000); await flush();
+	await stopped;
+	assert.equal(calls, 1, "no resend after a stop landing during the backoff");
+	assert.equal(h.store.get(item.id).status, "waiting_human");
 });
