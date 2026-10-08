@@ -339,6 +339,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 	private readonly turnIds = new Map<string, string>();
 	/** Abort reason noted mid-turn (watchdog / user stop) applied to the row. */
 	private readonly turnAborts = new Map<string, string>();
+	/** Conversation ids parked in a transient-retry backoff wait. isStreaming is
+	 * false during the sleep, so busy/idle judgments (isIdle, abortAllTurns)
+	 * must consult this set or the ≈5-minute retry ladder is invisible to
+	 * install_now and the auto-updater (review M2). */
+	private readonly retryWaits = new Set<string>();
 	/** Tool calls made so far in the in-flight turn of each conversation. */
 	private readonly turnToolCalls = new Map<string, number>();
 
@@ -884,6 +889,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 	abortSession(conversationId: string): boolean {
 		const cached = this.sessions.get(conversationId);
 		if (!cached) return false;
+		// /stop lands HERE (not markTurnAbort) — and during a retry-backoff wait
+		// cached.abort() is a no-op (no activeRun), so the in-flight turn must be
+		// MARKED for the retry loop's checks to see the stop (review H1). The
+		// first reason wins: watchdog/install_now mark themselves before aborting.
+		if (this.turnIds.has(conversationId) && !this.turnAborts.has(conversationId)) {
+			this.turnAborts.set(conversationId, "user");
+		}
 		try {
 			cached.abort();
 		} catch {
@@ -2195,6 +2207,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 					await agent.continue();
 					return retries;
 				}
+				// Unrecoverable overflow is NOT transient (review M1): a retry
+				// would re-run force compaction (an LLM call) plus the same
+				// oversized prompt ten times. End the turn honestly instead.
+				console.warn("[engine] context overflow: recovery failed — ending the turn instead of retrying");
+				return retries;
 			}
 			const endedEmpty = this.endedWithoutText(agent);
 			if (!threwTransient && !(errorText && TRANSIENT_STREAM_ERROR.test(errorText)) && !endedEmpty) return retries;
@@ -2217,7 +2234,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// lands DURING the wait must not fire another request (same shape as
 			// the work-window H1, review 2026-10-08).
 			this.touchActivity(conversationId);
-			await (this.opts.retrySleepFn ?? sleep)(delayMs);
+			this.retryWaits.add(conversationId);
+			try {
+				await (this.opts.retrySleepFn ?? sleep)(delayMs);
+			} finally {
+				this.retryWaits.delete(conversationId);
+			}
 			if (this.turnAborts.has(conversationId)) return retries - 1;
 			threwTransient = false;
 			try {
@@ -2361,6 +2383,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	isIdle(): boolean {
 		if (hasActiveShellCommands(this.config)) return false;
 		if (this.computer?.busy) return false;
+		if (this.retryWaits.size > 0) return false; // mid-backoff: a turn is alive (review M2)
 		for (const [, agent] of this.sessions) {
 			if (agent.state.isStreaming) return false;
 		}
@@ -2376,6 +2399,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 			if (!agent.state.isStreaming) continue;
 			this.markTurnAbort(conversationId, reason);
 			this.abortSession(conversationId);
+			aborted += 1;
+		}
+		// Turns parked in a retry backoff are not isStreaming, but they ARE
+		// alive — mark them so the post-sleep check ends the loop instead of
+		// firing another request (review M2; install_now/updater depend on it).
+		for (const conversationId of this.retryWaits) {
+			this.markTurnAbort(conversationId, reason);
 			aborted += 1;
 		}
 		return aborted;

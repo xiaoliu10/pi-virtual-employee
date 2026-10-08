@@ -220,17 +220,45 @@ test("a persistent outage exhausts 10 retries (11 attempts) then surfaces the ho
 
 // ── behavioral: a stop landing during the backoff fires no further requests ──
 
-test("an abort landing during the backoff ends the loop without another request (engine-side H1)", async (t) => {
+test("a /stop landing during the backoff ends the loop without another request (engine-side H1)", async (t) => {
 	let sleeps = 0;
 	const { engine, config } = makeEngine(t, {
 		streamFn: async () => { throw new Error("Connection error."); },
-		// The stop lands DURING the first backoff wait (what /stop actually does).
-		retrySleepFn: async () => { sleeps += 1; engine.markTurnAbort("default", "user"); },
+		// Production /stop shape: manager calls engine.abortSession, NOT
+		// markTurnAbort (review H1 — the old test drove the wrong entry point).
+		retrySleepFn: async () => { sleeps += 1; engine.abortSession("conv-abort"); },
 	});
 	supplierConfig(config);
 	const agent = engine.getOrCreateSession("conv-abort");
+	// Production agents carry sessionId (set by the session factory); the stub
+	// must mirror it or send() falls back to "default" and the keys diverge.
+	agent.sessionId = "conv-abort";
 	const result = await engine.send(agent, "hi");
 	assert.equal(agent.runs, 2, "only the final-summary run after the stop — no retried request");
 	assert.equal(sleeps, 1, "loop exited at the post-sleep re-check");
 	assert.equal(result.deterministic, true, "turn ends honestly instead of resuming");
+});
+
+test("the backoff window is visible to isIdle and interruptible by abortAllTurns (review M2)", async (t) => {
+	let idleDuringWait;
+	let sleeps = 0;
+	const { engine, config } = makeEngine(t, {
+		streamFn: async () => { throw new Error("Connection error."); },
+		retrySleepFn: async () => {
+			sleeps += 1;
+			if (sleeps === 1) {
+				idleDuringWait = engine.isIdle();
+				// install_now shape: the updater only installs when isIdle clears;
+				// abortAllTurns must reach the waiting turn anyway.
+				assert.equal(engine.abortAllTurns("install_now"), 1, "the waiting turn is counted as aborted");
+			}
+		},
+	});
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-m2");
+	const result = await engine.send(agent, "hi");
+	assert.equal(idleDuringWait, false, "isIdle must be false inside the backoff window");
+	assert.equal(agent.runs, 2, "no retried request after install_now");
+	assert.equal(sleeps, 1, "loop exited at the post-sleep re-check");
+	assert.equal(result.deterministic, true);
 });
