@@ -91,6 +91,19 @@ test("a customized rule block cannot switch the integrity and security red lines
 	assert.ok(prompt.includes("## 安全红线（内置，勿删）"), "the credential red line is still injected");
 });
 
+test("skill authoring tools are taught unconditionally (field 2026-10-08: VE claimed it lacked save_to_skill)", () => {
+	// save_to_skill / refresh_skills are always-registered (skills are a built-in
+	// channel, not config-gated). The prompt MUST teach them or the model won't
+	// know it can persist a skill — field report: VE did MuMu screenshots fine,
+	// then reported "没有技能保存能力" because the prompt never mentioned the tool.
+	const allOff = buildSystemPrompt({ ...BASE, ...ALL_OFF });
+	assert.ok(allOff.includes("save_to_skill"), "save_to_skill taught even with every capability off");
+	assert.ok(allOff.includes("refresh_skills"), "refresh_skills taught unconditionally");
+	const allOn = buildSystemPrompt({ ...BASE, ...ALL_ON });
+	assert.ok(allOn.includes("save_to_skill"));
+	assert.ok(allOn.includes("refresh_skills"));
+});
+
 test("integrity rules survive with every capability disabled (minimal deployment)", () => {
 	const prompt = buildSystemPrompt({ ...BASE, ...ALL_OFF });
 	assert.ok(prompt.includes("## 数据真实性（内置，勿删）"));
