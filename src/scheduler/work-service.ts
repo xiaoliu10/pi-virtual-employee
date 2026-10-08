@@ -1,3 +1,4 @@
+import { nextStallStep, STALL_QUIET_RETRIES } from "./autonomous.js";
 /**
  * Persistent, single-window work dispatcher. No periodic polling: store lifecycle
  * events wake queued work; one timer wakes the earliest model-selected due time.
@@ -277,7 +278,25 @@ export class WorkService<Session extends WorkSession> {
 					firstWindow, lateByMs, kbSearchEnabled: kb.search, kbLearnEnabled: kb.learn,
 					lastCheck: active.dueAt ? { at: active.dueAt, reason: active.prevReason, streak: active.prevStreak ?? 0 } : undefined,
 				});
-				const result = await this.opts.send(active.session, prefix + (turn === 0 ? "请按目标与执行条件推进工作。" : "继续。"), fresh.created_by);
+				// Transient model/relay failures get quiet backoff retries (parity with
+				// the scheduled-chain stall grading, 0.2.128): an intermittent
+				// "Connection error." absorbed by a retry must not surface as an
+				// execution error. The turn does not consume budget on a retry, and
+				// only the graded exhaustion (STALL_QUIET_RETRIES + 1 attempts) falls
+				// through to the honest execution-error pause below.
+				let stallAttempt = 0;
+				let result: { reply?: string; error?: string };
+				for (;;) {
+					result = await this.opts.send(active.session, prefix + (turn === 0 ? "请按目标与执行条件推进工作。" : "继续。"), fresh.created_by);
+					if (!result.error) break;
+					stallAttempt += 1;
+					const step = nextStallStep(stallAttempt);
+					if (step.action !== "retry" || active.stopReason || !this.running) break;
+					// Error CONTENT is deliberately not logged (may carry secrets) —
+					// same discipline as the pushed text below.
+					console.warn(`[work] ${item.id.slice(0, 8)} turn ${turn + 1}: send produced no reply; silent retry ${stallAttempt}/${STALL_QUIET_RETRIES} in ${Math.round(step.backoffMs / 1000)}s`);
+					await new Promise<void>((resolve) => { this.clock.setTimeout(resolve, step.backoffMs); });
+				}
 				if (result.error) throw new Error(result.error);
 				// A turn that produced NO text (field 2026-09-29: stopReason=length with
 				// thinking-only output burned the whole output budget) has no closure and
@@ -355,7 +374,7 @@ export class WorkService<Session extends WorkSession> {
 		} catch (err) {
 			outcome = "waiting_human";
 			// Do not push raw exception strings (may include credentials/URLs).
-			question = active.stopReason ?? "执行出错，可能已产生操作；请管理员核查后明确恢复（不会自动重试）。";
+			question = active.stopReason ?? "执行出错（静默重试仍失败），可能已产生操作；请管理员核查后明确恢复。";
 			this.opts.onError?.(err);
 		} finally {
 			if (active.deadline !== undefined) this.clock.clearTimeout(active.deadline);

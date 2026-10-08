@@ -133,18 +133,23 @@ test("unparseable NEXT_CHECK no longer kills the chain (soft 1h fallback) — fi
 	assert.ok(h.clock.timers.size >= 1, "a re-check timer exists");
 });
 
-test("throws and returned errors retain staged answers, settle cleanup and wait (no unsafe retries)", async t => {
+test("throws are never retried; returned no-reply errors get graded quiet retries (user ruling 2026-10-08)", async t => {
 	for (const mode of ["throw", "error"]) {
 		const h = fixture(t, { send: () => { if (mode === "throw") throw new Error("secret=do-not-push"); return { error: "secret=do-not-push" }; } });
 		const item = h.create("waiting_human"); h.store.resume(item.id, "审批通过");
 		h.service.start(); await flush();
-		assert.equal(h.store.get(item.id).status, "waiting_human");
-		assert.equal(h.store.get(item.id).answer, "审批通过");
+		// throw: exactly one attempt (an arbitrary exception may be anything) —
+		// the window settles immediately. error (engine no-reply class): 1 + 2
+		// graded quiet retries, then the honest pause — the window is still
+		// running inside the backoff until the retries exhaust.
+		assert.equal(h.store.get(item.id).status, mode === "throw" ? "waiting_human" : "working");
+		await h.clock.advance(24 * 3_600_000); await flush();
+		assert.equal(h.store.get(item.id).status, "waiting_human", "neither mode retries forever");
+		assert.equal(h.store.get(item.id).answer, "审批通过", "staged answer retained for the next resume");
 		assert.equal(h.released.length, 1);
 		assert.equal(h.errors.length, 1);
 		assert.doesNotMatch(h.pushes[0].text, /secret|do-not-push/);
-		await h.clock.advance(24 * 3_600_000);
-		assert.equal(h.sends.length, 1);
+		assert.equal(h.sends.length, mode === "throw" ? 1 : 3);
 	}
 });
 
@@ -749,4 +754,30 @@ test("an admin update-nextCheck landing during release wins over the run's stale
 	assert.ok(push, "scheduled push still lands (row stays scheduled)");
 	assert.match(push.text, /管理员改期到两小时后/, "push announces the admin's new schedule, not the run's local one");
 	assert.doesNotMatch(push.text, /30 分钟|等批次/);
+});
+
+test("transient send failure is absorbed by quiet backoff retries — no execution-error pause", async t => {
+	let calls = 0;
+	const h = fixture(t, { send: () => {
+		calls += 1;
+		if (calls <= 2) return { error: "Connection error." };
+		return { reply: "核对全部完成\n[[TASK_DONE]]" };
+	} });
+	const item = h.create();
+	h.service.start(); await flush();
+	await h.clock.advance(10 * 60_000); await flush();
+	assert.equal(h.store.get(item.id).status, "done", "item completes after retries absorb the blip");
+	assert.equal(calls, 3, "2 quiet retries + the successful attempt");
+	assert.ok(!h.pushes.some(p => /执行出错/.test(p.text)), "no execution-error surface for an absorbed blip");
+});
+
+test("persistent send failure escalates to the execution-error pause after graded retries", async t => {
+	const h = fixture(t, { send: () => ({ error: "Connection error." }) });
+	const item = h.create();
+	h.service.start(); await flush();
+	await h.clock.advance(10 * 60_000); await flush();
+	await flush();
+	assert.equal(h.store.get(item.id).status, "waiting_human");
+	assert.ok(h.pushes.some(p => /执行出错/.test(p.text)), "honest error pause after retries exhausted");
+	assert.ok(h.errors.length >= 1, "onError recorded for observability");
 });
