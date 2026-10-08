@@ -307,7 +307,7 @@ export interface MessageRow {
 }
 
 /** A scheduled task (created in conversation or via settings, run by the scheduler). */
-/** 自主任务（work item）在设置页的只读视图 —— 字段与 WorkItemRow 对齐，仅取展示所需。 */
+/** 自主任务（work item）在设置页的只读视图 —— WorkItemRow 的投影子集（IPC 载荷同步裁剪到这些字段）。 */
 export interface WorkItemView {
 	id: string;
 	title: string;

@@ -426,7 +426,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 															<div className="mt-1 text-[11px] text-slate-400">
 																{w.next_check_at ? `下次跟进 ${new Date(w.next_check_at).toLocaleString("zh-CN", { hour12: false })}` : "无排期"}
 																{w.remind_count > 0 ? ` · 已提醒 ${w.remind_count} 次` : ""}
-																{w.created_by ? ` · 发起 ${w.created_by}` : ""}
+																{w.created_by ? ` · 确认创建 ${w.created_by}` : ""}
 															</div>
 														</div>
 													);
