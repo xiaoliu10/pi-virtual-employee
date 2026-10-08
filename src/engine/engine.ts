@@ -134,6 +134,19 @@ function extractText(message: AgentMessage): string {
 const TRANSIENT_STREAM_ERROR =
 	/terminated|fetch failed|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|ETIMEDOUT|UND_ERR|overloaded|502|503|connection error|network error/i;
 
+/** Retries AFTER the initial attempt for transient stream failures — Claude
+ * Code / zcode style: keep retrying a flaky gateway with increasing waits
+ * instead of surfacing the blip to the user (field 2026-10-08: one immediate
+ * retry was not enough for a multi-second relay outage). */
+export const TRANSIENT_RETRIES = 10;
+
+/** Backoff before retry N (1-based): 1s, 2s, 4s … capped at 60s. Total wait
+ * across all 10 retries ≈ 5 minutes — a window deliberately bounded so a
+ * hard-down gateway still reaches the honest failure path quickly enough. */
+export function transientRetryBackoffMs(retry: number): number {
+	return Math.min(1000 * 2 ** (Math.max(1, retry) - 1), 60_000);
+}
+
 /**
  * Chinese guidance for the two login-related pi-ai failure shapes (review H4):
  * an expired/failed OAuth refresh and a provider with no stored credential.
@@ -169,6 +182,10 @@ export interface EngineOptions {
 	streamFn?: StreamFn;
 	/** Per-LLM-call timeout (ms). 0 = no timeout. */
 	timeoutMs?: number;
+	/** Test seam: the backoff sleep between transient retries (defaults to a
+	 * real timer). Injecting an instant resolve lets suites drive all 10
+	 * retries without waiting minutes. */
+	retrySleepFn?: (ms: number) => Promise<void>;
 	/** Credential store backing the Models registry. Default: FileCredentialStore
 	 * on the shared pi agent dir (auth.json). Injectable for tests. */
 	credentialStore?: CredentialStore;
@@ -208,7 +225,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * the pi agent dir's auth.json (shared with the pi CLI), so account logins
 	 * work everywhere; injectable for tests. */
 	private readonly credentialStore: CredentialStore;
-	private readonly opts: { timeoutMs: number; streamFn?: StreamFn };
+	private readonly opts: { timeoutMs: number; streamFn?: StreamFn; retrySleepFn?: (ms: number) => Promise<void> };
 	private readonly skillLoader: SkillLoader;
 	/** Authoring surface for declarative skills (save_to_skill). */
 	private readonly skillWriter: SkillWriter;
@@ -259,7 +276,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		private readonly paths: { builtinSkillsDir: string; userSkillsDir: string; shellAuditLogPath?: string; proposalsDir?: string },
 		options: EngineOptions = {},
 	) {
-		this.opts = { timeoutMs: options.timeoutMs ?? 0, streamFn: options.streamFn };
+		this.opts = { timeoutMs: options.timeoutMs ?? 0, streamFn: options.streamFn, retrySleepFn: options.retrySleepFn };
 		this.credentialStore = options.credentialStore ?? new FileCredentialStore();
 		this.models = createModels({ credentials: this.credentialStore });
 		for (const provider of builtinProviders()) this.models.setProvider(provider);
@@ -1718,7 +1735,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		});
 
 		let hardError: string | undefined;
-		let retried = false;
+		let retries = 0;
 		let capHit = false;
 		let contextBudgetHit = false;
 		// Which last-resort path produced the reply, if any. Tracked explicitly
@@ -1726,7 +1743,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		let askedForSummary = false;
 		let deterministic = false;
 		try {
-			retried = await this.promptWithRetry(agent, message, ctx?.images);
+			retries = await this.promptWithRetry(agent, conversationId, message, ctx?.images);
 		} catch (err) {
 			// Login-shaped failures get actionable Chinese guidance (review H4) at
 			// this bubble-up point; everything else keeps its original message.
@@ -1819,7 +1836,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			reply,
 			hardError,
 			agentError: errorMessage,
-			retried,
+			retries,
 			capHit,
 			askedForSummary,
 			deterministic,
@@ -1860,7 +1877,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		reply: string;
 		hardError?: string;
 		agentError?: string;
-		retried: boolean;
+		retries: number;
 		capHit: boolean;
 		askedForSummary: boolean;
 		deterministic: boolean;
@@ -1900,7 +1917,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				status,
 				error: errorText,
 				toolCalls,
-				retries: input.retried ? 1 : 0,
+				retries: input.retries,
 				stepCapHit: input.capHit,
 				emptyReply,
 				deterministic: input.deterministic,
@@ -2118,7 +2135,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/**
-	 * agent.prompt() + one retry for transient stream failures.
+	 * agent.prompt() + up to TRANSIENT_RETRIES graded-backoff retries for
+	 * transient stream failures (Claude Code / zcode style, user ruling
+	 * 2026-10-08: one immediate retry let a multi-second gateway outage surface
+	 * as an execution error).
 	 *
 	 * The stream can be cut mid-turn (local relay restart, upstream rate limit),
 	 * leaving the transcript ending on the user message / tool result. continue()
@@ -2129,14 +2149,17 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * occasionally finishes a stream with an empty assistant message — either
 	 * stopReason="error" with no content, or a thinking-only "stop" — which would
 	 * otherwise surface to the user as a blank reply with no error.
+	 *
+	 * Returns the number of retries performed (0 = first attempt succeeded).
 	 */
-	private async promptWithRetry(agent: Agent, message: string, images?: { data: string; mimeType: string }[]): Promise<boolean> {
+	private async promptWithRetry(agent: Agent, conversationId: string, message: string, images?: { data: string; mimeType: string }[]): Promise<number> {
 		// Vision input: only pass images when the session's model actually accepts
 		// them — a non-vision model would reject the image block and fail the turn.
 		const visionImages: ImageContent[] | undefined =
 			images?.length && agent.state.model.input.includes("image")
 				? images.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }))
 				: undefined;
+		let retries = 0;
 		let threwTransient = false;
 		try {
 			await agent.prompt(message, visionImages);
@@ -2151,42 +2174,62 @@ export class EmployeeEngine implements EmployeeRuntime {
 				if (recovered) {
 					console.warn("[engine] context overflow: retrying the request on a compacted transcript");
 					await agent.prompt(message, visionImages);
-					return false;
+					return 0;
 				}
 				throw err;
 			}
 			if (!TRANSIENT_STREAM_ERROR.test(text)) throw err;
 			threwTransient = true;
 		}
-		let errorText = agent.state.errorMessage ?? "";
-		// The relay may report the overflow as an in-turn error rather than throwing.
-		// Same recovery: shrink the transcript, then continue the same turn.
-		if (errorText && isContextOverflowError(errorText)) {
-			if (await this.recoverFromContextOverflow(agent)) {
-				console.warn("[engine] context overflow reported in-turn: retrying on a compacted transcript");
-				this.stripDanglingAssistant(agent);
-				await agent.continue();
-				return true;
+		for (;;) {
+			// Re-read EVERY iteration: a successful retry clears errorMessage, and
+			// using the stale first-failure text here kept the loop retrying a
+			// turn that had already produced its reply (caught by test-engine-retry).
+			const errorText = agent.state.errorMessage ?? "";
+			// The relay may report the overflow as an in-turn error rather than throwing.
+			// Same recovery: shrink the transcript, then continue the same turn.
+			if (errorText && isContextOverflowError(errorText)) {
+				if (await this.recoverFromContextOverflow(agent)) {
+					console.warn("[engine] context overflow reported in-turn: retrying on a compacted transcript");
+					this.stripDanglingAssistant(agent);
+					await agent.continue();
+					return retries;
+				}
+			}
+			const endedEmpty = this.endedWithoutText(agent);
+			if (!threwTransient && !(errorText && TRANSIENT_STREAM_ERROR.test(errorText)) && !endedEmpty) return retries;
+			if (retries >= TRANSIENT_RETRIES) {
+				console.warn(`[engine] transient failure persists after ${retries} retries — giving up`);
+				return retries;
+			}
+			// A stop/watchdog abort already noted mid-wait must end the loop: the
+			// turn was deliberately cut, and continuing would override the stop.
+			if (this.turnAborts.has(conversationId)) return retries;
+			retries += 1;
+			const delayMs = transientRetryBackoffMs(retries);
+			const reason = endedEmpty && !threwTransient && !errorText
+				? "turn ended without visible text"
+				: `transient stream error (${errorText || "stream aborted"})`;
+			console.warn(`[engine] ${reason} — retry ${retries}/${TRANSIENT_RETRIES} in ${Math.round(delayMs / 1000)}s`);
+			// Deliberate backoff is LIFE, not silence: llmInFlight is 0 during the
+			// wait, so the silence-measuring stall watchdog would see a dead turn
+			// without this touch. Re-checked after the sleep too — an abort that
+			// lands DURING the wait must not fire another request (same shape as
+			// the work-window H1, review 2026-10-08).
+			this.touchActivity(conversationId);
+			await (this.opts.retrySleepFn ?? sleep)(delayMs);
+			if (this.turnAborts.has(conversationId)) return retries - 1;
+			threwTransient = false;
+			try {
+				await this.safeContinue(agent);
+			} catch (err) {
+				const text = err instanceof Error ? err.message : String(err);
+				if (!text.startsWith("Cannot continue")) throw err;
+				// Last-resort: a transcript whose only resumable anchor is gone —
+				// replay the user message as a fresh turn instead of failing the request.
+				await agent.prompt(message, visionImages);
 			}
 		}
-		const endedEmpty = this.endedWithoutText(agent);
-		if (!threwTransient && !(errorText && TRANSIENT_STREAM_ERROR.test(errorText)) && !endedEmpty) return false;
-
-		const reason = endedEmpty && !threwTransient && !errorText
-			? "turn ended without visible text"
-			: `transient stream error (${errorText || "stream aborted"})`;
-		console.warn(`[engine] ${reason} — retrying once`);
-		await sleep(1000);
-		try {
-			await this.safeContinue(agent);
-		} catch (err) {
-			const text = err instanceof Error ? err.message : String(err);
-			if (!text.startsWith("Cannot continue")) throw err;
-			// Last-resort: a transcript whose only resumable anchor is gone —
-			// replay the user message as a fresh turn instead of failing the request.
-			await agent.prompt(message, visionImages);
-		}
-		return true;
 	}
 
 	/**
