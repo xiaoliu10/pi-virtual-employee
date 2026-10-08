@@ -16,6 +16,7 @@ const api = {
 	previewPrompt: () => ipcRenderer.invoke("prompt:preview"),
 	defaultPromptRules: () => ipcRenderer.invoke("prompt:defaults"),
 	listScheduledTasks: () => ipcRenderer.invoke("tasks:schedList"),
+	listWorkItems: () => ipcRenderer.invoke("tasks:workList"),
 	deleteScheduledTask: (id: string) => ipcRenderer.invoke("tasks:schedDelete", id),
 	toggleScheduledTask: (id: string, enabled: boolean) =>
 		ipcRenderer.invoke("tasks:schedToggle", id, enabled),

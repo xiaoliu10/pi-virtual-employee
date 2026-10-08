@@ -307,6 +307,22 @@ export interface MessageRow {
 }
 
 /** A scheduled task (created in conversation or via settings, run by the scheduler). */
+/** 自主任务（work item）在设置页的只读视图 —— WorkItemRow 的投影子集（IPC 载荷同步裁剪到这些字段）。 */
+export interface WorkItemView {
+	id: string;
+	title: string;
+	goal: string | null;
+	status: "proposed" | "queued" | "working" | "waiting_human" | "scheduled" | "done" | "cancelled";
+	progress: string | null;
+	/** waiting_human 时的卡点问题——管理员最需要看到的信息。 */
+	question: string | null;
+	next_check_at: number | null;
+	remind_count: number;
+	created_by: string | null;
+	created_at: number;
+	updated_at: number;
+}
+
 export interface ScheduledTaskRow {
 	id: string;
 	title: string;
