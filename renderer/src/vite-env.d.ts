@@ -16,6 +16,7 @@ export interface RendererApi {
 	listWorkItems(): Promise<WorkItemView[]>;
 	deleteScheduledTask(id: string): Promise<boolean>;
 	toggleScheduledTask(id: string, enabled: boolean): Promise<boolean>;
+	setScheduledTaskSilent(id: string, silent: boolean): Promise<boolean>;
 	testReportTarget(): Promise<{ ok: boolean; detail: string }>;
 testGitee(): Promise<{ ok: boolean; detail: string }>;
 testOss(): Promise<{ ok: boolean; detail: string }>;

@@ -72,11 +72,12 @@ export function createSchedulerTools(
 			prompt: Type.String({ description: "到点要执行的指令，如「查询昨日所有订单状态并汇总异常」" }),
 			cron: Type.String({ description: "5 字段 cron 表达式（本地时间），如 0 9 * * *" }),
 			autonomous: Type.Optional(Type.Boolean({ description: "自主模式：到点后不止执行一轮，而是连续多轮工作直到目标完成、需要人工或预算耗尽（默认预算 20 轮/2小时）。适合「整理并核对月末报表」这类长目标；单次可完成的任务不要开" })),
+			silent: Type.Optional(Type.Boolean({ description: "静默执行：到点照常执行并记录结果，但完成时不推送回会话（不发送「定时任务完成+报告链接」）。适合保活、巡检、维护类任务——只要跑成功就不需要人知道。出错时仍会推送，静默不等于隐藏失败" })),
 			maxTurns: Type.Optional(Type.Number({ description: "自主模式最大轮数（默认 20，上限 200）" })),
 			maxMinutes: Type.Optional(Type.Number({ description: "自主模式最大时长分钟（默认 120，上限 1440）" })),
 		}),
 		async execute(_id, params) {
-			const p = params as { title: string; prompt: string; cron: string; autonomous?: boolean; maxTurns?: number; maxMinutes?: number };
+			const p = params as { title: string; prompt: string; cron: string; autonomous?: boolean; silent?: boolean; maxTurns?: number; maxMinutes?: number };
 			try {
 				scheduler.validateCron(p.cron);
 			} catch (err) {
@@ -103,6 +104,7 @@ export function createSchedulerTools(
 				origin,
 				createdBy,
 				autonomous: p.autonomous === true,
+				silent: p.silent === true,
 				maxTurns: p.autonomous ? (p.maxTurns ?? null) : null,
 				maxMinutes: p.autonomous ? (p.maxMinutes ?? null) : null,
 			});
@@ -112,8 +114,8 @@ export function createSchedulerTools(
 					{
 						type: "text",
 						text: conversationId.startsWith("dt:")
-								? `已创建定时任务「${task.title}」${task.autonomous ? "（自主模式：将持续多轮工作直到完成、需要人工或预算耗尽；预算耗尽会主动请示是否续跑）" : ""}。下次执行：${fmtTime(task.next_run_at)}。到点后我会自动执行，并把结果主动推送回当前${conversationId.startsWith("dt:group:") ? "群聊" : "单聊"}。`
-								: `已创建定时任务「${task.title}」${task.autonomous ? "（自主模式）" : ""}。下次执行：${fmtTime(task.next_run_at)}。到点后我会自动执行并把结果记入对话。`,
+								? `已创建定时任务「${task.title}」${task.autonomous ? "（自主模式：将持续多轮工作直到完成、需要人工或预算耗尽；预算耗尽会主动请示是否续跑）" : ""}。下次执行：${fmtTime(task.next_run_at)}。到点后我会自动执行，${task.silent ? "**静默执行**——成功时不推送，只有出错才会通知你" : `把结果主动推送回当前${conversationId.startsWith("dt:group:") ? "群聊" : "单聊"}`}。`
+								: `已创建定时任务「${task.title}」${task.autonomous ? "（自主模式）" : ""}。下次执行：${fmtTime(task.next_run_at)}。到点后我会自动执行并把结果记入对话${task.silent ? "（静默执行：成功不推送，出错才通知）" : ""}。`,
 					},
 					...(createdBy
 						? [{
@@ -154,7 +156,7 @@ export function createSchedulerTools(
 			const pending = rows.filter((r) => !r.created_by).length;
 			const lines = rows.map(
 				(r, i) =>
-					`${i + 1}. [${r.enabled ? "启用" : "停用"}] ${r.title}（id=${r.id}）\n   cron: ${r.cron}  下次: ${fmtTime(r.next_run_at)}  上次: ${fmtTime(r.last_run_at)}${r.last_status ? ` (${r.last_status})` : ""}\n   创建于: ${createdIn(r, conversationId).label}\n   执行身份: ${identityLabel(r)}`,
+					`${i + 1}. [${r.enabled ? "启用" : "停用"}]${r.silent === 1 ? "[静默]" : ""} ${r.title}（id=${r.id}）\n   cron: ${r.cron}  下次: ${fmtTime(r.next_run_at)}  上次: ${fmtTime(r.last_run_at)}${r.last_status ? ` (${r.last_status})` : ""}\n   创建于: ${createdIn(r, conversationId).label}\n   执行身份: ${identityLabel(r)}${r.silent === 1 ? "\n   推送: 静默执行（成功不推送，出错才通知）" : ""}`,
 			);
 			return {
 				content: [{
@@ -189,7 +191,7 @@ export function createSchedulerTools(
 			}
 			const text = [
 				`定时任务「${task.title}」（id=${task.id}）`,
-				`状态: ${task.enabled ? "启用" : "停用"}  cron: ${task.cron}`,
+				`状态: ${task.enabled ? "启用" : "停用"}${task.silent === 1 ? "（静默执行：成功不推送，出错才通知）" : ""}  cron: ${task.cron}`,
 				`下次: ${fmtTime(task.next_run_at)}  上次: ${fmtTime(task.last_run_at)}${task.last_status ? ` (${task.last_status})` : ""}`,
 				`创建于: ${createdIn(task, conversationId).label}`,
 				`执行身份: ${identityLabel(task)}`,
@@ -396,12 +398,13 @@ export function createSchedulerTools(
 			cron: Type.Optional(Type.String({ description: "新的 5 字段 cron（本地时间），如 0 9 * * *" })),
 			bindCurrent: Type.Optional(Type.Boolean({ description: "true=把推送目标改绑为当前会话。仅当对方明确要求改绑；改绑已有推送目标需当前消息含「确认」" })),
 			autonomous: Type.Optional(Type.Boolean({ description: "开/关自主模式（连续多轮工作直到完成、需要人工或预算耗尽）" })),
+			silent: Type.Optional(Type.Boolean({ description: "静默执行开关：true=执行并记录但不推送完成通知（出错仍推送）；false=恢复完成推送" })),
 			maxTurns: Type.Optional(Type.Number({ description: "自主模式最大轮数（默认 20，上限 200）" })),
 			maxMinutes: Type.Optional(Type.Number({ description: "自主模式最大时长分钟（默认 120，上限 1440）" })),
 		}),
 		async execute(_toolCallId, params) {
-			const p = params as { id: string; title?: string; prompt?: string; cron?: string; bindCurrent?: boolean; autonomous?: boolean; maxTurns?: number; maxMinutes?: number };
-			const patch: { title?: string; prompt?: string; cron?: string; conversationId?: string | null; autonomous?: boolean; maxTurns?: number | null; maxMinutes?: number | null } = {};
+			const p = params as { id: string; title?: string; prompt?: string; cron?: string; bindCurrent?: boolean; autonomous?: boolean; silent?: boolean; maxTurns?: number; maxMinutes?: number };
+			const patch: { title?: string; prompt?: string; cron?: string; conversationId?: string | null; autonomous?: boolean; silent?: boolean; maxTurns?: number | null; maxMinutes?: number | null } = {};
 			if (p.title !== undefined) patch.title = p.title;
 			if (p.prompt !== undefined) patch.prompt = p.prompt;
 			if (p.cron !== undefined) patch.cron = p.cron;
@@ -410,6 +413,7 @@ export function createSchedulerTools(
 				patch.maxTurns = p.autonomous ? (p.maxTurns ?? null) : null;
 				patch.maxMinutes = p.autonomous ? (p.maxMinutes ?? null) : null;
 			}
+			if (p.silent !== undefined) patch.silent = p.silent;
 			// The push target is where results LAND; the editing conversation is where
 			// the request CAME from. Conflating the two silently reroutes a group
 			// task's output into whoever's DM happened to edit it (field 2026-09-22).
@@ -436,7 +440,7 @@ export function createSchedulerTools(
 				patch.conversationId = conversationId;
 			}
 			if (Object.keys(patch).length === 0) {
-				return { content: [{ type: "text", text: "没有给出任何要修改的字段（title / prompt / cron / bindCurrent）。" }], details: { ok: false } };
+				return { content: [{ type: "text", text: "没有给出任何要修改的字段（title / prompt / cron / silent / bindCurrent）。" }], details: { ok: false } };
 			}
 			const updated = scheduler.update(p.id, patch);
 			if (!updated) {
@@ -451,6 +455,7 @@ export function createSchedulerTools(
 				patch.prompt !== undefined ? "执行指令" : null,
 				patch.cron !== undefined ? `cron（下次执行 ${fmtTime(updated.next_run_at)}）` : null,
 				patch.autonomous !== undefined ? (patch.autonomous ? "开启自主模式" : "关闭自主模式") : null,
+				patch.silent !== undefined ? (patch.silent ? "开启静默执行（成功不推送，出错仍通知）" : "关闭静默执行（完成照常推送）") : null,
 				patch.conversationId !== undefined ? `推送目标→${patch.conversationId?.startsWith("dt:group:") ? "当前群聊" : "当前单聊"}` : null,
 				patch.conversationId === undefined ? "推送目标未变" : null,
 			].filter(Boolean) as string[];

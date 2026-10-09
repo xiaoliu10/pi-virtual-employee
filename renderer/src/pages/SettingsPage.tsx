@@ -450,9 +450,14 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 												<div key={t.id} className="rounded-xl border border-slate-200 bg-[#f7f8fa] px-4 py-3 text-sm">
 													<div className="flex items-center gap-2">
 														<span className="truncate font-medium text-slate-700">{t.title}</span>
+														{t.silent === 1 && <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-500" title="执行并记录结果，但成功时不推送；出错仍会通知">静默</span>}
 														<label className="ml-auto flex items-center gap-1.5 text-xs text-slate-400">
 															启用
 															<input type="checkbox" checked={t.enabled === 1} onChange={(e) => { void api.toggleScheduledTask(t.id, e.target.checked).then(refreshSched); }} className="h-4 w-4 accent-blue-500" />
+														</label>
+														<label className="flex items-center gap-1.5 text-xs text-slate-400" title="静默执行：照常执行并记录，但成功时不推送「定时任务完成」；出错仍会推送">
+															静默
+															<input type="checkbox" checked={t.silent === 1} onChange={(e) => { void api.setScheduledTaskSilent(t.id, e.target.checked).then(refreshSched); }} className="h-4 w-4 accent-blue-500" />
 														</label>
 														<button type="button" onClick={() => void api.deleteScheduledTask(t.id).then(refreshSched)} className="text-xs text-rose-400 hover:text-rose-600">删除</button>
 													</div>

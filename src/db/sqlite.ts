@@ -304,6 +304,13 @@ function migrate(db: DB): void {
 	if (!taskCols.has("max_turns")) db.exec("ALTER TABLE scheduled_tasks ADD COLUMN max_turns INTEGER");
 	if (!taskCols.has("max_minutes")) db.exec("ALTER TABLE scheduled_tasks ADD COLUMN max_minutes INTEGER");
 	if (!taskCols.has("chain_state")) db.exec("ALTER TABLE scheduled_tasks ADD COLUMN chain_state TEXT");
+	// Silent runs (2026-10-09): a task may run without pushing its result back to
+	// the IM chat. Field: a token keep-alive task's 5-hourly 「⏰ 定时任务完成 +
+	// 报告链接」 push is noise — the task's PURPOSE is silent maintenance, and the
+	// completion notification is product-level (main.ts scheduler runner), not
+	// prompt-controllable. The run still executes, records status, and stores its
+	// report; only the push is skipped.
+	if (!taskCols.has("silent")) db.exec("ALTER TABLE scheduled_tasks ADD COLUMN silent INTEGER NOT NULL DEFAULT 0");
 
 	// Work items (autonomous work phase-2, 2026-09-30): mined from daily IM
 	// conversations, confirmed by an admin, then worked by the employee across

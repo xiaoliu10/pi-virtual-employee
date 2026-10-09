@@ -19,14 +19,14 @@ const workDir = await mkdtemp(join(root, "node_modules/.schedsvc-test-"));
 process.on("exit", () => { void rm(workDir, { recursive: true, force: true }); });
 const bundle = join(workDir, "schedsvc.mjs");
 await build({
-	stdin: { contents: 'export { SchedulerService } from "./src/scheduler/scheduler-service.ts";', resolveDir: root, loader: "ts" },
+	stdin: { contents: 'export { SchedulerService, shouldPushScheduledResult } from "./src/scheduler/scheduler-service.ts";', resolveDir: root, loader: "ts" },
 	outfile: bundle,
 	bundle: true,
 	platform: "node",
 	format: "esm",
 	packages: "external",
 });
-const { SchedulerService } = await import(pathToFileURL(bundle).href);
+const { SchedulerService, shouldPushScheduledResult } = await import(pathToFileURL(bundle).href);
 
 function memoryStore() {
 	const tasks = [];
@@ -151,4 +151,28 @@ test("fireNow fires a task immediately and is guarded against overlap", async ()
 	await sleep(60);
 	assert.deepEqual(ran, ["now"]);
 	assert.equal(svc.fireNow("now"), true, "guard releases after the run settles");
+});
+
+// ── silent runs (2026-10-09): maintenance tasks run without pushing ──
+
+test("shouldPushScheduledResult: silent + success = no push; everything else pushes", () => {
+	assert.equal(shouldPushScheduledResult({ conversation_id: "dt:g1", silent: 1 }, undefined, "done"), false, "silent success stays quiet");
+	assert.equal(shouldPushScheduledResult({ conversation_id: "dt:g1", silent: 1 }, "Connection error.", "done"), true, "a silent task's ERROR still pushes");
+	assert.equal(shouldPushScheduledResult({ conversation_id: "dt:g1", silent: 0 }, undefined, "done"), true, "normal success pushes");
+	assert.equal(shouldPushScheduledResult({ conversation_id: null, silent: 1 }, undefined, "done"), false, "no target never pushes");
+	assert.equal(shouldPushScheduledResult({ conversation_id: "dt:g1", silent: 0 }, undefined, ""), false, "an empty reply never pushes");
+});
+
+test("shouldPushScheduledResult: autonomous outcome mapping — only 'done' is silenceable", () => {
+	// main.ts passes attention = outcome !== "done" ? outcome : undefined.
+	const gate = (outcome, silent) => shouldPushScheduledResult(
+		{ conversation_id: "dt:g1", silent },
+		outcome === "done" ? undefined : outcome,
+		"text",
+	);
+	assert.equal(gate("done", 1), false, "silent: done stays quiet");
+	assert.equal(gate("done", 0), true, "non-silent: done pushes");
+	for (const outcome of ["human", "budget", "stalled", "error"]) {
+		assert.equal(gate(outcome, 1), true, `silent: ${outcome} still pushes (needs attention)`);
+	}
 });

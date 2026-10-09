@@ -21,7 +21,7 @@ import { ScheduledTaskStore, type ScheduledTaskRow } from "../src/db/scheduled-t
 import { WorkItemStore } from "../src/db/work-item-store.js";
 import { WorkService, buildWorkLearning } from "../src/scheduler/work-service.js";
 import { resolveRole } from "../src/security/permissions.js";
-import { SchedulerService } from "../src/scheduler/scheduler-service.js";
+import { SchedulerService, shouldPushScheduledResult } from "../src/scheduler/scheduler-service.js";
 import {
 	type AutonomousChainState,
 	buildAutonomousTurnPrefix,
@@ -595,8 +595,10 @@ async function main(): Promise<void> {
 				progressInFlight = true;
 				void engine.progressBrief(agent, chain.convId)
 					.then((note) => {
-						if (agent.state.isStreaming && task.conversation_id) {
-							void im.pushToConversation(task.conversation_id, note.startsWith("⏳") ? note : `⏳ ${note}`);
+						const hb = note.startsWith("⏳") ? note : `⏳ ${note}`;
+						if (agent.state.isStreaming && shouldPushScheduledResult(task, undefined, hb)) {
+							const cid = task.conversation_id!;
+							void im.pushToConversation(cid, hb);
 						}
 					})
 					.catch(() => {})
@@ -668,8 +670,10 @@ async function main(): Promise<void> {
 							// No note text in the log — these entries are exactly the
 							// credential-prone kind (#41 masking standard).
 							appendAppLog(`[sched] chain ${task.id} remember saved (id=${saved.id}, merged=${saved.merged}, len=${note.length})`);
-							if (task.conversation_id) {
-								void im.pushToConversation(task.conversation_id, `📌 已沉淀经验到知识库：${note.slice(0, 120)}`);
+							const conNote = `📌 已沉淀经验到知识库：${note.slice(0, 120)}`;
+							if (shouldPushScheduledResult(task, undefined, conNote)) {
+								const cid = task.conversation_id!;
+								void im.pushToConversation(cid, conNote);
 							}
 						}
 					} catch (learnErr) {
@@ -730,11 +734,11 @@ async function main(): Promise<void> {
 				// the target chat sees the chain is alive without reading the console.
 				chain.stallCount = 0; // a successful turn clears the stall streak
 				persistChain();
-				if (task.conversation_id) {
-					await im.pushToConversation(
-						task.conversation_id,
-						`⏳ **${task.title}** 第 ${chain.turns}/${budget.maxTurns} 轮完成，继续推进…\n${tailForProgress(decision.text)}`,
-					);
+				const tbNote = `⏳ **${task.title}** 第 ${chain.turns}/${budget.maxTurns} 轮完成，继续推进…
+${tailForProgress(decision.text)}`;
+				if (shouldPushScheduledResult(task, undefined, tbNote)) {
+					const cid = task.conversation_id!;
+					await im.pushToConversation(cid, tbNote);
 				}
 			}
 		} finally {
@@ -780,14 +784,16 @@ async function main(): Promise<void> {
 					appendAppLog(`[sched] chain ${task.id} auto-learn turn failed (deterministic=${!!learnSend.deterministic}, error=${learnSend.error?.slice(0, 80) ?? "none"}); skipped`);
 				} else {
 					appendAppLog(`[sched] chain ${task.id} (${task.title}) outcome=${outcome}; auto-learn turn ok`);
-					if (task.conversation_id) {
-						const stuckNote = outcome === "error"
-							? "📌 已把本次的卡点沉淀到知识库（卡在哪、已尝试什么、下次建议）。"
-							: "📌 已把本次的卡点沉淀到知识库（卡在哪、已尝试什么、下次建议），恢复后会先查经验再继续。";
-						await im.pushToConversation(task.conversation_id, outcome === "done"
-							? "📌 已把本次任务的经验沉淀到知识库，下次同类任务直接复用。"
-							: stuckNote);
-					}
+				const alNote = outcome === "error"
+					? "📌 已把本次的卡点沉淀到知识库（卡在哪、已尝试什么、下次建议）。"
+					: "📌 已把本次的卡点沉淀到知识库（卡在哪、已尝试什么、下次建议），恢复后会先查经验再继续。";
+				const alText = outcome === "done"
+					? "📌 已把本次任务的经验沉淀到知识库，下次同类任务直接复用。"
+					: alNote;
+				if (shouldPushScheduledResult(task, undefined, alText)) {
+					const cid = task.conversation_id!;
+					await im.pushToConversation(cid, alText);
+				}
 				}
 			} catch (err) {
 				appendAppLog(`[sched] chain ${task.id} auto-learn failed: ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`);
@@ -808,8 +814,16 @@ async function main(): Promise<void> {
 							: outcome === "stalled"
 								? `⏸️ **自主任务已中断暂停：${task.title}**（模型服务连续 ${STALL_QUIET_RETRIES + 1} 次未返回内容，任务在第 ${chain.turns} 轮中断，不会自动继续）${stalledHint}`
 								: `⚠️ **自主任务出错停止：${task.title}**\n\n${lastText}`;
-			const pushed = await im.pushToConversation(task.conversation_id, pushText);
-			if (!pushed.ok) console.warn(`[sched] autonomous push failed for ${task.conversation_id}: ${pushed.error}`);
+		// Silent autonomous runs suppress the SUCCESS (done) notice only — every
+		// other outcome (human/budget/stalled/error) needs attention and still
+		// pushes. shouldPushScheduledResult's "error" param is the attention
+		// signal here: a non-done outcome counts as requiring human notice.
+		const attention = outcome !== "done" ? outcome : undefined;
+		if (shouldPushScheduledResult(task, attention, pushText)) {
+			const cid = task.conversation_id!;
+			const pushed = await im.pushToConversation(cid, pushText);
+			if (!pushed.ok) console.warn(`[sched] autonomous push failed for ${cid}: ${pushed.error}`);
+		}
 		}
 
 		const status =
@@ -947,14 +961,21 @@ async function main(): Promise<void> {
 			// chunks anything past the platform's per-message cap into ordered
 			// parts, so the report arrives whole. The link stays appended for the
 			// rendered/original copy. Non-IM tasks skip push.
+			// Silent runs (2026-10-09): the task executed and is recorded, but its
+			// completion push is suppressed — maintenance tasks (e.g. a token
+			// keep-alive firing every few hours) exist to run, not to notify, and
+			// the ⏰ completion + report-link notice is product-level and cannot be
+			// muted from the prompt. An ERROR still pushes (silence never hides a
+			// failure); the decision lives in shouldPushScheduledResult.
 			let pushError: string | undefined;
-			if (task.conversation_id && reply) {
+			const pushTarget = task.conversation_id;
+			if (pushTarget && shouldPushScheduledResult(task, error, reply)) {
 				const body = reportUrl ? `${reply}\n\n📎 查看报告：${reportUrl}` : reply;
 				const pushText = `⏰ **定时任务完成：${task.title}**\n\n${body}`;
-				const pushed = await im.pushToConversation(task.conversation_id, pushText);
+				const pushed = await im.pushToConversation(pushTarget, pushText);
 				if (!pushed.ok) {
 					pushError = pushed.error || "未知推送错误";
-					console.warn(`[sched] push result failed for ${task.conversation_id}: ${pushError}`);
+					console.warn(`[sched] push result failed for ${pushTarget}: ${pushError}`);
 				}
 			}
 			appendAppLog(`[sched] task ${task.id} (${task.title}) ${error ? `error=${error.slice(0, 120).replace(/\s+/g, " ")}` : pushError ? `ok;push_error=${pushError}` : "ok"}`);
@@ -1287,6 +1308,10 @@ async function main(): Promise<void> {
 		({ id, title, goal, status, progress, question, next_check_at, remind_count, created_by, created_at, updated_at })));
 	ipcMain.handle("tasks:schedDelete", (_e, id: string) => {
 		scheduler.delete(id);
+		return true;
+	});
+	ipcMain.handle("tasks:schedSilent", (_e, id: string, silent: boolean) => {
+		scheduler.update(id, { silent });
 		return true;
 	});
 	ipcMain.handle("tasks:schedToggle", (_e, id: string, enabled: boolean) => {

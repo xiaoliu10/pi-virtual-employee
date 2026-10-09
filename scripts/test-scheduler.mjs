@@ -443,3 +443,40 @@ test("resume_scheduled_task: non-admin non-creator is refused; chain-less task i
 	const plain = await tool(tools, "resume_scheduled_task").execute("r2", { id: "t2" });
 	assert.equal(plain.details.ok, false, "a non-autonomous task has nothing to resume");
 });
+
+// ── silent runs (2026-10-09): a maintenance task may run without pushing ──
+
+test("create_scheduled_task with silent=true records the flag and says so in the reply", async (t) => {
+	const { scheduler, tools } = build1(t, {}, [], actor("boss"), "dt:group:g1");
+	const created = tool(tools, "create_scheduled_task");
+	const out = await created.execute("c1", { title: "spay 保活", prompt: "登录 spay 保持会话", cron: "0 */5 * * *", silent: true });
+	const text = out.content.map((c) => c.text).join("\n");
+	assert.equal(scheduler.tasks.at(-1).silent, true, "the flag reaches the store");
+	assert.match(text, /静默执行/, "the reply tells the admin it will stay quiet");
+	assert.match(text, /出错才会通知/, "and that errors still notify");
+});
+
+test("update_scheduled_task can flip silent without touching other fields", async (t) => {
+	const rows = [{ id: "s1", title: "保活", silent: 0 }];
+	const { scheduler, tools } = build1(t, {}, rows, actor("boss"), "dt:boss");
+	// Only the tool→service patch shape is asserted here; the service→store
+	// merge semantics (silent preserved when absent) live in test-scheduler-store.
+	let seenPatch;
+	scheduler.update = (id, patch) => { seenPatch = patch; return { ...rows[0], id, ...patch }; };
+	const updated = tool(tools, "update_scheduled_task");
+	const out = await updated.execute("u1", { id: "s1", silent: true });
+	assert.deepEqual(seenPatch, { silent: true }, "only the silent field is patched");
+	assert.match(out.content[0].text, /开启静默执行/);
+	const out2 = await updated.execute("u2", { id: "s1", silent: false });
+	assert.match(out2.content[0].text, /关闭静默执行/);
+});
+
+test("list_scheduled_tasks marks silent tasks; get_scheduled_task detail shows the push mode", async (t) => {
+	const rows = [{ id: "s1", title: "保活", silent: 1 }, { id: "s2", title: "早报", silent: 0 }];
+	const { tools } = build1(t, {}, rows, actor("boss"), "dt:boss");
+	const listed = await tool(tools, "list_scheduled_tasks").execute("l1", {});
+	assert.match(listed.content[0].text, /\[静默\] 保活/, "silent task is marked in the list");
+	assert.match(listed.content[0].text, /推送: 静默执行/);
+	const detail = await tool(tools, "get_scheduled_task").execute("g1", { id: "s1" });
+	assert.match(detail.content[0].text, /静默执行：成功不推送，出错才通知/);
+});
