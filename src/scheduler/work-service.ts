@@ -278,6 +278,7 @@ export class WorkService<Session extends WorkSession> {
 					lessons: workLessons(fresh.lessons), turn, budget: this.budget, answer: answer ?? undefined,
 					firstWindow, lateByMs, kbSearchEnabled: kb.search, kbLearnEnabled: kb.learn,
 					lastCheck: active.dueAt ? { at: active.dueAt, reason: active.prevReason, streak: active.prevStreak ?? 0 } : undefined,
+					now: this.clock.now(),
 				});
 				// Engine no-reply signals (result.error, or deterministic with a canned
 				// apology) get quiet backoff retries: an intermittent "Connection
