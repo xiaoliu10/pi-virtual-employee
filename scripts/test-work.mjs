@@ -154,6 +154,8 @@ test("buildWorkWindowPrefix carries conditions, progress, lessons and the protoc
 		turn: 0,
 		budget: { maxTurns: 15, maxMinutes: 30 },
 	});
+	assert.match(prefix, /【当前时间】\d{4}-\d{2}-\d{2}（周[一二三四五六日]）/);
+	assert.match(prefix, /不要从历史消息里的旧日期推断今天/);
 	assert.match(prefix, /【工作项】月末对账/);
 	assert.match(prefix, /【目标】核对 9 月流水/);
 	assert.match(prefix, /15 分钟/);

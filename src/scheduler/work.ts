@@ -18,6 +18,8 @@
  * default re-check so the chain stays alive.
  * Follow-ups must be at least 15 minutes away; no fixed polling cadence.
  */
+import { beijingNow } from "../engine/tools/time.js";
+
 import { AUTONOMOUS_DONE_MARK, AUTONOMOUS_HUMAN_MARK } from "./autonomous.js";
 
 export { AUTONOMOUS_DONE_MARK, AUTONOMOUS_HUMAN_MARK };
@@ -279,6 +281,11 @@ export interface WorkItemWindowContext {
 	 * reference unregistered tools; undefined = enabled (tests/legacy). */
 	kbSearchEnabled?: boolean;
 	kbLearnEnabled?: boolean;
+	/** The real current time (epoch ms). Rendered as 【当前时间】 so the model
+	 * never infers "today" from history anchors: a long-lived chain whose
+	 * transcript is full of late-September dates reported "现在是 2026-09-30，
+	 * 10 月份没有数据" on 2026-10-09 (field 2026-10-09). undefined = now. */
+	now?: number;
 }
 
 // A true kickoff must plan before acting — and the plan must justify its own
@@ -294,6 +301,8 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 	if (ctx.lessons?.length) memory.push(`【踩坑记录（别再踩）】\n${ctx.lessons.map((l) => `- ${l}`).join("\n")}`);
 	if (ctx.firstWindow && ctx.turn === 0) memory.push(FIRST_WINDOW_PLAN);
 	const head = ctx.turn === 0 ? "【工作窗口开始】" : `【工作窗口继续 · 本窗第 ${ctx.turn + 1} 轮】`;
+	const t = beijingNow(ctx.now ? new Date(ctx.now) : new Date());
+	const nowLine = `【当前时间】${t.date}（${t.weekdayName}）${t.time}，北京时间——「今天/昨天/本月」等时间口径一律以此为准，不要从历史消息里的旧日期推断今天。`;
 	const answerBlock = ctx.answer ? `\n用户对你上一轮问题的回复：${ctx.answer}\n` : "";
 	const lastCheck = ctx.lastCheck
 		? `\n【上次跟进】${new Date(ctx.lastCheck.at).toLocaleString("zh-CN", { hour12: false })}${ctx.lastCheck.reason ? `（${ctx.lastCheck.reason}）` : ""}\n`
@@ -326,5 +335,5 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 		lessonBullet,
 		unattendedBullet,
 	].join("\n");
-	return `${head}\n【工作项】${ctx.title}\n【目标】${ctx.goal}\n${[...memory, protocol].join("\n\n")}\n${answerBlock}${lastCheck}${lateNote}${cadenceWarning}\n`;
+	return `${head}\n${nowLine}\n【工作项】${ctx.title}\n【目标】${ctx.goal}\n${[...memory, protocol].join("\n\n")}\n${answerBlock}${lastCheck}${lateNote}${cadenceWarning}\n`;
 }

@@ -636,7 +636,11 @@ async function main(): Promise<void> {
 				const resumeKbHint = prior?.pending && chain.turns === 0 && !stallResumed && kbLookupOn
 					? "\n\n恢复前先 kb_search 本次卡点相关经验；已有解法直接应用，不要重复无效尝试。"
 					: "";
-				const message = chain.turns === 0 && !stallResumed ? scheduledTimePrefix() + prefix + answerBlock + task.prompt + resumeKbHint : prefix + "继续。";
+				// The real-time stamp rides EVERY turn, not just turn 0: chains run
+				// for days, and a continuation turn after midnight (or a stall
+				// resume, which used to skip the stamp entirely) otherwise leaves
+				// the model anchoring "today" on history dates (field 2026-10-09).
+				const message = scheduledTimePrefix() + (chain.turns === 0 && !stallResumed ? prefix + answerBlock + task.prompt + resumeKbHint : prefix + "继续。");
 				const send = await engine.send(agent, message, {
 					// Same creator-identity re-attachment as single-turn runs: guarded
 					// tools authorize against the LIVE role on every turn.
