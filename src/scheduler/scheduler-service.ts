@@ -24,6 +24,19 @@ export interface SchedulerRunner {
 	runTask(task: ScheduledTaskRow): Promise<{ status: string }>;
 }
 
+/**
+ * Should a finished run push its result back to the IM chat?
+ *
+ * Silent tasks (2026-10-09) execute and record without pushing — a token
+ * keep-alive firing every few hours must not notify anyone for succeeding.
+ * An ERROR still pushes: silence must never hide a failure the admin has to
+ * act on. Tasks with no push target never push either.
+ */
+export function shouldPushScheduledResult(task: { conversation_id: string | null; silent: number }, error: string | undefined, reply: string): boolean {
+	if (!task.conversation_id || !reply) return false;
+	return !(task.silent === 1 && !error);
+}
+
 const TICK_MS = 60_000;
 /**
  * Hard ceiling on one task run. Field incident 2026-09-22: a scheduled run that
@@ -129,6 +142,7 @@ export class SchedulerService {
 			autonomous?: boolean;
 			maxTurns?: number | null;
 			maxMinutes?: number | null;
+			silent?: boolean;
 		},
 	): ScheduledTaskRow | undefined {
 		const task = this.store.get(id);

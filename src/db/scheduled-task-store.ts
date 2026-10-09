@@ -25,6 +25,10 @@ export interface ScheduledTaskRow {
 	max_minutes: number | null;
 	/** JSON AutonomousChainState — live chain across fires/restarts, null when idle. */
 	chain_state: string | null;
+	/** Silent run (2026-10-09): execute and record, but never push the result to
+	 * the IM chat. 0 | 1. For maintenance tasks whose completion notice is noise
+	 * (e.g. a token keep-alive). */
+	silent: number;
 	created_at: number;
 	updated_at: number;
 }
@@ -38,6 +42,8 @@ export interface CreateScheduledTaskInput {
 	origin?: string;
 	/** Admin senderId (verified 1:1 creator). Stored so unattended runs can re-attach it. */
 	createdBy?: string | null;
+	/** Silent run: execute + record, but skip the completion push (default false). */
+	silent?: boolean;
 	/** Autonomous chaining opts (defaults when autonomous but no explicit budget). */
 	autonomous?: boolean;
 	maxTurns?: number | null;
@@ -66,14 +72,15 @@ export class ScheduledTaskStore {
 			max_turns: input.autonomous ? (input.maxTurns ?? null) : null,
 			max_minutes: input.autonomous ? (input.maxMinutes ?? null) : null,
 			chain_state: null,
+			silent: input.silent ? 1 : 0,
 			created_at: now,
 			updated_at: now,
 		};
 		this.db
 			.prepare(
 				`INSERT INTO scheduled_tasks
-				 (id, title, prompt, cron, enabled, conversation_id, origin, created_by, last_run_at, next_run_at, last_status, autonomous, max_turns, max_minutes, chain_state, created_at, updated_at)
-				 VALUES (@id, @title, @prompt, @cron, @enabled, @conversation_id, @origin, @created_by, @last_run_at, @next_run_at, @last_status, @autonomous, @max_turns, @max_minutes, @chain_state, @created_at, @updated_at)`,
+				 (id, title, prompt, cron, enabled, conversation_id, origin, created_by, last_run_at, next_run_at, last_status, autonomous, max_turns, max_minutes, chain_state, silent, created_at, updated_at)
+				 VALUES (@id, @title, @prompt, @cron, @enabled, @conversation_id, @origin, @created_by, @last_run_at, @next_run_at, @last_status, @autonomous, @max_turns, @max_minutes, @chain_state, @silent, @created_at, @updated_at)`,
 			)
 			.run(row);
 		return row;
@@ -120,6 +127,7 @@ export class ScheduledTaskStore {
 			autonomous?: boolean;
 			maxTurns?: number | null;
 			maxMinutes?: number | null;
+			silent?: boolean;
 		},
 		nextRunAt?: number | null,
 	): ScheduledTaskRow | undefined {
@@ -134,10 +142,11 @@ export class ScheduledTaskStore {
 			autonomous: autonomous ? 1 : 0,
 			max_turns: autonomous ? (patch.maxTurns !== undefined ? patch.maxTurns : task.max_turns) : null,
 			max_minutes: autonomous ? (patch.maxMinutes !== undefined ? patch.maxMinutes : task.max_minutes) : null,
+			silent: patch.silent !== undefined ? (patch.silent ? 1 : 0) : task.silent,
 		};
 		this.db
 			.prepare(
-				"UPDATE scheduled_tasks SET title = @title, prompt = @prompt, cron = @cron, conversation_id = @conversation_id, autonomous = @autonomous, max_turns = @max_turns, max_minutes = @max_minutes, next_run_at = @next_run_at, updated_at = @updated_at WHERE id = @id",
+				"UPDATE scheduled_tasks SET title = @title, prompt = @prompt, cron = @cron, conversation_id = @conversation_id, autonomous = @autonomous, max_turns = @max_turns, max_minutes = @max_minutes, silent = @silent, next_run_at = @next_run_at, updated_at = @updated_at WHERE id = @id",
 			)
 			.run({
 				id,

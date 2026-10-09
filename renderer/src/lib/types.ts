@@ -331,9 +331,19 @@ export interface ScheduledTaskRow {
 	enabled: number; // 0 | 1
 	conversation_id: string | null;
 	origin: string;
+	/** Admin senderId captured at creation (unattended runs follow their role). */
+	created_by: string | null;
 	last_run_at: number | null;
 	next_run_at: number | null;
 	last_status: string | null;
+	/** Autonomous chaining: keep working across turns until done / human / budget. */
+	autonomous: number; // 0 | 1
+	max_turns: number | null;
+	max_minutes: number | null;
+	/** JSON AutonomousChainState — live chain across fires/restarts, null when idle. */
+	chain_state: string | null;
+	/** Silent run: execute + record, but never push the completion notice (errors still push). */
+	silent: number; // 0 | 1
 	created_at: number;
 	updated_at: number;
 }

@@ -21,7 +21,7 @@ import { ScheduledTaskStore, type ScheduledTaskRow } from "../src/db/scheduled-t
 import { WorkItemStore } from "../src/db/work-item-store.js";
 import { WorkService, buildWorkLearning } from "../src/scheduler/work-service.js";
 import { resolveRole } from "../src/security/permissions.js";
-import { SchedulerService } from "../src/scheduler/scheduler-service.js";
+import { SchedulerService, shouldPushScheduledResult } from "../src/scheduler/scheduler-service.js";
 import {
 	type AutonomousChainState,
 	buildAutonomousTurnPrefix,
@@ -947,14 +947,21 @@ async function main(): Promise<void> {
 			// chunks anything past the platform's per-message cap into ordered
 			// parts, so the report arrives whole. The link stays appended for the
 			// rendered/original copy. Non-IM tasks skip push.
+			// Silent runs (2026-10-09): the task executed and is recorded, but its
+			// completion push is suppressed — maintenance tasks (e.g. a token
+			// keep-alive firing every few hours) exist to run, not to notify, and
+			// the ⏰ completion + report-link notice is product-level and cannot be
+			// muted from the prompt. An ERROR still pushes (silence never hides a
+			// failure); the decision lives in shouldPushScheduledResult.
 			let pushError: string | undefined;
-			if (task.conversation_id && reply) {
+			const pushTarget = task.conversation_id;
+			if (pushTarget && shouldPushScheduledResult(task, error, reply)) {
 				const body = reportUrl ? `${reply}\n\n📎 查看报告：${reportUrl}` : reply;
 				const pushText = `⏰ **定时任务完成：${task.title}**\n\n${body}`;
-				const pushed = await im.pushToConversation(task.conversation_id, pushText);
+				const pushed = await im.pushToConversation(pushTarget, pushText);
 				if (!pushed.ok) {
 					pushError = pushed.error || "未知推送错误";
-					console.warn(`[sched] push result failed for ${task.conversation_id}: ${pushError}`);
+					console.warn(`[sched] push result failed for ${pushTarget}: ${pushError}`);
 				}
 			}
 			appendAppLog(`[sched] task ${task.id} (${task.title}) ${error ? `error=${error.slice(0, 120).replace(/\s+/g, " ")}` : pushError ? `ok;push_error=${pushError}` : "ok"}`);
@@ -1287,6 +1294,10 @@ async function main(): Promise<void> {
 		({ id, title, goal, status, progress, question, next_check_at, remind_count, created_by, created_at, updated_at })));
 	ipcMain.handle("tasks:schedDelete", (_e, id: string) => {
 		scheduler.delete(id);
+		return true;
+	});
+	ipcMain.handle("tasks:schedSilent", (_e, id: string, silent: boolean) => {
+		scheduler.update(id, { silent });
 		return true;
 	});
 	ipcMain.handle("tasks:schedToggle", (_e, id: string, enabled: boolean) => {

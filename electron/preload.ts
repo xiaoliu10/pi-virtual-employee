@@ -20,6 +20,8 @@ const api = {
 	deleteScheduledTask: (id: string) => ipcRenderer.invoke("tasks:schedDelete", id),
 	toggleScheduledTask: (id: string, enabled: boolean) =>
 		ipcRenderer.invoke("tasks:schedToggle", id, enabled),
+	setScheduledTaskSilent: (id: string, silent: boolean) =>
+		ipcRenderer.invoke("tasks:schedSilent", id, silent),
 
 	// Report / artifact center
 	testReportTarget: () => ipcRenderer.invoke("reports:test"),
