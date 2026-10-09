@@ -25,7 +25,7 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 			contents: `
-				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, lastAssistantTailOf, isCompactionTemplateText } from "./src/engine/context.ts";
+				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, lastAssistantTailOf, recentAssistantVisibleTexts, isCompactionTemplateText } from "./src/engine/context.ts";
 				export { shouldCompact, DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-agent-core";
 				export { estimateTokens } from "@earendil-works/pi-agent-core";
 			`,
@@ -38,7 +38,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, lastAssistantTailOf, isCompactionTemplateText } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, lastAssistantTailOf, recentAssistantVisibleTexts, isCompactionTemplateText } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -619,4 +619,65 @@ test("substantialAnchorOf strips the autonomous chain scaffold too (turn 0 and c
 test("empty goal line does not swallow the next scaffold line; 【工作项】 fallback stays reachable", () => {
 	const windowTurn = user("【工作窗口开始】\n【工作项】兜底工作项\n【目标】\n【执行条件（务必遵守）】\n系统自动对账 08:00-09:30");
 	assert.equal(substantialAnchorOf([windowTurn]), "兜底工作项");
+});
+
+// Field 2026-10-09 (hardening): a compaction summary rehydrated as a PLAIN
+// assistant message used to be quoted verbatim as "recent progress" — "## Goal
+// … ## Constraints …" reaching the user through the heartbeat fallback tail.
+// lastAssistantTailOf now skips template messages (the signature is judged on
+// the RAW visible text, the cut on the flattened text); the live transcript
+// and the compaction protocol are untouched.
+test("lastAssistantTailOf skips a rehydrated compaction template; an ordinary '## Goal' mention is still quoted", () => {
+	const template = assistant("## Goal 跟踪处理 24 条工行数币掉单异常\n## Constraints & Preferences\n- 处理流程：获取对账文件 → 下载 → 检查");
+	const real = assistant("第一步已完成文件下载，" + "正在逐条核对金额差异并汇总差异清单。".repeat(30));
+	const tail = lastAssistantTailOf([real, user("继续"), template]);
+	assert.ok(!tail.includes("## Goal") && !tail.includes("Constraints"), "the template is never the tail");
+	assert.ok(tail.startsWith("…"), "the earlier REAL turn still supplies the tail");
+	assert.ok(tail.length <= 81, "the cut still applies to the real tail");
+
+	// Only the template (plus non-assistant) → empty, never an echo.
+	assert.equal(lastAssistantTailOf([user("继续"), template]), "");
+
+	// A single 「## Goal」 heading is NOT the template signature — ordinary
+	// English vocabulary must not be rejected (review H1 negative).
+	const single = assistant("## Goal 只是引用的一个英文词，这一条是真实的执行叙述。");
+	assert.ok(lastAssistantTailOf([single]).includes("## Goal"));
+});
+
+test("recentAssistantVisibleTexts returns chronological visible texts, skipping empty turns and template echoes", () => {
+	const first = assistant("第一条真实叙述");
+	const template = assistant("## Goal x\n## Constraints & Preferences y");
+	const empty = assistant("");
+	const second = assistant("第二条真实叙述");
+	assert.deepEqual(recentAssistantVisibleTexts([first, template, empty, second, user("继续")]), ["第一条真实叙述", "第二条真实叙述"]);
+	assert.deepEqual(recentAssistantVisibleTexts([template, empty]), []);
+	assert.deepEqual(recentAssistantVisibleTexts([]), []);
+	// Bounded by limit, keeping the NEWEST turns.
+	const many = Array.from({ length: 12 }, (_, i) => assistant(`叙述 ${i}`));
+	assert.equal(recentAssistantVisibleTexts(many).length, 8);
+	assert.equal(recentAssistantVisibleTexts(many)[0], "叙述 4");
+});
+
+// Review M1: the heartbeat fallback's evidence scan is bounded to the CURRENT
+// task — stopAt the task anchor (latest real user message) so a previous
+// task's four-field report is never reused for the new one.
+test("recentAssistantVisibleTexts: stopAt bounds evidence to the current task (review M1)", () => {
+	const oldReport = assistant("已完成：24 条全部对账；剩余：0 条；正在：生成汇总；卡点：无");
+	const anchor = user("把上周的掉单明细整理成表格发我");
+	const narration = assistant("已开始读取上周掉单明细，整理表格结构中。");
+	// Stop at the anchor: the old task's report is invisible.
+	assert.deepEqual(recentAssistantVisibleTexts([oldReport, anchor, narration], 8, anchor), ["已开始读取上周掉单明细，整理表格结构中。"]);
+	// The anchor is the LAST message (turn just started): nothing qualifies —
+	// conservatively empty rather than borrowing the old task's report.
+	assert.deepEqual(recentAssistantVisibleTexts([oldReport, anchor], 8, anchor), []);
+	// An ack anchor bounds just the same (宁可未知，不跨任务误报).
+	const ack = user("继续");
+	assert.deepEqual(recentAssistantVisibleTexts([oldReport, ack, narration], 8, ack), ["已开始读取上周掉单明细，整理表格结构中。"]);
+	// No stopAt → legacy unbounded scan (both turns qualify).
+	assert.deepEqual(recentAssistantVisibleTexts([oldReport, anchor, narration], 8), [oldReport.content[0].text, narration.content[0].text].map((s) => s.replace(/\s+/g, " ").trim()));
+	// stopAt a message that is NOT in the transcript → no boundary applied.
+	assert.deepEqual(recentAssistantVisibleTexts([oldReport, anchor, narration], 8, user("别的会话的消息")).length, 2);
+	// Template echoes between anchor and tail are still skipped under stopAt.
+	const template = assistant("## Goal x\n## Constraints & Preferences y");
+	assert.deepEqual(recentAssistantVisibleTexts([oldReport, anchor, template, narration], 8, anchor), ["已开始读取上周掉单明细，整理表格结构中。"]);
 });

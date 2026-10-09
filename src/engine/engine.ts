@@ -45,7 +45,8 @@ import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
 import { createMcpManager, type McpManager } from "./tools/mcp.js";
-import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isCompactionTemplateText, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, substantialAnchorOf, lastAssistantTailOf, SUMMARIZER_RETRY, truncateToFit, usableContextWindow } from "./context.js";
+import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, recentAssistantVisibleTexts, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, substantialAnchorOf, SUMMARIZER_RETRY, taskAnchorOf, truncateToFit, usableContextWindow } from "./context.js";
+import { extractProgressFromTexts, formatDeterministicBrief, standardizeProgressReport } from "./progress.js";
 import { fetchModelInfo, resolveEffectiveLimits, type RemoteModelInfo } from "./model-info.js";
 
 /** Default single-reply output cap for relay (custom baseUrl) models without an explicit per-model override. */
@@ -2063,34 +2064,36 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * 2026-09-23 quoting the latest assistant narration leaked low-level
 	 * mechanics ("重置把分页调回了 10/页"); 2026-09-24 quoting a user message
 	 * misquoted MID-TURN STEERING ("如果图片不好识别可以换下一张…") as the
-	 * task name; the resulting always-true empty line was then rejected in
-	 * 2026-09-29 ("这个过程汇报总结没有实质性的内容"). What remains honest AND
-	 * substantive: the chained compaction summary via heartbeatGoalOf — a
-	 * curated task record that is neither narration nor steering. When even
-	 * that doesn't exist (no summary, or only a truncateToFit discard-note),
-	 * the empty line is the last resort.
+	 * task name; 2026-10-09 quoting the raw last-assistant tail echoed the
+	 * compaction template ("## Goal … ## Constraints …") verbatim once the
+	 * summary had been rehydrated as a plain assistant message; and the
+	 * always-true empty line was rejected already in 2026-09-29.
+	 *
+	 * What remains honest AND substantive (all deterministic, via progress.ts):
+	 * (1) a four-field report the transcript already evidences (a prior
+	 * assistant turn in the canonical shape — the newest one wins), bounded to
+	 * the CURRENT task: the scan stops at the latest real user message, so a
+	 * previous task's 「已完成：…卡点：无」 is never reused for the new one
+	 * (review M1) — for an ack/继续 anchor this may yield nothing, and 暂未确认
+	 * is honest where a cross-task number would be a misreport; (2) for every
+	 * UNEVIDENCED field, 「暂未确认」 — never an inferred 「无」 and no invented
+	 * numbers, with the active step reading the honest generic line; (3) the
+	 * head quotes only sanitized sources, CURRENT TASK FIRST: the latest
+	 * substantial user request (acks skipped, field 2026-09-30) is
+	 * unambiguously the current ask and is labeled 当前请求; the chained
+	 * compaction summary (template stripped by heartbeatGoalOf) is labeled
+	 * 任务 and consulted ONLY when no substantial request survives in the live
+	 * transcript — quoting it over a fresh request headed a NEW task's brief
+	 * with the OLD task's curated goal (review M1).
 	 */
 	briefProgress(agent: Agent): string {
-		// Layered, all deterministic: (1) the chained compaction summary — a
-		// curated goal record; (2) the latest SUBSTANTIAL user request (pure acks
-		// like 「确认」 are skipped — field 2026-09-30: "任务：确认。"); (3) the
-		// always-true generic line. The LLM path remains the primary quality source.
-		const summary = heartbeatGoalOf(agent.state.messages);
-		const request = substantialAnchorOf(agent.state.messages);
-		const goal = (summary || request).replace(/\s+/g, " ").trim();
-		const goalSnippet = goal.length > 60 ? goal.slice(0, 60) + "…" : goal;
-		const goalLabel = summary ? "任务" : "当前请求";
-		// Real progress narration from the last completed assistant turn — the
-		// side-channel LLM summary is the primary source, but when it fails the
-		// fallback must still say what is happening, not just what was asked
-		// (field 2026-10-05: "没有汇报具体的进度或者卡点"). Labeled "最近" so it
-		// is never mistaken for the task name (field 2026-09-23's leak).
-		const recent = lastAssistantTailOf(agent.state.messages, 80);
-		const parts: string[] = [];
-		if (goalSnippet) parts.push(`${goalLabel}：${goalSnippet}`);
-		if (recent) parts.push(`最近：${recent}`);
-		if (parts.length) return `⏳ 任务仍在进行中（已耗时较长）。${parts.join("，")}。完成后会立即回复结果，请稍候。`;
-		return "⏳ 任务仍在进行中（已耗时较长），请稍候，完成后会立即回复结果。";
+		// Template echoes are filtered inside recentAssistantVisibleTexts, and
+		// progress.ts re-checks each candidate before parsing it as well.
+		const messages = agent.state.messages;
+		const fields = extractProgressFromTexts(recentAssistantVisibleTexts(messages, 8, taskAnchorOf(messages)));
+		const request = substantialAnchorOf(messages);
+		const goal = (request || heartbeatGoalOf(messages)).replace(/\s+/g, " ").trim();
+		return formatDeterministicBrief(fields, goal || undefined, request ? "当前请求" : "任务");
 	}
 
 	/**
@@ -2127,7 +2130,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 					this.models,
 					model,
 					512, // ~0.8×512 tokens of output budget — plenty for 120 Chinese chars
-					"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过120字的中文汇报进展，且必须严格按以下四段结构输出（用中文标签，每段都要有，没有对应信息就写「未知」或「无」）：「已完成：…」；「剩余：…」；「正在：…」；「卡点：无」或「卡点：具体问题」。禁止输出「## Goal」「## Constraints & Preferences」「## Next Steps」等英文模板标题——那是会话压缩总结的模板，不是进展汇报，出现了就是错误输出；禁止照抄任务目标原文或执行条件来充当进展；节选中更早的其他请求都是早已完成的旧任务，绝对不要提及；把琐碎的执行步骤归纳为阶段性成果，禁止提及工具名、参数、重试等技术细节；只依据记录中真实发生的事，绝不编造未发生的进度。",
+					"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过120字的中文汇报进展，且必须严格按以下四段结构输出，四段缺一不可，用中文标签：「已完成：…」「剩余：…」「正在：…」「卡点：…」。记录里查不到依据的段落一律写「暂未确认」——严禁在记录没有依据时推断成「无」，严禁编造数字或进度；只有当执行记录明确显示当前没有任何障碍时，卡点才可以写「无」。禁止输出「## Goal」「## Constraints & Preferences」「## Next Steps」等英文模板标题——那是会话压缩总结的模板，不是进展汇报，出现了就是错误输出；禁止照抄任务目标原文或执行条件来充当进展；节选中更早的其他请求都是早已完成的旧任务，绝对不要提及；把琐碎的执行步骤归纳为阶段性成果，禁止提及工具名、参数、重试等技术细节；只依据记录中真实发生的事，绝不编造未发生的进度。",
 					undefined, // previousSummary
 					undefined, // thinkingLevel
 					SUMMARIZER_RETRY,
@@ -2138,22 +2141,21 @@ export class EmployeeEngine implements EmployeeRuntime {
 				if (conversationId) this.endSideLlmCall(conversationId);
 			}
 			if (!result.ok || !result.value?.trim()) return fallback();
-			const raw = result.value.replace(/\s+/g, " ").trim();
-			// Deterministic guard for the field 2026-10-09 leak: the summary model
-			// echoed the compaction template ("## Goal … ## Constraints & …")
-			// despite the instruction. TIGHT signature (review H1): the double
-			// heading pair, or an ENGLISH template heading as a line prefix — a
-			// compliant Chinese report using 「## 已完成」 or the word "Goal" must
-			// NOT be discarded for it (the old broad /\bGoal\b|^##/ fell back to
-			// exactly the structureless brief the user complained about).
-			if (isCompactionTemplateText(raw) || /^##\s*(Goal|Constraints|Preferences|Next Steps)\b/i.test(raw)) {
-				console.warn("[engine] progress brief echoed a compaction template — falling back to the deterministic brief");
+			// Normalize through the shared four-field helper (progress.ts). The raw
+			// value is NOT whitespace-flattened beforehand: the template signature
+			// and the Chinese markdown headings are line-anchored, and the parser
+			// handles both the inline and the 「## 已完成\n…」 layouts itself. A
+			// template echo, a structureless blob, or a report MISSING any of the
+			// four labels all yield null → the deterministic fallback fills
+			// honestly, instead of showing a partial report (or one where absence
+			// got upgraded to 「无」). Fields are clamped PER FIELD: the old global
+			// 180-char slice could cut mid-report and amputate the whole 卡点 item.
+			const standardized = standardizeProgressReport(result.value);
+			if (!standardized) {
+				console.warn("[engine] progress brief is not a usable four-field report — falling back to the deterministic brief");
 				return fallback();
 			}
-			// 180 chars with a segment-boundary cut (review M2): a hard slice at
-			// 140 lands inside 「卡点：」 and shows the label with no content.
-			const text = raw.length <= 180 ? raw : raw.slice(0, 180).replace(/[；;][^；;]*$/, "").trimEnd() || raw.slice(0, 180);
-			return `⏳ 任务仍在进行中。${text}`;
+			return `⏳ 任务仍在进行中。${standardized}`;
 		} catch (err) {
 			console.warn("[engine] progress summary failed:", err instanceof Error ? err.message : err);
 			return fallback();
