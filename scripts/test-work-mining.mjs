@@ -42,7 +42,7 @@ await build({
 				}
 				export const DEFAULT_COMPACTION_SETTINGS = {};
 				export const convertToLlm = x => x;
-				export const estimateContextTokens = () => 0;
+				export const estimateContextTokens = () => ({ tokens: 0 });
 				export const estimateTokens = () => 0;
 				export const generateSummary = () => '';
 				export const shouldCompact = () => false;

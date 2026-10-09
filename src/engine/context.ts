@@ -22,6 +22,7 @@ import {
 } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Models, RetryPolicy, TextContent, Usage } from "@earendil-works/pi-ai";
 import type { MessageRow } from "../db/history-store.js";
+import { isCompactionTemplateReport } from "./progress.js";
 
 /** Bound on persisted messages replayed into a fresh session. Older turns stay
  * visible in the UI; the transcript re-grows (and re-compacts) naturally. */
@@ -464,25 +465,51 @@ export function stripSyntheticPromptPrefix(raw: string): string {
  * Used by the heartbeat fallback so a substantial request is quoted instead of
  * an ack, without needing an LLM pass. */
 /** Tail of the most recent ASSISTANT turn — real execution narration.
- * Used by the heartbeat fallback's "最近：" line so a failed side-channel
- * summary still tells the user what is actually happening (field 2026-10-05:
- * the fallback quoted only the task instruction, not progress). Deliberately
- * labeled "最近" — never as the task name (field 2026-09-23's leak was
- * mislabeling narration as the task, not showing it). */
+ * Used so a failed side-channel summary still tells the user what is actually
+ * happening (field 2026-10-05: the fallback quoted only the task instruction,
+ * not progress). Deliberately labeled "最近" by callers — never as the task
+ * name (field 2026-09-23's leak was mislabeling narration as the task, not
+ * showing it).
+ *
+ * A compaction summary rehydrated as a PLAIN assistant message is SKIPPED:
+ * after an app restart the role-based filter misses it, and the raw tail
+ * echoed "## Goal … ## Constraints …" verbatim as "recent progress" (field
+ * 2026-10-09). The signature is judged on the RAW visible text (its headings
+ * are line-anchored), the cut on the flattened text. Read-only: the live
+ * transcript and the compaction protocol are untouched. */
 export function lastAssistantTailOf(messages: AgentMessage[], maxChars = 80): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const message = messages[i];
 		if (message.role !== "assistant") continue;
-		const content = (message as { content?: unknown }).content;
-		const text = (typeof content === "string"
-			? content
-			: Array.isArray(content)
-				? (content as { type?: string; text?: string }[]).filter((part) => part?.type === "text").map((part) => part.text ?? "").join("")
-				: "").replace(/\s+/g, " ").trim();
+		const visible = assistantVisibleText(message);
+		const text = visible.replace(/\s+/g, " ").trim();
 		if (!text) continue;
+		if (isCompactionTemplateText(visible)) continue;
 		return text.length > maxChars ? "…" + text.slice(-maxChars) : text;
 	}
 	return "";
+}
+
+/** Visible text of the most recent assistant turns, chronological order,
+ * skipping empty turns and rehydrated compaction-template echoes (same
+ * signature/rationale as lastAssistantTailOf). Feeds the heartbeat fallback's
+ * four-field extraction (progress.ts); bounded to the last `limit` qualifying
+ * turns so a huge transcript cannot stall it. Pure: never mutates state. */
+export function recentAssistantVisibleTexts(messages: AgentMessage[], limit = 8, stopAt?: AgentMessage): string[] {
+	const out: string[] = [];
+	for (let i = messages.length - 1; i >= 0 && out.length < limit; i--) {
+		const m = messages[i];
+		// Evidence must come from the CURRENT task's execution: stop at the task
+		// anchor so a previous task's "已完成：…卡点：无" report is never reused
+		// for the new one (review M1 — cross-task progress reuse).
+		if (stopAt && m === stopAt) break;
+		if (m.role !== "assistant") continue;
+		const visible = assistantVisibleText(m);
+		const text = visible.replace(/\s+/g, " ").trim();
+		if (!text || isCompactionTemplateText(visible)) continue;
+		out.unshift(text);
+	}
+	return out;
 }
 
 export function substantialAnchorOf(messages: AgentMessage[]): string {
@@ -530,6 +557,35 @@ export function heartbeatGoalOf(messages: AgentMessage[]): string {
 }
 
 /**
+ * Signature of the harness compaction-summary template ("## Goal …\n## Constraints
+ * & Preferences …"). After an app restart a compaction summary is rehydrated from
+ * history as a PLAIN assistant message, so the role-based filter above misses it
+ * and the heartbeat model echoes the English template verbatim as the "progress
+ * report" (field 2026-10-09 screenshot: "## Goal 跟踪处理 … ## Constraints &
+ * Preferences - 处理流程：…"). Both headings together are unambiguous — no real
+ * assistant narration carries them. Note: \b holds at ASCII↔CJK boundaries, so
+ * 「## Goal跟踪处理」 (no space) matches too — keep the \b.
+ *
+ * The canonical implementation is isCompactionTemplateReport in progress.ts
+ * (review L: the signature existed in TWO modules and could drift apart —
+ * progress.ts is the pure, dependency-free home; this alias keeps the
+ * established context.ts API name for existing callers/tests).
+ */
+export const isCompactionTemplateText = isCompactionTemplateReport;
+
+/** Visible text blocks only (no thinking/tool args) — template-signature checks
+ * must judge what the USER would see (review L1). */
+function assistantVisibleText(message: AgentMessage): string {
+	const content = (message as { content?: unknown }).content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return (content as { type?: string; text?: string }[])
+		.filter((part) => part?.type === "text")
+		.map((part) => part.text ?? "")
+		.join("");
+}
+
+/**
  * Context for the heartbeat progress summary (field request 2026-09-17: the
  * raw latest-narration snippet read like "检查表格当前行状态" — no sense of
  * where the task actually is). The side-channel LLM call gets the CURRENT
@@ -552,7 +608,8 @@ export function progressContextSlice(messages: AgentMessage[], keepRecentTokens 
 	}
 	const tail = messages
 		.slice(cut)
-		.filter((m) => m.role !== "compactionSummary" && m.role !== "branchSummary");
+		.filter((m) => m.role !== "compactionSummary" && m.role !== "branchSummary")
+		.filter((m) => m.role !== "assistant" || !isCompactionTemplateText(assistantVisibleText(m)));
 	const anchor = taskAnchorOf(messages);
 	if (anchor && !tail.some((m) => m === anchor)) return [anchor, ...tail];
 	return tail;
