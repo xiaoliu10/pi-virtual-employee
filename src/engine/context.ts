@@ -530,6 +530,19 @@ export function heartbeatGoalOf(messages: AgentMessage[]): string {
 }
 
 /**
+ * Signature of the harness compaction-summary template ("## Goal …\n## Constraints
+ * & Preferences …"). After an app restart a compaction summary is rehydrated from
+ * history as a PLAIN assistant message, so the role-based filter above misses it
+ * and the heartbeat model echoes the English template verbatim as the "progress
+ * report" (field 2026-10-09 screenshot: "## Goal 跟踪处理 … ## Constraints &
+ * Preferences - 处理流程：…"). Both headings together are unambiguous — no real
+ * assistant narration carries them.
+ */
+export function isCompactionTemplateText(text: string): boolean {
+	return /^##\s*Goal\b/m.test(text) && /##\s*Constraints/i.test(text);
+}
+
+/**
  * Context for the heartbeat progress summary (field request 2026-09-17: the
  * raw latest-narration snippet read like "检查表格当前行状态" — no sense of
  * where the task actually is). The side-channel LLM call gets the CURRENT
@@ -552,7 +565,8 @@ export function progressContextSlice(messages: AgentMessage[], keepRecentTokens 
 	}
 	const tail = messages
 		.slice(cut)
-		.filter((m) => m.role !== "compactionSummary" && m.role !== "branchSummary");
+		.filter((m) => m.role !== "compactionSummary" && m.role !== "branchSummary")
+		.filter((m) => m.role !== "assistant" || !isCompactionTemplateText(messageText(m)));
 	const anchor = taskAnchorOf(messages);
 	if (anchor && !tail.some((m) => m === anchor)) return [anchor, ...tail];
 	return tail;

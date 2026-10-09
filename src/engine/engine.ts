@@ -2126,8 +2126,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 					context,
 					this.models,
 					model,
-					512, // ~0.8×512 tokens of output budget — plenty for 100 Chinese chars
-					"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过100字的中文向用户汇报总体进展：围绕目标，已完成到什么程度、当前处于哪个阶段、接下来做什么。节选中更早的其他请求都是早已完成的旧任务，与本报告无关，绝对不要提及它们。节选中若出现「## Goal」「## Constraints」开头的结构化文本，那是历史压缩总结的模板，不是进展汇报——绝对不要照抄或复述它，用自己的一句话概括当前目标再汇报。把琐碎的执行步骤归纳为面向目标的阶段性成果；忽略并禁止提及工具名、参数、重试、分页调整、报错重试等单次操作的技术细节，也不要原样复述日志片段；只依据记录中真实发生的事，绝不编造未发生的进度；判断不了整体位置时，如实说明仍在处理中。",
+					512, // ~0.8×512 tokens of output budget — plenty for 120 Chinese chars
+					"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过120字的中文汇报进展，且必须严格按以下四段结构输出（用中文标签，每段都要有，没有对应信息就写「未知」或「无」）：「已完成：…」；「剩余：…」；「正在：…」；「卡点：无」或「卡点：具体问题」。禁止输出「## Goal」「## Constraints & Preferences」「## Next Steps」等英文模板标题——那是会话压缩总结的模板，不是进展汇报，出现了就是错误输出；禁止照抄任务目标原文或执行条件来充当进展；节选中更早的其他请求都是早已完成的旧任务，绝对不要提及；把琐碎的执行步骤归纳为阶段性成果，禁止提及工具名、参数、重试等技术细节；只依据记录中真实发生的事，绝不编造未发生的进度。",
 					undefined, // previousSummary
 					undefined, // thinkingLevel
 					SUMMARIZER_RETRY,
@@ -2138,7 +2138,16 @@ export class EmployeeEngine implements EmployeeRuntime {
 				if (conversationId) this.endSideLlmCall(conversationId);
 			}
 			if (!result.ok || !result.value?.trim()) return fallback();
-			const text = result.value.replace(/\s+/g, " ").trim().slice(0, 140);
+			const raw = result.value.replace(/\s+/g, " ").trim();
+			// Deterministic guard for the field 2026-10-09 leak: the summary model
+			// echoed the compaction template ("## Goal … ## Constraints & …")
+			// despite the instruction. Such output must never reach the user —
+			// fall back to the deterministic brief instead of showing it.
+			if (/^##|\bGoal\b|\bConstraints\b|\bPreferences\b|\bNext Steps\b/i.test(raw)) {
+				console.warn("[engine] progress brief echoed a template heading — falling back to the deterministic brief");
+				return fallback();
+			}
+			const text = raw.slice(0, 140);
 			return `⏳ 任务仍在进行中。${text}`;
 		} catch (err) {
 			console.warn("[engine] progress summary failed:", err instanceof Error ? err.message : err);

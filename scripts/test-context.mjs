@@ -25,7 +25,7 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 			contents: `
-				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, lastAssistantTailOf } from "./src/engine/context.ts";
+				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, lastAssistantTailOf, isCompactionTemplateText } from "./src/engine/context.ts";
 				export { shouldCompact, DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-agent-core";
 				export { estimateTokens } from "@earendil-works/pi-agent-core";
 			`,
@@ -38,7 +38,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, lastAssistantTailOf } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, lastAssistantTailOf, isCompactionTemplateText } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -190,6 +190,18 @@ test("cut point falls back to the last user turn when the tail is inside the fin
 // conversation's FIRST user message. In a long-lived IM conversation the
 // anchor must be the LATEST user request; stale goals must never reach the
 // summarizer.
+test("a compaction summary rehydrated as a plain assistant message is excluded from the progress slice (field 2026-10-09: '## Goal … ## Constraints' echoed verbatim)", () => {
+	const templateText = "## Goal 跟踪处理 24 条工行数币掉单异常\n## Constraints & Preferences\n- 处理流程：获取对账文件 → 下载 → 检查";
+	const template = { role: "assistant", content: [{ type: "text", text: templateText }] };
+	const real = { role: "assistant", content: [{ type: "text", text: "已完成 12 条重新对账，剩余 12 条待下载检查" }] };
+	const anchor = { role: "user", content: "跟踪处理掉单异常" };
+	const slice = progressContextSlice([template, real, anchor], 20_000);
+	assert.ok(!slice.some((m) => m === template), "the English template summary must not reach the heartbeat model");
+	assert.ok(slice.some((m) => m === real), "real narration stays");
+	assert.ok(isCompactionTemplateText(templateText), "signature: both headings together");
+	assert.equal(isCompactionTemplateText("## Goal 单独出现不算"), false, "one heading alone is not the template");
+});
+
 test("progress context anchors on the current request, not days-old goals", () => {
 	const staleGoal = user("任务（几天前）：在 sls 中检查机组主机心跳是否都为 ok");
 	const filler = [];
