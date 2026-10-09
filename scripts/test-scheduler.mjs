@@ -459,9 +459,8 @@ test("create_scheduled_task with silent=true records the flag and says so in the
 test("update_scheduled_task can flip silent without touching other fields", async (t) => {
 	const rows = [{ id: "s1", title: "保活", silent: 0 }];
 	const { scheduler, tools } = build1(t, {}, rows, actor("boss"), "dt:boss");
-	// The fake's update is a no-op returning undefined; drive the patch merge
-	// through the real service/store instead is covered by test-scheduler-detail —
-	// here assert the tool BUILDS the silent patch and reports it.
+	// Only the tool→service patch shape is asserted here; the service→store
+	// merge semantics (silent preserved when absent) live in test-scheduler-store.
 	let seenPatch;
 	scheduler.update = (id, patch) => { seenPatch = patch; return { ...rows[0], id, ...patch }; };
 	const updated = tool(tools, "update_scheduled_task");
@@ -475,7 +474,6 @@ test("update_scheduled_task can flip silent without touching other fields", asyn
 test("list_scheduled_tasks marks silent tasks; get_scheduled_task detail shows the push mode", async (t) => {
 	const rows = [{ id: "s1", title: "保活", silent: 1 }, { id: "s2", title: "早报", silent: 0 }];
 	const { tools } = build1(t, {}, rows, actor("boss"), "dt:boss");
-	const listText = tool(tools, "list_scheduled_tasks").content ?? null;
 	const listed = await tool(tools, "list_scheduled_tasks").execute("l1", {});
 	assert.match(listed.content[0].text, /\[静默\] 保活/, "silent task is marked in the list");
 	assert.match(listed.content[0].text, /推送: 静默执行/);

@@ -162,3 +162,17 @@ test("shouldPushScheduledResult: silent + success = no push; everything else pus
 	assert.equal(shouldPushScheduledResult({ conversation_id: null, silent: 1 }, undefined, "done"), false, "no target never pushes");
 	assert.equal(shouldPushScheduledResult({ conversation_id: "dt:g1", silent: 0 }, undefined, ""), false, "an empty reply never pushes");
 });
+
+test("shouldPushScheduledResult: autonomous outcome mapping — only 'done' is silenceable", () => {
+	// main.ts passes attention = outcome !== "done" ? outcome : undefined.
+	const gate = (outcome, silent) => shouldPushScheduledResult(
+		{ conversation_id: "dt:g1", silent },
+		outcome === "done" ? undefined : outcome,
+		"text",
+	);
+	assert.equal(gate("done", 1), false, "silent: done stays quiet");
+	assert.equal(gate("done", 0), true, "non-silent: done pushes");
+	for (const outcome of ["human", "budget", "stalled", "error"]) {
+		assert.equal(gate(outcome, 1), true, `silent: ${outcome} still pushes (needs attention)`);
+	}
+});
