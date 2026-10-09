@@ -536,10 +536,23 @@ export function heartbeatGoalOf(messages: AgentMessage[]): string {
  * and the heartbeat model echoes the English template verbatim as the "progress
  * report" (field 2026-10-09 screenshot: "## Goal 跟踪处理 … ## Constraints &
  * Preferences - 处理流程：…"). Both headings together are unambiguous — no real
- * assistant narration carries them.
+ * assistant narration carries them. Note: \b holds at ASCII↔CJK boundaries, so
+ * 「## Goal跟踪处理」 (no space) matches too — keep the \b.
  */
 export function isCompactionTemplateText(text: string): boolean {
 	return /^##\s*Goal\b/m.test(text) && /##\s*Constraints/i.test(text);
+}
+
+/** Visible text blocks only (no thinking/tool args) — template-signature checks
+ * must judge what the USER would see (review L1). */
+function assistantVisibleText(message: AgentMessage): string {
+	const content = (message as { content?: unknown }).content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return (content as { type?: string; text?: string }[])
+		.filter((part) => part?.type === "text")
+		.map((part) => part.text ?? "")
+		.join("");
 }
 
 /**
@@ -566,7 +579,7 @@ export function progressContextSlice(messages: AgentMessage[], keepRecentTokens 
 	const tail = messages
 		.slice(cut)
 		.filter((m) => m.role !== "compactionSummary" && m.role !== "branchSummary")
-		.filter((m) => m.role !== "assistant" || !isCompactionTemplateText(messageText(m)));
+		.filter((m) => m.role !== "assistant" || !isCompactionTemplateText(assistantVisibleText(m)));
 	const anchor = taskAnchorOf(messages);
 	if (anchor && !tail.some((m) => m === anchor)) return [anchor, ...tail];
 	return tail;

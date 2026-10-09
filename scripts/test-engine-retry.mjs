@@ -115,7 +115,7 @@ await build({
 						export const estimateContextTokens = () => 0;
 						export const estimateTokensSafe = () => 0;
 						export const estimateTokens = () => 0;
-						export const generateSummary = async () => ({ ok: false });
+						export const generateSummary = (...args) => (globalThis.__generateSummaryHook ? globalThis.__generateSummaryHook(...args) : Promise.resolve({ ok: false }));
 						export const shouldCompact = () => false;
 						export const createCompactionSummaryMessage = (x) => x;
 					`,
@@ -261,4 +261,41 @@ test("the backoff window is visible to isIdle and interruptible by abortAllTurns
 	assert.equal(agent.runs, 2, "no retried request after install_now");
 	assert.equal(sleeps, 1, "loop exited at the post-sleep re-check");
 	assert.equal(result.deterministic, true);
+});
+
+test("progress brief: a compaction-template echo falls back, a compliant four-field brief passes (review H1/L2)", async (t) => {
+	const { engine, config } = makeEngine(t, { streamFn: async () => ({ async *[Symbol.asyncIterator]() {}, result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }) }) });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-progress");
+	// progressBrief only calls the side channel once the transcript is worth it
+	// (>= ~2000 tokens) — feed a realistic tail.
+	for (let i = 0; i < 40; i++) {
+		agent.state.messages.push({ role: "assistant", content: [{ type: "text", text: `第 ${i} 步：下载对账文件并核对掉单记录，已处理若干条目，继续推进中。` }] });
+	}
+	try {
+		// H1: template echo must fall back to the deterministic brief — and must
+		// NOT be discarded merely for using 「## 已完成」 or the word "Goal".
+		globalThis.__generateSummaryHook = async () => ({ ok: true, value: "## Goal 跟踪处理掉单\n## Constraints & Preferences\n- 处理流程：获取对账文件" });
+		const leaked = await engine.progressBrief(agent, "conv-progress");
+		assert.ok(!leaked.includes("## Goal"), "template headings never reach the user");
+		assert.ok(leaked.includes("任务仍在进行中"), "the deterministic brief is shown instead");
+
+		globalThis.__generateSummaryHook = async () => ({ ok: true, value: "已完成：12 条重新对账；剩余：12 条待下载；正在：逐条下载对账文件；卡点：无" });
+		const good = await engine.progressBrief(agent, "conv-progress");
+		assert.equal(good, "⏳ 任务仍在进行中。已完成：12 条重新对账；剩余：12 条待下载；正在：逐条下载对账文件；卡点：无", "a compliant brief passes verbatim");
+
+		// H1 negative: an English word or a Chinese markdown heading is NOT a leak.
+		globalThis.__generateSummaryHook = async () => ({ ok: true, value: "## 已完成\n12 条对账完成；剩余：无；正在：汇总；卡点：无" });
+		const cnHeading = await engine.progressBrief(agent, "conv-progress");
+		assert.ok(!cnHeading.includes("（已耗时较长）"), "a Chinese ## heading must not trigger the fallback");
+
+		// M2: a long four-field brief is cut at a segment boundary, never mid-label.
+		const long = "已完成：完成对账文件下载解析与金额比对并发现三条差异已提交复核等待财务确认；剩余：12 条待下载检查的记录需要逐条处理；正在：逐条下载最新对账文件并核对金额差异；卡点：无";
+		globalThis.__generateSummaryHook = async () => ({ ok: true, value: long });
+		const cut = await engine.progressBrief(agent, "conv-progress");
+		assert.ok(cut.length <= "⏳ 任务仍在进行中。".length + 180, "bounded output");
+		assert.ok(!cut.endsWith("卡点："), "never ends on a dangling label");
+	} finally {
+		delete globalThis.__generateSummaryHook;
+	}
 });

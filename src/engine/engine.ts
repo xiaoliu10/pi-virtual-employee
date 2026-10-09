@@ -45,7 +45,7 @@ import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
 import { createMcpManager, type McpManager } from "./tools/mcp.js";
-import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, substantialAnchorOf, lastAssistantTailOf, SUMMARIZER_RETRY, truncateToFit, usableContextWindow } from "./context.js";
+import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isCompactionTemplateText, isContextOverflowError, maybeCompact, progressContextSlice, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, substantialAnchorOf, lastAssistantTailOf, SUMMARIZER_RETRY, truncateToFit, usableContextWindow } from "./context.js";
 import { fetchModelInfo, resolveEffectiveLimits, type RemoteModelInfo } from "./model-info.js";
 
 /** Default single-reply output cap for relay (custom baseUrl) models without an explicit per-model override. */
@@ -2141,13 +2141,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 			const raw = result.value.replace(/\s+/g, " ").trim();
 			// Deterministic guard for the field 2026-10-09 leak: the summary model
 			// echoed the compaction template ("## Goal … ## Constraints & …")
-			// despite the instruction. Such output must never reach the user —
-			// fall back to the deterministic brief instead of showing it.
-			if (/^##|\bGoal\b|\bConstraints\b|\bPreferences\b|\bNext Steps\b/i.test(raw)) {
-				console.warn("[engine] progress brief echoed a template heading — falling back to the deterministic brief");
+			// despite the instruction. TIGHT signature (review H1): the double
+			// heading pair, or an ENGLISH template heading as a line prefix — a
+			// compliant Chinese report using 「## 已完成」 or the word "Goal" must
+			// NOT be discarded for it (the old broad /\bGoal\b|^##/ fell back to
+			// exactly the structureless brief the user complained about).
+			if (isCompactionTemplateText(raw) || /^##\s*(Goal|Constraints|Preferences|Next Steps)\b/i.test(raw)) {
+				console.warn("[engine] progress brief echoed a compaction template — falling back to the deterministic brief");
 				return fallback();
 			}
-			const text = raw.slice(0, 140);
+			// 180 chars with a segment-boundary cut (review M2): a hard slice at
+			// 140 lands inside 「卡点：」 and shows the label with no content.
+			const text = raw.length <= 180 ? raw : raw.slice(0, 180).replace(/[；;][^；;]*$/, "").trimEnd() || raw.slice(0, 180);
 			return `⏳ 任务仍在进行中。${text}`;
 		} catch (err) {
 			console.warn("[engine] progress summary failed:", err instanceof Error ? err.message : err);
