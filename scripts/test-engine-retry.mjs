@@ -70,6 +70,11 @@ await build({
 							// Mirrors the SDK steering queue: steer() only enqueues.
 							steered = [];
 							steer(m) { this.steered.push(m); }
+							signal = undefined;
+							hasQueuedMessages() { return this.steered.length > 0; }
+							clearSteeringQueue() { this.steered = []; }
+							clearFollowUpQueue() {}
+							clearAllQueues() { this.clearSteeringQueue(); }
 							// Mirrors runWithLifecycle: errorMessage cleared at run start,
 							// provider failures become a failure assistant message + state
 							// errorMessage (NOT a throw), success emits message_end events.
@@ -536,7 +541,7 @@ test("steerConversation delivers to a LIVE agent and persists the instruction", 
 	const agent = engine.getOrCreateSession("conv-steer-live");
 	// A live turn: the SDK's steer only makes sense mid-run.
 	agent.state.isStreaming = true;
-	assert.equal(engine.steerConversation("conv-steer-live", "取消任务"), true, "a live agent accepts the steer");
+	assert.equal(engine.steerConversation("conv-steer-live", "取消任务").status, "accepted", "a live agent accepts the steer");
 	assert.equal(agent.steered.length, 1, "the message reached the SDK steering queue");
 	assert.equal(agent.steered[0].content, "取消任务");
 	assert.equal(engine.isConversationStreaming("conv-steer-live"), true);
@@ -546,9 +551,21 @@ test("steerConversation refuses an idle conversation (nothing to interrupt)", (t
 	const { engine } = makeEngine(t, { streamFn: async () => ({ async *[Symbol.asyncIterator]() {}, result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }) }) });
 	const agent = engine.getOrCreateSession("conv-steer-idle");
 	agent.state.isStreaming = false;
-	assert.equal(engine.steerConversation("conv-steer-idle", "取消"), false, "idle → the caller must run it as an ordinary turn");
+	assert.equal(engine.steerConversation("conv-steer-idle", "取消").status, "idle", "idle → the caller must run it as an ordinary turn");
 	assert.equal(agent.steered.length, 0, "nothing is queued on an idle agent");
 	assert.equal(engine.isConversationStreaming("conv-steer-idle"), false);
 	// An unknown conversation is also not steer-able.
-	assert.equal(engine.steerConversation("conv-steer-unknown", "取消"), false);
+	assert.equal(engine.steerConversation("conv-steer-unknown", "取消").status, "idle");
+});
+
+test("steerConversation enforces the task-owner boundary on non-local chats", (t) => {
+	const { engine } = makeEngine(t, { streamFn: async () => ({ async *[Symbol.asyncIterator]() {}, result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }) }) });
+	const agent = engine.getOrCreateSession("dt:steer-owner");
+	agent.state.isStreaming = true;
+	// No turn has run, so turnActor has no owner → a foreign sender must be refused.
+	const foreign = { senderId: "someone-else", channel: "dingtalk", chatType: "single" };
+	const refused = engine.steerConversation("dt:steer-owner", "取消任务", foreign);
+	assert.equal(refused.status, "rejected", "a non-owner cannot steer another's live task");
+	assert.match(refused.reason, /发起人|权限/, "the refusal explains why");
+	assert.equal(agent.steered.length, 0, "nothing reaches the queue on refusal");
 });

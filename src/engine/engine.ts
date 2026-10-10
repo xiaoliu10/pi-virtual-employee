@@ -41,7 +41,7 @@ import type { DownloadService } from "../downloads/download-service.js";
 import { buildSystemPrompt, buildTools } from "./definition.js";
 import type { UpdateOperations } from "./tools/update.js";
 import { hasActiveShellCommands } from "./tools/shell.js";
-import { isLocalConversation, resolveRole } from "../security/permissions.js";
+import { checkPermission, isLocalConversation, resolveRole } from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
@@ -898,15 +898,33 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * An idle conversation is NOT steered (there is nothing to interrupt): the
 	 * caller should then run it as an ordinary turn.
 	 */
-	steerConversation(conversationId: string, text: string): boolean {
+	steerConversation(conversationId: string, text: string, actor?: InboundActor):
+		{ status: "accepted" | "idle" } | { status: "rejected"; reason: string } {
 		const agent = this.sessions.get(conversationId);
-		if (!agent || !agent.state.isStreaming) return false;
+		if (!agent || (!agent.state.isStreaming && !this.retryWaits.has(conversationId))) return { status: "idle" };
+		const admission = checkPermission(this.config, actor, conversationId, "chat");
+		if (!admission.ok) return { status: "rejected", reason: admission.reason };
+		// Do not run a different group member's instructions under the current
+		// requester's tool permissions. Steering never changes turnActor.
+		if (!isLocalConversation(conversationId)) {
+			const owner = this.turnActor.get(conversationId);
+			if (!actor?.senderId || !owner || actor.senderId !== owner.senderId ||
+				actor.channel !== owner.channel || actor.chatType !== owner.chatType) {
+				return { status: "rejected", reason: "中途指令只能由当前任务的发起人在同一会话发送，不能借用其他人的任务权限。" };
+			}
+		}
+		if (this.turnAborts.has(conversationId) || agent.signal?.aborted) {
+			return { status: "rejected", reason: "当前回合正在中断，不能再接收中途指令；请等待结束后重新发送。" };
+		}
+		if (!text.trim() || text.length > 4_000) {
+			return { status: "rejected", reason: "中途指令需为非空文本，且不超过 4000 字；长任务请作为独立消息发送。" };
+		}
 		try {
 			agent.steer({ role: "user", content: text, timestamp: Date.now() });
 		} catch (err) {
 			// steer() itself only enqueues, but a torn-down session can still throw.
 			console.warn(`[engine] steer ${conversationId} failed:`, err instanceof Error ? err.message : err);
-			return false;
+			return { status: "rejected", reason: "中途指令未能入队，请重试或用 /stop 中断。" };
 		}
 		// The agent loop puts the steered message in the LIVE transcript, but
 		// history.appendMessage only ever sees send()'s message — without this
@@ -914,11 +932,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// would show the task obeying an instruction that was never recorded).
 		// Marked so a reader can tell it arrived mid-run.
 		try {
-			this.history.appendMessage(conversationId, "user", `${text}\n[任务执行中转达]`);
+			this.history.appendMessage(conversationId, "user", `${text}\n[已接收中途指令，待任务步骤边界处理]`);
 		} catch (err) {
 			console.warn(`[engine] steer persist failed for ${conversationId}:`, err instanceof Error ? err.message : err);
 		}
-		return true;
+		return { status: "accepted" };
 	}
 
 	/** True when a live turn is running on this conversation (steer-able). */
@@ -945,6 +963,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 		if (this.turnIds.has(conversationId) && !this.turnAborts.has(conversationId)) {
 			this.turnAborts.set(conversationId, "user");
 		}
+		// Never leak an unconsumed steer into a later /new or ordinary turn.
+		cached.clearSteeringQueue();
 		try {
 			cached.abort();
 		} catch {
@@ -1816,6 +1836,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 			hardError = loginGuidanceOf(err) ?? (err instanceof Error ? err.message : String(err));
 			console.error(`[engine] prompt failed for ${conversationId}:`, err);
 		} finally {
+			// A terminal provider failure, cap, or abort can exit before polling
+			// steering. Do not replay those queued instructions on a later task.
+			if (agent.hasQueuedMessages()) {
+				agent.clearSteeringQueue();
+				reply += "\n\n⚠️ 有中途指令尚未送达模型，本轮已结束，请重新发送。";
+			}
 			unsubscribe();
 			this.turnSendFile.delete(conversationId);
 			this.turnSendImage.delete(conversationId);

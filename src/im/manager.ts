@@ -210,10 +210,14 @@ export class IMAdapterManager {
 				if (inbound?.name === "steer") {
 					if (this.draining) return Promise.resolve("⏳ 系统正在安装应用更新，当前消息不会被执行；请稍后重新发送。");
 					const text = (inbound.arg ?? "").trim();
-					if (!text) return Promise.resolve("用法：/steer <要说的话>——它会送达到正在执行的任务（在当前步骤结束后生效），例如「/steer 别做了，先保存结果收尾」。要硬中断请用 /stop。");
-					if (this.engine.steerConversation(msg.conversationId, text)) {
-						return Promise.resolve(`🧭 已转达给正在执行的任务：「${text}」。它会在当前步骤结束后收下这条指令并调整方向；如需立即硬中断请发 /stop。`);
+					if (!text) return Promise.resolve("用法：/steer <要说的话>——它会送达到正在执行的任务（在当前步骤边界生效，任务会据此收尾/调整），例如「/steer 别做了，先保存结果收尾」。要硬中断请用 /stop。");
+					const steered = this.engine.steerConversation(msg.conversationId, text, msg.actor);
+					if (steered.status === "accepted") {
+						return Promise.resolve(`🧭 已把「${text}」转达给正在执行的任务——它会在当前步骤边界收下并据此收尾/调整。若几步内没动静，请发 /stop 硬中断。`);
 					}
+					if (steered.status === "rejected") return Promise.resolve(steered.reason);
+					// idle: no live turn — nothing to interrupt. Run the payload as an
+					// ordinary turn so "/steer X" on an idle chat is not a dead end.
 					return this.serialize(msg.conversationId, async () => {
 						if (this.draining) return "⏳ 系统正在安装应用更新，当前消息不会被执行；请稍后重新发送。";
 						this.engine.recordConversationMember(msg.conversationId, msg.actor);
@@ -229,9 +233,13 @@ export class IMAdapterManager {
 				// what you are doing" — queueing it behind the very task it
 				// cancels is the reported dead end. Idle → ordinary turn.
 				if (isCancelPhrase(msg.text) && this.engine.isConversationStreaming(msg.conversationId)) {
-					if (this.engine.steerConversation(msg.conversationId, msg.text)) {
-						return Promise.resolve(`🧭 已把「${msg.text.trim()}」转达给正在执行的任务——它会在当前步骤结束后停下并收尾。如需立即硬中断请发 /stop。`);
+					const steered = this.engine.steerConversation(msg.conversationId, msg.text, msg.actor);
+					if (steered.status === "accepted") {
+						return Promise.resolve(`🧭 已把「${msg.text.trim()}」转达给正在执行的任务——它会在当前步骤边界停下并收尾。若几步内没停，请发 /stop 硬中断。`);
 					}
+					// rejected (e.g. not the task owner) must NOT silently fall through to
+					// the queue — that reintroduces the reported dead end. Surface it.
+					if (steered.status === "rejected") return Promise.resolve(steered.reason);
 				}
 				// /new bypasses the per-conversation queue on purpose: a wedged
 				// in-flight turn would otherwise block this command forever.
