@@ -103,7 +103,8 @@ export function isCompactionTemplateReport(text: string): boolean {
  *
  * Used to REJECT a contaminated candidate wholesale (standardize /
  * extractProgressFromTexts) and to disarm a contaminated field value in the
- * deterministic fallback (the field degrades to 暂未确认, the fragment never
+ * deterministic fallback (the field degrades to 暂未确认 — 卡点 to 暂无 — the
+ * fragment never
  * reaches the user).
  */
 export function containsTemplateHeadingLine(text: string): boolean {
@@ -239,7 +240,8 @@ export function extractProgressFromTexts(texts: string[]): ProgressFields | null
  */
 export function formatDeterministicBrief(fields: ProgressFields | null, taskName?: string, taskLabel = "任务"): string {
 	// A field value carrying a template-heading fragment ("## Goal 旧标题") is
-	// contamination, not evidence — degrade it to 暂未确认 rather than show the
+	// contamination, not evidence — degrade it to 暂未确认 (卡点 to 暂无) rather
+	// than show the
 	// fragment to the user (review L). Values reaching here are already
 	// whitespace-collapsed, so the check is deliberately NOT line-anchored.
 	const contaminated = (value: string): boolean => /##\s*(?:Goal|Constraints|Preferences|Next\s*Steps)\b/i.test(value);

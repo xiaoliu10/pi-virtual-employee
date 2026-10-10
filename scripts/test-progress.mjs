@@ -256,6 +256,15 @@ test("formatDeterministicBrief: unevidenced fields read 暂未确认, never an i
 	assert.ok(!brief.includes("## Goal"), "no template headings, ever");
 });
 
+test("formatDeterministicBrief: a template-CONTAMINATED 卡点 also reads 暂无 (never the fragment)", () => {
+	// 污染值被丢弃后「没有已知障碍」是事实为真的弱声明；把片段留给用户才是
+	// review L2 的钉子。
+	const brief = formatDeterministicBrief({ done: "下载完成", remaining: "剩余", doing: "执行", blocked: "## Goal 旧标题" });
+	assert.ok(brief.includes("卡点：暂无"), "a contaminated 卡点 degrades to 暂无");
+	assert.ok(!brief.includes("## Goal"), "the fragment never reaches the user");
+	assert.ok(!brief.includes("卡点：暂未确认"), "卡点 never falls back to 暂未确认 here");
+});
+
 test("formatDeterministicBrief: evidenced fields pass through; partial evidence fills only the gaps", () => {
 	const full = formatDeterministicBrief({ done: "12 条重新对账", remaining: "12 条待下载", doing: "逐条下载", blocked: "无" }, "跟踪处理掉单异常");
 	assert.ok(full.includes("任务：跟踪处理掉单异常。"), "the sanitized task name heads the brief");

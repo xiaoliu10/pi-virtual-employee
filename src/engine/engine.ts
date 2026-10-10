@@ -2082,7 +2082,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * previous task's 「已完成：…卡点：无」 is never reused for the new one
 	 * (review M1) — for an ack/继续 anchor this may yield nothing, and 暂未确认
 	 * is honest where a cross-task number would be a misreport; (2) for every
-	 * UNEVIDENCED field, 「暂未确认」 — never an inferred 「无」 and no invented
+	 * UNEVIDENCED field, 「暂未确认」 (卡点 「暂无」) — never an inferred 「无」 and no invented
 	 * numbers, with the active step reading the honest generic line; (3) the
 	 * head quotes only sanitized sources, CURRENT TASK FIRST: the latest
 	 * substantial user request (acks skipped, field 2026-09-30) is
