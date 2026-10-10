@@ -269,3 +269,33 @@ test("manage_skills rejects non-https urls and invalid skill files", async (t) =
 	const junk = await tool.execute("t2", { action: "install", url: "https://example.com/SKILL.md" });
 	assert.match(junk.content[0].text, /不是有效的技能/);
 });
+
+// ── built-in skill inventory (2026-10-10): the auto-research loop must ship ──
+
+test("built-in pi-auto-research skill ships, parses, and teaches the full loop", async () => {
+	const { skills } = await new SkillLoader(
+		join(root, "resources", "skills"),
+		join(dataDir, "unused-user"),
+	).list();
+	const research = skills.find((skill) => skill.name === "pi-auto-research");
+	assert.ok(research, "pi-auto-research must be discoverable from resources/skills");
+	assert.ok(research.description.includes("验证"), "description states the verify step");
+	assert.ok(research.description.includes("沉淀"), "description states the sediment step");
+	for (const keyword of ["search_knowledge_base", "research_web", "save_to_knowledge", "save_to_skill"]) {
+		assert.ok(research.content.includes(keyword), `the loop names the real tool: ${keyword}`);
+	}
+	assert.ok(research.content.includes("验证"), "content teaches verification before sedimenting");
+	assert.ok(!research.disableModelInvocation, "the skill is active by default");
+});
+
+test("both built-in skills have valid, unique frontmatter", async () => {
+	const { skills, info } = await new SkillLoader(
+		join(root, "resources", "skills"),
+		join(dataDir, "unused-user"),
+	).list();
+	assert.ok(skills.find((skill) => skill.name === "pi-knowledge-base"), "pi-knowledge-base still loads");
+	assert.equal(info.filter((i) => i.source === "builtin" && i.warnings?.length).length, 0,
+		`builtin skills must parse without warnings: ${JSON.stringify(info)}`);
+	const names = skills.map((skill) => skill.name);
+	assert.equal(new Set(names).size, names.length, "no duplicate skill names");
+});
