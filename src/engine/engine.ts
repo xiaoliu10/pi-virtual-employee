@@ -41,7 +41,7 @@ import type { DownloadService } from "../downloads/download-service.js";
 import { buildSystemPrompt, buildTools } from "./definition.js";
 import type { UpdateOperations } from "./tools/update.js";
 import { hasActiveShellCommands } from "./tools/shell.js";
-import { isLocalConversation, resolveRole } from "../security/permissions.js";
+import { checkPermission, isLocalConversation, resolveRole } from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
@@ -881,6 +881,75 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/**
+	 * Steer an in-flight turn (pi SDK `agent.steer`): the message is queued and
+	 * offered to the model at the NEXT step boundary (after the current assistant
+	 * turn + tool batch), so it can change course WITHOUT killing the whole turn.
+	 * Enqueueing does not guarantee delivery or stopping: the run may end before
+	 * that boundary, and the model decides how to respond to a delivered steer.
+	 *
+	 * Why this exists (field 2026-10-10): a huge task that keeps running for a
+	 * long time made the user's "取消任务" unreachable — the per-conversation
+	 * IM queue is strict, so a natural-language cancel just queued behind the
+	 * very task it wanted to stop. /stop killed the turn, but the user has to
+	 * know to type it, and a hard abort discards the run. Steer is the middle
+	 * gear: the running turn can learn it should stop/wrap up at a step boundary.
+	 * Use /stop when an immediate hard abort is required.
+	 *
+	 * Returns accepted only when the message entered a LIVE agent queue (including
+	 * retry backoff), idle when no turn is active, or rejected with a reason.
+	 * An idle conversation is NOT steered (there is nothing to interrupt): the
+	 * caller should then run it as an ordinary turn.
+	 */
+	steerConversation(conversationId: string, text: string, actor?: InboundActor):
+		{ status: "accepted" | "idle" } | { status: "rejected"; reason: string } {
+		const agent = this.sessions.get(conversationId);
+		if (!agent || (!agent.state.isStreaming && !this.retryWaits.has(conversationId))) return { status: "idle" };
+		const admission = checkPermission(this.config, actor, conversationId, "chat");
+		if (!admission.ok) return { status: "rejected", reason: admission.reason };
+		// Do not run a different group member's instructions under the current
+		// requester's tool permissions. Steering never changes turnActor.
+		if (!isLocalConversation(conversationId)) {
+			const owner = this.turnActor.get(conversationId);
+			if (!actor?.senderId || !owner || actor.senderId !== owner.senderId ||
+				actor.channel !== owner.channel || actor.chatType !== owner.chatType) {
+				return { status: "rejected", reason: "中途指令只能由当前任务的发起人在同一会话发送，不能借用其他人的任务权限。如需立即中断，请发 /stop。" };
+			}
+		}
+		if (this.turnAborts.has(conversationId) || agent.signal?.aborted) {
+			return { status: "rejected", reason: "当前回合正在中断，不能再接收中途指令；请等待结束后重新发送。" };
+		}
+		if (!text.trim() || text.length > 4_000) {
+			return { status: "rejected", reason: "中途指令需为非空文本，且不超过 4000 字；长任务请作为独立消息发送。" };
+		}
+		try {
+			agent.steer({ role: "user", content: text, timestamp: Date.now() });
+		} catch (err) {
+			// steer() itself only enqueues, but a torn-down session can still throw.
+			console.warn(`[engine] steer ${conversationId} failed:`, err instanceof Error ? err.message : err);
+			return { status: "rejected", reason: "中途指令未能入队，请重试或用 /stop 中断。" };
+		}
+		// The agent loop puts the steered message in the LIVE transcript, but
+		// history.appendMessage only ever sees send()'s message — without this
+		// the steer vanishes from the persisted conversation (restart/rehydrate
+		// would show the task obeying an instruction that was never recorded).
+		// Marked so a reader can tell it arrived mid-run; the sender rides along
+		// so the audit trail says WHO steered (a group has many people).
+		const who = actor?.senderName ? `（${actor.senderName}）` : "";
+		try {
+			this.history.appendMessage(conversationId, "user", `${text}\n[已接收中途指令${who}，待任务步骤边界处理]`);
+		} catch (err) {
+			console.warn(`[engine] steer persist failed for ${conversationId}:`, err instanceof Error ? err.message : err);
+		}
+		return { status: "accepted" };
+	}
+
+	/** True when a live turn is running on this conversation (steer-able). */
+	isConversationStreaming(conversationId: string): boolean {
+		const agent = this.sessions.get(conversationId);
+		return Boolean(agent?.state.isStreaming) || this.retryWaits.has(conversationId);
+	}
+
+	/**
 	 * /new phase 1: abort an in-flight turn on this conversation so the IM
 	 * per-conversation queue can drain. Returns true when a live session was
 	 * aborted. The actual reset runs as phase 2 ({@link resetSession}) at the
@@ -898,6 +967,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 		if (this.turnIds.has(conversationId) && !this.turnAborts.has(conversationId)) {
 			this.turnAborts.set(conversationId, "user");
 		}
+		// Never leak an unconsumed steer into a later /new or ordinary turn.
+		cached.clearSteeringQueue();
 		try {
 			cached.abort();
 		} catch {
@@ -1761,6 +1832,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// rather than sniffed from the text: telemetry's job is to be accurate.
 		let askedForSummary = false;
 		let deterministic = false;
+		let undeliveredSteer = false;
 		try {
 			retries = await this.promptWithRetry(agent, conversationId, message, ctx?.images);
 		} catch (err) {
@@ -1769,6 +1841,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 			hardError = loginGuidanceOf(err) ?? (err instanceof Error ? err.message : String(err));
 			console.error(`[engine] prompt failed for ${conversationId}:`, err);
 		} finally {
+			// A terminal provider failure, cap, or abort can exit before polling
+			// steering. Do not replay those queued instructions on a later task.
+			undeliveredSteer = agent.hasQueuedMessages();
+			agent.clearSteeringQueue();
 			unsubscribe();
 			this.turnSendFile.delete(conversationId);
 			this.turnSendImage.delete(conversationId);
@@ -1828,6 +1904,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 			console.warn(`[engine] no reply produced for ${conversationId}; emitted deterministic failure (${cause || "no error reported"})`);
 		}
 
+		// Add delivery status only after choosing the outcome: it must neither
+		// mask an empty reply's failure nor be overwritten by a final summary.
+		if (undeliveredSteer) {
+			reply += "\n\n⚠️ 有中途指令尚未送达模型，本轮已结束，请重新发送。";
+		}
 		reply = reply.trim();
 		if (!ctx?.ephemeral) {
 			this.history.appendMessage(conversationId, "assistant", reply);

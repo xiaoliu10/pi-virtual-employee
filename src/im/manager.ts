@@ -14,7 +14,7 @@ import type { ReportService } from "../reports/report-service.js";
 import { EchoAdapter } from "./adapters/echo.js";
 import { DingtalkAdapter } from "./adapters/dingtalk.js";
 import type { IMAdapter, IMIO, InboundActor } from "./types.js";
-import { looksLikeCommandAttempt, parseCommand, type ParsedCommand } from "./commands.js";
+import { isCancelPhrase, looksLikeCommandAttempt, parseCommand, type ParsedCommand } from "./commands.js";
 import { diag } from "./diag.js";
 import { CAPABILITY_LABEL, checkPermission, describeAccess, isAdmin } from "../security/permissions.js";
 import { maskId } from "../engine/tools/admin.js";
@@ -201,6 +201,46 @@ export class IMAdapterManager {
 							: "当前没有正在进行的回合。",
 					);
 				}
+				// /steer <内容> — deliver to the LIVE turn at its next step
+				// boundary (pi SDK steer). Field 2026-10-10: a huge task blocked
+				// the strict per-conversation queue, so the user's "取消任务"
+				// never reached the model; steer reaches it without killing the
+				// turn. An idle conversation has nothing to steer — run it as an
+				// ordinary turn instead.
+				if (inbound?.name === "steer") {
+					if (this.draining) return Promise.resolve("⏳ 系统正在安装应用更新，当前消息不会被执行；请稍后重新发送。");
+					const text = (inbound.arg ?? "").trim();
+					if (!text) return Promise.resolve("用法：/steer <要说的话>——它会在当前步骤边界把这条指令交给正在执行的任务，让它据此收尾/调整（但不保证立即停下），例如「/steer 别做了，先保存结果收尾」。要硬中断请用 /stop。");
+					const steered = this.engine.steerConversation(msg.conversationId, text, msg.actor);
+					if (steered.status === "accepted") {
+						return Promise.resolve(`🧭 已把「${text}」交给正在执行的任务——它会在当前步骤边界收到这条指令，应据此收尾/调整（但不保证立即停下）。若几步内没动静，请发 /stop 硬中断。`);
+					}
+					if (steered.status === "rejected") return Promise.resolve(steered.reason);
+					// idle: no live turn — nothing to interrupt. Run the payload as an
+					// ordinary turn so "/steer X" on an idle chat is not a dead end.
+					return this.serialize(msg.conversationId, async () => {
+						if (this.draining) return "⏳ 系统正在安装应用更新，当前消息不会被执行；请稍后重新发送。";
+						this.engine.recordConversationMember(msg.conversationId, msg.actor);
+						const admission = checkPermission(this.config, msg.actor, msg.conversationId, "chat");
+						if (!admission.ok) return admission.reason;
+						const agent = this.engine.getOrCreateSession(msg.conversationId);
+						const result = await this.engine.send(agent, text, { actor: msg.actor, conversationName: msg.conversationName, onPersist: (id) => this.onActivity?.(id) });
+						return result.reply || `⚠️ 抱歉,处理失败:${friendlyError(result.error)}`;
+					});
+				}
+				// A plain cancel/stop phrase sent while a turn is running is
+				// STEERED, not queued (field 2026-10-10). The user means "stop
+				// what you are doing" — queueing it behind the very task it
+				// cancels is the reported dead end. Idle → ordinary turn.
+				if (isCancelPhrase(msg.text) && this.engine.isConversationStreaming(msg.conversationId)) {
+					const steered = this.engine.steerConversation(msg.conversationId, msg.text, msg.actor);
+					if (steered.status === "accepted") {
+						return Promise.resolve(`🧭 已把「${msg.text.trim()}」交给正在执行的任务——它会在当前步骤边界收到这条指令，应据此停下/收尾（但不保证立即停）。若几步内没停，请发 /stop 硬中断。`);
+					}
+					// rejected (e.g. not the task owner) must NOT silently fall through to
+					// the queue — that reintroduces the reported dead end. Surface it.
+					if (steered.status === "rejected") return Promise.resolve(steered.reason);
+				}
 				// /new bypasses the per-conversation queue on purpose: a wedged
 				// in-flight turn would otherwise block this command forever.
 				// Abort the live agent FIRST (unblocks the queue), then run the
@@ -352,7 +392,7 @@ export class IMAdapterManager {
 		actor?: InboundActor,
 		userText?: string,
 	): string | Promise<string> {
-		if (cmd.name === "new" || cmd.name === "stop") {
+		if (cmd.name === "new" || cmd.name === "stop" || cmd.name === "steer") {
 			// Intercepted in makeIO (they must bypass the queue). Reaching here would
 			// mean the interception was bypassed — say so instead of silently doing
 			// nothing, which is exactly the failure this module was written for.
@@ -365,6 +405,7 @@ export class IMAdapterManager {
 				"/new — 中断当前回合并清空上下文，开启新会话（群聊里 @ 我 /new 同样有效）",
 				"/compact — 压缩上下文（较早对话汇总为摘要，近期对话保留）",
 				"/stop — 中断当前回合（上下文保留）",
+				"/steer <内容> — 在当前步骤边界把话交给正在执行的任务，让它据此收尾/调整（不保证立即停下），例如 /steer 先保存结果收尾",
 				"/perm — 查看我在当前会话的权限（角色 + 各项能力是否放行）",
 				"/restart — 重启应用（仅管理员，单聊）",
 				"/version — 查看应用版本",

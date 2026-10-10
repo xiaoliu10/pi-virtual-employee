@@ -58,6 +58,7 @@ await build({
 						export class Agent {
 							constructor(opts) {
 								this.opts = opts;
+								this.sessionId = opts.sessionId;
 								this.state = { ...opts.initialState, isStreaming: false, messages: [], errorMessage: undefined };
 								this.runs = 0;
 								this.#handlers = new Set();
@@ -67,6 +68,14 @@ await build({
 							subscribe(h) { this.#handlers.add(h); return () => this.#handlers.delete(h); }
 							#emit(event) { for (const h of this.#handlers) h(event); }
 							abort() {}
+							// Mirrors the SDK steering queue: steer() only enqueues.
+							steered = [];
+							steer(m) { this.steered.push(m); }
+							signal = undefined;
+							hasQueuedMessages() { return this.steered.length > 0; }
+							clearSteeringQueue() { this.steered = []; }
+							clearFollowUpQueue() {}
+							clearAllQueues() { this.clearSteeringQueue(); }
 							// Mirrors runWithLifecycle: errorMessage cleared at run start,
 							// provider failures become a failure assistant message + state
 							// errorMessage (NOT a throw), success emits message_end events.
@@ -85,6 +94,11 @@ await build({
 										if (final?.role === "assistant" && !this.state.errorMessage) {
 											this.state.messages.push(final);
 											this.#emit({ type: "message_end", message: final });
+											// Exercise the engine's real cap hook for scripted tool batches.
+											await this.createLoopConfig().finishTurn?.({
+												toolResults: response.toolResults ?? [],
+												context: { messages: this.state.messages },
+											});
 										}
 									}
 								} catch (err) {
@@ -171,7 +185,7 @@ function makeEngine(t, { streamFn, retrySleepFn } = {}) {
 	// turnIds (and thus markTurnAbort) only register when a telemetry store
 	// exists — provide a no-op one so the abort test drives the real path.
 	engine.setTelemetryStore({ recordTurn: () => {}, recordTool: () => {} });
-	return { engine, config, delays };
+	return { engine, config, history, delays };
 }
 
 const supplierConfig = (config) => config.update({
@@ -269,9 +283,6 @@ test("a /stop landing during the backoff ends the loop without another request (
 	});
 	supplierConfig(config);
 	const agent = engine.getOrCreateSession("conv-abort");
-	// Production agents carry sessionId (set by the session factory); the stub
-	// must mirror it or send() falls back to "default" and the keys diverge.
-	agent.sessionId = "conv-abort";
 	const result = await engine.send(agent, "hi");
 	assert.equal(agent.runs, 2, "only the final-summary run after the stop — no retried request");
 	assert.equal(sleeps, 1, "loop exited at the post-sleep re-check");
@@ -523,4 +534,219 @@ test("compaction-summary head is still used when every substantial request was c
 	const brief = await engine.progressBrief(agent, "conv-m1-summary");
 	assert.ok(brief.includes("任务：跟踪处理 24 条工行数币掉单异常"), "the curated summary heads the brief, labeled 任务");
 	assert.ok(!brief.includes("## Goal"), "the template heading itself is never echoed");
+});
+
+/** Explicit entry signal + release gate; always release/await sends in finally. */
+function enteredGate() {
+	let enter;
+	let release;
+	const entered = new Promise((resolve) => { enter = resolve; });
+	const blocked = new Promise((resolve) => { release = resolve; });
+	return { entered, blocked, enter, release };
+}
+
+// ── steer (field 2026-10-10): a long task blocked the strict per-conversation
+//    queue, so the user's "取消任务" never reached the model ──
+
+test("steerConversation enqueues an instruction for a LIVE agent", (t) => {
+	const { engine } = makeEngine(t, { streamFn: async () => ({ async *[Symbol.asyncIterator]() {}, result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }) }) });
+	const agent = engine.getOrCreateSession("conv-steer-live");
+	// A live turn: the SDK's steer only makes sense mid-run.
+	agent.state.isStreaming = true;
+	assert.equal(engine.steerConversation("conv-steer-live", "取消任务").status, "accepted", "a live agent accepts the steer");
+	assert.equal(agent.steered.length, 1, "the message reached the SDK steering queue");
+	assert.equal(agent.steered[0].content, "取消任务");
+	assert.equal(engine.isConversationStreaming("conv-steer-live"), true);
+});
+
+test("steerConversation refuses an idle conversation (nothing to interrupt)", (t) => {
+	const { engine } = makeEngine(t, { streamFn: async () => ({ async *[Symbol.asyncIterator]() {}, result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }) }) });
+	const agent = engine.getOrCreateSession("conv-steer-idle");
+	agent.state.isStreaming = false;
+	assert.equal(engine.steerConversation("conv-steer-idle", "取消").status, "idle", "idle → the caller must run it as an ordinary turn");
+	assert.equal(agent.steered.length, 0, "nothing is queued on an idle agent");
+	assert.equal(engine.isConversationStreaming("conv-steer-idle"), false);
+	// An unknown conversation is also not steer-able.
+	assert.equal(engine.steerConversation("conv-steer-unknown", "取消").status, "idle");
+});
+
+test("steerConversation enforces the task-owner boundary on non-local chats", (t) => {
+	const { engine } = makeEngine(t, { streamFn: async () => ({ async *[Symbol.asyncIterator]() {}, result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }) }) });
+	const agent = engine.getOrCreateSession("dt:steer-owner");
+	agent.state.isStreaming = true;
+	// No turn has run, so turnActor has no owner → a foreign sender must be refused.
+	const foreign = { senderId: "someone-else", channel: "dingtalk", chatType: "single" };
+	const refused = engine.steerConversation("dt:steer-owner", "取消任务", foreign);
+	assert.equal(refused.status, "rejected", "a non-owner cannot steer another's live task");
+	assert.match(refused.reason, /发起人|权限/, "the refusal explains why");
+	assert.equal(agent.steered.length, 0, "nothing reaches the queue on refusal");
+});
+
+test("steerConversation accepts the TASK OWNER mid-turn and persists senderName (review L2 positive path)", async (t) => {
+	const gate = enteredGate();
+	const { engine, history } = makeEngine(t, { streamFn: async () => {
+		// Signal actual provider entry, not an assumed event-loop scheduling tick.
+		gate.enter();
+		await gate.blocked;
+		return { async *[Symbol.asyncIterator]() {}, result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }) };
+	} });
+	const actor = { senderId: "owner-1", senderName: "任务发起人", channel: "dingtalk", chatType: "single" };
+	const agent = engine.getOrCreateSession("dt:owner-live");
+	const sendPromise = engine.send(agent, "do a long task", { actor });
+	try {
+		await gate.entered;
+		const steered = engine.steerConversation("dt:owner-live", "取消任务", actor);
+		assert.equal(steered.status, "accepted", "the task owner may steer their own live task");
+		assert.equal(agent.steered.length, 1, "the steer is queued");
+		const persisted = history.listMessages("dt:owner-live").find((m) => m.content.startsWith("取消任务\n"));
+		assert.equal(persisted?.role, "user");
+		assert.equal(persisted?.content, "取消任务\n[已接收中途指令（任务发起人），待任务步骤边界处理]");
+	} finally {
+		gate.release();
+		await sendPromise;
+	}
+});
+
+for (const mode of ["provider failure", "empty output"]) {
+	test(`undelivered steer preserves deterministic failure for persistent ${mode}, and never leaks into the next send`, async (t) => {
+		const gate = enteredGate();
+		let recovered = false;
+		const { engine, config, history, delays } = makeEngine(t, { streamFn: async () => {
+			gate.enter();
+			await gate.blocked;
+			if (!recovered && mode === "provider failure") throw new Error("Connection error.");
+			return {
+				async *[Symbol.asyncIterator]() {},
+				result: async () => ({ role: "assistant", content: [{ type: "text", text: recovered ? "恢复成功" : "" }], stopReason: "stop" }),
+			};
+		} });
+		supplierConfig(config);
+		const conversationId = `conv-steer-${mode}`;
+		const agent = engine.getOrCreateSession(conversationId);
+		const sendPromise = engine.send(agent, "do a long task");
+		let result;
+		try {
+			await gate.entered;
+			assert.equal(engine.steerConversation(conversationId, "取消任务").status, "accepted");
+			assert.equal(agent.steered.length, 1);
+		} finally {
+			gate.release();
+			result = await sendPromise;
+		}
+		assert.equal(result.deterministic, true, "the warning must not turn failure into success");
+		if (mode === "provider failure") {
+			assert.match(result.reply, /没能完成你的请求.*Connection error\./);
+			assert.equal(result.error, "Connection error.");
+		} else {
+			assert.match(result.reply, /模型服务连续多次未返回内容/);
+			assert.equal(result.error, undefined);
+		}
+		assert.match(result.reply, /有中途指令尚未送达模型/);
+		assert.equal(agent.runs, 1 + TRANSIENT_RETRIES + 1, "final summary is still attempted before deterministic fallback");
+		assert.equal(delays.length, TRANSIENT_RETRIES);
+		assert.equal(agent.hasQueuedMessages(), false, "terminal failure clears the steering queue");
+		assert.equal(history.listMessages(conversationId).filter((m) => m.role === "assistant").at(-1)?.content, result.reply, "the complete failure and warning are persisted");
+
+		recovered = true;
+		const next = await engine.send(agent, "try again");
+		assert.equal(next.reply, "恢复成功", "the next send has no stale delivery warning");
+		assert.equal(next.deterministic, false);
+		assert.equal(next.error, undefined);
+		assert.equal(agent.hasQueuedMessages(), false);
+	});
+}
+
+test("undelivered steer warning survives a tool-cap final-summary overwrite", async (t) => {
+	const gate = enteredGate();
+	let runs = 0;
+	const { engine, config, history } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		if (runs === 1) {
+			gate.enter();
+			await gate.blocked;
+		}
+		return {
+			async *[Symbol.asyncIterator]() {},
+			result: async () => ({ role: "assistant", content: [{ type: "text", text: runs === 1 ? "正在处理工具步骤" : "已保存结果，剩余任务未完成" }], stopReason: "stop" }),
+			toolResults: runs === 1 ? [{ role: "toolResult", content: [{ type: "text", text: "saved" }] }] : [],
+		};
+	} });
+	supplierConfig(config);
+	config.update({ general: { maxToolSteps: 1 } });
+	const agent = engine.getOrCreateSession("conv-steer-cap");
+	const sendPromise = engine.send(agent, "do a long task");
+	let result;
+	try {
+		await gate.entered;
+		assert.equal(engine.steerConversation("conv-steer-cap", "先收尾").status, "accepted");
+	} finally {
+		gate.release();
+		result = await sendPromise;
+	}
+	assert.equal(runs, 2, "the real tool-cap hook forces a final summary");
+	assert.match(result.reply, /^已保存结果，剩余任务未完成/);
+	assert.doesNotMatch(result.reply, /正在处理工具步骤/, "summary replaces the initial narration");
+	assert.match(result.reply, /有中途指令尚未送达模型/);
+	assert.equal(result.deterministic, false, "the summary remains a model outcome");
+	assert.equal(agent.hasQueuedMessages(), false);
+	assert.equal(history.listMessages("conv-steer-cap").filter((m) => m.role === "assistant").at(-1)?.content, result.reply);
+});
+
+test("abortSession clears queued steering immediately", (t) => {
+	const { engine } = makeEngine(t);
+	const agent = engine.getOrCreateSession("conv-steer-clear-abort");
+	agent.state.isStreaming = true;
+	assert.equal(engine.steerConversation("conv-steer-clear-abort", "取消任务").status, "accepted");
+	assert.equal(agent.hasQueuedMessages(), true);
+	assert.equal(engine.abortSession("conv-steer-clear-abort"), true);
+	assert.equal(agent.hasQueuedMessages(), false, "abort clears even before send's finally");
+});
+
+test("retryWaits accepts steering while not streaming, then /stop clears it and rejects more", async (t) => {
+	const gate = enteredGate();
+	let sleeps = 0;
+	const { engine, config } = makeEngine(t, {
+		streamFn: async () => { throw new Error("Connection error."); },
+		retrySleepFn: async () => {
+			sleeps += 1;
+			gate.enter();
+			await gate.blocked;
+		},
+	});
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-steer-retry-stop");
+	const sendPromise = engine.send(agent, "do a long task");
+	let result;
+	try {
+		await gate.entered;
+		assert.equal(agent.state.isStreaming, false, "the SDK run is over during backoff");
+		assert.equal(engine.isConversationStreaming("conv-steer-retry-stop"), true, "retryWaits is a live turn");
+		assert.equal(engine.steerConversation("conv-steer-retry-stop", "取消任务").status, "accepted");
+		assert.equal(agent.hasQueuedMessages(), true);
+		assert.equal(engine.abortSession("conv-steer-retry-stop"), true);
+		assert.equal(agent.hasQueuedMessages(), false, "/stop clears the queued steer immediately");
+		const refused = engine.steerConversation("conv-steer-retry-stop", "继续");
+		assert.equal(refused.status, "rejected");
+		assert.match(refused.reason, /中断/);
+		assert.equal(agent.hasQueuedMessages(), false);
+	} finally {
+		gate.release();
+		result = await sendPromise;
+	}
+	assert.equal(sleeps, 1);
+	assert.equal(agent.runs, 2, "stop prevents a retry; only final summary remains");
+	assert.equal(result.deterministic, true);
+	assert.doesNotMatch(result.reply, /有中途指令尚未送达模型/, "explicit stop already cleared the queue");
+	assert.equal(engine.isConversationStreaming("conv-steer-retry-stop"), false);
+});
+
+test("steerConversation rejects when the turn is already aborting (review L2)", (t) => {
+	const { engine } = makeEngine(t, { streamFn: async () => ({ async *[Symbol.asyncIterator]() {}, result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }) }) });
+	const agent = engine.getOrCreateSession("conv-steer-aborting");
+	agent.state.isStreaming = true;
+	agent.signal = { aborted: true }; // a torn-down / aborting run
+	const r = engine.steerConversation("conv-steer-aborting", "取消");
+	assert.equal(r.status, "rejected", "an aborting turn must not take new steering");
+	assert.match(r.reason, /中断/, "the refusal points at the in-progress abort");
+	assert.equal(agent.steered.length, 0);
 });

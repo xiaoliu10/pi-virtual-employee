@@ -59,6 +59,13 @@ await build({
 							}
 							subscribe() { return () => {}; }
 							abort() {}
+							steered = [];
+							steer(m) { this.steered.push(m); }
+							signal = undefined;
+							hasQueuedMessages() { return this.steered.length > 0; }
+							clearSteeringQueue() { this.steered = []; }
+							clearFollowUpQueue() {}
+							clearAllQueues() { this.clearSteeringQueue(); }
 							async prompt(input) {
 								// Consume like the real agent-loop does (await the streamFn — it's
 								// async — then for await over events drives the lazy stream init; a
