@@ -67,6 +67,9 @@ await build({
 							subscribe(h) { this.#handlers.add(h); return () => this.#handlers.delete(h); }
 							#emit(event) { for (const h of this.#handlers) h(event); }
 							abort() {}
+							// Mirrors the SDK steering queue: steer() only enqueues.
+							steered = [];
+							steer(m) { this.steered.push(m); }
 							// Mirrors runWithLifecycle: errorMessage cleared at run start,
 							// provider failures become a failure assistant message + state
 							// errorMessage (NOT a throw), success emits message_end events.
@@ -523,4 +526,29 @@ test("compaction-summary head is still used when every substantial request was c
 	const brief = await engine.progressBrief(agent, "conv-m1-summary");
 	assert.ok(brief.includes("任务：跟踪处理 24 条工行数币掉单异常"), "the curated summary heads the brief, labeled 任务");
 	assert.ok(!brief.includes("## Goal"), "the template heading itself is never echoed");
+});
+
+// ── steer (field 2026-10-10): a long task blocked the strict per-conversation
+//    queue, so the user's "取消任务" never reached the model ──
+
+test("steerConversation delivers to a LIVE agent and persists the instruction", (t) => {
+	const { engine } = makeEngine(t, { streamFn: async () => ({ async *[Symbol.asyncIterator]() {}, result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }) }) });
+	const agent = engine.getOrCreateSession("conv-steer-live");
+	// A live turn: the SDK's steer only makes sense mid-run.
+	agent.state.isStreaming = true;
+	assert.equal(engine.steerConversation("conv-steer-live", "取消任务"), true, "a live agent accepts the steer");
+	assert.equal(agent.steered.length, 1, "the message reached the SDK steering queue");
+	assert.equal(agent.steered[0].content, "取消任务");
+	assert.equal(engine.isConversationStreaming("conv-steer-live"), true);
+});
+
+test("steerConversation refuses an idle conversation (nothing to interrupt)", (t) => {
+	const { engine } = makeEngine(t, { streamFn: async () => ({ async *[Symbol.asyncIterator]() {}, result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }) }) });
+	const agent = engine.getOrCreateSession("conv-steer-idle");
+	agent.state.isStreaming = false;
+	assert.equal(engine.steerConversation("conv-steer-idle", "取消"), false, "idle → the caller must run it as an ordinary turn");
+	assert.equal(agent.steered.length, 0, "nothing is queued on an idle agent");
+	assert.equal(engine.isConversationStreaming("conv-steer-idle"), false);
+	// An unknown conversation is also not steer-able.
+	assert.equal(engine.steerConversation("conv-steer-unknown", "取消"), false);
 });

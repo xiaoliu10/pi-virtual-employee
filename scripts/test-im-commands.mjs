@@ -21,7 +21,7 @@ process.on("exit", () => { void rm(workDir, { recursive: true, force: true }); }
 const bundle = join(workDir, "commands.mjs");
 await build({
 	stdin: {
-		contents: 'export { parseCommand, normalizeInboundText, looksLikeCommandAttempt } from "./src/im/commands.ts";',
+		contents: 'export { parseCommand, normalizeInboundText, looksLikeCommandAttempt, isCancelPhrase, QUEUE_BYPASS_COMMANDS } from "./src/im/commands.ts";',
 		resolveDir: root,
 		loader: "ts",
 	},
@@ -31,7 +31,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { parseCommand, normalizeInboundText, looksLikeCommandAttempt } = await import(pathToFileURL(bundle).href);
+const { parseCommand, normalizeInboundText, looksLikeCommandAttempt, isCancelPhrase, QUEUE_BYPASS_COMMANDS } = await import(pathToFileURL(bundle).href);
 
 test("/new is recognised however the client serializes the mention", () => {
 	const variants = [
@@ -109,4 +109,47 @@ test("normalizeInboundText only touches the start, and leaves prose alone", () =
 	assert.equal(normalizeInboundText("联系 @张三 处理"), "联系 @张三 处理", "a mention later in the sentence is content");
 	assert.equal(normalizeInboundText("  @小派   把昨天订单汇总一下"), "把昨天订单汇总一下");
 	assert.equal(normalizeInboundText(""), "");
+});
+
+// ── steer + cancel phrases (field 2026-10-10: a long task blocked the queue,
+//    so the user's "取消任务" never reached the model) ──
+
+test("/steer parses with and without a payload", () => {
+	assert.deepEqual(parseCommand("/steer 先保存结果收尾"), { name: "steer", arg: "先保存结果收尾" });
+	assert.deepEqual(parseCommand("/steer"), { name: "steer", arg: undefined });
+	assert.deepEqual(parseCommand("@机器人 /steer 别做了"), { name: "steer", arg: "别做了" });
+	// A slash word we do not know must NOT be mistaken for steer.
+	assert.equal(parseCommand("/steering"), null);
+});
+
+test("steer bypasses the per-conversation queue (like /new and /stop)", () => {
+	assert.ok(QUEUE_BYPASS_COMMANDS.includes("steer"), "steer must bypass the queue");
+	assert.ok(QUEUE_BYPASS_COMMANDS.includes("stop"));
+	assert.ok(QUEUE_BYPASS_COMMANDS.includes("new"));
+});
+
+test("plain cancel phrases are recognised so a live turn can be steered", () => {
+	for (const text of ["取消", "取消任务", "取消这个任务", "停止", "停下", "先停一下", "别做了", "终止当前任务", "现在停止执行", "给我取消"]) {
+		assert.ok(isCancelPhrase(text), `cancel phrase: ${text}`);
+	}
+});
+
+test("cancel detection is narrow: instructions and questions are NOT cancels", () => {
+	for (const text of [
+		"取消一下昨天的订单然后重新提交",     // an instruction, not a bare cancel
+		"先取消这个，然后把剩下的跑完",     // continues the task
+		"取消是什么意思",                   // a question
+		"帮我看下为什么停了",               // asks about a stop
+		"不用取消，继续",                   // explicitly NOT a cancel
+		"今天的对账取消了吗",               // asks about state
+		"/stop",                            // slash commands have their own path
+		"停",                               // too short/ambiguous alone
+	]) {
+		assert.ok(!isCancelPhrase(text), `not a cancel: ${text}`);
+	}
+});
+
+test("mention/full-width-slash variants of a cancel phrase still count", () => {
+	assert.ok(isCancelPhrase("@机器人 取消任务"));
+	assert.ok(isCancelPhrase("取消任务。"));
 });
