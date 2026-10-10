@@ -41,8 +41,14 @@ test("finishTurn {action:'end'} stops the loop; boolean true (0.99 shape) does N
 	for (const [label, hookReturn] of [["1.x action", { action: "end" }], ["0.99 boolean true", true]]) {
 		let toolRuns = 0;
 		const agent = new Agent({
-			initialState: { systemPrompt: "s", model: { id: "m", api: "anthropic-messages", provider: "test", name: "m", baseUrl: "", reasoning: false, input: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 8_192 } },
-			tools: [{ name: "noop", description: "d", parameters: { type: "object", properties: {} }, execute: async () => { toolRuns += 1; return { content: [{ type: "text", text: "ok" }] }; } }],
+			initialState: {
+				systemPrompt: "s",
+				model: { id: "m", api: "anthropic-messages", provider: "test", name: "m", baseUrl: "", reasoning: false, input: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 8_192 },
+				// Top-level `tools` is NOT a constructor option (agent.js only reads
+				// initialState.tools) — a misplaced array silently executes nothing
+				// and the regression goes vacuous (review M1).
+				tools: [{ name: "noop", description: "d", parameters: { type: "object", properties: {} }, execute: async () => { toolRuns += 1; return { content: [{ type: "text", text: "ok" }] }; } }],
+			},
 			streamFn: makeStream(50),
 		});
 		// Attach the 1.x contract hook directly on the loop config.
@@ -53,6 +59,12 @@ test("finishTurn {action:'end'} stops the loop; boolean true (0.99 shape) does N
 			return cfg;
 		};
 		await agent.prompt("go");
-		assert.ok(toolRuns <= 2, `${label}: loop must end after the cap (toolRuns=${toolRuns})`);
+		if (hookReturn && typeof hookReturn === "object") {
+			assert.ok(toolRuns <= 2, `${label}: loop must end after the cap (toolRuns=${toolRuns})`);
+		} else {
+			// The regression bites BOTH ways: the legacy boolean must NOT stop the
+			// 1.x loop (otherwise this test could never catch a contract revert).
+			assert.ok(toolRuns > 2, `${label}: a boolean return must NOT end the 1.x loop (toolRuns=${toolRuns})`);
+		}
 	}
 });

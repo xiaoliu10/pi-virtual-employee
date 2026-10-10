@@ -1460,18 +1460,19 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 	/**
 	 * Install a per-turn tool-loop safety cap on an Agent, honoring
-	 * `config.general.maxToolSteps`. The cap uses the SDK's `shouldStopAfterTurn`
-	 * loop hook: after each assistant turn's tool calls finish, increment the
-	 * counter; once it reaches `maxToolSteps`, return `true` to end the loop
+	 * `config.general.maxToolSteps`. The cap uses the SDK's `finishTurn` loop
+	 * hook (pi 1.x; formerly `shouldStopAfterTurn` with a boolean return): after
+	 * each assistant turn's tool calls finish, increment the counter; once it
+	 * reaches `maxToolSteps`, return `{action:"end"}` to end the loop
 	 * gracefully and set a flag on the agent. `send()` checks that flag after
 	 * `promptWithRetry` resolves and, if set, asks the model for a final
 	 * plain-language summary (no tools) so the user gets a closing reply
 	 * instead of a mid-task truncation — same pattern as the empty-reply
 	 * fallback.
 	 *
-	 * Wrap the SDK's `createLoopConfig()` per-instance to attach `finishTurn`
-	 * (pi 1.x uses an action decision, not the legacy boolean stop hook).
-	 * The counter resets on each
+	 * The SDK's `Agent` doesn't expose `finishTurn` as a constructor option (it
+	 * lives on the internal `AgentLoopConfig`), so we wrap the prototype
+	 * `createLoopConfig()` per-instance to attach it. The counter resets on each
 	 * fresh `agent.prompt()` (new user turn) but not on `agent.continue()`
 	 * (transient-error retry, same logical turn). A `maxToolSteps` of 0 means
 	 * unlimited and preserves prior behavior.
