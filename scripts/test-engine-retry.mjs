@@ -569,3 +569,35 @@ test("steerConversation enforces the task-owner boundary on non-local chats", (t
 	assert.match(refused.reason, /发起人|权限/, "the refusal explains why");
 	assert.equal(agent.steered.length, 0, "nothing reaches the queue on refusal");
 });
+
+test("steerConversation accepts the TASK OWNER mid-turn on a non-local chat (review L2 positive path)", async (t) => {
+	let release;
+	const gate = new Promise((r) => { release = r; });
+	const { engine } = makeEngine(t, { streamFn: async () => {
+		// Hold the turn so steerConversation runs WHILE a turn is in flight —
+		// turnActor only exists during send(), so this is the realistic window.
+		await gate;
+		return { async *[Symbol.asyncIterator]() {}, result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }) };
+	} });
+	const actor = { senderId: "owner-1", channel: "dingtalk", chatType: "single" };
+	const agent = engine.getOrCreateSession("dt:owner-live");
+	agent.sessionId = "dt:owner-live"; // stub mirror: factory doesn't set it (see line ~282)
+	const sendPromise = engine.send(agent, "do a long task", { actor });
+	await new Promise((r) => setImmediate(r)); // let send() set turnActor + enter the blocked streamFn
+	const steered = engine.steerConversation("dt:owner-live", "取消任务", actor);
+	assert.equal(steered.status, "accepted", "the task owner may steer their own live task");
+	assert.equal(agent.steered.length, 1, "the steer is queued");
+	release();
+	await sendPromise;
+});
+
+test("steerConversation rejects when the turn is already aborting (review L2)", (t) => {
+	const { engine } = makeEngine(t, { streamFn: async () => ({ async *[Symbol.asyncIterator]() {}, result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }) }) });
+	const agent = engine.getOrCreateSession("conv-steer-aborting");
+	agent.state.isStreaming = true;
+	agent.signal = { aborted: true }; // a torn-down / aborting run
+	const r = engine.steerConversation("conv-steer-aborting", "取消");
+	assert.equal(r.status, "rejected", "an aborting turn must not take new steering");
+	assert.match(r.reason, /中断/, "the refusal points at the in-progress abort");
+	assert.equal(agent.steered.length, 0);
+});

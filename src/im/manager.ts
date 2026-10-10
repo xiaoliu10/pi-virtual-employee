@@ -210,10 +210,10 @@ export class IMAdapterManager {
 				if (inbound?.name === "steer") {
 					if (this.draining) return Promise.resolve("⏳ 系统正在安装应用更新，当前消息不会被执行；请稍后重新发送。");
 					const text = (inbound.arg ?? "").trim();
-					if (!text) return Promise.resolve("用法：/steer <要说的话>——它会送达到正在执行的任务（在当前步骤边界生效，任务会据此收尾/调整），例如「/steer 别做了，先保存结果收尾」。要硬中断请用 /stop。");
+					if (!text) return Promise.resolve("用法：/steer <要说的话>——它会在当前步骤边界把这条指令交给正在执行的任务，让它据此收尾/调整（但不保证立即停下），例如「/steer 别做了，先保存结果收尾」。要硬中断请用 /stop。");
 					const steered = this.engine.steerConversation(msg.conversationId, text, msg.actor);
 					if (steered.status === "accepted") {
-						return Promise.resolve(`🧭 已把「${text}」转达给正在执行的任务——它会在当前步骤边界收下并据此收尾/调整。若几步内没动静，请发 /stop 硬中断。`);
+						return Promise.resolve(`🧭 已把「${text}」交给正在执行的任务——它会在当前步骤边界收到这条指令，应据此收尾/调整（但不保证立即停下）。若几步内没动静，请发 /stop 硬中断。`);
 					}
 					if (steered.status === "rejected") return Promise.resolve(steered.reason);
 					// idle: no live turn — nothing to interrupt. Run the payload as an
@@ -235,7 +235,7 @@ export class IMAdapterManager {
 				if (isCancelPhrase(msg.text) && this.engine.isConversationStreaming(msg.conversationId)) {
 					const steered = this.engine.steerConversation(msg.conversationId, msg.text, msg.actor);
 					if (steered.status === "accepted") {
-						return Promise.resolve(`🧭 已把「${msg.text.trim()}」转达给正在执行的任务——它会在当前步骤边界停下并收尾。若几步内没停，请发 /stop 硬中断。`);
+						return Promise.resolve(`🧭 已把「${msg.text.trim()}」交给正在执行的任务——它会在当前步骤边界收到这条指令，应据此停下/收尾（但不保证立即停）。若几步内没停，请发 /stop 硬中断。`);
 					}
 					// rejected (e.g. not the task owner) must NOT silently fall through to
 					// the queue — that reintroduces the reported dead end. Surface it.
@@ -405,7 +405,7 @@ export class IMAdapterManager {
 				"/new — 中断当前回合并清空上下文，开启新会话（群聊里 @ 我 /new 同样有效）",
 				"/compact — 压缩上下文（较早对话汇总为摘要，近期对话保留）",
 				"/stop — 中断当前回合（上下文保留）",
-				"/steer <内容> — 把话送达到正在执行的任务（当前步骤结束后生效，任务会调整方向），例如 /steer 先保存结果收尾",
+				"/steer <内容> — 在当前步骤边界把话交给正在执行的任务，让它据此收尾/调整（不保证立即停下），例如 /steer 先保存结果收尾",
 				"/perm — 查看我在当前会话的权限（角色 + 各项能力是否放行）",
 				"/restart — 重启应用（仅管理员，单聊）",
 				"/version — 查看应用版本",

@@ -910,7 +910,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			const owner = this.turnActor.get(conversationId);
 			if (!actor?.senderId || !owner || actor.senderId !== owner.senderId ||
 				actor.channel !== owner.channel || actor.chatType !== owner.chatType) {
-				return { status: "rejected", reason: "中途指令只能由当前任务的发起人在同一会话发送，不能借用其他人的任务权限。" };
+				return { status: "rejected", reason: "中途指令只能由当前任务的发起人在同一会话发送，不能借用其他人的任务权限。如需立即中断，请发 /stop。" };
 			}
 		}
 		if (this.turnAborts.has(conversationId) || agent.signal?.aborted) {
@@ -930,9 +930,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// history.appendMessage only ever sees send()'s message — without this
 		// the steer vanishes from the persisted conversation (restart/rehydrate
 		// would show the task obeying an instruction that was never recorded).
-		// Marked so a reader can tell it arrived mid-run.
+		// Marked so a reader can tell it arrived mid-run; the sender rides along
+		// so the audit trail says WHO steered (a group has many people).
+		const who = actor?.senderName ? `（${actor.senderName}）` : "";
 		try {
-			this.history.appendMessage(conversationId, "user", `${text}\n[已接收中途指令，待任务步骤边界处理]`);
+			this.history.appendMessage(conversationId, "user", `${text}\n[已接收中途指令${who}，待任务步骤边界处理]`);
 		} catch (err) {
 			console.warn(`[engine] steer persist failed for ${conversationId}:`, err instanceof Error ? err.message : err);
 		}
