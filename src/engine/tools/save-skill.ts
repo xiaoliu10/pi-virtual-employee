@@ -6,8 +6,9 @@ import type { SkillWriter } from "../skills/skill-writer.js";
  * Build the skill-authoring tool. Lets the employee create or update a
  * declarative SKILL.md package under the user skills directory. The split
  * between this and `save_to_knowledge` is intentional and enforced by the
- * system prompt: skills are only for explicit "做成技能/Skill" intent; all
- * other 知识/经验/聊天整理 defaults to the knowledge base.
+ * system prompt: skills are for explicit "做成技能/Skill" intent, OR for the
+ * pi-auto-research loop's verified-reusable-procedure fixation; all other
+ * 知识/经验/聊天整理 defaults to the knowledge base.
  */
 export function createSaveToSkillTool(
 	skillWriter: SkillWriter,

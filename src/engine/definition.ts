@@ -265,7 +265,8 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 		}));
 	}
 	// Skill authoring is an always-on channel: explicit 技能/Skill intent writes
-	// here; everything else defaults to the knowledge base (see prompt routing rules).
+	// here, as does the pi-auto-research loop's verified-procedure fixation;
+	// everything else defaults to the knowledge base (see prompt routing rules).
 	tools.push(guarded("learn", createSaveToSkillTool(options.skillWriter, options.onSkillsChanged)));
 	// Read-only access to a skill's bundled assets (scripts/templates that shipped
 	// alongside SKILL.md in a zip or directory import). Always-on with skills.
