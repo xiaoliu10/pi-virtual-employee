@@ -21,6 +21,7 @@ await build({
 		contents: `
 			export { SkillWriter } from "./src/engine/skills/skill-writer.ts";
 			export { SkillLoader } from "./src/engine/skills/skill-loader.ts";
+			export { formatInlineSkills } from "./src/engine/skills/skills-prompt.ts";
 			export { createManageSkillsTool, DEFAULT_MARKET_URL, effectiveMarketUrl } from "./src/engine/tools/skills-market.ts";
 			export { ConfigStore } from "./src/db/config-store.ts";
 			export { requireConfirmedAdmin } from "./src/engine/tools/admin.ts";
@@ -34,7 +35,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { SkillWriter, SkillLoader, createManageSkillsTool, effectiveMarketUrl, DEFAULT_MARKET_URL, ConfigStore } = await import(
+const { SkillWriter, SkillLoader, createManageSkillsTool, effectiveMarketUrl, DEFAULT_MARKET_URL, ConfigStore, formatInlineSkills } = await import(
 	pathToFileURL(join(workDir, "skills.mjs")).href,
 );
 
@@ -289,13 +290,45 @@ test("built-in pi-auto-research skill ships, parses, and teaches the full loop",
 });
 
 test("both built-in skills have valid, unique frontmatter", async () => {
-	const { skills, info } = await new SkillLoader(
-		join(root, "resources", "skills"),
-		join(dataDir, "unused-user"),
-	).list();
+	const loader = new SkillLoader(join(root, "resources", "skills"), join(dataDir, "unused-user"));
+	const { skills, info } = await loader.list();
 	assert.ok(skills.find((skill) => skill.name === "pi-knowledge-base"), "pi-knowledge-base still loads");
 	assert.equal(info.filter((i) => i.source === "builtin" && i.warnings?.length).length, 0,
 		`builtin skills must parse without warnings: ${JSON.stringify(info)}`);
-	const names = skills.map((skill) => skill.name);
-	assert.equal(new Set(names).size, names.length, "no duplicate skill names");
+	// The Map dedupe hides source-level duplicates — compare RAW collect records.
+	const [builtin] = await Promise.all([loader.collect(join(root, "resources", "skills"), "builtin")]);
+	const rawNames = builtin.skills.map((skill) => skill.name);
+	assert.equal(new Set(rawNames).size, rawNames.length, "no duplicate names among builtin source files");
+});
+
+test("auto-research teaches verify-before-sediment, not just the word 验证", async () => {
+	const loader = new SkillLoader(join(root, "resources", "skills"), join(dataDir, "unused-user"));
+	const { skills } = await loader.list();
+	const research = skills.find((skill) => skill.name === "pi-auto-research");
+	assert.ok(research);
+	// The ORDER matters: the verification section must appear before the
+	// sediment section, and sediment must be conditioned on 验证通过.
+	const verifyAt = research.content.indexOf("## 验证");
+	const sedimentAt = research.content.indexOf("## 沉淀");
+	assert.ok(verifyAt >= 0 && sedimentAt > verifyAt, "验证 comes before 沉淀");
+	assert.match(research.content, /验证通过后/);
+	// Same-name skills do NOT auto-merge — conflicts stop and wait for the admin.
+	assert.match(research.content, /同名技能不会自动合并/);
+	// Capability degradation: tools may be absent, and refusal ≠ absence.
+	assert.match(research.content, /以当前实际可用的工具为准/);
+	assert.match(research.content, /权限被拒/);
+});
+
+test("disabling pi-auto-research removes BOTH its body and the preamble research hint", async () => {
+	const loader = new SkillLoader(join(root, "resources", "skills"), join(dataDir, "unused-user"));
+	const { skills } = await loader.list();
+	const disabled = skills.map((skill) =>
+		skill.name === "pi-auto-research" ? { ...skill, disableModelInvocation: true } : skill,
+	);
+	const withHint = formatInlineSkills(skills);
+	assert.match(withHint, /按 pi-auto-research 技能的闭环处理/, "hint present while enabled");
+	const without = formatInlineSkills(disabled);
+	assert.ok(!without.includes("按 pi-auto-research 技能的闭环处理"),
+		"disabling the skill must also drop the preamble research hint (review M2)");
+	assert.ok(without.includes("pi-knowledge-base"), "other skills still load");
 });
