@@ -1301,7 +1301,7 @@ ${tailForProgress(decision.text)}`;
 
 	// --- Scheduled-task management (settings UI) ---
 	ipcMain.handle("tasks:schedList", () => scheduler.list());
-	// Autonomous work items (settings UI): the store orders by updated_at DESC.
+	// Autonomous tasks (settings UI): the store orders by updated_at DESC.
 	// Projected to the view fields the renderer shows (review L1) — answer /
 	// conditions / lessons stay on the main-process side.
 	ipcMain.handle("tasks:workList", () => (engine.workItems?.list() ?? []).map(({ id, title, goal, status, progress, question, next_check_at, remind_count, created_by, created_at, updated_at }) =>
