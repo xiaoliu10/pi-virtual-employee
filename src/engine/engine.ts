@@ -2163,7 +2163,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * previous task's 「已完成：…卡点：无」 is never reused for the new one
 	 * (review M1) — for an ack/继续 anchor this may yield nothing, and 暂未确认
 	 * is honest where a cross-task number would be a misreport; (2) for every
-	 * UNEVIDENCED field, 「暂未确认」 — never an inferred 「无」 and no invented
+	 * UNEVIDENCED field, 「暂未确认」 (卡点 「暂无」) — never an inferred 「无」 and no invented
 	 * numbers, with the active step reading the honest generic line; (3) the
 	 * head quotes only sanitized sources, CURRENT TASK FIRST: the latest
 	 * substantial user request (acks skipped, field 2026-09-30) is
@@ -2221,7 +2221,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 					512, // ~0.8×512 tokens of output budget — plenty for 120 Chinese chars
 					undefined, // apiKey
 					signal,
-					"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过120字的中文汇报进展，且必须严格按以下四段结构输出，四段缺一不可，用中文标签：「已完成：…」「剩余：…」「正在：…」「卡点：…」。记录里查不到依据的段落一律写「暂未确认」——严禁在记录没有依据时推断成「无」，严禁编造数字或进度；只有当执行记录明确显示当前没有任何障碍时，卡点才可以写「无」。禁止输出「## Goal」「## Constraints & Preferences」「## Next Steps」等英文模板标题——那是会话压缩总结的模板，不是进展汇报，出现了就是错误输出；禁止照抄任务目标原文或执行条件来充当进展；节选中更早的其他请求都是早已完成的旧任务，绝对不要提及；把琐碎的执行步骤归纳为阶段性成果，禁止提及工具名、参数、重试等技术细节；只依据记录中真实发生的事，绝不编造未发生的进度。",
+					"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过120字的中文汇报进展，且必须严格按以下四段结构输出，四段缺一不可，用中文标签：「已完成：…」「剩余：…」「正在：…」「卡点：…」。记录里查不到依据的段落一律写「暂未确认」——严禁在记录没有依据时推断成「无」，严禁编造数字或进度；卡点查不到依据时写「暂无」；只有当执行记录明确显示当前没有任何障碍时，卡点才可以写「无」。禁止输出「## Goal」「## Constraints & Preferences」「## Next Steps」等英文模板标题——那是会话压缩总结的模板，不是进展汇报，出现了就是错误输出；禁止照抄任务目标原文或执行条件来充当进展；节选中更早的其他请求都是早已完成的旧任务，绝对不要提及；把琐碎的执行步骤归纳为阶段性成果，禁止提及工具名、参数、重试等技术细节；只依据记录中真实发生的事，绝不编造未发生的进度。",
 					undefined, // previousSummary
 					undefined, // thinkingLevel
 					this.rawStreamFn,

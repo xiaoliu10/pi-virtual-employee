@@ -13,7 +13,8 @@
  *  - each field is clamped INDEPENDENTLY, so a long 已完成 can never push the
  *    卡点 out of the report (the old global 180-char slice truncated wherever
  *    the budget happened to land and could amputate the whole 卡点 item);
- *  - missing information reads 「暂未确认」 — never an inferred 「无」 or a
+ *  - missing information reads 「暂未确认」 (卡点 reads 「暂无」 — a running
+ *    task with no blocker is normal, not something unresolved) — never an
  *    made-up number (only an execution record that clearly shows no obstacle
  *    earns a 「无」, and this layer never upgrades absence into one);
  *  - the English compaction template is rejected, while Chinese markdown
@@ -55,6 +56,10 @@ const FIELD_MAX: Record<keyof ProgressFields, number> = {
 const MAX_TASK_CHARS = 40;
 
 const UNKNOWN = "暂未确认";
+/** 卡点没有内容时的占位——它和「不确定」语义不同：一条进行中的任务没有
+ * 障碍是常态，写「暂未确认」会让人以为出了什么我们没搞清楚的事（field
+ * request 2026-10-10）。其余三个字段缺依据仍是「暂未确认」。 */
+const NO_BLOCKER = "暂无";
 const DOING_FALLBACK = "任务执行中，正在核实最新进展";
 
 const FIELD_LABELS = ["已完成", "剩余", "正在", "卡点"] as const;
@@ -98,7 +103,8 @@ export function isCompactionTemplateReport(text: string): boolean {
  *
  * Used to REJECT a contaminated candidate wholesale (standardize /
  * extractProgressFromTexts) and to disarm a contaminated field value in the
- * deterministic fallback (the field degrades to 暂未确认, the fragment never
+ * deterministic fallback (the field degrades to 暂未确认 — 卡点 to 暂无 — the
+ * fragment never
  * reaches the user).
  */
 export function containsTemplateHeadingLine(text: string): boolean {
@@ -182,7 +188,7 @@ export function clampField(text: string, max: number): string {
  * A label present with empty content becomes 「暂未确认」; a field the model
  * explicitly wrote as 「无」 stays 「无」 (per the instruction only a record
  * that clearly shows no blocker earns it — this layer never upgrades absence
- * into 「无」 on its own).
+ * into 「无」 on its own). An absent 卡点 reads 「暂无」.
  */
 export function standardizeProgressReport(raw: string): string | null {
 	if (!raw || isCompactionTemplateReport(raw) || containsTemplateHeadingLine(raw)) return null;
@@ -193,7 +199,8 @@ export function standardizeProgressReport(raw: string): string | null {
 		const t = value.trim();
 		return t ? clampField(t, max) : UNKNOWN;
 	};
-	return `已完成：${fill(fields.done, FIELD_MAX.done)}；剩余：${fill(fields.remaining, FIELD_MAX.remaining)}；正在：${fill(fields.doing, FIELD_MAX.doing)}；卡点：${fill(fields.blocked, FIELD_MAX.blocked)}`;
+	const blocked = fields.blocked.trim() ? clampField(fields.blocked.trim(), FIELD_MAX.blocked) : NO_BLOCKER;
+	return `已完成：${fill(fields.done, FIELD_MAX.done)}；剩余：${fill(fields.remaining, FIELD_MAX.remaining)}；正在：${fill(fields.doing, FIELD_MAX.doing)}；卡点：${blocked}`;
 }
 
 /**
@@ -222,7 +229,8 @@ export function extractProgressFromTexts(texts: string[]): ProgressFields | null
 /**
  * The deterministic heartbeat fallback body: four canonical fields filled
  * from what the transcript actually evidences. Anything unevidenced reads
- * 「暂未确认」 — never an inferred 「无」 or invented numbers. The active step
+ * 「暂未确认」 (卡点 reads 「暂无」) — never an inferred 「无」 or invented
+ * numbers. The active step
  * gets an honest generic line when the transcript has nothing specific.
  * `taskName` is optional and must be pre-sanitized by the caller (it quotes
  * the curated compaction summary or the latest substantial request — never a
@@ -232,7 +240,8 @@ export function extractProgressFromTexts(texts: string[]): ProgressFields | null
  */
 export function formatDeterministicBrief(fields: ProgressFields | null, taskName?: string, taskLabel = "任务"): string {
 	// A field value carrying a template-heading fragment ("## Goal 旧标题") is
-	// contamination, not evidence — degrade it to 暂未确认 rather than show the
+	// contamination, not evidence — degrade it to 暂未确认 (卡点 to 暂无) rather
+	// than show the
 	// fragment to the user (review L). Values reaching here are already
 	// whitespace-collapsed, so the check is deliberately NOT line-anchored.
 	const contaminated = (value: string): boolean => /##\s*(?:Goal|Constraints|Preferences|Next\s*Steps)\b/i.test(value);
@@ -242,7 +251,11 @@ export function formatDeterministicBrief(fields: ProgressFields | null, taskName
 	};
 	const doingRaw = (fields?.doing ?? "").trim();
 	const doing = doingRaw && !contaminated(doingRaw) ? clampField(doingRaw, FIELD_MAX.doing) : DOING_FALLBACK;
-	const body = `已完成：${unevidenced(fields?.done, FIELD_MAX.done)}；剩余：${unevidenced(fields?.remaining, FIELD_MAX.remaining)}；正在：${doing}；卡点：${unevidenced(fields?.blocked, FIELD_MAX.blocked)}`;
+	// 卡点 unevidenced reads 「暂无」 — an in-flight task with no known blocker
+	// is normal, whereas 暂未确认 would imply something we failed to find out.
+	const blockedRaw = (fields?.blocked ?? "").trim();
+	const blocked = blockedRaw && !contaminated(blockedRaw) ? clampField(blockedRaw, FIELD_MAX.blocked) : NO_BLOCKER;
+	const body = `已完成：${unevidenced(fields?.done, FIELD_MAX.done)}；剩余：${unevidenced(fields?.remaining, FIELD_MAX.remaining)}；正在：${doing}；卡点：${blocked}`;
 	const safeTask = (taskName ?? "").trim();
 	const head = safeTask && !contaminated(safeTask) ? `${taskLabel}：${clampField(safeTask, MAX_TASK_CHARS)}。` : "";
 	return `⏳ 任务仍在进行中（已耗时较长）。${head}${body}。完成后会立即回复结果，请稍候。`;

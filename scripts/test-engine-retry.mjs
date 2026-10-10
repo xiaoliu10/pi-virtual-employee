@@ -395,7 +395,7 @@ test("a partial model report (missing labels) falls back and fills 卡点 with �
 		globalThis.__generateSummaryHook = async () => ({ ok: true, value: "已完成：前三批共 120 条重新对账；剩余：12 条待处理" });
 		const brief = await engine.progressBrief(agent, "conv-fb-partial");
 		assert.ok(!brief.includes("前三批共 120 条"), "the partial report is not shown");
-		assert.ok(brief.includes("卡点：暂未确认"), "the fallback fills 卡点 honestly");
+		assert.ok(brief.includes("卡点：暂无"), "the fallback fills an absent 卡点 with 暂无 (field request 2026-10-10)");
 		assert.ok(!brief.includes("卡点：无"));
 	} finally {
 		delete globalThis.__generateSummaryHook;
