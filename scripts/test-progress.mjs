@@ -121,8 +121,8 @@ test("standardizeProgressReport: the compaction template, blobs, and MISSING lab
 test("standardizeProgressReport: empty-content fields read 暂未确认; an explicit 无 stays 无; unknown never becomes 无", () => {
 	assert.equal(
 		standardizeProgressReport("已完成：；剩余：；正在：；卡点："),
-		"已完成：暂未确认；剩余：暂未确认；正在：暂未确认；卡点：暂未确认",
-		"labels present but empty → 暂未确认, never 无",
+		"已完成：暂未确认；剩余：暂未确认；正在：暂未确认；卡点：暂无",
+		"empty fields → 暂未确认, never 无; an EMPTY 卡点 reads 暂无 (field request 2026-10-10)",
 	);
 	assert.equal(
 		standardizeProgressReport("已完成：12 条重新对账；剩余：12 条待下载；正在：逐条下载；卡点：暂未确认"),
@@ -247,7 +247,10 @@ test("formatDeterministicBrief: unevidenced fields read 暂未确认, never an i
 	const brief = formatDeterministicBrief(null);
 	assert.ok(brief.includes("已完成：暂未确认"));
 	assert.ok(brief.includes("剩余：暂未确认"));
-	assert.ok(brief.includes("卡点：暂未确认"));
+	// 卡点 is the exception (field request 2026-10-10): a running task with no
+	// known blocker is normal — 暂未确认 would imply something we failed to find.
+	assert.ok(brief.includes("卡点：暂无"));
+	assert.ok(!brief.includes("卡点：暂未确认"));
 	assert.ok(brief.includes("正在：任务执行中，正在核实最新进展"), "the honest generic active-step line");
 	assert.ok(!brief.includes("卡点：无"), "unknown must not be reported as 无");
 	assert.ok(!brief.includes("## Goal"), "no template headings, ever");
@@ -266,7 +269,7 @@ test("formatDeterministicBrief: evidenced fields pass through; partial evidence 
 	assert.ok(partial.includes("已完成：第一批完成"));
 	assert.ok(partial.includes("剩余：暂未确认"));
 	assert.ok(partial.includes("正在：任务执行中，正在核实最新进展"));
-	assert.ok(partial.includes("卡点：暂未确认"));
+	assert.ok(partial.includes("卡点：暂无"), "unevidenced 卡点 reads 暂无");
 	assert.ok(!partial.includes("任务："), "no task-name head when none was given");
 });
 
