@@ -107,6 +107,7 @@
 		"files": [
 			"dist-electron/**/*",
 			"renderer/dist/**/*",
+			"third-party/**/*",
 			"node_modules/**/*",
 			"!node_modules/esbuild/**",
 			"!node_modules/@esbuild/**",

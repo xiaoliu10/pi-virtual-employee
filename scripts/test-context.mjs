@@ -457,9 +457,9 @@ test("maybeCompact forwards the abort signal to the summarizer request", async (
 	// rawStreamFn so the summary rides the same supplier path as real turns).
 	const streamFn = async (_model, _context, options) => {
 		seenSignal = options.signal;
-		// A real aborted stream settles its result() as a rejection (the EventStream
-		// terminates with an error event) — model that, not a resolved message.
-		return { result: async () => { throw new Error("aborted by test"); } };
+		// Error events resolve result() with the terminal assistant message,
+		// including non-empty partial content on abort. Never persist that text.
+		return { result: async () => ({ role: "assistant", content: [{ type: "text", text: "partial summary" }], stopReason: "aborted", errorMessage: "aborted by test" }) };
 	};
 	const controller = new AbortController();
 	controller.abort();

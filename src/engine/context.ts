@@ -232,9 +232,16 @@ export function isContextOverflowError(text: string): boolean {
  * statement is kept verbatim at the seam (mirrors findForcedCompactionCut).
  */
 export function truncateToFit(agent: Agent, targetTokens: number, now = new Date().toISOString()): number | null {
-	const messages = agent.state.messages;
+	// Preserve the transcript's ORIGINAL leading system message (the prompt
+	// replay), not a getCurrentSystemMessage fold — the fold accumulates every
+	// tool declaration into toolsAdded, and feeding that back makes the next
+	// turn's tool-changes delta empty (declareToolChanges compares against the
+	// tools the message already asserts), freezing skill/config tool updates.
+	// Later section-update system messages are replay artifacts, not the prompt.
+	const systemHead = agent.state.messages.find((m) => m.role === "system");
+	const messages = agent.state.messages.filter((m) => m.role !== "system");
 	if (messages.length <= 2) return null;
-	const before = estimateTokensSafe(messages);
+	const before = estimateTokensSafe(agent.state.messages);
 	// A target larger than the transcript itself can never be reached by the
 	// walk-back — cap it at half of what is here so the cut always lands inside.
 	const goal = Math.min(targetTokens, Math.max(4_000, Math.floor(before / 2)));
@@ -263,6 +270,7 @@ export function truncateToFit(agent: Agent, targetTokens: number, now = new Date
 	if (dropped <= 0) return null;
 	const keptMessages = taskAnchor >= 0 ? [messages[taskAnchor], ...messages.slice(cut)] : messages.slice(cut);
 	agent.state.messages = [
+		...(systemHead ? [systemHead] : []),
 		createCompactionSummaryMessage(
 			`（上下文超出模型上限，本次请求已丢弃更早的 ${dropped} 条消息以继续；完整历史仍可在会话记录中查看。）`,
 			before,
@@ -636,13 +644,16 @@ export async function maybeCompact(
 	streamFn?: import("./pi-compaction.js").StreamFn,
 ): Promise<CompactOutcome> {
 	const settings = DEFAULT_COMPACTION_SETTINGS;
-	const messages = agent.state.messages;
+	// Same rationale as truncateToFit: keep the transcript's ORIGINAL system
+	// message (never a getCurrentSystemMessage fold — it freezes tool updates).
+	const systemHead = agent.state.messages.find((m) => m.role === "system");
+	const messages = agent.state.messages.filter((m) => m.role !== "system");
 	const model = agent.state.model;
 	const contextWindow = model.contextWindow || FALLBACK_CONTEXT_WINDOW;
 	// CJK-aware: pi's own estimate divides characters by 4, which under-counts a
 	// Chinese transcript badly enough that compaction never fires (see
 	// estimateTokensSafe). Overshooting only compacts a bit sooner.
-	if (!force && !shouldCompact(estimateTokensSafe(messages), usableContextWindow(contextWindow, model.maxTokens), settings)) {
+	if (!force && !shouldCompact(estimateTokensSafe(agent.state.messages), usableContextWindow(contextWindow, model.maxTokens), settings)) {
 		return { compacted: false, skipReason: "below_threshold" };
 	}
 
@@ -688,7 +699,7 @@ export async function maybeCompact(
 		return { compacted: false, skipReason: "empty_head" };
 	}
 
-	const tokensBefore = estimateTokensSafe(messages);
+	const tokensBefore = estimateTokensSafe(agent.state.messages);
 	// pi 1.x: plain AbortSignal param (no chord Context), and the call now
 	// THROWS instead of returning a Result. streamFn routes the summary through
 	// the same LLM path as normal turns (custom suppliers/gateways included).
@@ -707,7 +718,21 @@ export async function maybeCompact(
 			SUMMARIZER_RETRY,
 			agent.sessionId,
 		);
+		// An aborted or empty summarization must never land as a "successful"
+		// compaction: pi-ai's EventStream.result() RESOLVES an aborted turn as a
+		// message with stopReason "aborted" and empty content, and upstream's
+		// getSummarizationFailure only guards error/length — so an empty string
+		// would otherwise replace the whole transcript (0.99.1 guarded this;
+		// field class: the summary path re-tries forever afterwards because the
+		// empty head keeps measuring over-budget). Leave the transcript intact
+		// and report the honest skip reason.
+		if (!summary.trim()) {
+			console.warn("[engine] compaction summary was empty (aborted or blank response) — transcript kept");
+			return { compacted: false, skipReason: "summary_failed" };
+		}
+		// previousSummary remains the first conversational message on re-compaction.
 		agent.state.messages = [
+			...(systemHead ? [systemHead] : []),
 			createCompactionSummaryMessage(summary, tokensBefore, new Date().toISOString()),
 			...recent.map(stripStaleUsage),
 		];

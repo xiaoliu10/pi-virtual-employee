@@ -1,7 +1,8 @@
 /**
  * Compaction primitives vendored from @earendil-works/pi-coding-agent 1.1.0
  * (core/compaction/compaction.js, core/compaction/utils.js, core/messages.js —
- * MIT license, copyright the pi authors).
+ * Copyright (c) 2025 Mario Zechner, MIT license.
+ * Full notice: third-party/pi-LICENSE.txt (also included in packaged apps).
  *
  * WHY VENDORED (2026-10-09, pi SDK 0.99.1 → 1.1.0): pi 1.x moved the compaction
  * toolset (generateSummary / shouldCompact / estimateTokens /
@@ -11,8 +12,10 @@
  * would drag the whole CLI dependency tree (pi-tui, pi-codemode + quickjs WASM,
  * highlight.js, …) into the Electron bundle — the Windows installer already
  * sits ~96.5 MiB against Gitee's 100 MiB single-asset cap. This file inlines
- * exactly the subset we use, ported verbatim so behavior matches upstream 1.1.0
- * (token math, cut thresholds, summary prompts, retry semantics).
+ * the subset we use, adapted for this host (token math, cut thresholds,
+ * summary prompts, retry semantics). Host-specific hardening rejects aborted
+ * summaries as well as upstream error/length responses. Only this app's
+ * compaction/branch custom messages are supported; CLI-only roles are omitted.
  *
  * If upstream extracts a lightweight compaction package later, replace this
  * file with that dependency.
@@ -428,6 +431,11 @@ ${UPDATE_SUMMARIZATION_INSTRUCTIONS}`;
  * A length stop contains partial text and must not become a session checkpoint.
  */
 export function getSummarizationFailure(response: AssistantMessage, label: string): string | undefined {
+	// Host hardening beyond upstream 1.1.0: aborted streams RESOLVE an
+	// incomplete message; never persist even a non-empty partial summary.
+	if (response.stopReason === "aborted") {
+		return `${label} failed: ${response.errorMessage || "Aborted"}`;
+	}
 	if (response.stopReason === "error") {
 		return `${label} failed: ${response.errorMessage || "Unknown error"}`;
 	}

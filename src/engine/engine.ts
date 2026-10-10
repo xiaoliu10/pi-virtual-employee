@@ -10,10 +10,9 @@
  * Alias / relay model ids (not in the pi-ai registry) are supported by cloning a
  * base model of the matching api type and overriding id + baseUrl.
  */
-import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import { randomUUID } from "node:crypto";
 import { Agent } from "@earendil-works/pi-agent-core";
-import type { AgentEvent, AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
+import type { AgentEvent, AgentMessage, FinishTurn, StreamFn } from "@earendil-works/pi-agent-core";
 import type { Skill } from "./skills/types.js";
 import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "./pi-compaction.js";
 import { createModels, ModelsError } from "@earendil-works/pi-ai";
@@ -1470,9 +1469,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * instead of a mid-task truncation — same pattern as the empty-reply
 	 * fallback.
 	 *
-	 * The SDK's `Agent` doesn't expose `shouldStopAfterTurn` as a constructor
-	 * option (it lives on the internal `AgentLoopConfig`), so we wrap the
-	 * prototype `createLoopConfig()` per-instance. The counter resets on each
+	 * Wrap the SDK's `createLoopConfig()` per-instance to attach `finishTurn`
+	 * (pi 1.x uses an action decision, not the legacy boolean stop hook).
+	 * The counter resets on each
 	 * fresh `agent.prompt()` (new user turn) but not on `agent.continue()`
 	 * (transient-error retry, same logical turn). A `maxToolSteps` of 0 means
 	 * unlimited and preserves prior behavior.
@@ -1505,11 +1504,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 		target.createLoopConfig = (opts?: unknown) => {
 			const config = originalCreateLoopConfig(opts) as Record<string, unknown>;
-			config.shouldStopAfterTurn = async (context: { toolResults?: unknown[] }) => {
+			const finishTurn: FinishTurn = async (turn) => {
 				// The SDK invokes this hook after every assistant response, including a
 				// normal text-only final answer. Only responses that actually executed
 				// tools count as tool-loop steps.
-				if (!context.toolResults?.length) return false;
+				if (!turn.toolResults.length) return;
 
 				// CONTEXT BUDGET — checked here because this is the last moment before
 				// the next request is built. A single huge tool result (a browser dump,
@@ -1533,10 +1532,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 					try {
 						const recovered = await this.recoverFromContextOverflow(agent);
 						if (recovered && estimateTokensSafe(agent.state.messages) < budget) {
+							// The running loop owns a snapshot distinct from Agent.state.
+							// Replacing only state would send the OLD overflowed transcript.
+							turn.context.messages = agent.state.messages.slice();
 							console.warn(
 								`[engine] context budget reached mid-task (~${estimateTokensSafe(agent.state.messages)} < ${budget} after recovery); compacted in-turn and continuing the task`,
 							);
-							return false;
+							return;
 						}
 					} catch (err) {
 						console.warn("[engine] in-turn context recovery failed:", err instanceof Error ? err.message : err);
@@ -1545,17 +1547,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 					console.warn(
 						`[engine] context budget reached and recovery could not free room (~${estimateTokensSafe(agent.state.messages)} ≥ ${budget} of ${window}); ending turn for final summary`,
 					);
-					return true;
+					return { action: "end" };
 				}
 
 				const max = this.config.all().general.maxToolSteps ?? 0;
-				if (max <= 0) return false; // unlimited
+				if (max <= 0) return; // unlimited
 				steps += 1;
-				if (steps < max) return false;
+				if (steps < max) return;
 				target.__toolStepCapHit = true;
 				console.warn(`[engine] tool-loop cap reached (maxToolSteps=${max}); ending turn for final summary`);
-				return true;
+				return { action: "end" };
 			};
+			config.finishTurn = finishTurn;
 			return config;
 		};
 	}
