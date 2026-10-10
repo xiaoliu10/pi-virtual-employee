@@ -589,7 +589,7 @@ test("substantialAnchorOf strips runner-injected scaffolding from the anchor", (
 	// Work-window turns carry task identity INSIDE the scaffold — the 【目标】
 	// line is the anchor.
 	const windowTurn = user(
-		"【工作窗口开始】\n【工作项】月末对账\n【目标】核对 9 月流水并汇报异常\n" +
+		"【工作窗口开始】\n【自主任务】月末对账\n【目标】核对 9 月流水并汇报异常\n" +
 		"【执行条件（务必遵守）】\n系统自动对账 08:00-09:30\n\n窗口规则：\n- 最多 15 轮。\n请按目标与执行条件推进工作。",
 	);
 	const windowAnchor = substantialAnchorOf([windowTurn]);
@@ -619,9 +619,9 @@ test("substantialAnchorOf strips the autonomous chain scaffold too (turn 0 and c
 	assert.equal(substantialAnchorOf([continueTurn, turn0]), "对账异常巡检：查询今日对账情况并汇报异常");
 });
 
-test("empty goal line does not swallow the next scaffold line; 【工作项】 fallback stays reachable", () => {
-	const windowTurn = user("【工作窗口开始】\n【工作项】兜底工作项\n【目标】\n【执行条件（务必遵守）】\n系统自动对账 08:00-09:30");
-	assert.equal(substantialAnchorOf([windowTurn]), "兜底工作项");
+test("empty goal line does not swallow the next scaffold line; 【自主任务】 fallback stays reachable", () => {
+	const windowTurn = user("【工作窗口开始】\n【自主任务】兜底自主任务\n【目标】\n【执行条件（务必遵守）】\n系统自动对账 08:00-09:30");
+	assert.equal(substantialAnchorOf([windowTurn]), "兜底自主任务");
 });
 
 // Field 2026-10-09 (hardening): a compaction summary rehydrated as a PLAIN

@@ -679,7 +679,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		scanned: number;
 		error?: string;
 	}> {
-		if (!this.workItems) return { proposals: [], scanned: 0, error: "工作项未启用" };
+		if (!this.workItems) return { proposals: [], scanned: 0, error: "自主任务未启用" };
 		if (this.miningInFlight) return { proposals: [], scanned: 0, error: "任务挖掘正在进行，请稍后再试" };
 		this.miningInFlight = true;
 		const created: Awaited<ReturnType<EmployeeEngine["mineRecentWork"]>>["proposals"] = [];

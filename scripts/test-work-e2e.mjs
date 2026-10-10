@@ -358,7 +358,7 @@ test("source scoping: the same admin in a DIFFERENT conversation can READ but no
 	// group-owned item was undiagnosable from a DM — list/get couldn't see it).
 	// The item shows up, labeled as foreign.
 	const list = await otherItems.execute("call", { action: "list" });
-	assert.match(list.content[0].text, /全部会话共 1 个工作项/);
+	assert.match(list.content[0].text, /全部会话共 1 个自主任务/);
 	assert.match(list.content[0].text, /来源：其他会话/);
 	const get = await otherItems.execute("call", { action: "get", id: itemId });
 	assert.match(get.content[0].text, /每日订单巡检/, "admin can read the item cross-conversation");
