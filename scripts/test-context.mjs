@@ -26,8 +26,9 @@ await build({
 	stdin: {
 			contents: `
 				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, lastAssistantTailOf, recentAssistantVisibleTexts, isCompactionTemplateText } from "./src/engine/context.ts";
-				export { shouldCompact, DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-agent-core";
-				export { estimateTokens } from "@earendil-works/pi-agent-core";
+				// pi 1.x moved the compaction primitives to the coding-agent package;
+				// the app vendors them in src/engine/pi-compaction.ts.
+				export { shouldCompact, DEFAULT_COMPACTION_SETTINGS, estimateTokens } from "./src/engine/pi-compaction.ts";
 			`,
 		resolveDir: root,
 		loader: "ts",
@@ -452,15 +453,17 @@ test("maybeCompact forwards the abort signal to the summarizer request", async (
 	const agent = { state: { messages, model: { id: "test", contextWindow: 200_000, maxTokens: 131_072 } } };
 
 	let seenSignal;
-	const models = {
-		completeSimple: async (_model, _context, options) => {
-			seenSignal = options.signal;
-			return { stopReason: "aborted", errorMessage: "aborted by test" };
-		},
+	// pi 1.x: maybeCompact takes an optional StreamFn (the engine passes its
+	// rawStreamFn so the summary rides the same supplier path as real turns).
+	const streamFn = async (_model, _context, options) => {
+		seenSignal = options.signal;
+		// A real aborted stream settles its result() as a rejection (the EventStream
+		// terminates with an error event) — model that, not a resolved message.
+		return { result: async () => { throw new Error("aborted by test"); } };
 	};
 	const controller = new AbortController();
 	controller.abort();
-	const outcome = await maybeCompact(agent, models, true, controller.signal);
+	const outcome = await maybeCompact(agent, true, controller.signal, streamFn);
 	assert.equal(outcome.compacted, false);
 	assert.equal(outcome.skipReason, "summary_failed", "an aborted summarizer fails the pass cleanly");
 	assert.ok(seenSignal, "the signal must reach the summarizer request");

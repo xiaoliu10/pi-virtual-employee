@@ -6,7 +6,7 @@
  * Skill enablement is persisted as a set of disabled names in config so the
  * built-in skills can be turned off without deleting their files.
  */
-import type { Skill } from "@earendil-works/pi-agent-core";
+import type { Skill } from "./types.js";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { parseSkillFile } from "./skill-parser.js";

@@ -48,6 +48,9 @@ await build({
 			name: "stub-agent-sdk",
 			setup(b) {
 				b.onResolve({ filter: /^@earendil-works\/pi-agent-core$/ }, () => ({ path: "agent", namespace: "stub" }));
+				// The compaction primitives moved into the vendored module — stub it
+				// with the same namespace so the hook stays wired.
+				b.onResolve({ filter: /pi-compaction\.(js|ts)$/ }, () => ({ path: "compaction", namespace: "stub" }));
 				b.onLoad({ filter: /.*/, namespace: "stub" }, () => ({
 					contents: `
 						export const agents = [];
@@ -116,7 +119,19 @@ await build({
 						export const estimateContextTokens = () => ({ tokens: 0 });
 						export const estimateTokensSafe = () => 0;
 						export const estimateTokens = () => 0;
-						export const generateSummary = (...args) => (globalThis.__generateSummaryHook ? globalThis.__generateSummaryHook(...args) : Promise.resolve({ ok: false }));
+						// pi 1.x contract: generateSummary returns the summary string and
+						// THROWS on failure (the 0.99 {ok, value} Result is gone). Hooks
+						// may keep returning the old Result shape — translated here.
+						export const generateSummary = (...args) => {
+							if (!globalThis.__generateSummaryHook) return Promise.reject(new Error("stubbed generateSummary: no hook"));
+							return Promise.resolve(globalThis.__generateSummaryHook(...args)).then((r) => {
+								if (r && typeof r === "object" && "ok" in r) {
+									if (!r.ok) throw new Error("stubbed summarizer failed");
+									return r.value;
+								}
+								return r;
+							});
+						};
 						export const shouldCompact = () => false;
 						export const createCompactionSummaryMessage = (x) => x;
 					`,
@@ -387,7 +402,7 @@ test("the progress instruction demands 暂未确认 over invented 无; a 暂未�
 	let instruction;
 	try {
 		globalThis.__generateSummaryHook = async (...args) => {
-			instruction = args[4];
+			instruction = args[5];
 			return { ok: true, value: "已完成：12 条重新对账；剩余：12 条待下载；正在：逐条下载；卡点：暂未确认" };
 		};
 		const brief = await engine.progressBrief(agent, "conv-instruction");

@@ -10,8 +10,10 @@
  *    passes pi's compaction threshold, older turns are summarized into a
  *    single compaction-summary message while a recent tail is kept verbatim.
  */
-import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage, RetryPolicy, TextContent, Usage } from "@earendil-works/pi-ai";
+// pi 1.x moved the compaction primitives out of pi-agent-core into the
+// coding-agent package; we vendor the needed subset (see pi-compaction.ts).
 import {
 	createCompactionSummaryMessage,
 	DEFAULT_COMPACTION_SETTINGS,
@@ -19,8 +21,9 @@ import {
 	estimateTokens,
 	generateSummary,
 	shouldCompact,
-} from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Models, RetryPolicy, TextContent, Usage } from "@earendil-works/pi-ai";
+} from "./pi-compaction.js";
+// pi-agent-custom-messages.d.ts (ambient) re-registers the compactionSummary /
+// branchSummary roles on AgentMessage via declaration merging.
 import type { MessageRow } from "../db/history-store.js";
 import { isCompactionTemplateReport } from "./progress.js";
 
@@ -628,9 +631,9 @@ export interface CompactOutcome {
 
 export async function maybeCompact(
 	agent: Agent,
-	models: Models,
 	force = false,
 	signal?: AbortSignal,
+	streamFn?: import("./pi-compaction.js").StreamFn,
 ): Promise<CompactOutcome> {
 	const settings = DEFAULT_COMPACTION_SETTINGS;
 	const messages = agent.state.messages;
@@ -686,28 +689,32 @@ export async function maybeCompact(
 	}
 
 	const tokensBefore = estimateTokensSafe(messages);
-	// pi 0.99 moved the abort signal into the chord context (10th arg).
-	const context = signal ? withAbortSignal(signal, BACKGROUND_CONTEXT) : BACKGROUND_CONTEXT;
-	const result = await generateSummary(
-		old,
-		models,
-		model,
-		settings.reserveTokens,
-		undefined,
-		previousSummary,
-		undefined,
-		SUMMARIZER_RETRY,
-		undefined,
-		context,
-	);
-	if (!result.ok) {
-		console.warn("[engine] compaction summary failed:", result.error);
+	// pi 1.x: plain AbortSignal param (no chord Context), and the call now
+	// THROWS instead of returning a Result. streamFn routes the summary through
+	// the same LLM path as normal turns (custom suppliers/gateways included).
+	try {
+		const summary = await generateSummary(
+			old,
+			model,
+			settings.reserveTokens,
+			undefined,
+			signal,
+			undefined,
+			previousSummary,
+			undefined,
+			streamFn,
+			undefined,
+			SUMMARIZER_RETRY,
+			agent.sessionId,
+		);
+		agent.state.messages = [
+			createCompactionSummaryMessage(summary, tokensBefore, new Date().toISOString()),
+			...recent.map(stripStaleUsage),
+		];
+	} catch (err) {
+		console.warn("[engine] compaction summary failed:", err instanceof Error ? err.message : err);
 		return { compacted: false, skipReason: "summary_failed" };
 	}
-	agent.state.messages = [
-		createCompactionSummaryMessage(result.value, tokensBefore, new Date().toISOString()),
-		...recent.map(stripStaleUsage),
-	];
 	console.log(
 		`[engine] compacted ${agent.sessionId ?? "?"}: ${old.length} turns → summary (~${tokensBefore} tokens before)`,
 	);

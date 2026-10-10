@@ -12,7 +12,7 @@
 import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { existsSync, lstatSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
-import type { Skill } from "@earendil-works/pi-agent-core";
+import type { Skill } from "./types.js";
 import { SkillLoader } from "./skill-loader.js";
 import { SKILL_NAME_PATTERN, parseSkillFile } from "./skill-parser.js";
 
