@@ -25,10 +25,12 @@
  * middle of a sentence.
  */
 
-/** Commands that must bypass the per-conversation queue (see IM manager). */
-export const QUEUE_BYPASS_COMMANDS = ["new", "stop"] as const;
+/** Commands that must bypass the per-conversation queue (see IM manager).
+ * `steer` joins them: a steer has to reach a LIVE turn, and the queue is
+ * exactly what a long-running task blocks (field 2026-10-10). */
+export const QUEUE_BYPASS_COMMANDS = ["new", "stop", "steer"] as const;
 
-export type CommandName = "new" | "stop" | "version" | "models" | "model" | "compact" | "help" | "perm" | "restart";
+export type CommandName = "new" | "stop" | "steer" | "version" | "models" | "model" | "compact" | "help" | "perm" | "restart";
 
 export interface ParsedCommand {
 	name: CommandName;
@@ -75,6 +77,9 @@ export function parseCommand(raw: string): ParsedCommand | null {
 			return { name: "new" };
 		case "stop":
 			return { name: "stop" };
+		case "steer":
+			// Bare /steer (no text) still parses — the manager answers with usage.
+			return { name: "steer", arg: arg || undefined };
 		case "version":
 		case "ver":
 			return { name: "version" };
@@ -97,6 +102,30 @@ export function parseCommand(raw: string): ParsedCommand | null {
 		default:
 			return null;
 	}
+}
+
+/**
+ * Natural-language cancel phrases that, while a turn is running, should be
+ * STEERED into it instead of queueing behind it (field 2026-10-10: a long task
+ * made "取消任务" unreachable in the strict per-conversation queue).
+ *
+ * Deliberately NARROW — this is a cancel/stop heuristic, not a general "the
+ * user said something mid-turn" rule: a false positive steers a message that
+ * would have been handled fine as the next queued turn, which is visible but
+ * recoverable; a false NEGATIVE reintroduces the reported dead end. The phrase
+ * must contain a cancel/stop word; a bare "停" inside a longer sentence is not
+ * enough (checked as a whole-message pattern below).
+ */
+const CANCEL_PHRASE_RE =
+	/^(?:请|麻烦|给我|现在|先|赶紧|赶快|快点|立即|马上)?\s*(?:取消|停止|停下|终止|中止|停下来|停一下|先停|别再?|不要|不用)\s*(?:再|做|干|执行|跑)?\s*(?:了|这个|这个任务|当前任务|手上的|手上的事|任务|工作|手上的活|活|事情|事|执行|操作|流程)?\s*[。！!，,.\s]*$/;
+
+/** True when the text is a plain cancel/stop request (no other instruction). */
+export function isCancelPhrase(raw: string): boolean {
+	const line = commandLine(raw);
+	if (!line) return false;
+	// A slash command is never a "cancel phrase" — it has its own path.
+	if (line.startsWith("/")) return false;
+	return CANCEL_PHRASE_RE.test(line);
 }
 
 /**

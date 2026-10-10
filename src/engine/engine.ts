@@ -881,6 +881,53 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/**
+	 * Steer an in-flight turn (pi SDK `agent.steer`): the message is queued and
+	 * delivered at the NEXT step boundary (after the current assistant turn +
+	 * tool batch), so the model can change course mid-task WITHOUT killing the
+	 * whole turn.
+	 *
+	 * Why this exists (field 2026-10-10): a huge task that keeps running for a
+	 * long time made the user's "取消任务" unreachable — the per-conversation
+	 * IM queue is strict, so a natural-language cancel just queued behind the
+	 * very task it wanted to stop. /stop killed the turn, but the user has to
+	 * know to type it, and a hard abort discards the run. Steer is the middle
+	 * gear: the running turn learns it should stop/wrap up and finishes at its
+	 * next step.
+	 *
+	 * Returns true only when the message actually reached a LIVE agent queue.
+	 * An idle conversation is NOT steered (there is nothing to interrupt): the
+	 * caller should then run it as an ordinary turn.
+	 */
+	steerConversation(conversationId: string, text: string): boolean {
+		const agent = this.sessions.get(conversationId);
+		if (!agent || !agent.state.isStreaming) return false;
+		try {
+			agent.steer({ role: "user", content: text, timestamp: Date.now() });
+		} catch (err) {
+			// steer() itself only enqueues, but a torn-down session can still throw.
+			console.warn(`[engine] steer ${conversationId} failed:`, err instanceof Error ? err.message : err);
+			return false;
+		}
+		// The agent loop puts the steered message in the LIVE transcript, but
+		// history.appendMessage only ever sees send()'s message — without this
+		// the steer vanishes from the persisted conversation (restart/rehydrate
+		// would show the task obeying an instruction that was never recorded).
+		// Marked so a reader can tell it arrived mid-run.
+		try {
+			this.history.appendMessage(conversationId, "user", `${text}\n[任务执行中转达]`);
+		} catch (err) {
+			console.warn(`[engine] steer persist failed for ${conversationId}:`, err instanceof Error ? err.message : err);
+		}
+		return true;
+	}
+
+	/** True when a live turn is running on this conversation (steer-able). */
+	isConversationStreaming(conversationId: string): boolean {
+		const agent = this.sessions.get(conversationId);
+		return Boolean(agent?.state.isStreaming) || this.retryWaits.has(conversationId);
+	}
+
+	/**
 	 * /new phase 1: abort an in-flight turn on this conversation so the IM
 	 * per-conversation queue can drain. Returns true when a live session was
 	 * aborted. The actual reset runs as phase 2 ({@link resetSession}) at the
