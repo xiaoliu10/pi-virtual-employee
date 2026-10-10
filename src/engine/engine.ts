@@ -882,19 +882,21 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 	/**
 	 * Steer an in-flight turn (pi SDK `agent.steer`): the message is queued and
-	 * delivered at the NEXT step boundary (after the current assistant turn +
-	 * tool batch), so the model can change course mid-task WITHOUT killing the
-	 * whole turn.
+	 * offered to the model at the NEXT step boundary (after the current assistant
+	 * turn + tool batch), so it can change course WITHOUT killing the whole turn.
+	 * Enqueueing does not guarantee delivery or stopping: the run may end before
+	 * that boundary, and the model decides how to respond to a delivered steer.
 	 *
 	 * Why this exists (field 2026-10-10): a huge task that keeps running for a
 	 * long time made the user's "取消任务" unreachable — the per-conversation
 	 * IM queue is strict, so a natural-language cancel just queued behind the
 	 * very task it wanted to stop. /stop killed the turn, but the user has to
 	 * know to type it, and a hard abort discards the run. Steer is the middle
-	 * gear: the running turn learns it should stop/wrap up and finishes at its
-	 * next step.
+	 * gear: the running turn can learn it should stop/wrap up at a step boundary.
+	 * Use /stop when an immediate hard abort is required.
 	 *
-	 * Returns true only when the message actually reached a LIVE agent queue.
+	 * Returns accepted only when the message entered a LIVE agent queue (including
+	 * retry backoff), idle when no turn is active, or rejected with a reason.
 	 * An idle conversation is NOT steered (there is nothing to interrupt): the
 	 * caller should then run it as an ordinary turn.
 	 */
@@ -1830,6 +1832,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// rather than sniffed from the text: telemetry's job is to be accurate.
 		let askedForSummary = false;
 		let deterministic = false;
+		let undeliveredSteer = false;
 		try {
 			retries = await this.promptWithRetry(agent, conversationId, message, ctx?.images);
 		} catch (err) {
@@ -1840,10 +1843,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 		} finally {
 			// A terminal provider failure, cap, or abort can exit before polling
 			// steering. Do not replay those queued instructions on a later task.
-			if (agent.hasQueuedMessages()) {
-				agent.clearSteeringQueue();
-				reply += "\n\n⚠️ 有中途指令尚未送达模型，本轮已结束，请重新发送。";
-			}
+			undeliveredSteer = agent.hasQueuedMessages();
+			agent.clearSteeringQueue();
 			unsubscribe();
 			this.turnSendFile.delete(conversationId);
 			this.turnSendImage.delete(conversationId);
@@ -1903,6 +1904,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 			console.warn(`[engine] no reply produced for ${conversationId}; emitted deterministic failure (${cause || "no error reported"})`);
 		}
 
+		// Add delivery status only after choosing the outcome: it must neither
+		// mask an empty reply's failure nor be overwritten by a final summary.
+		if (undeliveredSteer) {
+			reply += "\n\n⚠️ 有中途指令尚未送达模型，本轮已结束，请重新发送。";
+		}
 		reply = reply.trim();
 		if (!ctx?.ephemeral) {
 			this.history.appendMessage(conversationId, "assistant", reply);

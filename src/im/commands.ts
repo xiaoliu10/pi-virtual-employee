@@ -77,9 +77,12 @@ export function parseCommand(raw: string): ParsedCommand | null {
 			return { name: "new" };
 		case "stop":
 			return { name: "stop" };
-		case "steer":
-			// Bare /steer (no text) still parses — the manager answers with usage.
-			return { name: "steer", arg: arg || undefined };
+		case "steer": {
+			// Only /steer preserves the full payload, including following lines.
+			// Bare /steer still parses — the manager answers with usage.
+			const payload = normalizeInboundText(raw).slice(1 + word.length).trim();
+			return { name: "steer", arg: payload || undefined };
+		}
 		case "version":
 		case "ver":
 			return { name: "version" };
@@ -121,11 +124,12 @@ const CANCEL_PHRASE_RE =
 
 /** True when the text is a plain cancel/stop request (no other instruction). */
 export function isCancelPhrase(raw: string): boolean {
-	const line = commandLine(raw);
-	if (!line) return false;
+	const text = normalizeInboundText(raw);
+	if (!text) return false;
+	// Match the entire message: following lines may contain other instructions.
 	// A slash command is never a "cancel phrase" — it has its own path.
-	if (line.startsWith("/")) return false;
-	return CANCEL_PHRASE_RE.test(line);
+	if (text.startsWith("/")) return false;
+	return CANCEL_PHRASE_RE.test(text);
 }
 
 /**

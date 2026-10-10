@@ -118,6 +118,10 @@ test("/steer parses with and without a payload", () => {
 	assert.deepEqual(parseCommand("/steer 先保存结果收尾"), { name: "steer", arg: "先保存结果收尾" });
 	assert.deepEqual(parseCommand("/steer"), { name: "steer", arg: undefined });
 	assert.deepEqual(parseCommand("@机器人 /steer 别做了"), { name: "steer", arg: "别做了" });
+	assert.deepEqual(parseCommand("/steer 先保存结果\n然后收尾"), { name: "steer", arg: "先保存结果\n然后收尾" });
+	assert.deepEqual(parseCommand("@机器人 ／STEER\r\n先保存结果\r\n然后收尾\n"), { name: "steer", arg: "先保存结果\r\n然后收尾" });
+	assert.deepEqual(parseCommand("/steer\n先保存结果"), { name: "steer", arg: "先保存结果" });
+	assert.deepEqual(parseCommand("/steer\n"), { name: "steer", arg: undefined });
 	// A slash word we do not know must NOT be mistaken for steer.
 	assert.equal(parseCommand("/steering"), null);
 });
@@ -144,6 +148,8 @@ test("cancel detection is narrow: instructions and questions are NOT cancels", (
 		"今天的对账取消了吗",               // asks about state
 		"/stop",                            // slash commands have their own path
 		"停",                               // too short/ambiguous alone
+		"取消任务\n然后删除数据库",          // following lines are instructions too
+		"@机器人 取消任务\r\n然后继续",     // normalized mentions must not hide later lines
 	]) {
 		assert.ok(!isCancelPhrase(text), `not a cancel: ${text}`);
 	}
@@ -152,4 +158,6 @@ test("cancel detection is narrow: instructions and questions are NOT cancels", (
 test("mention/full-width-slash variants of a cancel phrase still count", () => {
 	assert.ok(isCancelPhrase("@机器人 取消任务"));
 	assert.ok(isCancelPhrase("取消任务。"));
+	assert.ok(isCancelPhrase("取消任务\n"), "trailing newline is still a plain cancel");
+	assert.ok(isCancelPhrase("@机器人 取消任务。\r\n"));
 });
