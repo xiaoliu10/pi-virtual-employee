@@ -332,7 +332,7 @@ test("admin list/get read across source conversations, labeled; mutations stay s
 	const f = fixture({ rows: [hidden, row({ status: "waiting_human", question: "本来源问题" })] });
 	const list = await f.items({ action: "list" });
 	assert.equal(list.details.count, 2);
-	assert.match(list.content[0].text, /全部会话共 2 个工作项/);
+	assert.match(list.content[0].text, /全部会话共 2 个自主任务/);
 	assert.match(list.content[0].text, /来源：其他会话/);
 	assert.match(JSON.stringify(list), /PRIVATE_TITLE/);
 	const get = await f.items({ action: "get", id: "private-item" });

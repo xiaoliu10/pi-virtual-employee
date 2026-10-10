@@ -453,7 +453,7 @@ const AUTONOMOUS_CONTINUE_RE = /^【自主任务模式 · [^】]*】/;
 
 /** Strip runner-injected prompt scaffolding from a stored user message so
  * anchors quote the real request/task identity. Work-window turns carry task
- * identity inside the scaffold (【目标】/【工作项】 lines) — that is what gets
+ * identity inside the scaffold (【目标】/【自主任务】 lines) — that is what gets
  * returned; autonomous chain turns yield the task prompt after the protocol
  * block (later "继续。" turns then fall through the ack skip to the turn-0
  * message). May return "" when nothing identity-bearing remains. */
@@ -463,9 +463,9 @@ export function stripSyntheticPromptPrefix(raw: string): string {
 	else if (AUTONOMOUS_CONTINUE_RE.test(text)) text = text.replace(AUTONOMOUS_CONTINUE_RE, "").trim();
 	if (WORK_WINDOW_HEAD_RE.test(text)) {
 		// [^\n] (not \s*\S) so an EMPTY goal line doesn't swallow the next
-		// scaffold line — the 【工作项】 fallback must stay reachable.
+		// scaffold line — the 【自主任务】 fallback must stay reachable.
 		const goal = /^【目标】[ \t]*([^\n]+?)[ \t]*$/m.exec(text)?.[1]?.trim();
-		const item = /^【工作项】[ \t]*([^\n]+?)[ \t]*$/m.exec(text)?.[1]?.trim();
+		const item = /^【自主任务】[ \t]*([^\n]+?)[ \t]*$/m.exec(text)?.[1]?.trim();
 		text = goal || item || "";
 	}
 	return text;
