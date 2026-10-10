@@ -4,7 +4,7 @@
  * file path to read), this embeds the content directly so an agent without
  * filesystem tools can still follow the skill.
  */
-import type { Skill } from "@earendil-works/pi-agent-core";
+import type { Skill } from "./types.js";
 
 export function formatInlineSkills(skills: Skill[]): string {
 	const visible = skills.filter((skill) => !skill.disableModelInvocation);

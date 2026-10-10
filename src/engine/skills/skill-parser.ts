@@ -5,7 +5,7 @@
  * Mirrors the on-disk format that pi-agent-core's own loader expects, so a
  * hand-authored or imported skill stays portable.
  */
-import type { Skill } from "@earendil-works/pi-agent-core";
+import type { Skill } from "./types.js";
 
 export interface ParsedSkill {
 	skill: Skill | null;

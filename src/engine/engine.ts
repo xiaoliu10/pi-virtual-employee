@@ -10,10 +10,11 @@
  * Alias / relay model ids (not in the pi-ai registry) are supported by cloning a
  * base model of the matching api type and overriding id + baseUrl.
  */
-import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import { randomUUID } from "node:crypto";
-import { Agent, convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "@earendil-works/pi-agent-core";
-import type { AgentEvent, AgentMessage, Skill, StreamFn } from "@earendil-works/pi-agent-core";
+import { Agent } from "@earendil-works/pi-agent-core";
+import type { AgentEvent, AgentMessage, FinishTurn, StreamFn } from "@earendil-works/pi-agent-core";
+import type { Skill } from "./skills/types.js";
+import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "./pi-compaction.js";
 import { createModels, ModelsError } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { Api, AuthInteraction, AuthPrompt, AuthEvent, CredentialStore, ImageContent, Model, MutableModels, TextContent } from "@earendil-works/pi-ai";
@@ -1459,18 +1460,19 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 	/**
 	 * Install a per-turn tool-loop safety cap on an Agent, honoring
-	 * `config.general.maxToolSteps`. The cap uses the SDK's `shouldStopAfterTurn`
-	 * loop hook: after each assistant turn's tool calls finish, increment the
-	 * counter; once it reaches `maxToolSteps`, return `true` to end the loop
+	 * `config.general.maxToolSteps`. The cap uses the SDK's `finishTurn` loop
+	 * hook (pi 1.x; formerly `shouldStopAfterTurn` with a boolean return): after
+	 * each assistant turn's tool calls finish, increment the counter; once it
+	 * reaches `maxToolSteps`, return `{action:"end"}` to end the loop
 	 * gracefully and set a flag on the agent. `send()` checks that flag after
 	 * `promptWithRetry` resolves and, if set, asks the model for a final
 	 * plain-language summary (no tools) so the user gets a closing reply
 	 * instead of a mid-task truncation — same pattern as the empty-reply
 	 * fallback.
 	 *
-	 * The SDK's `Agent` doesn't expose `shouldStopAfterTurn` as a constructor
-	 * option (it lives on the internal `AgentLoopConfig`), so we wrap the
-	 * prototype `createLoopConfig()` per-instance. The counter resets on each
+	 * The SDK's `Agent` doesn't expose `finishTurn` as a constructor option (it
+	 * lives on the internal `AgentLoopConfig`), so we wrap the prototype
+	 * `createLoopConfig()` per-instance to attach it. The counter resets on each
 	 * fresh `agent.prompt()` (new user turn) but not on `agent.continue()`
 	 * (transient-error retry, same logical turn). A `maxToolSteps` of 0 means
 	 * unlimited and preserves prior behavior.
@@ -1503,11 +1505,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 		target.createLoopConfig = (opts?: unknown) => {
 			const config = originalCreateLoopConfig(opts) as Record<string, unknown>;
-			config.shouldStopAfterTurn = async (context: { toolResults?: unknown[] }) => {
+			const finishTurn: FinishTurn = async (turn) => {
 				// The SDK invokes this hook after every assistant response, including a
 				// normal text-only final answer. Only responses that actually executed
 				// tools count as tool-loop steps.
-				if (!context.toolResults?.length) return false;
+				if (!turn.toolResults.length) return;
 
 				// CONTEXT BUDGET — checked here because this is the last moment before
 				// the next request is built. A single huge tool result (a browser dump,
@@ -1531,10 +1533,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 					try {
 						const recovered = await this.recoverFromContextOverflow(agent);
 						if (recovered && estimateTokensSafe(agent.state.messages) < budget) {
+							// The running loop owns a snapshot distinct from Agent.state.
+							// Replacing only state would send the OLD overflowed transcript.
+							turn.context.messages = agent.state.messages.slice();
 							console.warn(
 								`[engine] context budget reached mid-task (~${estimateTokensSafe(agent.state.messages)} < ${budget} after recovery); compacted in-turn and continuing the task`,
 							);
-							return false;
+							return;
 						}
 					} catch (err) {
 						console.warn("[engine] in-turn context recovery failed:", err instanceof Error ? err.message : err);
@@ -1543,17 +1548,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 					console.warn(
 						`[engine] context budget reached and recovery could not free room (~${estimateTokensSafe(agent.state.messages)} ≥ ${budget} of ${window}); ending turn for final summary`,
 					);
-					return true;
+					return { action: "end" };
 				}
 
 				const max = this.config.all().general.maxToolSteps ?? 0;
-				if (max <= 0) return false; // unlimited
+				if (max <= 0) return; // unlimited
 				steps += 1;
-				if (steps < max) return false;
+				if (steps < max) return;
 				target.__toolStepCapHit = true;
 				console.warn(`[engine] tool-loop cap reached (maxToolSteps=${max}); ending turn for final summary`);
-				return true;
+				return { action: "end" };
 			};
+			config.finishTurn = finishTurn;
 			return config;
 		};
 	}
@@ -2123,24 +2129,30 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// (field 2026-09-30: 60s aborted almost every attempt under load, so
 			// heartbeats degraded to the generic line).
 			const signal = conversationId ? this.beginSideLlmCall(conversationId, 180_000) : undefined;
-			let result;
+			// pi 1.x: generateSummary throws instead of returning a Result, and the
+			// signal is a plain param (no chord Context). The summary routes through
+			// rawStreamFn so it uses the same supplier/gateway path as real turns.
+			let raw: string | undefined;
 			try {
-				result = await generateSummary(
+				raw = await generateSummary(
 					context,
-					this.models,
 					model,
 					512, // ~0.8×512 tokens of output budget — plenty for 120 Chinese chars
+					undefined, // apiKey
+					signal,
 					"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过120字的中文汇报进展，且必须严格按以下四段结构输出，四段缺一不可，用中文标签：「已完成：…」「剩余：…」「正在：…」「卡点：…」。记录里查不到依据的段落一律写「暂未确认」——严禁在记录没有依据时推断成「无」，严禁编造数字或进度；只有当执行记录明确显示当前没有任何障碍时，卡点才可以写「无」。禁止输出「## Goal」「## Constraints & Preferences」「## Next Steps」等英文模板标题——那是会话压缩总结的模板，不是进展汇报，出现了就是错误输出；禁止照抄任务目标原文或执行条件来充当进展；节选中更早的其他请求都是早已完成的旧任务，绝对不要提及；把琐碎的执行步骤归纳为阶段性成果，禁止提及工具名、参数、重试等技术细节；只依据记录中真实发生的事，绝不编造未发生的进度。",
 					undefined, // previousSummary
 					undefined, // thinkingLevel
+					this.rawStreamFn,
+					undefined, // env
 					SUMMARIZER_RETRY,
-					undefined, // callbacks
-					signal ? withAbortSignal(signal, BACKGROUND_CONTEXT) : BACKGROUND_CONTEXT,
 				);
+			} catch {
+				// fall through to the deterministic fallback below
 			} finally {
 				if (conversationId) this.endSideLlmCall(conversationId);
 			}
-			if (!result.ok || !result.value?.trim()) return fallback();
+			if (!raw?.trim()) return fallback();
 			// Normalize through the shared four-field helper (progress.ts). The raw
 			// value is NOT whitespace-flattened beforehand: the template signature
 			// and the Chinese markdown headings are line-anchored, and the parser
@@ -2150,7 +2162,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// honestly, instead of showing a partial report (or one where absence
 			// got upgraded to 「无」). Fields are clamped PER FIELD: the old global
 			// 180-char slice could cut mid-report and amputate the whole 卡点 item.
-			const standardized = standardizeProgressReport(result.value);
+			const standardized = standardizeProgressReport(raw);
 			if (!standardized) {
 				console.warn("[engine] progress brief is not a usable four-field report — falling back to the deterministic brief");
 				return fallback();
@@ -2288,7 +2300,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		const conversationId = this.conversationIdOf(agent);
 		const signal = conversationId ? this.beginSideLlmCall(conversationId) : undefined;
 		try {
-			return await maybeCompact(agent, this.models, force, signal);
+			return await maybeCompact(agent, force, signal, this.rawStreamFn);
 		} finally {
 			if (conversationId) this.endSideLlmCall(conversationId);
 		}
