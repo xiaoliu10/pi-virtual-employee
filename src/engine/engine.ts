@@ -575,7 +575,17 @@ export class EmployeeEngine implements EmployeeRuntime {
 				: baseUrl
 					? Math.min(base.maxTokens ?? RELAY_DEFAULT_MAX_OUTPUT, RELAY_DEFAULT_MAX_OUTPUT)
 					: base.maxTokens;
-		return { ...base, id: modelId, name: modelId, input, contextWindow, ...(maxTokens !== undefined ? { maxTokens } : {}), ...(baseUrl ? { baseUrl } : {}) };
+		// Session affinity default-ON (user ruling 2026-10-13): the same conversation
+		// sticks to the same upstream backend, so the gateway's prompt cache actually
+		// hits. pi-ai only auto-enables it for OpenRouter endpoints — VE gateways
+		// (LiteLLM, relays) would never send the header, so set it explicitly on every
+		// model. Header choice stays with pi-ai's auto-detection (openrouter hosts →
+		// x-session-id; openai-protocol → session_id/x-client-request-id/
+		// x-session-affinity; anthropic → x-session-affinity). Kill switch:
+		// model.sessionAffinity=false via manage_settings.
+		const affinity = this.config.all().model.sessionAffinity !== false;
+		const compat = { ...(base.compat as object), sendSessionAffinityHeaders: affinity };
+		return { ...base, id: modelId, name: modelId, input, contextWindow, ...(maxTokens !== undefined ? { maxTokens } : {}), ...(baseUrl ? { baseUrl } : {}), compat } as Model<Api>;
 	}
 
 	/**
