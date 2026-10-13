@@ -128,9 +128,12 @@ test("model.sessionAffinity=false is the kill switch", (t) => {
 	assert.equal(agent.state.model?.compat?.sendSessionAffinityHeaders, false, "explicit false wins over the default");
 });
 
-test("affinity flag survives session rebuilds on the same supplier/model", (t) => {
+test("affinity flag is set on every session built from the same supplier/model (review L2: distinct conversations, not a same-session rebuild)", (t) => {
 	const { engine, config } = makeEngine(t);
 	supplierCfg(config);
+	// Two distinct conversations: each factory call resolves its own model, so
+	// the flag must not depend on per-session state. (The withRemoteInfo re-clone
+	// path is spread-faithful by code read — not exercised here; review L2.)
 	const a = engine.getOrCreateSession("conv-aff-remote-1");
 	const b = engine.getOrCreateSession("conv-aff-remote-2");
 	assert.equal(a.state.model?.compat?.sendSessionAffinityHeaders, true);
