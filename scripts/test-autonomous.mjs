@@ -35,6 +35,9 @@ const {
 	buildAutonomousTurnPrefix,
 	buildLearnTurnAsk,
 	normalizeBudget,
+	budgetPauseLabel,
+	turnLimited,
+	turnProgressLabel,
 	parseChainReply,
 	parseChainState,
 	nextStallStep,
@@ -73,12 +76,29 @@ test("budgetExceeded fires on turns OR wall clock", () => {
 	assert.ok(budgetExceeded(elapsed, { maxTurns: 20, maxMinutes: 120 }, now), "wall-clock budget");
 	const healthy = { convId: "c", turns: 5, startedAt: now - 30_000 };
 	assert.ok(!budgetExceeded(healthy, { maxTurns: 20, maxMinutes: 120 }, now));
+	// Unlimited turns (user ruling 2026-10-13): the turn count NEVER trips the
+	// budget — only the wall clock does.
+	assert.ok(!budgetExceeded({ ...state, turns: 9999 }, { maxTurns: 0, maxMinutes: 120 }, now), "unlimited: turns never trip the budget");
+	const elapsedUnlimited = { convId: "c", turns: 1, startedAt: now - 121 * 60_000 };
+	assert.ok(budgetExceeded(elapsedUnlimited, { maxTurns: 0, maxMinutes: 120 }, now), "unlimited: the wall clock still stops the chain");
 });
 
-test("normalizeBudget clamps to sane bounds and falls back on garbage", () => {
-	assert.deepEqual(normalizeBudget(undefined, undefined), { maxTurns: 20, maxMinutes: 120 });
-	assert.deepEqual(normalizeBudget(-5, "abc"), { maxTurns: 20, maxMinutes: 120 });
-	assert.deepEqual(normalizeBudget(9999, 99999), { maxTurns: 200, maxMinutes: 1440 }, "upper clamp");
+test("unlimited-turn helpers: turnLimited / turnProgressLabel / budgetPauseLabel", () => {
+	const unlimited = { maxTurns: 0, maxMinutes: 120 };
+	const bounded = { maxTurns: 20, maxMinutes: 120 };
+	assert.equal(turnLimited(unlimited), false);
+	assert.equal(turnLimited(bounded), true);
+	assert.equal(turnProgressLabel(12, unlimited), "已进行 12 轮", 'unlimited must NOT render "12/0 轮"');
+	assert.equal(turnProgressLabel(12, bounded), "12/20 轮");
+	assert.equal(budgetPauseLabel(12, unlimited), "已达时间上限（时长上限 120 分钟，已进行 12 轮）");
+	assert.equal(budgetPauseLabel(12, bounded), "已达预算（12/20 轮）");
+});
+
+test("normalizeBudget: 0/absent/garbage maxTurns = UNLIMITED; explicit positives clamp", () => {
+	assert.deepEqual(normalizeBudget(undefined, undefined), { maxTurns: 0, maxMinutes: 120 }, "absent = unlimited (user ruling 2026-10-13)");
+	assert.deepEqual(normalizeBudget(-5, "abc"), { maxTurns: 0, maxMinutes: 120 }, "garbage falls back to unlimited, never a surprise cap");
+	assert.deepEqual(normalizeBudget(0, 60), { maxTurns: 0, maxMinutes: 60 }, "explicit 0 = unlimited");
+	assert.deepEqual(normalizeBudget(9999, 99999), { maxTurns: 200, maxMinutes: 1440 }, "explicit positives keep the sanity clamp");
 	assert.deepEqual(normalizeBudget(7, 45), { maxTurns: 7, maxMinutes: 45 });
 });
 

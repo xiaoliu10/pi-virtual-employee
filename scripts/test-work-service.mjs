@@ -801,3 +801,82 @@ test("a stop landing during backoff does not fire another send (review H1)", asy
 	assert.equal(calls, 1, "no resend after a stop landing during the backoff");
 	assert.equal(h.store.get(item.id).status, "waiting_human");
 });
+
+// ── unlimited-turn windows (user ruling 2026-10-13: 自主任务默认不限轮数) ──
+// The default budget (maxTurns 0) must NOT bound a window by turn count: the
+// 30-minute wall clock is the real limit, and a hard cap made long-running items
+// stall mid-work. These pin the loop contract through the REAL WorkService.
+
+test("default budget (fixture passes none) keeps working past 25 turns and reaches DONE", async t => {
+	// budget undefined → DEFAULT_WINDOW_BUDGET { maxTurns: 0, maxMinutes: 30 }.
+	// The model only finishes on turn 26: any turn cap below that would pause it.
+	const h = fixture(t, { options: { budget: undefined }, send: h => h.sends.length < 26 ? { reply: "推进中" } : { reply: "全部完成\n[[TASK_DONE]]" } });
+	const item = h.create();
+	h.service.start(); await flush();
+	assert.equal(h.sends.length, 26, "no turn ceiling stopped the window at 15/20/25");
+	assert.equal(h.store.get(item.id).status, "done");
+	assert.match(h.sends.at(-1).message, /本窗口不限轮数（时长上限 30 分钟）/);
+	assert.doesNotMatch(h.sends[0].message, /本窗口最多 \d+ 轮/);
+});
+
+test("explicit maxTurns 0 also means unlimited (0 is a ruling, not a falsy bug)", async t => {
+	const h = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } }, send: h => h.sends.length < 26 ? { reply: "推进中" } : { reply: "完成\n[[TASK_DONE]]" } });
+	h.create();
+	h.service.start(); await flush();
+	assert.equal(h.sends.length, 26);
+	assert.equal(h.store.get(h.store.list()[0].id).status, "done");
+});
+
+test("unlimited turns still hit the wall-clock deadline and say it was the TIME cap", async t => {
+	// Each send advances the FAKE clock: an unlimited window with a frozen fake
+	// clock would spin in microtasks forever (the loop's time check never trips
+	// and no macrotask ever runs) — the exact starvation this test must avoid.
+	const h = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } }, send: h2 => { h2.clock.time += 6 * 60_000; return { reply: "持续推进，尚未完成" }; } });
+	const item = h.create();
+	h.service.start(); await flush();
+	assert.ok(h.sends.length >= 5, "several turns ran inside the window");
+	const row = h.store.get(item.id);
+	assert.equal(row.status, "waiting_human", "the time cap still stops the window");
+	assert.match(row.question, /时间上限已到/, "the pause must name the real limit, not a turn budget");
+	assert.doesNotMatch(row.question, /预算已用尽/);
+	// The DEADLINE timer is cleared on exit; what remains (≤1) is the
+	// waiting_human REMINDER timer — a pause must never go silent (field
+	// 2026-10-04), so its timer surviving the window is correct behavior.
+	assert.ok(h.clock.timers.size <= 1, "the window deadline was cleared; at most the reminder timer remains");
+});
+
+test("unlimited turns: a cancel and a need-human pause still win immediately", async t => {
+	// A pause must not need the turn counter to trip, and a cancelled item stays
+	// silent (no push) even when the window would otherwise keep looping.
+	const paused = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } }, send: () => ({ reply: "卡住了\n[[NEED_HUMAN]]: 等第三方接口恢复" }) });
+	const p = paused.create();
+	paused.service.start(); await flush();
+	assert.equal(paused.sends.length, 1, "no extra turns after the marker");
+	assert.equal(paused.store.get(p.id).status, "waiting_human");
+	assert.match(paused.store.get(p.id).question, /等第三方接口恢复/);
+
+	const cancelled = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } }, send: h => h.sends.length === 1 ? gate.promise : { reply: "[[TASK_DONE]]" } });
+	const gate = cancelled.gate();
+	const c = cancelled.create();
+	cancelled.service.start(); await flush();
+	cancelled.store.cancel(c.id); await flush();
+	assert.deepEqual(cancelled.aborted, [c.id]);
+	assert.equal(cancelled.pushes.length, 0, "a cancelled item pushes nothing");
+	gate.resolve({ reply: "推进中" }); await flush();
+	assert.equal(cancelled.store.get(c.id).status, "cancelled");
+	assert.equal(cancelled.sends.length, 1, "the cancel stops the window, not the turn budget");
+});
+
+test("fake clock + deferred gate exit cleanly: no leaked timers after an unlimited window", async t => {
+	const h = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } }, send: h => h.sends.length < 4 ? gate.promise : { reply: "[[TASK_DONE]]" } });
+	const gate = h.gate();
+	h.create();
+	h.service.start(); await flush();
+	assert.equal(h.clock.timers.size, 1, "only the window deadline is armed");
+	gate.resolve({ reply: "继续推进" }); await flush();
+	assert.equal(h.store.get(h.store.list()[0].id).status, "done");
+	assert.equal(h.clock.timers.size, 0, "the deadline timer was cleared on exit");
+	assert.equal(h.released.length, 1, "the conversation was released");
+	await h.service.stop();
+	assert.equal(h.clock.timers.size, 0, "stop() leaves nothing behind");
+});

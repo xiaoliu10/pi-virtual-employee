@@ -34,7 +34,7 @@ await build({
 	packages: "external",
 });
 const work = await import(pathToFileURL(bundle).href);
-const { parseWindowReply, parseNextCheck, buildWorkWindowPrefix, parseMiningReply, isDuplicateGoal, isSameDailySlot, nextRoutineStreak } = work;
+const { parseWindowReply, parseNextCheck, buildWorkWindowPrefix, parseMiningReply, isDuplicateGoal, isSameDailySlot, nextRoutineStreak, DEFAULT_WINDOW_BUDGET } = work;
 
 test("parseWindowReply classifies the four window outcomes", () => {
 	const done = parseWindowReply("对账完成，共 1204 笔无异常。\n[[TASK_DONE]]");
@@ -279,6 +279,30 @@ test("buildWorkWindowPrefix delay-awareness: notes only when late by ≥30min", 
 	assert.match(late, /下午观察点|快速核查/);
 	// Omitted → no note (kickoffs/resumes).
 	assert.doesNotMatch(buildWorkWindowPrefix({ ...base }), /【延迟说明】/);
+});
+
+// User ruling 2026-10-13: the default work window has UNLIMITED turns (0);
+// the 30-minute cap stays the real limit. Pinned here so a future default
+// flip cannot silently re-bound windows.
+test("DEFAULT_WINDOW_BUDGET is unlimited turns (0) with the 30-minute cap kept", () => {
+	assert.deepEqual(DEFAULT_WINDOW_BUDGET, { maxTurns: 0, maxMinutes: 30 });
+});
+
+test("unlimited-turn window prompt: no turn count, explicit no-early-stop rule, time cap stated", () => {
+	const prefix = buildWorkWindowPrefix({ title: "月末对账", goal: "核对流水", turn: 0, budget: { maxTurns: 0, maxMinutes: 30 } });
+	assert.match(prefix, /本窗口不限轮数（时长上限 30 分钟）/);
+	assert.match(prefix, /不要因为假想轮数将尽而自行停下/);
+	assert.match(prefix, /收尾标记或时间上限/);
+	assert.doesNotMatch(prefix, /最多 0 轮/);
+	assert.ok(!prefix.includes("/0"), "no \"/0\" in the unlimited prompt");
+	// The 30-minute cap remains a real, enforced limit in the same line.
+	assert.match(prefix, /时长上限 30 分钟/);
+});
+
+test("positive maxTurns keeps the classic turn-count wording (explicit budgets still cap)", () => {
+	const prefix = buildWorkWindowPrefix({ title: "月末对账", goal: "核对流水", turn: 0, budget: { maxTurns: 15, maxMinutes: 30 } });
+	assert.match(prefix, /本窗口最多 15 轮 \/ 30 分钟/);
+	assert.doesNotMatch(prefix, /不限轮数/);
 });
 
 test("window protocol: KB-first before escalation; login expiry searches KB; resolution write-back", () => {
