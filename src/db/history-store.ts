@@ -131,6 +131,32 @@ export class HistoryStore {
 		this.db.prepare("DELETE FROM work_mining_cursors WHERE conversation_id = ?").run(id);
 	}
 
+	/**
+	 * Delete ONE-OFF machine conversations untouched since `cutoffMs`
+	 * (scheduled-task runs / autonomous work / prompt-lab eval). Returns the
+	 * number removed.
+	 *
+	 * Why only these origins (field 2026-10-13: the task list filled with
+	 * hundreds of one-shot sched:/work: sessions the user can't act on): an IM
+	 * conversation is a real chat the user may return to, and a console session
+	 * is their own scratchpad — both are the user's data, never auto-deleted.
+	 * A machine conversation is pure execution residue: its value is the push it
+	 * already delivered, so age + inactivity is the right criterion.
+	 *
+	 * The id PREFIX is matched directly rather than the origin column: origin is
+	 * only written by ensureConversation, so a row created by an older build may
+	 * carry a different value, while the id prefix is immutable from birth. A
+	 * conversation still being worked on has a fresh updated_at, so it is never
+	 * pruned mid-run even when its prefix matches.
+	 */
+	pruneOneOffConversations(cutoffMs: number): number {
+		const rows = this.db
+			.prepare("SELECT id FROM conversations WHERE updated_at < ? AND (id LIKE 'sched:%' OR id LIKE 'work:%' OR id LIKE 'eval:%')")
+			.all(cutoffMs) as { id: string }[];
+		for (const row of rows) this.deleteConversation(row.id);
+		return rows.length;
+	}
+
 	listMessages(conversationId: string): MessageRow[] {
 		return this.db
 			.prepare("SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC")
