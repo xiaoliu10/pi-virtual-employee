@@ -60,7 +60,10 @@ const UNKNOWN = "暂未确认";
  * 障碍是常态，写「暂未确认」会让人以为出了什么我们没搞清楚的事（field
  * request 2026-10-10）。其余三个字段缺依据仍是「暂未确认」。 */
 const NO_BLOCKER = "暂无";
-const DOING_FALLBACK = "任务执行中，正在核实最新进展";
+/** 「正在」字段的无依据占位。不用「正在核实最新进展」——那句话是自我循环的
+ * 废话（说自己在确认进展，却什么都没说，field 2026-10-10 现场批评）。宁可
+ * 如实说「还没有可确认的阶段结论」，也不要用空话占位。 */
+const DOING_FALLBACK = "执行中，尚无已确认的阶段结论";
 
 const FIELD_LABELS = ["已完成", "剩余", "正在", "卡点"] as const;
 type FieldLabel = (typeof FIELD_LABELS)[number];
@@ -238,7 +241,7 @@ export function extractProgressFromTexts(texts: string[]): ProgressFields | null
  * curated compaction record, 「当前请求」 for a quoted user request (field
  * 2026-09-24: a quoted request must never be labeled as the task name).
  */
-export function formatDeterministicBrief(fields: ProgressFields | null, taskName?: string, taskLabel = "任务"): string {
+export function formatDeterministicBrief(fields: ProgressFields | null, taskName?: string, taskLabel = "任务", latestNarration?: string): string {
 	// A field value carrying a template-heading fragment ("## Goal 旧标题") is
 	// contamination, not evidence — degrade it to 暂未确认 (卡点 to 暂无) rather
 	// than show the
@@ -249,8 +252,20 @@ export function formatDeterministicBrief(fields: ProgressFields | null, taskName
 		const t = (value ?? "").trim();
 		return t && !contaminated(t) ? clampField(t, max) : UNKNOWN;
 	};
+	// 「正在」的三级证据链（field 2026-10-10：兜底汇报四字段全「暂未确认/正在
+	// 核实进展」被批「没有任何有效信息」）：
+	//   ① 结构化 doing（模型报告或转录里带标签的段落）——最可用，直接用；
+	//   ② latestNarration：转录里最新一条助手可见叙述（"登录态有效不用验证
+	//      码，改用 Playwright 脚本访问 spay"）——真实执行信号，比空话强；
+	//   ③ 都没有才写 DOING_FALLBACK，且明说「尚无已确认的阶段结论」而不是
+	//      假装在核实。
 	const doingRaw = (fields?.doing ?? "").trim();
-	const doing = doingRaw && !contaminated(doingRaw) ? clampField(doingRaw, FIELD_MAX.doing) : DOING_FALLBACK;
+	const narration = (latestNarration ?? "").trim();
+	const doing = doingRaw && !contaminated(doingRaw)
+		? clampField(doingRaw, FIELD_MAX.doing)
+		: narration && !contaminated(narration)
+			? `${clampField(narration, FIELD_MAX.doing)}`
+			: DOING_FALLBACK;
 	// 卡点 unevidenced reads 「暂无」 — an in-flight task with no known blocker
 	// is normal, whereas 暂未确认 would imply something we failed to find out.
 	const blockedRaw = (fields?.blocked ?? "").trim();
