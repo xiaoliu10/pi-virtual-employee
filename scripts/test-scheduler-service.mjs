@@ -53,16 +53,30 @@ function memoryStore() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-test("a run that never settles is force-failed at the timeout and does NOT wedge the scheduler", async () => {
+test("a run that never settles is force-failed at the timeout and does NOT wedge the scheduler", async (t) => {
 	const store = memoryStore();
 	store.create({ id: "wedged", prompt: "x", cron: "* * * * *", next_run_at: Date.now() - 1000 });
 	store.create({ id: "healthy", prompt: "x", cron: "* * * * *", next_run_at: Date.now() - 1000 });
 	const ran = [];
+	// The wedged run must stay UNSETTLED past the 50ms timeout (that is the whole
+	// regression: a run that never settles used to hold the tick lock forever).
+	// It still has to settle EVENTUALLY — a permanently-pending promise keeps a
+	// handle node:test waits on at loop drain, which fails the whole file with
+	// cancelledByParent (field 2026-10-13: this suite went red 5/5 runs on a clean
+	// tree, blocking the release gate, with zero assertion failures). Settle it
+	// long after the timeout so the race still loses, then clean up explicitly.
+	const wedgedTimer = setTimeout(() => settleWedged && settleWedged(), 10_000);
+	let settleWedged;
+	t.after(() => { clearTimeout(wedgedTimer); settleWedged?.(); });
 	const svc = new SchedulerService(store, 50); // 50ms test timeout
 	svc.setRunner({
 		async runTask(task) {
 			ran.push(task.id);
-			if (task.id === "wedged") return new Promise(() => {}); // never settles
+			if (task.id === "wedged") {
+				return new Promise((resolve) => {
+					settleWedged = () => resolve({ status: "late" });
+				});
+			}
 			return { status: "ok" };
 		},
 	});
