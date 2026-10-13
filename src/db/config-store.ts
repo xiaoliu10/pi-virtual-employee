@@ -453,7 +453,7 @@ const DEFAULTS: AppConfig = {
 	model: { suppliers: [], defaultSupplierId: "", defaultModelId: "", sessionAffinity: true },
 	identity: { name: "客服小派", role: "虚拟客服", duty: "在线为客户提供专业、礼貌、高效的服务", serviceHours: "7×24h" },
 	im: { enabled: false, channels: [], ack: { enabled: true, text: "👍 收到，正在处理…" } },
-	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 30, turnTimeoutMin: 20, maxToolSteps: 20, autoUpdate: true, oneOffRetentionDays: 7 },
+	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 30, turnTimeoutMin: 20, maxToolSteps: 20, autoUpdate: true, oneOffRetentionDays: 30 },
 	browser: { enabled: false, headless: true, allowedDomains: [], downloadHost: "" },
 	computer: DEFAULT_COMPUTER_CONFIG,
 	scheduler: { enabled: true },
@@ -966,6 +966,11 @@ export class ConfigStore {
 				const parsed = JSON.parse(row.value) as DeepPartial<AppConfig>;
 				// NOTE: kb.research legacy migration runs lazily on the next all() read — no need to duplicate it here.
 	const merged = deepMerge(DEFAULTS, parsed);
+				// One-time default bump (field 2026-10-13): oneOffRetentionDays shipped
+				// as 7 in 0.2.145, user ruling raised it to 30. A persisted 7 is almost
+				// certainly the old default rather than a deliberate choice, so carry it
+				// forward; any OTHER stored value is the user's and is left alone.
+				if (merged.general.oneOffRetentionDays === 7) merged.general.oneOffRetentionDays = 30;
 				const normalized = {
 					...merged,
 					model: normalizeModelConfig(parsed.model ?? merged.model),

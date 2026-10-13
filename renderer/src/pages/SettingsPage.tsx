@@ -723,13 +723,13 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 												/>
 											</Field>
 
-											<Field label="一次性任务会话保留天数" hint="定时任务执行、自主任务、评测跑出来的会话（列表里那些机器生成的记录）在停止更新超过该天数后自动删除，避免任务列表无限堆积。0 = 不自动清理。你与员工的 IM 对话、控制台自己的会话永不自动删除（只能手动删）。默认 7 天，保存后立即生效。">
+											<Field label="一次性任务会话保留天数" hint="定时任务执行、自主任务、评测跑出来的会话（列表里那些机器生成的记录）在停止更新超过该天数后自动删除，避免任务列表无限堆积。0 = 不自动清理。你与员工的 IM 对话、控制台自己的会话永不自动删除（只能手动删）。默认 30 天，保存后立即生效。">
 												<input
 													type="number"
 													min={0}
-													value={Number.isFinite(draft.general.oneOffRetentionDays) ? draft.general.oneOffRetentionDays : 7}
+													value={Number.isFinite(draft.general.oneOffRetentionDays) ? draft.general.oneOffRetentionDays : 30}
 													onChange={(e) => setGeneral({ oneOffRetentionDays: Math.max(0, Math.floor(Number(e.target.value) || 0)) })}
-													placeholder="7"
+													placeholder="30"
 													className={inputCls}
 												/>
 											</Field>
