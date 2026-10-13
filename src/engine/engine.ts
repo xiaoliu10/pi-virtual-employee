@@ -2187,10 +2187,17 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// Template echoes are filtered inside recentAssistantVisibleTexts, and
 		// progress.ts re-checks each candidate before parsing it as well.
 		const messages = agent.state.messages;
-		const fields = extractProgressFromTexts(recentAssistantVisibleTexts(messages, 8, taskAnchorOf(messages)));
+		const texts = recentAssistantVisibleTexts(messages, 8, taskAnchorOf(messages));
+		const fields = extractProgressFromTexts(texts);
+		// Field 2026-10-10: the fallback used to fill 正在 with the self-referential
+		// 「正在核实最新进展」 while 已完成/剩余 both read 暂未确认 — the user's
+		// verdict was 「没有任何有效的信息」. The newest assistant narration IS a
+		// real execution signal ("登录态有效不用验证码，改用 Playwright 脚本访问
+		// spay"), so hand it to the fallback as the 正在 evidence of last resort.
+		const narration = texts.length ? texts[texts.length - 1] : "";
 		const request = substantialAnchorOf(messages);
 		const goal = (request || heartbeatGoalOf(messages)).replace(/\s+/g, " ").trim();
-		return formatDeterministicBrief(fields, goal || undefined, request ? "当前请求" : "任务");
+		return formatDeterministicBrief(fields, goal || undefined, request ? "当前请求" : "任务", narration);
 	}
 
 	/**
@@ -2231,7 +2238,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 					512, // ~0.8×512 tokens of output budget — plenty for 120 Chinese chars
 					undefined, // apiKey
 					signal,
-					"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过120字的中文汇报进展，且必须严格按以下四段结构输出，四段缺一不可，用中文标签：「已完成：…」「剩余：…」「正在：…」「卡点：…」。记录里查不到依据的段落一律写「暂未确认」——严禁在记录没有依据时推断成「无」，严禁编造数字或进度；卡点查不到依据时写「暂无」；只有当执行记录明确显示当前没有任何障碍时，卡点才可以写「无」。禁止输出「## Goal」「## Constraints & Preferences」「## Next Steps」等英文模板标题——那是会话压缩总结的模板，不是进展汇报，出现了就是错误输出；禁止照抄任务目标原文或执行条件来充当进展；节选中更早的其他请求都是早已完成的旧任务，绝对不要提及；把琐碎的执行步骤归纳为阶段性成果，禁止提及工具名、参数、重试等技术细节；只依据记录中真实发生的事，绝不编造未发生的进度。",
+					"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过120字的中文汇报进展，且必须严格按以下四段结构输出，四段缺一不可，用中文标签：「已完成：…」「剩余：…」「正在：…」「卡点：…」。记录里查不到依据的段落一律写「暂未确认」——严禁在记录没有依据时推断成「无」，严禁编造数字或进度；但**执行记录本身就是依据**：助手叙述、工具调用与工具返回结果里真实发生的事（如「登录态有效，改用 Playwright 访问 spay」「已导出到第 3 批」）必须如实归纳进对应字段，不许因为「没有现成的进度数字」就整段写暂未确认——工具正在做什么、卡在哪一步、用户还需要做什么，这些都是有效信息；卡点查不到依据时写「暂无」；只有当执行记录明确显示当前没有任何障碍时，卡点才可以写「无」。禁止输出「## Goal」「## Constraints & Preferences」「## Next Steps」等英文模板标题——那是会话压缩总结的模板，不是进展汇报，出现了就是错误输出；禁止照抄任务目标原文或执行条件来充当进展；节选中更早的其他请求都是早已完成的旧任务，绝对不要提及；把琐碎的执行步骤归纳为阶段性成果，禁止提及工具名、参数、重试等技术细节；只依据记录中真实发生的事，绝不编造未发生的进度。",
 					undefined, // previousSummary
 					undefined, // thinkingLevel
 					this.rawStreamFn,

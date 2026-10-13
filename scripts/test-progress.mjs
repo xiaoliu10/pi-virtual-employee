@@ -251,7 +251,7 @@ test("formatDeterministicBrief: unevidenced fields read 暂未确认, never an i
 	// known blocker is normal — 暂未确认 would imply something we failed to find.
 	assert.ok(brief.includes("卡点：暂无"));
 	assert.ok(!brief.includes("卡点：暂未确认"));
-	assert.ok(brief.includes("正在：任务执行中，正在核实最新进展"), "the honest generic active-step line");
+	assert.ok(brief.includes("正在：执行中，尚无已确认的阶段结论"), "the honest generic active-step line — never a self-referential 「正在核实进展」");
 	assert.ok(!brief.includes("卡点：无"), "unknown must not be reported as 无");
 	assert.ok(!brief.includes("## Goal"), "no template headings, ever");
 });
@@ -277,7 +277,17 @@ test("formatDeterministicBrief: evidenced fields pass through; partial evidence 
 	const partial = formatDeterministicBrief({ done: "第一批完成", remaining: null, doing: null, blocked: null });
 	assert.ok(partial.includes("已完成：第一批完成"));
 	assert.ok(partial.includes("剩余：暂未确认"));
-	assert.ok(partial.includes("正在：任务执行中，正在核实最新进展"));
+	assert.ok(partial.includes("正在：执行中，尚无已确认的阶段结论"));
+	// 三级证据链②：结构化 doing 缺失时，转录里最新一条助手叙述是真实执行
+	// 信号，必须接进「正在」——四字段全空 + 有叙述的现场（2026-10-10 用户
+	// 批评「没有任何有效的信息」）不能再返回空话占位。
+	const withNarration = formatDeterministicBrief({ done: "暂未确认", remaining: null, doing: null, blocked: null }, "登录 spay 提交工单", "当前请求", "登录态有效不用验证码，改用 Playwright 脚本访问 spay");
+	assert.ok(withNarration.includes("正在：登录态有效不用验证码，改用 Playwright 脚本访问 spay"), "the newest assistant narration feeds 正在");
+	assert.ok(!withNarration.includes("正在核实最新进展"), "the self-referential placeholder is gone");
+	assert.ok(!withNarration.includes("尚无已确认"), "a real signal outranks the generic line");
+	// ① 仍然优先：结构化 doing 在时不用叙述覆盖。
+	const both = formatDeterministicBrief({ done: null, remaining: null, doing: "正在逐条核对", blocked: null }, undefined, "任务", "改用 Playwright 脚本访问 spay");
+	assert.ok(both.includes("正在：正在逐条核对"), "a structured doing outranks narration");
 	assert.ok(partial.includes("卡点：暂无"), "unevidenced 卡点 reads 暂无");
 	assert.ok(!partial.includes("任务："), "no task-name head when none was given");
 });
