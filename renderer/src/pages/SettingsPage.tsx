@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/ipc";
 import type { AppConfig, ImChannelConfig, IMChannel, ScheduledTaskRow, UpdateState, WorkItemView } from "../lib/types";
 import { ModelServiceSection } from "../components/ModelServiceSection";
@@ -203,7 +203,22 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 		setShellCommandsText((config?.capabilities.shell.allowedCommands ?? []).join("\n"));
 	}, [config]);
 
-	useEffect(() => setDraft(config), [config]);
+	// Adopt an external config refresh ONLY when the draft has no unsaved edits —
+	// otherwise an IM-side change (manage_access / manage_settings) would wipe what
+	// the admin is typing in the open settings page (field 2026-10-13). "No edits" is
+	// measured against the last config we actually synced from, not by reference
+	// identity (config is a fresh object on every push). The primary scenario —
+	// settings page opened AFTER the change — sees the fresh config on mount anyway.
+	const lastSyncedConfig = useRef<AppConfig | null>(config);
+	useEffect(() => {
+		setDraft((current) => {
+			if (!config) return config;
+			const synced = lastSyncedConfig.current;
+			const untouched = current === null || (synced !== null && JSON.stringify(current) === JSON.stringify(synced));
+			lastSyncedConfig.current = config;
+			return untouched ? config : current;
+		});
+	}, [config]);
 	useEffect(() => {
 		api.imChannels()
 			.then((values) => values.length > 0 && setChannelTypes(values))

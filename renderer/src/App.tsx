@@ -28,6 +28,15 @@ export default function App() {
 	// 账号登录成功后引擎会直接写入 config store（ensureAuthSupplier 建供应商
 	// 条目）——重拉 config，让设置页 draft（跟随 config prop）拿到新条目，
 	// 否则后续任意保存会用 stale draft 整体覆盖 suppliers、把条目静默丢掉。
+	// Config-change pushes: IM-side writers (manage_access / manage_settings),
+	// imports, and any other main-process update refresh the settings page's
+	// draft. Without this a config written from IM shows as stale in the UI —
+	// and the next settings save overwrites it with the stale draft
+	// (field 2026-10-13: 「管理员完全访问」已通过对话打开，设置页仍显示未勾选).
+	useEffect(() => api.onConfigChanged(() => {
+		void api.getConfig().then((cfg) => setConfig(cfg as AppConfig)).catch(() => {});
+	}), []);
+
 	useEffect(() => api.onAuthLoginEvent((state) => {
 		if (state.status !== "done") return;
 		void api.getConfig().then((cfg) => setConfig(cfg as AppConfig)).catch(() => {});

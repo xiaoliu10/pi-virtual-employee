@@ -44,6 +44,14 @@ const api = {
 	simulateIM: (conversationId: string, text: string, actor?: { senderId: string; senderName?: string; channel: string; chatType: "single" | "group" }): Promise<string> =>
 		ipcRenderer.invoke("im:simulate", conversationId, text, actor),
 	imChannels: (): Promise<string[]> => ipcRenderer.invoke("im:channels"),
+	/** Subscribe to config-change pushes (main → renderer): any writer of the config store
+	 * (settings save, IM manage_access/manage_settings, import) broadcasts this, so an
+	 * open settings page re-reads instead of showing a stale draft. Returns an unsubscribe. */
+	onConfigChanged: (cb: () => void): (() => void) => {
+		const listener = () => cb();
+		ipcRenderer.on("config:changed", listener);
+		return () => ipcRenderer.removeListener("config:changed", listener);
+	},
 	/** Subscribe to IM/scheduled activity (main → renderer push) to refresh live. Carries the conversationId that changed. Returns an unsubscribe. */
 	onImActivity: (cb: (conversationId: string) => void): (() => void) => {
 		const listener = (_e: unknown, conversationId: string) => cb(conversationId);
