@@ -30,6 +30,8 @@ import {
 	parseChainReply,
 	parseChainState,
 	buildLearnTurnAsk,
+	budgetPauseLabel,
+	turnProgressLabel,
 	nextStallStep,
 	STALL_QUIET_RETRIES,
 } from "../src/scheduler/autonomous.js";
@@ -734,7 +736,7 @@ async function main(): Promise<void> {
 				// the target chat sees the chain is alive without reading the console.
 				chain.stallCount = 0; // a successful turn clears the stall streak
 				persistChain();
-				const tbNote = `⏳ **${task.title}** 第 ${chain.turns}/${budget.maxTurns} 轮完成，继续推进…
+				const tbNote = `⏳ **${task.title}** ${turnProgressLabel(chain.turns, budget)}，继续推进…
 ${tailForProgress(decision.text)}`;
 				if (shouldPushScheduledResult(task, undefined, tbNote)) {
 					const cid = task.conversation_id!;
@@ -810,7 +812,7 @@ ${tailForProgress(decision.text)}`;
 					: outcome === "human"
 						? `⏸️ **自主任务暂停（需要人工）:${task.title}**\n\n${question ?? lastText}\n\n回复「继续 ${task.title}」并附上答案，我会带着你的回复继续。`
 						: outcome === "budget"
-							? `⏸️ **自主任务已达预算：${task.title}**（${chain.turns}/${budget.maxTurns} 轮）\n\n${tailForProgress(lastText, 400)}${resumeHint}`
+							? `⏸️ **自主任务${budgetPauseLabel(chain.turns, budget)}：${task.title}**\n\n${tailForProgress(lastText, 400)}${resumeHint}`
 							: outcome === "stalled"
 								? `⏸️ **自主任务已中断暂停：${task.title}**（模型服务连续 ${STALL_QUIET_RETRIES + 1} 次未返回内容，任务在第 ${chain.turns} 轮中断，不会自动继续）${stalledHint}`
 								: `⚠️ **自主任务出错停止：${task.title}**\n\n${lastText}`;
@@ -829,7 +831,7 @@ ${tailForProgress(decision.text)}`;
 		const status =
 			outcome === "done" ? "done" :
 			outcome === "human" ? "paused:等待人工回复" :
-			outcome === "budget" ? `paused:预算耗尽（${chain.turns} 轮）` :
+			outcome === "budget" ? (budget.maxTurns > 0 ? `paused:预算耗尽（${chain.turns} 轮）` : `paused:已达时间上限（${chain.turns} 轮）`) :
 			outcome === "stalled" ? `paused:模型无返回，等待处理（${chain.turns} 轮）` :
 			"error:" + lastText.slice(0, 180);
 		return { status };

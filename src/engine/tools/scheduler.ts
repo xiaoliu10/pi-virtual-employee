@@ -72,9 +72,9 @@ export function createSchedulerTools(
 			title: Type.String({ description: "任务简短标题，如「每日订单早报」" }),
 			prompt: Type.String({ description: "到点要执行的指令，如「查询昨日所有订单状态并汇总异常」" }),
 			cron: Type.String({ description: "5 字段 cron 表达式（本地时间），如 0 9 * * *" }),
-			autonomous: Type.Optional(Type.Boolean({ description: "自主模式：到点后不止执行一轮，而是连续多轮工作直到目标完成、需要人工或预算耗尽（默认预算 20 轮/2小时）。适合「整理并核对月末报表」这类长目标；单次可完成的任务不要开" })),
+			autonomous: Type.Optional(Type.Boolean({ description: "自主模式：到点后不止执行一轮，而是连续多轮工作直到目标完成、需要人工或时间上限（默认不限制轮数、时长上限 120 分钟）。适合「整理并核对月末报表」这类长目标；单次可完成的任务不要开" })),
 			silent: Type.Optional(Type.Boolean({ description: "静默执行：到点照常执行并记录结果，但完成时不推送回会话（不发送「定时任务完成+报告链接」）。适合保活、巡检、维护类任务——只要跑成功就不需要人知道。出错时仍会推送，静默不等于隐藏失败" })),
-			maxTurns: Type.Optional(Type.Number({ description: "自主模式最大轮数（默认 20，上限 200）" })),
+			maxTurns: Type.Optional(Type.Number({ description: "自主模式最大轮数：不传或传 0 = 不限制轮数（默认，仅受时长上限约束）；仅当对方明确要求限制轮数时才传正数（上限 200）" })),
 			maxMinutes: Type.Optional(Type.Number({ description: "自主模式最大时长分钟（默认 120，上限 1440）" })),
 		}),
 		async execute(_id, params) {
@@ -115,7 +115,7 @@ export function createSchedulerTools(
 					{
 						type: "text",
 						text: conversationId.startsWith("dt:")
-								? `已创建定时任务「${task.title}」${task.autonomous ? "（自主模式：将持续多轮工作直到完成、需要人工或预算耗尽；预算耗尽会主动请示是否续跑）" : ""}。下次执行：${fmtTime(task.next_run_at)}。到点后我会自动执行，${task.silent ? "**静默执行**——成功时不推送，只有出错才会通知你" : `把结果主动推送回当前${conversationId.startsWith("dt:group:") ? "群聊" : "单聊"}`}。`
+								? `已创建定时任务「${task.title}」${task.autonomous ? "（自主模式：将持续多轮工作直到完成、需要人工或时间上限；时间到会主动请示是否续跑）" : ""}。下次执行：${fmtTime(task.next_run_at)}。到点后我会自动执行，${task.silent ? "**静默执行**——成功时不推送，只有出错才会通知你" : `把结果主动推送回当前${conversationId.startsWith("dt:group:") ? "群聊" : "单聊"}`}。`
 								: `已创建定时任务「${task.title}」${task.autonomous ? "（自主模式）" : ""}。下次执行：${fmtTime(task.next_run_at)}。到点后我会自动执行并把结果记入对话${task.silent ? "（静默执行：成功不推送，出错才通知）" : ""}。`,
 					},
 					...(createdBy
@@ -398,9 +398,9 @@ export function createSchedulerTools(
 			prompt: Type.Optional(Type.String({ description: "新的到点执行指令" })),
 			cron: Type.Optional(Type.String({ description: "新的 5 字段 cron（本地时间），如 0 9 * * *" })),
 			bindCurrent: Type.Optional(Type.Boolean({ description: "true=把推送目标改绑为当前会话。仅当对方明确要求改绑；改绑已有推送目标需当前消息含「确认」" })),
-			autonomous: Type.Optional(Type.Boolean({ description: "开/关自主模式（连续多轮工作直到完成、需要人工或预算耗尽）" })),
+			autonomous: Type.Optional(Type.Boolean({ description: "开/关自主模式（连续多轮工作直到完成、需要人工或时间上限；默认不限制轮数）" })),
 			silent: Type.Optional(Type.Boolean({ description: "静默执行开关：true=执行并记录但不推送完成通知（出错仍推送）；false=恢复完成推送" })),
-			maxTurns: Type.Optional(Type.Number({ description: "自主模式最大轮数（默认 20，上限 200）" })),
+			maxTurns: Type.Optional(Type.Number({ description: "自主模式最大轮数：不传 = 保持原样；传 0 = 改成不限制轮数；仅当对方明确要求限制轮数时才传正数（上限 200）" })),
 			maxMinutes: Type.Optional(Type.Number({ description: "自主模式最大时长分钟（默认 120，上限 1440）" })),
 		}),
 		async execute(_toolCallId, params) {
@@ -411,8 +411,19 @@ export function createSchedulerTools(
 			if (p.cron !== undefined) patch.cron = p.cron;
 			if (p.autonomous !== undefined) {
 				patch.autonomous = p.autonomous;
+				// Switching autonomy ON: an absent budget stays absent (the store keeps
+				// it NULL → normalizeBudget defaults to unlimited turns / 120 minutes).
+				// Switching it OFF drops the budget entirely — a non-autonomous task
+				// has no budget to carry.
 				patch.maxTurns = p.autonomous ? (p.maxTurns ?? null) : null;
 				patch.maxMinutes = p.autonomous ? (p.maxMinutes ?? null) : null;
+			} else {
+				// Independent budget update: the caller asked for a budget WITHOUT
+				// touching autonomous, so the patch must carry it on its own. Without
+				// this branch an explicit maxTurns: 0 / maxMinutes on an autonomous
+				// task was silently dropped (only the autonomous branch wrote them).
+				if (p.maxTurns !== undefined) patch.maxTurns = p.maxTurns;
+				if (p.maxMinutes !== undefined) patch.maxMinutes = p.maxMinutes;
 			}
 			if (p.silent !== undefined) patch.silent = p.silent;
 			// The push target is where results LAND; the editing conversation is where

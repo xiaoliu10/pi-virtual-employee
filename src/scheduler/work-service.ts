@@ -87,7 +87,10 @@ export class WorkService<Session extends WorkSession> {
 		this.clock = opts.clock ?? { now: Date.now, setTimeout, clearTimeout };
 		const b = opts.budget ?? DEFAULT_WINDOW_BUDGET;
 		this.budget = {
-			maxTurns: Number.isFinite(b.maxTurns) && b.maxTurns >= 1 ? Math.floor(b.maxTurns) : DEFAULT_WINDOW_BUDGET.maxTurns,
+			// maxTurns 0 = unlimited (the default, user ruling 2026-10-13). Invalid
+			// values (negative, NaN) also fall back to 0 — a bad config must not
+			// bound a window by surprise. Explicit positive values still cap it.
+			maxTurns: Number.isFinite(b.maxTurns) && b.maxTurns >= 0 ? Math.floor(b.maxTurns) : DEFAULT_WINDOW_BUDGET.maxTurns,
 			maxMinutes: Number.isFinite(b.maxMinutes) && b.maxMinutes > 0 ? b.maxMinutes : DEFAULT_WINDOW_BUDGET.maxMinutes,
 		};
 	}
@@ -249,12 +252,12 @@ export class WorkService<Session extends WorkSession> {
 			const initialProgress = item.progress;
 			const startedAt = this.clock.now();
 			active.deadline = this.clock.setTimeout(() => this.abortActive("工作窗口超时，已请求中止；请核查操作后由管理员明确恢复。"), this.budget.maxMinutes * 60_000);
-			for (let turn = 0; turn < this.budget.maxTurns; turn++) {
+			for (let turn = 0; this.budget.maxTurns <= 0 || turn < this.budget.maxTurns; turn++) {
 				// Fresh notebook and live identity on EVERY turn (including turn zero).
 				const fresh = store.get(item.id);
 				if (!fresh || fresh.status !== "working") return;
 				if (active.stopReason || !this.running || this.clock.now() - startedAt >= this.budget.maxMinutes * 60_000) {
-					question = active.stopReason ?? "工作窗口预算已用尽，请管理员明确恢复。";
+					question = active.stopReason ?? (this.budget.maxTurns > 0 ? "工作窗口预算已用尽，请管理员明确恢复。" : "工作窗口时间上限已到，请管理员明确恢复。");
 					break;
 				}
 				if (!fresh.created_by?.trim() || !this.opts.isAdmin(fresh.created_by)) {

@@ -46,16 +46,52 @@ export interface AutonomousBudget {
 	maxMinutes: number;
 }
 
-export const DEFAULT_AUTONOMOUS_BUDGET: AutonomousBudget = { maxTurns: 20, maxMinutes: 120 };
+/** Hard ceiling on an EXPLICIT maxTurns (sanity bound, not a default). */
+export const MAX_AUTONOMOUS_TURNS = 200;
 
-/** Coerce untrusted config/store values into a sane budget (fallback defaults). */
+export const DEFAULT_AUTONOMOUS_BUDGET: AutonomousBudget = { maxTurns: 0, maxMinutes: 120 };
+
+/**
+ * Coerce untrusted config/store values into a sane budget.
+ *
+ * maxTurns: 0 (or any zero-ish/absent/invalid value) = UNLIMITED turns (user
+ * ruling 2026-10-13) — the wall-clock cap is the real limit, and a hard 20-turn
+ * cap made long goals pause mid-work. An EXPLICIT positive value still caps it
+ * (upper-clamped to MAX_AUTONOMOUS_TURNS), so an operator can re-bound a task.
+ */
 export function normalizeBudget(maxTurns: unknown, maxMinutes: unknown): AutonomousBudget {
 	const turns = Number(maxTurns);
 	const minutes = Number(maxMinutes);
 	return {
-		maxTurns: Number.isFinite(turns) && turns >= 1 ? Math.min(Math.floor(turns), 200) : DEFAULT_AUTONOMOUS_BUDGET.maxTurns,
+		maxTurns: Number.isFinite(turns) && turns >= 1 ? Math.min(Math.floor(turns), MAX_AUTONOMOUS_TURNS) : DEFAULT_AUTONOMOUS_BUDGET.maxTurns,
 		maxMinutes: Number.isFinite(minutes) && minutes >= 1 ? Math.min(Math.floor(minutes), 24 * 60) : DEFAULT_AUTONOMOUS_BUDGET.maxMinutes,
 	};
+}
+
+/** True when the budget bounds the chain by a turn count (0 = unlimited). */
+export function turnLimited(budget: AutonomousBudget): boolean {
+	return budget.maxTurns > 0;
+}
+
+/**
+ * Turn counter for IM-facing copy. Unlimited turns (user ruling 2026-10-13)
+ * must NOT render as "12/0 轮" — a denominator of 0 reads as "zero turns
+ * allowed", the exact opposite of the truth. A bounded budget keeps the
+ * familiar "done/limit" shape.
+ */
+export function turnProgressLabel(turns: number, budget: AutonomousBudget): string {
+	return turnLimited(budget) ? `${turns}/${budget.maxTurns} 轮` : `已进行 ${turns} 轮`;
+}
+
+/**
+ * Headline + counter for the budget-pause push. With unlimited turns the only
+ * real budget that can be exhausted is the wall clock, so the copy must say
+ * so instead of announcing a turn ceiling that never existed.
+ */
+export function budgetPauseLabel(turns: number, budget: AutonomousBudget): string {
+	return turnLimited(budget)
+		? `已达预算（${turnProgressLabel(turns, budget)}）`
+		: `已达时间上限（时长上限 ${budget.maxMinutes} 分钟，${turnProgressLabel(turns, budget)}）`;
 }
 
 export function parseChainState(raw: string | null | undefined): AutonomousChainState | null {
@@ -171,9 +207,12 @@ function stripMarkerLines(text: string): string {
 		.trimEnd();
 }
 
-/** Wall-clock budget for the current window. */
+/** Wall-clock budget for the current window. Turns are checked ONLY when the
+ * budget actually bounds them (maxTurns > 0): an unlimited-turn chain is
+ * bounded by the wall clock alone (user ruling 2026-10-13). */
 export function budgetExceeded(state: AutonomousChainState, budget: AutonomousBudget, now = Date.now()): boolean {
-	return state.turns >= budget.maxTurns || now - state.startedAt >= budget.maxMinutes * 60_000;
+	if (turnLimited(budget) && state.turns >= budget.maxTurns) return true;
+	return now - state.startedAt >= budget.maxMinutes * 60_000;
 }
 
 /**
@@ -198,7 +237,12 @@ export function buildAutonomousTurnPrefix(opts: {
 		opts.turn === 0
 			? `【自主任务模式】这是一个多轮自主任务：你会连续工作多个回合直到达成目标，期间没有人逐条催你。`
 			: `【自主任务模式 · 第 ${opts.turn + 1} 轮】目标尚未完成，请继续推进（不要重复已完成的工作，从上次停下的地方接着干）。`;
-	const budgetLine = `预算：最多 ${opts.budget.maxTurns} 轮 / ${opts.budget.maxMinutes} 分钟，请高效推进，优先完成关键路径。`;
+	// Unlimited turns (user ruling 2026-10-13): the model must not invent a turn
+	// ceiling and stop early — only the closing markers or the wall-clock cap end
+	// the task. Explicit positive budgets keep the count wording.
+	const budgetLine = turnLimited(opts.budget)
+		? `预算：最多 ${opts.budget.maxTurns} 轮 / ${opts.budget.maxMinutes} 分钟，请高效推进，优先完成关键路径。`
+		: `预算：不限制轮数（时长上限 ${opts.budget.maxMinutes} 分钟）：没有「轮数用尽」这回事，不要因为假想轮数将尽而自行停下或草草收尾，是否结束只由收尾标记或时间上限决定；请高效推进，优先完成关键路径。`;
 	const protocol = [
 		`回合结束规则（必须遵守）：`,
 		`- 目标已全部完成 → 回复最后一行单独写 ${AUTONOMOUS_DONE_MARK}，并在它上面给出成果总结。`,
