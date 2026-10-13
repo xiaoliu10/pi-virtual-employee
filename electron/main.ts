@@ -984,6 +984,15 @@ ${tailForProgress(decision.text)}`;
 		},
 	});
 
+	/** Age out one-off machine conversations per general.oneOffRetentionDays (0=off). */
+	const pruneOneOffConversations = (): void => {
+		const days = config.all().general.oneOffRetentionDays;
+		if (!days || days <= 0) return;
+		const cutoff = Date.now() - days * 86_400_000;
+		const removed = history.pruneOneOffConversations(cutoff);
+		if (removed > 0) console.log("[main] pruned " + removed + " one-off conversation(s) older than " + days + "d");
+	};
+
 	// Local HTTP+SSE transport — the renderer streams chat through localhost.
 	const httpPort = Number(process.env.PORT) || 0;
 	const { port, server: httpServer } = await startHttpTransport(engine, { port: httpPort });
@@ -991,6 +1000,10 @@ ${tailForProgress(decision.text)}`;
 
 	// Preload skills so the first session already has them.
 	await engine.refreshSkills().catch((err) => console.error("[engine] skill load failed", err));
+
+	// One-off machine conversations (sched:/work:/eval:) accumulate forever in
+	// the task list; age out the untouched ones before the UI lists them.
+	pruneOneOffConversations();
 
 	// Reconcile IM adapter + autostart with saved config.
 	applyAutostart(config.all().general.autostart);
@@ -1052,6 +1065,9 @@ ${tailForProgress(decision.text)}`;
 			if (wc && !wc.isDestroyed()) wc.send("config:changed");
 		}
 		await computer.syncConfig();
+		// Retention tweaked from the settings page / IM: re-apply immediately so a
+		// shortened window takes effect without waiting for the next launch.
+		pruneOneOffConversations();
 		applyAutostart(updated.general.autostart);
 		await im.sync().catch((err) => console.error("[im] sync failed", err));
 		engine.setRequestTimeoutMs((updated.general.requestTimeoutMin || 0) * 60_000);

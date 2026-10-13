@@ -59,7 +59,7 @@ export const ROOT_CATALOG: Record<string, string> = {
 	model: "模型供应商与默认模型（suppliers/defaultSupplierId/defaultModelId；每个 supplier 条目内还有 per-model 覆盖：modelImage/modelContextWindow/modelMaxTokens，按 modelId 键值写入，如 model.suppliers.0.modelMaxTokens = {\"模型ID\": 32768}（单次输出上限：输出与输入共享上下文窗口，网关报 ContextWindowExceeded 且要求的 output 很大时就把它调小；不配时先查网关 model-info 接口（litellm /model/info），查不到才回退默认 32768）；改动错误会导致员工失联）；model.sessionAffinity（布尔，默认 true）= 会话亲和：每个模型请求带会话标识 header，同一会话粘同一上游以提升网关 prompt 缓存命中，false 关闭）",
 	identity: "员工身份（name/role/duty/serviceHours）",
 	im: "IM 渠道（im.enabled/channels[].appId/appSecret 等）",
-	general: "通用（autostart/language/requestTimeoutMin/longTaskProgressMin/maxToolSteps/autoUpdate）",
+	general: "通用（autostart/language/requestTimeoutMin/longTaskProgressMin/maxToolSteps/autoUpdate/oneOffRetentionDays；一次性会话保留天数：定时任务/自主任务/评测会话停止更新超过该天数自动删除，0=不清理，IM 与控制台会话永不自动删）",
 	browser: "浏览器自动化（enabled/headless/allowedDomains）",
 	computer: "Cua 桌面控制（enabled/driverPath/allowedApps/allowForeground/allowScheduled/connectTimeoutSec/actionTimeoutSec/sessionTimeoutSec；单位秒，总时限 0=不限时；allowedApps 空数组=拒绝全部，*=全部应用）",
 	scheduler: "定时任务总开关（scheduler.enabled）",
