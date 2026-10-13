@@ -133,7 +133,7 @@ export interface KbConfig {
 		consolidate: { enabled: boolean; intervalMinutes: number; batch: number };
 	};
 	manage: { enabled: boolean };
-	research: { enabled: boolean; engine: "duckduckgo" | "custom" };
+	research: { enabled: boolean; engine: "bing" | "custom" };
 }
 
 export interface AppConfig {

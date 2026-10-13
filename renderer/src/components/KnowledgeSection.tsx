@@ -691,9 +691,9 @@ export function KnowledgeSection({ kb, suppliers, onUpdate }: Props) {
 							</div>
 							<input type="checkbox" checked={kb.research.enabled} onChange={(e) => setResearch({ enabled: e.target.checked })} className="h-5 w-5 accent-blue-500" />
 						</label>
-						<Field label="搜索引擎" hint="DuckDuckGo 免 Key 即用；自定义模式需提供端点（在 config-store 进一步配置模板）。">
+						<Field label="搜索引擎" hint="Bing 免 Key 即用、国内可直连（默认）；自定义模式需提供端点（在 config-store 进一步配置模板）。">
 							<select value={kb.research.engine} onChange={(e) => setResearch({ engine: e.target.value as KbConfig["research"]["engine"] })} className={inputCls}>
-								<option value="duckduckgo">DuckDuckGo（免 Key）</option>
+								<option value="bing">Bing（免 Key，国内可直连）</option>
 								<option value="custom">自定义搜索引擎</option>
 							</select>
 						</Field>
