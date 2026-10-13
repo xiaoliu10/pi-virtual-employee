@@ -90,6 +90,8 @@ export interface Supplier {
 }
 
 export interface ModelConfig {
+	/** 会话亲和（2026-10-13 用户裁定默认开）：true 时每个 LLM 请求带会话标识 header，同一会话粘同一上游，提升网关侧 prompt 缓存命中。false 关闭。 */
+	sessionAffinity?: boolean;
 	suppliers: Supplier[];
 	defaultSupplierId: string;
 	defaultModelId: string;
@@ -441,7 +443,7 @@ export interface AppConfig {
 }
 
 const DEFAULTS: AppConfig = {
-	model: { suppliers: [], defaultSupplierId: "", defaultModelId: "" },
+	model: { suppliers: [], defaultSupplierId: "", defaultModelId: "", sessionAffinity: true },
 	identity: { name: "客服小派", role: "虚拟客服", duty: "在线为客户提供专业、礼貌、高效的服务", serviceHours: "7×24h" },
 	im: { enabled: false, channels: [], ack: { enabled: true, text: "👍 收到，正在处理…" } },
 	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 30, turnTimeoutMin: 20, maxToolSteps: 20, autoUpdate: true },
@@ -706,6 +708,9 @@ export function normalizeModelConfig(value: unknown): ModelConfig {
 	// authProvider (account-login) suppliers keep their models in the pi-ai registry,
 	// invisible here — a non-empty default pointing at one is accepted as-is; the
 	// engine validates it against the registry at resolve time.
+	// 会话亲和开关：缺省 = 开（与引擎默认一致）；显式 false 才关。
+	const sessionAffinity = typeof raw.sessionAffinity === "boolean" ? raw.sessionAffinity : true;
+
 	const current = suppliers.find((supplier) =>
 		supplier.id === defaultSupplierId && supplier.enabled &&
 		(supplier.models.includes(defaultModelId) || (defaultModelId !== "" && supplier.authProvider !== undefined)));
@@ -716,7 +721,7 @@ export function normalizeModelConfig(value: unknown): ModelConfig {
 		defaultModelId = firstSupplier?.models[0] ?? "";
 	}
 
-	return { suppliers, defaultSupplierId, defaultModelId };
+	return { suppliers, defaultSupplierId, defaultModelId, sessionAffinity };
 }
 
 /**
