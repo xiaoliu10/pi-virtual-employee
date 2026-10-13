@@ -34,6 +34,7 @@ testOss(): Promise<{ ok: boolean; detail: string }>;
 	setAutostart(enabled: boolean): Promise<boolean>;
 	simulateIM(conversationId: string, text: string, actor?: { senderId: string; senderName?: string; channel: string; chatType: "single" | "group" }): Promise<string>;
 	imChannels(): Promise<string[]>;
+	onConfigChanged(cb: () => void): () => void;
 	onImActivity(cb: (conversationId: string) => void): () => void;
 	listModels(): Promise<import("./lib/types").ModelOption[]>;
 	testModel(supplier: Supplier, modelId: string): Promise<{ ok: boolean; reply: string }>;

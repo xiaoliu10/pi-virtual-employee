@@ -1043,6 +1043,14 @@ ${tailForProgress(decision.text)}`;
 	ipcMain.handle("config:get", () => config.all());
 	ipcMain.handle("config:set", async (_e, patch) => {
 		const updated = config.update(patch);
+		// Push to the renderer: a config written from IM (manage_access /
+		// manage_settings) or an import must refresh an OPEN settings page, or
+		// its stale draft silently overwrites the change on the next save
+		// (field 2026-10-13: 「管理员完全访问」已在对话里打开，设置页仍显示未勾选).
+		{
+			const wc = mainWindow?.webContents;
+			if (wc && !wc.isDestroyed()) wc.send("config:changed");
+		}
 		await computer.syncConfig();
 		applyAutostart(updated.general.autostart);
 		await im.sync().catch((err) => console.error("[im] sync failed", err));
