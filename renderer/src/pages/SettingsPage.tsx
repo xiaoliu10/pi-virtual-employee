@@ -734,6 +734,17 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 												/>
 											</Field>
 
+											<Field label="对话记录保留天数" hint="员工对话的消息正文与执行遥测超过该天数后自动删除（会话条目保留，任务列表不受影响）。0 = 不自动清理。默认 30 天，保存后立即生效。">
+												<input
+													type="number"
+													min={0}
+													value={Number.isFinite(draft.general.messageRetentionDays) ? draft.general.messageRetentionDays : 30}
+													onChange={(e) => setGeneral({ messageRetentionDays: Math.max(0, Math.floor(Number(e.target.value) || 0)) })}
+													placeholder="30"
+													className={inputCls}
+												/>
+											</Field>
+
 											<Field label="单轮工具调用上限" hint="限制一轮对话中模型连续调用工具的最大步数，防止异常循环。达到上限后会停止调用工具，并根据已完成的操作生成结果总结。0 = 不限制。保存后立即生效。">
 												<input
 													type="number"

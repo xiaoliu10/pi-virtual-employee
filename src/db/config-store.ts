@@ -243,6 +243,8 @@ export interface AppConfig {
 		 * minted itself (sched:/work:/eval:) qualify.
 		 */
 		oneOffRetentionDays: number;
+		/** 对话记录（消息正文 + turn/tool 遥测）保留天数，超龄自动删除；会话条目保留。0 = 关闭。 */
+		messageRetentionDays: number;
 		/**
 		 * Per-turn tool-loop cap. Each "step" is one assistant response that fired
 		 * tool calls and received their results. After this many steps the agent
@@ -453,7 +455,7 @@ const DEFAULTS: AppConfig = {
 	model: { suppliers: [], defaultSupplierId: "", defaultModelId: "", sessionAffinity: true },
 	identity: { name: "客服小派", role: "虚拟客服", duty: "在线为客户提供专业、礼貌、高效的服务", serviceHours: "7×24h" },
 	im: { enabled: false, channels: [], ack: { enabled: true, text: "👍 收到，正在处理…" } },
-	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 30, turnTimeoutMin: 20, maxToolSteps: 20, autoUpdate: true, oneOffRetentionDays: 30 },
+	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 30, turnTimeoutMin: 20, maxToolSteps: 20, autoUpdate: true, oneOffRetentionDays: 30, messageRetentionDays: 30 },
 	browser: { enabled: false, headless: true, allowedDomains: [], downloadHost: "" },
 	computer: DEFAULT_COMPUTER_CONFIG,
 	scheduler: { enabled: true },

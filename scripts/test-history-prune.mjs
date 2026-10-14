@@ -37,6 +37,8 @@ function store() {
 	db.exec("CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, title TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, model_supplier_id TEXT, model_model_id TEXT, origin TEXT NOT NULL DEFAULT 'console');");
 	db.exec("CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT, created_at INTEGER NOT NULL);");
 	db.exec("CREATE TABLE IF NOT EXISTS work_mining_cursors (conversation_id TEXT NOT NULL, last_message_id TEXT, last_scanned_at INTEGER NOT NULL, PRIMARY KEY (conversation_id));");
+	db.exec("CREATE TABLE IF NOT EXISTS turn_events (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, origin TEXT NOT NULL DEFAULT 'console', started_at INTEGER NOT NULL, duration_ms INTEGER NOT NULL DEFAULT 0);");
+	db.exec("CREATE TABLE IF NOT EXISTS tool_events (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, name TEXT NOT NULL, started_at INTEGER NOT NULL, duration_ms INTEGER NOT NULL DEFAULT 0);");
 	return new HistoryStore(db);
 }
 
@@ -83,4 +85,23 @@ test("a retention window of 0 days prunes nothing (disabled)", (t) => {
 	// an explicit cutoff, so assert the cutoff path is what gates it.
 	assert.equal(s.pruneOneOffConversations(0), 0, "cutoff 0 = now, nothing is older than now");
 	assert.equal(s.listConversations().length, 1);
+});
+
+test("pruneOldMessages removes aged message bodies + telemetry but keeps every conversation", () => {
+	const s = store();
+	const now = Date.now();
+	for (const id of ["dt:group:cidIM", "sched:t1:1"]) s.ensureConversation(id, "t");
+	s.appendMessage("dt:group:cidIM", "user", "旧消息");
+	s.appendMessage("dt:group:cidIM", "user", "新消息");
+	s.db.prepare("UPDATE messages SET created_at = ? WHERE content = '旧消息'").run(now - 60 * 86_400_000);
+	s.db.prepare("INSERT INTO turn_events (id, conversation_id, started_at) VALUES ('te1', 'dt:group:cidIM', ?)").run(now - 60 * 86_400_000);
+	s.db.prepare("INSERT INTO tool_events (id, conversation_id, name, started_at) VALUES ('to1', 'dt:group:cidIM', 'browser_read', ?)").run(now - 60 * 86_400_000);
+
+	const removed = s.pruneOldMessages(now - 30 * 86_400_000);
+	assert.equal(removed, 1, "only the aged message row");
+	const left = s.listMessages("dt:group:cidIM").map((m) => m.content);
+	assert.deepEqual(left, ["新消息"], "recent messages survive");
+	assert.equal(s.getConversation("dt:group:cidIM")?.id, "dt:group:cidIM", "the conversation entry survives");
+	assert.equal(s.db.prepare("SELECT COUNT(*) n FROM turn_events").get().n, 0, "aged turn telemetry goes");
+	assert.equal(s.db.prepare("SELECT COUNT(*) n FROM tool_events").get().n, 0, "aged tool telemetry goes");
 });
