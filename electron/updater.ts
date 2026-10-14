@@ -31,6 +31,10 @@ const { autoUpdater } = electronUpdater;
 /** The update feed: a stable URL pointing at the `latest` release tag. */
 const UPDATE_FEED = "https://gitee.com/xiaoliu10/pi-virtual-employee/releases/download/latest";
 const FIRST_CHECK_DELAY_MS = 15_000;
+/** File-lock-style download failures (CDP/antivirus temp delete): retry this many
+ * times per version before deferring to the next scheduled check. */
+const MAX_DOWNLOAD_RETRIES = 3;
+const DOWNLOAD_RETRY_BACKOFF_MS = [30_000, 120_000, 600_000];
 const RECHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 /** Unattended mode: how often to re-check engine idleness after a download. */
 const IDLE_POLL_MS = 60_000;
@@ -388,7 +392,19 @@ function manualUrl(version: string): string {
  * the sweep only removes .tmp/.blocked partials older than an hour (never a
  * completed installer another instance may be installing).
  */
-function sweepStaleUpdaterTemps(): void {
+/**
+ * Delete orphaned updater temp files.
+ *
+ * \`noGrace\` (default false) removes the 1-hour age protection. Two callers,
+ * two needs (review M1, field 2026-10-14):
+ *  - the download-error path passes true — this instance's own download just
+ *    died, so a temp written seconds ago IS the orphan blocking the retry;
+ *  - checkNow() leaves it false — multi-profile hosts SHARE this cache dir, and
+ *    an age check is the only thing stopping profile B's periodic check from
+ *    deleting profile A's IN-FLIGHT temp (which would reproduce the exact
+ *    ENOENT-rename failure this whole path exists to fix).
+ */
+function sweepStaleUpdaterTemps(noGrace = false): void {
 	if (process.platform !== "win32") return;
 	const localAppData = process.env.LOCALAPPDATA;
 	if (!localAppData) return;
@@ -405,10 +421,19 @@ function sweepStaleUpdaterTemps(): void {
 				continue;
 			}
 			for (const name of entries) {
-				if (!/\.(tmp|blocked)$/i.test(name)) continue;
+				// electron-updater writes "temp-<installerName>.exe" into pending/ and
+				// renames it on success; an interrupted download (CDN drop, antivirus
+				// deleting the handle mid-write) leaves the temp orphaned and the NEXT
+				// attempt fails on the same name — field 2026-10-14: an ENOENT rename
+				// blocked every auto-update on one host until the cache was cleared by
+				// hand. Legacy .tmp/.blocked suffixes stay covered for older paths.
+				const isTemp = /^temp-/i.test(name) || /\.(tmp|blocked)$/i.test(name);
+				if (!isTemp) continue;
 				const full = join(dir, name);
 				try {
-					if (Date.now() - statSync(full).mtimeMs < 60 * 60_000) continue;
+					// Age guard only when the caller did not waive it (see the docstring):
+					// a shared cache means "young" can mean "another profile is writing it".
+					if (!noGrace && Date.now() - statSync(full).mtimeMs < 60 * 60_000) continue;
 					rmSync(full, { force: true, recursive: true });
 					log("INFO", `swept stale updater temp file: ${full}`);
 				} catch (err) {
@@ -424,6 +449,8 @@ function sweepStaleUpdaterTemps(): void {
 // finishes seconds later, so a delayed re-download succeeds.
 let epermRetriedForVersion: string | undefined;
 let epermRetryTimer: NodeJS.Timeout | undefined;
+/** Per-version file-lock download retry counter (cleared on a successful download). */
+const epermAttempts = new Map<string, number>();
 
 /**
  * Sweep old install-dir backups (`<instDir>.old-*`) older than 7 days. The
@@ -500,6 +527,8 @@ function wireEvents(): void {
 	});
 	autoUpdater.on("update-downloaded", (info: { version?: string; downloadedFile?: string } = {}) => {
 		downloading = false;
+		// A completed download clears the file-lock retry ladder for this version.
+		if (info.version) epermAttempts.delete(info.version);
 		downloadedInstallerPath = info.downloadedFile;
 		const targetVersion = info.version ?? pendingVersion ?? "unknown";
 		log("INFO", `update downloaded: version=${targetVersion} file=${downloadedInstallerPath ?? "unknown"}`);
@@ -547,10 +576,31 @@ function wireEvents(): void {
 		// collided on the same temp file → EPERM/sharing violation. Sweep stale
 		// partials and retry the download ONCE after the other instance has
 		// finished; never loop on repeated failures.
-		if (/EPERM|EBUSY|EACCES|sharing violation|-4082|ENOENT/i.test(message) && pendingVersion && epermRetriedForVersion !== pendingVersion) {
-			epermRetriedForVersion = pendingVersion;
-			log("WARN", `download failed with a file-lock style error (${message}) — sweeping stale temp files, retrying once in 30s`);
-			sweepStaleUpdaterTemps();
+		if (/EPERM|EBUSY|EACCES|sharing violation|-4082|ENOENT/i.test(message) && pendingVersion) {
+			// Graded ladder per version: a Gitee CDN drop or an antivirus delete can
+			// kill the temp file mid-download, and a SINGLE retry left the host waiting
+			// for the next 6-hour check cycle (field 2026-10-14). Three attempts at
+			// 30s/2min/10min absorb the transient window; after that we stop and the
+			// next scheduled check retries with the counter still armed (no loop).
+			const attempt = (epermAttempts.get(pendingVersion) ?? 0) + 1;
+			epermAttempts.set(pendingVersion, attempt);
+			if (attempt > MAX_DOWNLOAD_RETRIES) {
+				// Deliberately NOT recordFailure(): that file feeds the INSTALL
+				// breakers (per-version attempts + machine-wide consecutive), and a
+				// download that never completed has nothing to do with install health
+				// — charging it there would later block a perfectly good installer
+				// with "连续安装失败" copy that never happened (review M2). The log
+				// line above keeps the diagnostic; epermAttempts keeps the ladder
+				// armed so the next scheduled check retries with memory of this.
+				log("ERROR", `download failed ${MAX_DOWNLOAD_RETRIES} times for ${pendingVersion} (${message}) — giving up until the next scheduled check`);
+				requestedInstall = false;
+				return;
+			}
+			const backoffMs = DOWNLOAD_RETRY_BACKOFF_MS[attempt - 1];
+			log("WARN", `download failed with a file-lock style error (${message}) — sweeping stale temp files, retry ${attempt}/${MAX_DOWNLOAD_RETRIES} in ${Math.round(backoffMs / 1000)}s`);
+			// noGrace: THIS instance's download is the one that just failed, so its
+			// seconds-old temp is the orphan to clear — never another profile's.
+			sweepStaleUpdaterTemps(true);
 			if (epermRetryTimer) clearTimeout(epermRetryTimer);
 			epermRetryTimer = setTimeout(() => {
 				// Reset to "available" so downloadNow's phase gate lets us back in.
@@ -562,7 +612,7 @@ function wireEvents(): void {
 					manualUrl: manualUrl(pendingVersion ?? ""),
 				});
 				void downloadNow().catch(() => {});
-			}, 30_000);
+			}, backoffMs);
 			return;
 		}
 		requestedInstall = false;
