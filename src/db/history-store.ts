@@ -149,6 +149,24 @@ export class HistoryStore {
 	 * conversation still being worked on has a fresh updated_at, so it is never
 	 * pruned mid-run even when its prefix matches.
 	 */
+	/**
+	 * Delete conversation RECORDS (message rows + telemetry) older than
+	 * `cutoffMs`. Unlike pruneOneOffConversations this NEVER deletes
+	 * conversations — the task list and every chat entry survive; only the
+	 * message BODIES and turn/tool telemetry rows age out (field 2026-10-13:
+	 * unbounded growth concern; a message row is small but 7×24 operation
+	 * accumulates years of them). Returns the number of message rows removed.
+	 */
+	pruneOldMessages(cutoffMs: number): number {
+		const run = this.db.prepare("DELETE FROM messages WHERE created_at < ?");
+		const turns = this.db.prepare("DELETE FROM turn_events WHERE started_at < ?");
+		const tools = this.db.prepare("DELETE FROM tool_events WHERE started_at < ?");
+		const n = run.run(cutoffMs).changes;
+		turns.run(cutoffMs);
+		tools.run(cutoffMs);
+		return n;
+	}
+
 	pruneOneOffConversations(cutoffMs: number): number {
 		const rows = this.db
 			.prepare("SELECT id FROM conversations WHERE updated_at < ? AND (id LIKE 'sched:%' OR id LIKE 'work:%' OR id LIKE 'eval:%')")

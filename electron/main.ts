@@ -994,6 +994,13 @@ ${tailForProgress(decision.text)}`;
 		const removed = history.pruneOneOffConversations(cutoff);
 		if (removed > 0) console.log("[main] pruned " + removed + " one-off conversation(s) older than " + days + "d");
 	};
+	/** Age out message bodies + turn/tool telemetry per general.messageRetentionDays (0=off). */
+	const pruneOldMessages = (): void => {
+		const days = config.all().general.messageRetentionDays;
+		if (!days || days <= 0) return;
+		const removed = history.pruneOldMessages(Date.now() - days * 86_400_000);
+		if (removed > 0) console.log("[main] pruned " + removed + " old message row(s) older than " + days + "d");
+	};
 
 	// Local HTTP+SSE transport — the renderer streams chat through localhost.
 	const httpPort = Number(process.env.PORT) || 0;
@@ -1006,6 +1013,7 @@ ${tailForProgress(decision.text)}`;
 	// One-off machine conversations (sched:/work:/eval:) accumulate forever in
 	// the task list; age out the untouched ones before the UI lists them.
 	pruneOneOffConversations();
+	pruneOldMessages();
 
 	// Reconcile IM adapter + autostart with saved config.
 	applyAutostart(config.all().general.autostart);
@@ -1070,6 +1078,7 @@ ${tailForProgress(decision.text)}`;
 		// Retention tweaked from the settings page / IM: re-apply immediately so a
 		// shortened window takes effect without waiting for the next launch.
 		pruneOneOffConversations();
+		pruneOldMessages();
 		applyAutostart(updated.general.autostart);
 		await im.sync().catch((err) => console.error("[im] sync failed", err));
 		engine.setRequestTimeoutMs((updated.general.requestTimeoutMin || 0) * 60_000);
