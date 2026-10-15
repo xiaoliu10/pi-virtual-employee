@@ -89,6 +89,8 @@ export interface ToolSetOptions {
 	onRoleRefusal?: (conversationId: string, info: { capability: string; need: string }) => void;
 	/** Resolve the verified IM actor + raw inbound text for the turn in flight. */
 	resolveActor: (conversationId: string) => (InboundActor & { text: string }) | undefined;
+	/** Resolve the live turn's verified person/conversation memory scope. */
+	resolveMemoryContext?: (conversationId: string) => { personOwner?: string; conversationOwner?: string };
 	/** Called after a skill is written/updated, so the engine can refresh its
 	 * skill cache and mark sessions stale without aborting the running turn. */
 	onSkillsChanged: () => Promise<void>;
@@ -217,9 +219,15 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 	const guardAll = (capability: string, list: AgentTool<any>[]): AgentTool<any>[] => list.map((t) => guarded(capability, t));
 
 	if (options.kbEnabled) {
-		tools.push(guarded("knowledge", createKnowledgeTool(options.knowledge)));
+		tools.push(guarded("knowledge", createKnowledgeTool(options.knowledge, () => options.resolveMemoryContext?.(options.conversationId) ?? {})));
 		if (options.learnEnabled) {
-			tools.push(...guardAll("learn", [createSaveToKnowledgeTool(options.knowledge), createRememberTool(options.knowledge, options.onMemoryChanged)]));
+			tools.push(...guardAll("learn", [createSaveToKnowledgeTool(options.knowledge), createRememberTool({
+				knowledge: options.knowledge,
+				resolveActor: () => options.resolveActor(options.conversationId),
+				conversationId: options.conversationId,
+				config: options.config,
+				onSaved: options.onMemoryChanged,
+			})]));
 		}
 		if (options.manageEnabled) tools.push(guarded("knowledge_manage", createManageKnowledgeTool(options.knowledge)));
 		// "knowledge" floor, not "browser": web research is part of the KB loop and must not require browser permission.

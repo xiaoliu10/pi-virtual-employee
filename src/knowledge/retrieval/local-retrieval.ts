@@ -6,6 +6,7 @@
  * step throws, search degrades to BM25-only. BM25 is the always-available floor.
  */
 import type { DB } from "../../db/sqlite.js";
+import { isMemoryVisible } from "../memory-scope.js";
 import type { ChunkRow, KnowledgeContentStore } from "../store.js";
 import type {
 	EmbedProvider,
@@ -81,12 +82,16 @@ export class LocalRetrievalProvider implements RetrievalProvider {
 			.map((s) => (s.row.source === "manual" && s.row.source_id ? s.row.source_id : null))
 			.filter((x): x is string => !!x);
 		const meta = this.opts.store.fetchEntryMeta(manualIds);
+		const memoryMeta = this.opts.store.fetchMemoryMeta(manualIds);
 
 		const filtered = scored.filter((s) => {
 			if (s.row.source !== "manual" || !s.row.source_id) return true; // docs have no review state
 			const m = meta.get(s.row.source_id);
-			if (!m) return true;
-			if (m.archived || m.review_status === "rejected" || m.superseded_by) return false;
+			if (m && (m.archived || m.review_status === "rejected" || m.superseded_by)) return false;
+			// Scoped-memory isolation: a person/conversation memory outside the
+			// verified context must never surface to another chat.
+			const mm = memoryMeta.get(s.row.source_id);
+			if (mm && !isMemoryVisible(mm.scope, mm.owner, req.memoryCtx ?? {})) return false;
 			return true;
 		});
 

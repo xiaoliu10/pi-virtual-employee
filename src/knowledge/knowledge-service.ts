@@ -25,6 +25,7 @@ import { KnowledgeContentStore } from "./store.js";
 import { clusterBySimilarity } from "./clustering.js";
 import type { ReindexReport, RetrievalHit } from "./types.js";
 import { VecStore } from "./vec-store.js";
+import { isMemoryVisible } from "./memory-scope.js";
 import {
 	CONSOLIDATE_SYSTEM,
 	RESEARCH_SYNTHESIS_SYSTEM,
@@ -97,6 +98,10 @@ export class KnowledgeService {
 		return this.store.listEntries(options);
 	}
 
+	getEntry(id: string): KnowledgeEntry | undefined {
+		return this.store.listEntries({ includeArchived: true }).find((entry) => entry.id === id);
+	}
+
 	upsertEntry(input: { id?: string; title: string; tags: string; content: string }): KnowledgeEntry {
 		const entry = this.store.upsertEntry(input);
 		void this.maybeAutoIndex();
@@ -111,22 +116,39 @@ export class KnowledgeService {
 	}
 
 	/**
-	 * Memory layer (rides on the KB): entries tagged "memory" are user-specific
-	 * long-term facts injected as an always-on index into every session prompt —
-	 * unlike regular knowledge they surface WITHOUT a query. Same-title saves
-	 * merge (update-over-append), so correcting a memory is just re-saving it.
+	 * Memory layer (rides on the KB): entries tagged "memory" are long-term
+	 * facts. Scoped (profile/person/conversation) with a server-derived owner;
+	 * same (scope,owner,title) REPLACES in place so a correction overwrites the
+	 * old fact rather than appending it. `summary` is the always-on index hook.
 	 */
-	saveMemory(input: { title: string; content: string }): { id: string; merged: boolean } {
-		return this.saveLearned({ ...input, tags: "memory" });
+	saveMemory(input: {
+		title: string;
+		content: string;
+		scope?: string | null;
+		owner?: string | null;
+		summary?: string;
+	}): { id: string; merged: boolean } {
+		const result = this.store.saveMemoryFact({
+			title: input.title,
+			content: input.content,
+			scope: input.scope ?? null,
+			owner: input.owner ?? null,
+			summary: input.summary,
+		});
+		void this.maybeAutoIndex();
+		return result;
 	}
 
-	/** Compact memory index for prompt injection (one line per entry). */
-	listMemoryIndex(limit = 30): { id: string; title: string; snippet: string; updatedAt: number }[] {
-		return this.store.listMemory(limit).map((e) => ({
+	/** Compact memory index for prompt injection (one line per entry), scope-filtered. */
+	listMemoryIndex(ctx: { personOwner?: string; conversationOwner?: string } = {}, limit = 30): { id: string; title: string; snippet: string; updatedAt: number; scope: string | null }[] {
+		return this.store.listMemoryForContext(ctx, limit).map((e) => ({
 			id: e.id,
 			title: e.title,
-			snippet: e.content.replace(/\s+/g, " ").trim().slice(0, 100),
+			// Independent summary hook when present; otherwise fall back to title
+			// (never the body's first 100 chars, which kept a stale fact on top).
+			snippet: e.memory_summary?.trim() || "",
 			updatedAt: e.updated_at,
+			scope: e.memory_scope,
 		}));
 	}
 
@@ -207,10 +229,10 @@ export class KnowledgeService {
 	}
 
 	// --- retrieval ---
-	async search(query: string): Promise<RetrievalHit[]> {
+	async search(query: string, memoryCtx?: { personOwner?: string; conversationOwner?: string }): Promise<RetrievalHit[]> {
 		const kb = this.kb();
 		const topK = kb.local.topK;
-		const localHits = await this.local.search({ query, topK });
+		const localHits = await this.local.search({ query, topK, memoryCtx });
 		if (kb.mode !== "external") return localHits;
 
 		// mode is additive: local is primary, external source(s) extend coverage.
@@ -295,87 +317,80 @@ export class KnowledgeService {
 				error: (err as Error).message,
 			}),
 		);
-		this.consolidating = run.finally(() => {
-			if (this.consolidating === run) this.consolidating = null;
+		const pending = run.finally(() => {
+			if (this.consolidating === pending) this.consolidating = null;
 		});
-		return run;
+		this.consolidating = pending;
+		return pending;
 	}
 
 	private async runConsolidation(): Promise<ConsolidateReport> {
 		if (!this.llm) {
 			return { merged: 0, archived: 0, derived: 0, retagged: 0, skipped: 0, error: "llm 未接入" };
 		}
-		const kb = this.kb();
-		const batch = Math.max(2, Math.floor(kb.learn.consolidate.batch) || 40);
-		const candidates = this.store.listConsolidationCandidates(batch);
-		if (candidates.length < 2) {
-			return { merged: 0, archived: 0, derived: 0, retagged: 0, skipped: candidates.length };
+		const batch = Math.max(2, Math.floor(this.kb().learn.consolidate.batch) || 40);
+		const partitions = new Map<string, KnowledgeEntry[]>();
+		for (const entry of this.store.listConsolidationCandidates(batch)) {
+			// Drop scoped rows that lost their owner (NULL-owner person/conversation
+			// memory should not exist, but a hand-edited DB can produce one). Passing
+			// the row own owner as BOTH person/conversation context makes
+			// isMemoryVisible return true only when scope+owner are self-consistent:
+			// profile (owner NULL) or a scoped row WITH an owner. An owner-less
+			// scoped row falls through and is skipped, never merged by the LLM.
+			if (!isMemoryVisible(entry.memory_scope, entry.memory_owner, {
+				personOwner: entry.memory_owner ?? undefined,
+				conversationOwner: entry.memory_owner ?? undefined,
+			})) continue;
+			// Partition BEFORE clustering or LLM calls. A combined model reply could
+			// otherwise carry another owner's facts even when output ids are split.
+			const memory = entry.tags.split(/[,，]/).some((t) => t.trim() === "memory");
+			const key = JSON.stringify([memory, entry.memory_scope ?? "profile", entry.memory_owner ?? ""]);
+			const entries = partitions.get(key) ?? [];
+			entries.push(entry);
+			partitions.set(key, entries);
 		}
-		// Semantic pre-clustering: embed candidate titles and group related entries
-		// so the model merges/generalizes within coherent groups. Skipped (no LLM
-		// cost) when the embed provider or vector recall is unavailable.
-		const groups = await this.clusterCandidates(candidates).catch(() => undefined);
-		const reply = await this.llm(CONSOLIDATE_SYSTEM, buildConsolidationPrompt(candidates, groups));
-		const ops = parseConsolidationOps(reply);
-
-		// id → content for the whitelist backstop. op.ids are always a subset of the
-		// candidate batch the model was shown, so this map covers every source.
-		const contentById = new Map(candidates.map((c) => [c.id, c.content]));
-		const sourceContent = (id: string): string => contentById.get(id) ?? "";
-
-		let merged = 0;
-		let archived = 0;
-		let derived = 0;
-		let retagged = 0;
-		const txn = this.db.transaction(() => {
-			for (const op of ops.merge) {
-				// Field 2026-09-30: credential entries must stay independent — merging
-				// them into a procedure/spec entry makes its title/tags rank as the
-				// procedure topic, so credential queries (「后台管理地址」「账号密码」)
-				// stop matching even though the values were preserved verbatim.
-				const { mergeable, protected: protectedIds } = partitionMergeIds(op.ids, sourceContent);
-				if (protectedIds.length > 0) {
-					console.warn(
-						`[knowledge] refused to merge ${protectedIds.join(", ")}: contains critical values (kept independent)`,
-					);
+		const report: ConsolidateReport = { merged: 0, archived: 0, derived: 0, retagged: 0, skipped: 0 };
+		for (const candidates of partitions.values()) {
+			if (candidates.length < 2) { report.skipped += candidates.length; continue; }
+			const groups = await this.clusterCandidates(candidates).catch(() => undefined);
+			const reply = await this.llm(CONSOLIDATE_SYSTEM, buildConsolidationPrompt(candidates, groups));
+			const ops = parseConsolidationOps(reply);
+			const entries = new Map(candidates.map((c) => [c.id, c]));
+			const sourceContent = (id: string): string => entries.get(id)?.content ?? "";
+			const consumed = new Set<string>();
+			this.db.transaction(() => {
+				for (const op of ops.merge) {
+					// Reject the WHOLE op if it names anything outside this model's
+					// partition, rather than reusing potentially contaminated content.
+					if (op.ids.some((id) => !entries.has(id) || consumed.has(id))) continue;
+					const { mergeable } = partitionMergeIds([...new Set(op.ids)], sourceContent);
+					if (mergeable.length < 2) continue;
+					const { content } = ensureCriticalValuesPreserved(op.content, mergeable.map(sourceContent));
+					this.store.mergeEntries(mergeable, { title: op.title, content, tags: op.tags });
+					mergeable.forEach((id) => consumed.add(id));
+					report.merged += mergeable.length;
+					report.derived += 1;
 				}
-				if (mergeable.length < 2) continue;
-				// Deterministic credential backstop: if the model redacted/dropped any
-				// critical value (地址/账号/密码/卡号/商户号/密钥/端口…) from a source, force
-				// it back into the merged entry verbatim.
-				const { content, restored } = ensureCriticalValuesPreserved(
-					op.content,
-					mergeable.map(sourceContent),
-				);
-				if (restored.length > 0) {
-					console.warn(
-						`[knowledge] consolidation restored ${restored.length} critical value(s) the model dropped:`,
-						restored.map((r) => r.label).join(", "),
-					);
+				for (const id of ops.archive) {
+					const entry = entries.get(id);
+					if (!entry || consumed.has(id)) continue;
+					// Durable facts are corrected explicitly via remember or archived
+					// by their administrator, not silently forgotten by a background LLM.
+					if (entry.tags.split(/[,，]/).some((t) => t.trim() === "memory")) continue;
+					if (extractCriticalValues(entry.content).length > 0) continue;
+					this.store.archiveEntry(id);
+					report.archived += 1;
 				}
-				this.store.mergeEntries(mergeable, { title: op.title, content, tags: op.tags });
-				merged += mergeable.length;
-				derived += 1;
-			}
-			for (const id of ops.archive) {
-				// Never drop an entry that carries production credentials — archiving
-				// deletes its chunks, so the whitelist backstop must block it here too.
-				if (extractCriticalValues(sourceContent(id)).length > 0) {
-					console.warn(`[knowledge] refused to archive ${id}: contains critical values`);
-					continue;
+				for (const op of ops.retag) {
+					if (!entries.has(op.id) || consumed.has(op.id)) continue;
+					this.store.retagEntry(op.id, op.tags);
+					report.retagged += 1;
 				}
-				this.store.archiveEntry(id);
-				archived += 1;
-			}
-			for (const op of ops.retag) {
-				this.store.retagEntry(op.id, op.tags);
-				retagged += 1;
-			}
-		});
-		txn();
+			})();
+		}
 		void this.maybeAutoIndex();
 		this.store.setConsolidatedAt(Date.now());
-		return { merged, archived, derived, retagged, skipped: 0 };
+		return report;
 	}
 
 	/**

@@ -53,6 +53,7 @@ function makeDb() {
 			id TEXT PRIMARY KEY, title TEXT, tags TEXT, content TEXT,
 			origin TEXT, confidence REAL, version INTEGER DEFAULT 1, lineage TEXT,
 			archived INTEGER DEFAULT 0, review_status TEXT DEFAULT 'approved',
+			memory_scope TEXT, memory_owner TEXT, memory_summary TEXT,
 			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 		);
 		CREATE TABLE kb_chunks (

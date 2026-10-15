@@ -649,7 +649,7 @@ async function main(): Promise<void> {
 					// Same creator-identity re-attachment as single-turn runs: guarded
 					// tools authorize against the LIVE role on every turn.
 					...(task.created_by
-						? { actor: { senderId: task.created_by, channel: "scheduler" as const, chatType: "single" as const } }
+						? { actor: { senderId: task.created_by, channel: "scheduler" as const, chatType: "single" as const, ...(task.conversation_id ? { memoryConversationId: task.conversation_id } : {}), ...(task.created_channel ? { memoryChannel: task.created_channel } : {}) } }
 						: {}),
 					onPersist: () => {
 						pushActivity(chain.convId);
@@ -778,7 +778,7 @@ ${tailForProgress(decision.text)}`;
 				// against the learn turn instead of the actual question.
 				const learnSend = await engine.send(agent, learnPrefix + buildLearnTurnAsk(outcome, task.title), {
 					ephemeral: true,
-					...(task.created_by ? { actor: { senderId: task.created_by, channel: "scheduler" as const, chatType: "single" as const } } : {}),
+					...(task.created_by ? { actor: { senderId: task.created_by, channel: "scheduler" as const, chatType: "single" as const, ...(task.conversation_id ? { memoryConversationId: task.conversation_id } : {}), ...(task.created_channel ? { memoryChannel: task.created_channel } : {}) } } : {}),
 				});
 				// engine.send resolves (not throws) on model-service stalls — a failed
 				// learn turn must not be reported as success.
@@ -856,8 +856,8 @@ ${tailForProgress(decision.text)}`;
 			history.ensureConversation(convId, `🧭 ${item.title}`);
 			return engine.getOrCreateSession(convId);
 		},
-		send: (agent, message, senderId) => engine.send(agent, message, {
-			actor: { senderId, channel: "scheduler", chatType: "single" },
+		send: (agent, message, senderId, memoryConversationId, memoryChannel) => engine.send(agent, message, {
+			actor: { senderId, channel: "scheduler", chatType: "single", ...(memoryConversationId ? { memoryConversationId } : {}), ...(memoryChannel ? { memoryChannel } : {}) },
 			onPersist: (cid) => {
 				const wc = mainWindow?.webContents;
 				if (wc && !wc.isDestroyed()) wc.send("im:activity", cid);
@@ -929,7 +929,7 @@ ${tailForProgress(decision.text)}`;
 					// immediately. Only run_command honors scheduler actors — the
 					// other admin tools keep refusing non-IM conversations.
 					...(task.created_by
-						? { actor: { senderId: task.created_by, channel: "scheduler", chatType: "single" as const } }
+						? { actor: { senderId: task.created_by, channel: "scheduler", chatType: "single" as const, ...(task.conversation_id ? { memoryConversationId: task.conversation_id } : {}), ...(task.created_channel ? { memoryChannel: task.created_channel } : {}) } }
 						: {}),
 					onPersist: () => {
 						pushActivity(execConvId);

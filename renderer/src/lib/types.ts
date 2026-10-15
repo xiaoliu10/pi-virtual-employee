@@ -242,6 +242,9 @@ export interface KnowledgeEntry {
 	hit_count: number;
 	last_used_at: number | null;
 	superseded_by: string | null;
+	memory_scope: string | null;
+	memory_owner: string | null;
+	memory_summary: string | null;
 }
 
 export interface KnowledgeDoc {

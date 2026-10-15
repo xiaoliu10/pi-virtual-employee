@@ -72,7 +72,14 @@ function migrate(db: DB): void {
 			tags       TEXT,
 			content    TEXT,
 			created_at INTEGER NOT NULL,
-			updated_at INTEGER NOT NULL
+			updated_at INTEGER NOT NULL,
+			-- Scoped memory (2026-10-14): NULL/'profile' = shared, 'person' /
+			-- 'conversation' carry an opaque server-derived owner key. Regular
+			-- knowledge leaves these as NULL. memory_summary is the always-on index
+			-- hook so the injected line never depends on body order.
+			memory_scope   TEXT,
+			memory_owner   TEXT,
+			memory_summary TEXT
 		);
 		CREATE TABLE IF NOT EXISTS kb_chunks (
 			id         TEXT PRIMARY KEY,
@@ -253,6 +260,22 @@ function migrate(db: DB): void {
 	if (!entryCols.has("hit_count")) db.exec("ALTER TABLE kb_entries ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0");
 	if (!entryCols.has("last_used_at")) db.exec("ALTER TABLE kb_entries ADD COLUMN last_used_at INTEGER");
 	if (!entryCols.has("superseded_by")) db.exec("ALTER TABLE kb_entries ADD COLUMN superseded_by TEXT");
+	// Scoped memory (2026-10-14): additive columns. Existing memory-tagged rows
+	// stay scope=NULL (treated as profile) — they were previously injected into
+	// every session, so NULL preserves that visibility; no risky auto-attribution.
+	if (!entryCols.has("memory_scope")) db.exec("ALTER TABLE kb_entries ADD COLUMN memory_scope TEXT");
+	if (!entryCols.has("memory_owner")) db.exec("ALTER TABLE kb_entries ADD COLUMN memory_owner TEXT");
+	if (!entryCols.has("memory_summary")) {
+		db.exec("ALTER TABLE kb_entries ADD COLUMN memory_summary TEXT");
+		// Backfill the always-on hook for pre-existing memory entries from the
+		// first 80 chars of the body, preserving the previous index behavior.
+		db.exec(`
+			UPDATE kb_entries
+			SET memory_summary = substr(replace(replace(content, char(10), ' '), char(13), ' '), 1, 80)
+			WHERE (',' || COALESCE(tags, '') || ',') LIKE '%,memory,%' AND memory_summary IS NULL
+		`);
+	}
+	db.exec("CREATE INDEX IF NOT EXISTS idx_kb_entries_memory ON kb_entries(memory_scope, memory_owner)");
 
 	// Knowledge gaps: queries that missed the KB, feeding the auto-research loop.
 	db.exec(`
@@ -295,6 +318,7 @@ function migrate(db: DB): void {
 		(db.prepare("PRAGMA table_info(scheduled_tasks)").all() as { name: string }[]).map((r) => r.name),
 	);
 	if (!taskCols.has("created_by")) db.exec("ALTER TABLE scheduled_tasks ADD COLUMN created_by TEXT");
+	if (!taskCols.has("created_channel")) db.exec("ALTER TABLE scheduled_tasks ADD COLUMN created_channel TEXT");
 
 	// Autonomous chaining (2026-09-30): a task may keep working across turns in
 	// ONE conversation until the model reports done / asks for a human / the
@@ -340,6 +364,7 @@ function migrate(db: DB): void {
 			cadence_ms           INTEGER,
 			kicked_off           INTEGER NOT NULL DEFAULT 0,
 			created_by           TEXT,
+			created_channel      TEXT,
 			created_at           INTEGER NOT NULL,
 			updated_at           INTEGER NOT NULL
 		);
@@ -350,6 +375,7 @@ function migrate(db: DB): void {
 	);
 	// Staged reply for a waiting_human resume — consumed by the next window's turn 0.
 	if (!workCols.has("answer")) db.exec("ALTER TABLE work_items ADD COLUMN answer TEXT");
+	if (!workCols.has("created_channel")) db.exec("ALTER TABLE work_items ADD COLUMN created_channel TEXT");
 	// Adaptive-cadence bookkeeping: the last self-declared reason (re-injected as
 	// context) and how many consecutive windows picked the same daily slot
 	// (>=2 warns the model it is degenerating into a cron, >=3 suggests the

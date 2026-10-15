@@ -593,7 +593,8 @@ export function KnowledgeSection({ kb, suppliers, onUpdate }: Props) {
 												<button type="button" onClick={() => setExpandedId(open ? null : e.id)} className="min-w-0 text-left">
 													<div className="flex items-center gap-2">
 														<span className="truncate font-medium text-slate-700">{e.title}</span>
-														<OriginBadge origin={e.origin} />
+														<MemoryScopeBadge scope={e.memory_scope} />
+													<OriginBadge origin={e.origin} />
 														<ReviewBadge status={e.review_status} />
 														<ConfidenceBadge confidence={e.confidence} />
 													</div>
@@ -844,6 +845,17 @@ function AdvancedExternalOps({
 			</div>
 		</details>
 	);
+}
+
+/** Memory-scope badge — shown on scoped memory entries (person/conversation); profile/regular hidden. */
+function MemoryScopeBadge({ scope }: { scope: string | null }) {
+	if (!scope || scope === "profile") return null;
+	const map: Record<string, { label: string; cls: string }> = {
+		person: { label: "个人记忆", cls: "bg-indigo-50 text-indigo-600" },
+		conversation: { label: "群记忆", cls: "bg-teal-50 text-teal-600" },
+	};
+	const m = map[scope] ?? { label: scope, cls: "bg-slate-100 text-slate-500" };
+	return <span className={`rounded px-1.5 py-0.5 text-[10px] ${m.cls}`}>{m.label}</span>;
 }
 
 /** Entry-origin badge: manual (手工) / learned (AI沉淀) / derived (AI归纳) / research (联网研究). */

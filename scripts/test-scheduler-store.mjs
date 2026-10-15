@@ -44,7 +44,7 @@ function db(t, withLegacyRow = false) {
 		CREATE TABLE IF NOT EXISTS scheduled_tasks (
 			id TEXT PRIMARY KEY, title TEXT NOT NULL, prompt TEXT NOT NULL, cron TEXT NOT NULL,
 			enabled INTEGER NOT NULL DEFAULT 1, conversation_id TEXT, origin TEXT NOT NULL DEFAULT 'console',
-			created_by TEXT, last_run_at INTEGER, next_run_at INTEGER, last_status TEXT,
+			created_by TEXT, created_channel TEXT, last_run_at INTEGER, next_run_at INTEGER, last_status TEXT,
 			autonomous INTEGER NOT NULL DEFAULT 0, max_turns INTEGER, max_minutes INTEGER, chain_state TEXT,
 			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
 	`);
@@ -55,7 +55,7 @@ function db(t, withLegacyRow = false) {
 		d.exec(`CREATE TABLE scheduled_tasks (
 			id TEXT PRIMARY KEY, title TEXT NOT NULL, prompt TEXT NOT NULL, cron TEXT NOT NULL,
 			enabled INTEGER NOT NULL DEFAULT 1, conversation_id TEXT, origin TEXT NOT NULL DEFAULT 'console',
-			created_by TEXT, last_run_at INTEGER, next_run_at INTEGER, last_status TEXT,
+			created_by TEXT, created_channel TEXT, last_run_at INTEGER, next_run_at INTEGER, last_status TEXT,
 			autonomous INTEGER NOT NULL DEFAULT 0, max_turns INTEGER, max_minutes INTEGER, chain_state TEXT,
 			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);`);
 		d.exec(`INSERT INTO scheduled_tasks (id, title, prompt, cron, conversation_id, created_at, updated_at)
@@ -74,6 +74,11 @@ test("create defaults silent to 0 (push) and stores an explicit 1", (t) => {
 	assert.equal(pushy.silent, 0);
 	assert.equal(quiet.silent, 1);
 	assert.equal(store.get(quiet.id)?.silent, 1, "persisted");
+	const scoped = store.create({
+		title: "记忆任务", prompt: "p", cron: "0 9 * * *",
+		nextRunAt: Date.now() + 3_600_000, createdBy: "staff-1", createdChannel: "dingtalk",
+	});
+	assert.equal(store.get(scoped.id)?.created_channel, "dingtalk", "creator channel persists for scoped memory");
 });
 
 test("update merges silent without touching prompt/cron/schedule", (t) => {

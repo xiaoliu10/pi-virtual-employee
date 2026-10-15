@@ -272,7 +272,7 @@ export function createWorkTools(deps: {
 					if (!updated) return failure("应用修改失败，自主任务状态可能已改变。");
 					modified.push(rewrite.label);
 				}
-				const confirmed = workItems.confirm(item.id, actor.senderId);
+				const confirmed = workItems.confirm(item.id, actor.senderId, actor.channel);
 				if (!confirmed || confirmed.status !== "queued" || confirmed.created_by !== actor.senderId) return failure("确认失败，自主任务状态可能已改变。");
 				const fired = fireItem(item.id);
 				const changedNote = modified.length ? `（已按管理员要求修改${modified.join("、")}）` : "";

@@ -16,6 +16,8 @@ export interface ScheduledTaskRow {
 	origin: string; // 'console' | 'im' | 'scheduled'
 	/** Admin senderId captured at creation in a 1:1 chat; NULL for console-created. */
 	created_by: string | null;
+	/** Original channel of the verified creator; used to preserve scoped-memory owner in scheduler runs. */
+	created_channel: string | null;
 	last_run_at: number | null;
 	next_run_at: number | null;
 	last_status: string | null; // 'ok' | 'error:…'
@@ -42,6 +44,7 @@ export interface CreateScheduledTaskInput {
 	origin?: string;
 	/** Admin senderId (verified 1:1 creator). Stored so unattended runs can re-attach it. */
 	createdBy?: string | null;
+	createdChannel?: string | null;
 	/** Silent run: execute + record, but skip the completion push (default false). */
 	silent?: boolean;
 	/** Autonomous chaining opts (defaults when autonomous but no explicit budget). */
@@ -65,6 +68,7 @@ export class ScheduledTaskStore {
 			conversation_id: input.conversationId ?? null,
 			origin: input.origin ?? "console",
 			created_by: input.createdBy ?? null,
+			created_channel: input.createdChannel ?? null,
 			last_run_at: null,
 			next_run_at: input.nextRunAt,
 			last_status: null,
@@ -79,8 +83,8 @@ export class ScheduledTaskStore {
 		this.db
 			.prepare(
 				`INSERT INTO scheduled_tasks
-				 (id, title, prompt, cron, enabled, conversation_id, origin, created_by, last_run_at, next_run_at, last_status, autonomous, max_turns, max_minutes, chain_state, silent, created_at, updated_at)
-				 VALUES (@id, @title, @prompt, @cron, @enabled, @conversation_id, @origin, @created_by, @last_run_at, @next_run_at, @last_status, @autonomous, @max_turns, @max_minutes, @chain_state, @silent, @created_at, @updated_at)`,
+				 (id, title, prompt, cron, enabled, conversation_id, origin, created_by, created_channel, last_run_at, next_run_at, last_status, autonomous, max_turns, max_minutes, chain_state, silent, created_at, updated_at)
+				 VALUES (@id, @title, @prompt, @cron, @enabled, @conversation_id, @origin, @created_by, @created_channel, @last_run_at, @next_run_at, @last_status, @autonomous, @max_turns, @max_minutes, @chain_state, @silent, @created_at, @updated_at)`,
 			)
 			.run(row);
 		return row;
