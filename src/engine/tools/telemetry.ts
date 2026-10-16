@@ -34,6 +34,7 @@ const STATUS_LABEL: Record<string, string> = {
 	error: "报错",
 	aborted: "被中断",
 	empty_reply: "无正文（靠兜底总结收尾）",
+	degenerate_reply: "退化输出（碎片已拦下）",
 	deterministic_failure: "彻底失败（兜底文案）",
 };
 
