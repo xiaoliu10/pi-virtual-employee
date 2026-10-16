@@ -29,7 +29,7 @@ export const MAX_ERROR_LEN = 300;
 /** How long turn/tool rows are kept. Long enough to compare weeks of behaviour. */
 export const RETENTION_DAYS = 90;
 
-export type TurnStatus = "ok" | "error" | "empty_reply" | "deterministic_failure" | "aborted";
+export type TurnStatus = "ok" | "error" | "empty_reply" | "deterministic_failure" | "degenerate_reply" | "aborted";
 
 export interface ToolEventRow {
 	id: string;

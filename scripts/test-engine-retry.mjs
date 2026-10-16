@@ -28,7 +28,7 @@ const bundle = join(dir, "engine-retry.mjs");
 await build({
 	stdin: {
 		contents: `
-			export { EmployeeEngine, TRANSIENT_RETRIES, transientRetryBackoffMs } from "./src/engine/engine.ts";
+			export { EmployeeEngine, TRANSIENT_RETRIES, LENGTH_EMPTY_GIVE_UP, transientRetryBackoffMs, isDegenerateReplyText } from "./src/engine/engine.ts";
 			export { estimateTokensSafe } from "./src/engine/context.ts";
 			export { ConfigStore } from "./src/db/config-store.ts";
 			export { HistoryStore } from "./src/db/history-store.ts";
@@ -154,7 +154,7 @@ await build({
 		},
 	],
 });
-const { EmployeeEngine, TRANSIENT_RETRIES, transientRetryBackoffMs, estimateTokensSafe, ConfigStore, HistoryStore, FileCredentialStore } = await import(pathToFileURL(bundle).href);
+const { EmployeeEngine, TRANSIENT_RETRIES, LENGTH_EMPTY_GIVE_UP, transientRetryBackoffMs, isDegenerateReplyText, estimateTokensSafe, ConfigStore, HistoryStore, FileCredentialStore } = await import(pathToFileURL(bundle).href);
 
 /** Real engine + injected retry-sleep capturing the backoff schedule. */
 function makeEngine(t, { streamFn, retrySleepFn } = {}) {
@@ -749,4 +749,80 @@ test("steerConversation rejects when the turn is already aborting (review L2)", 
 	assert.equal(r.status, "rejected", "an aborting turn must not take new steering");
 	assert.match(r.reason, /中断/, "the refusal points at the in-progress abort");
 	assert.equal(agent.steered.length, 0);
+});
+
+// ── degenerate-reply guard (field 2026-10-16: 乱码「我完成. ## 11:30。5. …」直推进群) ──
+
+const GARBAGE = "我完成.\n\n## 11:30。5.\n16 0.0 11:2.0 11 .\n\n8. 11 1\n.0 1. 1 1 1 1 1 1\n1 .\n.\n.\n. .\n\n. .\n . . .";
+
+test("isDegenerateReplyText flags the field garbage; passes short/Chinese/English replies", () => {
+	assert.equal(isDegenerateReplyText(GARBAGE), true, "the exact field sample is degenerate (3 CJK chars in 88)");
+	assert.equal(isDegenerateReplyText("好的"), false, "short legit reply");
+	assert.equal(isDegenerateReplyText("验证码已填入，登录成功；日终对账共核对 128 条，发现 3 条异常，清单如下，请查收。"), false, "real Chinese report");
+	assert.equal(isDegenerateReplyText("Done. All 24 records were processed with zero errors today."), false, "English text has letter runs");
+	assert.equal(isDegenerateReplyText('run_command command="ls -la /var/log/"'), false, "tool-card captions pass");
+	assert.equal(isDegenerateReplyText("はい、かしこまりました。ただいまから対応いたしますので、しばらくおまちくださいませ。"), false, "kana counts as real script (review P2-1)");
+	assert.equal(isDegenerateReplyText(""), false, "empty is handled elsewhere");
+});
+
+test("fragment-soup reply is replaced by the honest deterministic fallback; history never keeps the garbage", async (t) => {
+	let runs = 0;
+	const { engine, config, history } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		return {
+			async *[Symbol.asyncIterator]() { /* no events */ },
+			result: async () => ({ role: "assistant", content: [{ type: "text", text: GARBAGE }], stopReason: "stop" }),
+		};
+	} });
+	supplierConfig(config);
+	const captured = [];
+	engine.setTelemetryStore({ recordTurn: (r) => captured.push(r), recordTool: () => {} });
+	const agent = engine.getOrCreateSession("conv-garbage");
+	const result = await engine.send(agent, "hi");
+	assert.equal(runs, 2, "turn reply + exactly ONE final-summary rescue attempt");
+	assert.ok(result.reply.startsWith("⚠️"), "user sees the fallback, never the garbage");
+	assert.match(result.reply, /没有得到模型回复/);
+	assert.equal(result.deterministic, true, "chain runners pause on this flag");
+	const assistantRows = history.listMessages("conv-garbage").filter((m) => m.role === "assistant");
+	assert.ok(assistantRows.length >= 1 && assistantRows.at(-1).content.startsWith("⚠️"), "history persists the fallback — future turns never rehydrate the garbage");
+	assert.equal(captured.at(-1).status, "degenerate_reply", "telemetry makes the degeneration visible");
+});
+
+test("legit Chinese reply passes the gate untouched", async (t) => {
+	const { engine, config } = makeEngine(t, { streamFn: async () => ({
+		async *[Symbol.asyncIterator]() { /* no events */ },
+		result: async () => ({ role: "assistant", content: [{ type: "text", text: "验证码已填入，登录成功；日终对账共核对 128 条，发现 3 条异常，清单如下，请查收。" }], stopReason: "stop" }),
+	}) });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-legit");
+	const result = await engine.send(agent, "hi");
+	assert.match(result.reply, /登录成功/);
+	assert.equal(result.deterministic, false);
+});
+
+test("consecutive length-truncated empty runs: compact before the first retry, give up at the 3rd stall", async (t) => {
+	let runs = 0;
+	const warns = [];
+	const origWarn = console.warn;
+	console.warn = (...a) => { warns.push(a.join(" ")); };
+	try {
+		const { engine, config, delays } = makeEngine(t, { streamFn: async () => {
+			runs += 1;
+			// The field shape: thinking-only output truncated by the limit, zero visible text.
+			return {
+				async *[Symbol.asyncIterator]() { /* no events */ },
+				result: async () => ({ role: "assistant", content: [{ type: "thinking", thinking: "……" }], stopReason: runs <= 3 ? "length" : "stop" }),
+			};
+		} });
+		supplierConfig(config);
+		const agent = engine.getOrCreateSession("conv-length-empty");
+		const result = await engine.send(agent, "hi");
+		assert.equal(runs, LENGTH_EMPTY_GIVE_UP + 1, "3 stalled attempts + the final-summary ask (NOT the full 10-retry ladder)");
+		assert.deepEqual(delays, [1000, 2000], "two compaction-backed retries, then the give-up");
+		assert.ok(warns.some((w) => w.includes("compacting before retry")), "the FIRST length stall compacts before retrying");
+		assert.ok(warns.some((w) => w.includes("consecutive length-truncated")), "the 3rd stall ends the turn instead of scraping for fragments");
+		assert.equal(result.deterministic, true, "ends honestly, not with fragment output");
+	} finally {
+		console.warn = origWarn;
+	}
 });

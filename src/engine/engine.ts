@@ -149,6 +149,31 @@ export function transientRetryBackoffMs(retry: number): number {
 	return Math.min(1000 * 2 ** (Math.max(1, retry) - 1), 60_000);
 }
 
+/** Consecutive length-truncated EMPTY runs tolerated before giving up (field
+ * 2026-10-16: qwen burned the whole output budget on thinking 5+ times in a
+ * row on a post-compaction over-full transcript — every blind retry reproduced
+ * the failure verbatim, and attempt #7's fragment output was pushed as the
+ * reply). The FIRST such stall compacts before retrying; the third ends the
+ * turn into the honest empty→summary→deterministic chain. */
+export const LENGTH_EMPTY_GIVE_UP = 3;
+
+/** Degenerate-reply detector (field 2026-10-16) — narrow by design, covering
+ * only the observed failure shape: real length but almost no CJK characters
+ * and no word-like letter run ("我完成. ## 11:30。5. 16 0.0 …" — 3 CJK chars
+ * in 88). Deliberately PASSES short replies (< 30 chars), genuine CJK reports
+ * (>= 10 chars; kana/hangul count too — real scripts a number-soup lacks),
+ * English text and code (any 4+ letter run), and tool-card captions. Extend
+ * only with another OBSERVED shape; degenerate_reply telemetry watches for
+ * false positives after release. */
+export function isDegenerateReplyText(raw: string): boolean {
+	const text = (raw ?? "").trim();
+	if (text.length < 30) return false;
+	const cjk = (text.match(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g) ?? []).length;
+	if (cjk >= 10) return false;
+	if (/[A-Za-z]{4,}/.test(text)) return false;
+	return true;
+}
+
 /**
  * Chinese guidance for the two login-related pi-ai failure shapes (review H4):
  * an expired/failed OAuth refresh and a provider with no stored credential.
@@ -1842,6 +1867,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// rather than sniffed from the text: telemetry's job is to be accurate.
 		let askedForSummary = false;
 		let deterministic = false;
+		let degenerate = false;
 		let undeliveredSteer = false;
 		try {
 			retries = await this.promptWithRetry(agent, conversationId, message, ctx?.images);
@@ -1914,6 +1940,27 @@ export class EmployeeEngine implements EmployeeRuntime {
 			console.warn(`[engine] no reply produced for ${conversationId}; emitted deterministic failure (${cause || "no error reported"})`);
 		}
 
+		// DEGENERATE-REPLY GUARD (field 2026-10-16): a length-starved model can
+		// still emit fragment soup — non-empty is not the same as valid. Run ONE
+		// final-summary attempt; if that is fragments too, fall back to the
+		// honest deterministic failure so garbage is never pushed nor persisted:
+		// HISTORY (what future sessions rehydrate) keeps the fallback text. The
+		// live SDK transcript still carries the fragment turn until compaction
+		// digests it — same profile as the existing empty-run path.
+		if (!deterministic && isDegenerateReplyText(reply)) {
+			degenerate = true;
+			askedForSummary = true;
+			console.warn(`[engine] degenerate reply detected for ${conversationId} (len=${reply.length}) — asking for a final summary before delivery`);
+			const summary = await this.finalSummary(agent);
+			if (summary && !isDegenerateReplyText(summary)) {
+				reply = summary;
+			} else {
+				deterministic = true;
+				const cause = hardError || (errorMessage ? loginGuidanceOf(errorMessage) ?? errorMessage : undefined);
+				reply = this.deterministicFailure(cause);
+			}
+		}
+
 		// Add delivery status only after choosing the outcome: it must neither
 		// mask an empty reply's failure nor be overwritten by a final summary.
 		if (undeliveredSteer) {
@@ -1950,6 +1997,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			capHit,
 			askedForSummary,
 			deterministic,
+			degenerate,
 			correction: turnCorrection,
 			actor: ctx?.actor,
 		});
@@ -1991,6 +2039,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		capHit: boolean;
 		askedForSummary: boolean;
 		deterministic: boolean;
+		degenerate?: boolean;
 		correction: boolean;
 		actor?: InboundActor;
 	}): void {
@@ -2008,11 +2057,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 			const errorText = input.hardError ?? input.agentError ?? undefined;
 			const emptyReply = !input.reply.trim();
 			// Status precedence: a hard error wins; then an explicitly aborted turn;
-			// then the two last-resort paths (deterministic failure, and "we had to
-			// ask for a summary because the turn produced no outcome text"); else ok.
+			// then degenerate (the ROOT event — detected fragment output — even when
+			// the deterministic fallback delivered it); then deterministic failure
+			// without degeneration; then the summary path; else ok.
 			let status: TurnStatus = "ok";
 			if (errorText) status = "error";
 			else if (abortReason) status = "aborted";
+			else if (input.degenerate) status = "degenerate_reply";
 			else if (input.deterministic) status = "deterministic_failure";
 			else if (input.askedForSummary || emptyReply) status = "empty_reply";
 			this.telemetry.recordTurn({
@@ -2299,6 +2350,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				: undefined;
 		let retries = 0;
 		let threwTransient = false;
+		let emptyStreak = 0;
 		try {
 			await agent.prompt(message, visionImages);
 		} catch (err) {
@@ -2340,6 +2392,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				return retries;
 			}
 			const endedEmpty = this.endedWithoutText(agent);
+			const emptyStall = endedEmpty && !threwTransient && !errorText;
 			if (!threwTransient && !(errorText && TRANSIENT_STREAM_ERROR.test(errorText)) && !endedEmpty) return retries;
 			if (retries >= TRANSIENT_RETRIES) {
 				console.warn(`[engine] transient failure persists after ${retries} retries — giving up`);
@@ -2348,9 +2401,30 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// A stop/watchdog abort already noted mid-wait must end the loop: the
 			// turn was deliberately cut, and continuing would override the stop.
 			if (this.turnAborts.has(conversationId)) return retries;
+			// A length-truncated EMPTY run means the provider consumed the whole
+			// output budget (typically thinking) before any answer — on an
+			// over-full transcript every blind retry reproduces it verbatim.
+			// Compact FIRST; after LENGTH_EMPTY_GIVE_UP consecutive stalls end the
+			// turn into the honest empty→summary→deterministic chain instead of
+			// scraping the retry ladder for fragments (field 2026-10-16).
+			if (emptyStall && this.lastRunLengthTruncated(agent)) {
+				emptyStreak += 1;
+				if (emptyStreak >= LENGTH_EMPTY_GIVE_UP) {
+					console.warn(`[engine] ${emptyStreak} consecutive length-truncated empty runs — ending the turn instead of retrying into the same wall`);
+					return retries;
+				}
+				console.warn("[engine] length-truncated empty run — compacting before retry (output budget consumed on an over-full transcript)");
+				try {
+					await this.recoverFromContextOverflow(agent);
+				} catch (err) {
+					console.warn("[engine] pre-retry compaction failed:", err instanceof Error ? err.message : err);
+				}
+			} else {
+				emptyStreak = 0; // anything but a length-truncated stall breaks the streak
+			}
 			retries += 1;
 			const delayMs = transientRetryBackoffMs(retries);
-			const reason = endedEmpty && !threwTransient && !errorText
+			const reason = emptyStall
 				? "turn ended without visible text"
 				: `transient stream error (${errorText || "stream aborted"})`;
 			console.warn(`[engine] ${reason} — retry ${retries}/${TRANSIENT_RETRIES} in ${Math.round(delayMs / 1000)}s`);
@@ -2483,6 +2557,15 @@ export class EmployeeEngine implements EmployeeRuntime {
 	private safeContinue(agent: Agent): Promise<void> {
 		this.stripDanglingAssistant(agent);
 		return agent.continue();
+	}
+
+	/** True when the LAST assistant message was cut by the output limit
+	 * (stopReason "length"). Combined with endedWithoutText this identifies the
+	 * field 2026-10-16 shape: thinking consumed the budget, zero answer text. */
+	private lastRunLengthTruncated(agent: Agent): boolean {
+		const msgs = agent.state.messages;
+		const last = msgs[msgs.length - 1] as { role?: string; stopReason?: string } | undefined;
+		return !!last && last.role === "assistant" && last.stopReason === "length";
 	}
 
 	private endedWithoutText(agent: Agent): boolean {
