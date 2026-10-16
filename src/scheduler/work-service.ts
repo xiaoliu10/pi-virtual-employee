@@ -36,7 +36,7 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	store: Store;
 	isAdmin(senderId: string): boolean;
 	open(item: WorkItemRow, conversationId: string): Session;
-	send(session: Session, message: string, senderId: string): Promise<{ reply?: string; error?: string; deterministic?: boolean }>;
+	send(session: Session, message: string, senderId: string, memoryConversationId?: string, memoryChannel?: string): Promise<{ reply?: string; error?: string; deterministic?: boolean }>;
 	release(conversationId: string): Promise<void>;
 	push(conversationId: string, text: string): Promise<unknown>;
 	/** Live kb.enabled AND kb.learn.enabled, checked at completion. */
@@ -298,7 +298,7 @@ export class WorkService<Session extends WorkSession> {
 				let stallAttempt = 0;
 				let result: { reply?: string; error?: string; deterministic?: boolean };
 				for (;;) {
-					result = await this.opts.send(active.session, prefix + (turn === 0 ? "请按目标与执行条件推进工作。" : "继续。"), fresh.created_by);
+					result = await this.opts.send(active.session, prefix + (turn === 0 ? "请按目标与执行条件推进工作。" : "继续。"), fresh.created_by, fresh.origin_conversation ?? undefined, fresh.created_channel ?? undefined);
 					if (!result.error && !result.deterministic) break;
 					stallAttempt += 1;
 					const step = nextStallStep(stallAttempt);

@@ -93,9 +93,13 @@ export function createSchedulerTools(
 			// A scheduler actor is excluded so a task cannot spawn further tasks
 			// unattended (creation stays an interactive act).
 			let createdBy: string | null = null;
+			let createdChannel: string | null = null;
 			if (resolveActor) {
 				const actor = resolveActor(conversationId);
-				if (actor?.senderId && !isSchedulerActor(actor)) createdBy = actor.senderId;
+				if (actor?.senderId && !isSchedulerActor(actor)) {
+					createdBy = actor.senderId;
+					createdChannel = actor.channel;
+				}
 			}
 			const task = scheduler.create({
 				title: p.title,
@@ -104,6 +108,7 @@ export function createSchedulerTools(
 				conversationId,
 				origin,
 				createdBy,
+				createdChannel,
 				autonomous: p.autonomous === true,
 				silent: p.silent === true,
 				maxTurns: p.autonomous ? (p.maxTurns ?? null) : null,

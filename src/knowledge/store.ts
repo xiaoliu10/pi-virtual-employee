@@ -38,6 +38,12 @@ export interface KnowledgeEntry {
 	last_used_at: number | null;
 	/** Points to a newer entry id when this one was superseded by a corrective update. */
 	superseded_by: string | null;
+	/** Scoped memory: NULL/'profile' shared, 'person' / 'conversation' owned. NULL = regular knowledge. */
+	memory_scope: string | null;
+	/** Opaque server-derived owner key for person/conversation memory; NULL for profile/regular. */
+	memory_owner: string | null;
+	/** Always-on index hook for memory (independent of body order); NULL falls back to title. */
+	memory_summary: string | null;
 }
 
 export interface KnowledgeDoc {
@@ -119,18 +125,110 @@ export class KnowledgeContentStore {
 	}
 
 	/**
-	 * Memory-layer entries: live entries carrying the "memory" tag (the
-	 * always-injected user-specific memory index rides on the KB store — no
-	 * separate schema). Newest first.
+	 * Always-on memory index visible in a verified scope context. Profile memory
+	 * (scope IS NULL/'profile', owner NULL) is always included; person/
+	 * conversation rows match the context's owner keys. Ordered with the most
+	 * specific scope first (conversation → person → profile), then recency.
 	 */
-	listMemory(limit = 30): KnowledgeEntry[] {
+	listMemoryForContext(ctx: {
+		personOwner?: string;
+		conversationOwner?: string;
+	}, limit = 30): KnowledgeEntry[] {
+		const parts = [
+			"archived = 0",
+			"(',' || COALESCE(tags, '') || ',') LIKE '%,memory,%'",
+			"(memory_scope IS NULL OR memory_scope = 'profile')",
+		];
+		const params: (string | number)[] = [];
+		if (ctx.personOwner) {
+			parts.push("(memory_scope = 'person' AND memory_owner = ?)");
+			params.push(ctx.personOwner);
+		}
+		if (ctx.conversationOwner) {
+			parts.push("(memory_scope = 'conversation' AND memory_owner = ?)");
+			params.push(ctx.conversationOwner);
+		}
+		const where = [
+			"archived = 0",
+			"(',' || COALESCE(tags, '') || ',') LIKE '%,memory,%'",
+			"(" + parts.slice(2).join(" OR ") + ")",
+		];
+		params.push(limit);
 		return this.db
 			.prepare(
 				`SELECT * FROM kb_entries
-				 WHERE archived = 0 AND (',' || COALESCE(tags, '') || ',') LIKE '%,memory,%'
-				 ORDER BY updated_at DESC LIMIT ?`,
+				 WHERE ${where.join(" AND ")}
+				 ORDER BY CASE memory_scope WHEN 'conversation' THEN 0 WHEN 'person' THEN 1 ELSE 2 END,
+				          updated_at DESC
+				 LIMIT ?`,
 			)
-			.all(limit) as KnowledgeEntry[];
+			.all(...params) as KnowledgeEntry[];
+	}
+
+	/**
+	 * Corrective memory write: one durable fact keyed by (scope, owner, title).
+	 * Same key REPLACES content/summary in place (update-overwrite), rebuilds
+	 * chunks, and bumps version — a correction must never append the old fact.
+	 * Different owner/scope with the same title is a distinct entry.
+	 */
+	saveMemoryFact(input: {
+		title: string;
+		content: string;
+		scope: string | null;
+		owner: string | null;
+		summary?: string;
+	}): { id: string; merged: boolean } {
+		return this.db.transaction(() => this.writeMemoryFact(input))();
+	}
+
+	private writeMemoryFact(input: { title: string; content: string; scope: string | null; owner: string | null; summary?: string }): { id: string; merged: boolean } {
+		const title = input.title.trim();
+		const content = input.content.trim();
+		if (!title || !content) throw new Error("title and content are required");
+		if (input.scope && !["profile", "person", "conversation"].includes(input.scope)) throw new Error("unknown memory scope");
+		if ((input.scope === "person" || input.scope === "conversation") && !input.owner) throw new Error("memory owner is required");
+		if ((!input.scope || input.scope === "profile") && input.owner) throw new Error("profile memory cannot have an owner");
+		const scope = input.scope ?? null;
+		const owner = input.owner ?? null;
+		const summary = input.summary?.trim() || null;
+		const now = Date.now();
+		const tags = ",memory,";
+		const existing = this.db
+			.prepare(
+				"SELECT * FROM kb_entries WHERE archived = 0 AND (',' || COALESCE(tags,'') || ',') LIKE '%,memory,%' " +
+					"AND title = ? AND COALESCE(memory_scope,'profile') = COALESCE(?,'profile') AND COALESCE(memory_owner,'') = COALESCE(?,'')",
+			)
+			.get(title, scope, owner) as KnowledgeEntry | undefined;
+		if (existing) {
+			this.db
+				.prepare(
+					"UPDATE kb_entries SET content=?, memory_summary=?, updated_at=?, version=version+1 WHERE id=?",
+				)
+				.run(content, summary, now, existing.id);
+			this.replaceEntryChunks(existing.id, MANUAL_SOURCE, title, tags, content);
+			return { id: existing.id, merged: true };
+		}
+		const id = randomUUID();
+		this.db
+			.prepare(
+				"INSERT INTO kb_entries (id,title,tags,content,origin,confidence,review_status,memory_scope,memory_owner,memory_summary,created_at,updated_at) " +
+					"VALUES (?,?,?,?, 'learned', 0.9, 'approved', ?,?,?, ?,?)",
+			)
+			.run(id, title, tags, content, scope, owner, summary, now, now);
+		this.replaceEntryChunks(id, MANUAL_SOURCE, title, tags, content);
+		return { id, merged: false };
+	}
+
+	/** Fetch memory scope/owner for a batch of manual entry ids (retrieval filtering). */
+	fetchMemoryMeta(ids: string[]): Map<string, { scope: string | null; owner: string | null }> {
+		const map = new Map<string, { scope: string | null; owner: string | null }>();
+		if (ids.length === 0) return map;
+		const placeholders = ids.map(() => "?").join(",");
+		const rows = this.db
+			.prepare(`SELECT id, memory_scope AS scope, memory_owner AS owner FROM kb_entries WHERE id IN (${placeholders})`)
+			.all(...ids) as { id: string; scope: string | null; owner: string | null }[];
+		for (const r of rows) map.set(r.id, { scope: r.scope, owner: r.owner });
+		return map;
 	}
 
 	upsertEntry(input: { id?: string; title: string; tags: string; content: string }): KnowledgeEntry {
@@ -157,15 +255,20 @@ export class KnowledgeContentStore {
 		const content = input.content.trim();
 		if (!title || !content) throw new Error("title and content are required");
 		const now = Date.now();
+		const tags = stripMemoryTag(unionTags(input.tags ?? ""));
 		const existing = this.db
-			.prepare("SELECT * FROM kb_entries WHERE title = ? AND archived = 0")
+			.prepare(
+				"SELECT * FROM kb_entries WHERE title = ? AND archived = 0 " +
+					"AND (memory_scope IS NULL OR memory_scope = 'profile') " +
+					"AND NOT ((',' || COALESCE(tags,'') || ',') LIKE '%,memory,%')",
+			)
 			.get(title) as KnowledgeEntry | undefined;
 
 		if (existing) {
 			const mergedContent = existing.content.includes(content)
 				? existing.content
 				: `${existing.content}\n\n---\n${content}`;
-			const mergedTags = unionTags(existing.tags, input.tags ?? "");
+			const mergedTags = unionTags(existing.tags, tags);
 			const origin = existing.origin === "derived" ? "derived" : "learned";
 			this.db
 				.prepare(
@@ -177,7 +280,6 @@ export class KnowledgeContentStore {
 		}
 
 		const id = randomUUID();
-		const tags = unionTags(input.tags ?? "");
 		this.db
 			.prepare(
 				"INSERT INTO kb_entries (id, title, tags, content, origin, confidence, created_at, updated_at) VALUES (?, ?, ?, ?, 'learned', 0.6, ?, ?)",
@@ -204,7 +306,7 @@ export class KnowledgeContentStore {
 		if (!title || !content) throw new Error("title and content are required");
 		const now = Date.now();
 		const id = randomUUID();
-		const tags = unionTags(input.tags ?? "");
+		const tags = stripMemoryTag(unionTags(input.tags ?? ""));
 		this.db
 			.prepare(
 				"INSERT INTO kb_entries (id, title, tags, content, origin, confidence, review_status, source_url, created_at, updated_at) " +
@@ -237,7 +339,8 @@ export class KnowledgeContentStore {
 					: `${entry.content}\n\n---\n${input.content}`
 				: input.content;
 		const title = input.title?.trim() || entry.title;
-		const tags = input.tags !== undefined ? unionTags(input.tags) : entry.tags;
+		if (hasMemoryTag(entry.tags) || (entry.memory_scope && entry.memory_scope !== "profile")) return undefined; // memory is corrected through remember
+		const tags = input.tags !== undefined ? stripMemoryTag(unionTags(input.tags)) : entry.tags;
 		this.db
 			.prepare(
 				"UPDATE kb_entries SET title = ?, tags = ?, content = ?, updated_at = ?, version = version + 1 WHERE id = ?",
@@ -500,12 +603,36 @@ export class KnowledgeContentStore {
 		const id = randomUUID();
 		const tags = merged.tags ?? "";
 		const sources = ids.filter((x) => typeof x === "string");
+		// Preserve scoped-memory identity: callers only merge same-scope rows,
+		// so inherit scope/owner/summary from the first source. A derived memory
+		// must keep the memory tag + scope or it would leak into general KB /
+		// vanish from the memory index.
+		const first = sources.length
+			? (this.db.prepare("SELECT tags, memory_scope, memory_owner, memory_summary FROM kb_entries WHERE id = ?").get(sources[0]) as
+				| { tags: string | null; memory_scope: string | null; memory_owner: string | null; memory_summary: string | null }
+				| undefined)
+			: undefined;
+		if (sources.length === 0 || new Set(sources).size !== sources.length || !first) throw new Error("merge requires distinct existing sources");
+		for (const sourceId of sources) {
+			const row = this.db.prepare("SELECT tags, memory_scope, memory_owner FROM kb_entries WHERE id = ? AND archived = 0").get(sourceId) as KnowledgeEntry | undefined;
+			if (!row || (row.memory_scope ?? "profile") !== (first.memory_scope ?? "profile") ||
+				(row.memory_owner ?? "") !== (first.memory_owner ?? "") || hasMemoryTag(row.tags) !== hasMemoryTag(first.tags)) {
+				throw new Error("cannot merge across memory scope/owner boundaries");
+			}
+		}
+		const allMemory = hasMemoryTag(first.tags);
+		const nextTags = allMemory ? unionTags(stripMemoryTag(tags), "memory") : stripMemoryTag(tags);
 		this.db
 			.prepare(
-				"INSERT INTO kb_entries (id, title, tags, content, origin, confidence, lineage, created_at, updated_at) VALUES (?, ?, ?, ?, 'derived', 0.7, ?, ?, ?)",
+				"INSERT INTO kb_entries (id, title, tags, content, origin, confidence, lineage, memory_scope, memory_owner, memory_summary, created_at, updated_at) " +
+					"VALUES (?, ?, ?, ?, 'derived', 0.7, ?, ?, ?, ?, ?, ?)",
 			)
-			.run(id, merged.title, tags, merged.content, JSON.stringify(sources), now, now);
-		this.replaceEntryChunks(id, MANUAL_SOURCE, merged.title, tags, merged.content);
+			.run(id, merged.title, nextTags, merged.content, JSON.stringify(sources),
+				allMemory ? first!.memory_scope : null,
+				allMemory ? first!.memory_owner : null,
+				allMemory ? (first!.memory_summary ?? merged.title.slice(0, 120)) : null,
+				now, now);
+		this.replaceEntryChunks(id, MANUAL_SOURCE, merged.title, nextTags, merged.content);
 		for (const sid of sources) this.archiveEntry(sid);
 		return id;
 	}
@@ -516,8 +643,9 @@ export class KnowledgeContentStore {
 			| KnowledgeEntry
 			| undefined;
 		if (!entry) return;
-		this.db.prepare("UPDATE kb_entries SET tags = ?, updated_at = ? WHERE id = ?").run(tags, Date.now(), id);
-		this.replaceEntryChunks(id, MANUAL_SOURCE, entry.title, tags, entry.content);
+		const safeTags = hasMemoryTag(entry.tags) ? unionTags(stripMemoryTag(tags), "memory") : stripMemoryTag(tags);
+		this.db.prepare("UPDATE kb_entries SET tags = ?, updated_at = ? WHERE id = ?").run(safeTags, Date.now(), id);
+		this.replaceEntryChunks(id, MANUAL_SOURCE, entry.title, safeTags, entry.content);
 	}
 
 	getConsolidatedAt(): number {
@@ -648,6 +776,20 @@ export class KnowledgeContentStore {
 			insertChunk.run(randomUUID(), source, entryId, title, tags, content || "", 0, now, now);
 		}
 	}
+}
+
+/** The memory tag is reserved for the remember/scoped-memory path. General
+ * knowledge tools must not mint an always-injected memory entry by naming it. */
+function stripMemoryTag(tags: string | null | undefined): string {
+	return (tags ?? "")
+		.split(/[,，]/)
+		.map((t) => t.trim())
+		.filter((t) => t && t !== "memory")
+		.join(",");
+}
+
+function hasMemoryTag(tags: string | null | undefined): boolean {
+	return (tags ?? "").split(/[,，]/).some((tag) => tag.trim() === "memory");
 }
 
 /** Normalize one or more comma-separated tag lists into a de-duplicated comma list. */

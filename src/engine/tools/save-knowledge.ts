@@ -1,6 +1,10 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { KnowledgeService } from "../../knowledge/knowledge-service.js";
+import { deriveMemoryContext, ownerForScope, type MemoryScope } from "../../knowledge/memory-scope.js";
+import { isLocalConversation, resolveRole, type Role } from "../../security/permissions.js";
+import type { ConfigStore } from "../../db/config-store.js";
+import type { InboundActor } from "../../im/types.js";
 
 /**
  * Build the auto-learn tool that lets the employee persist reusable knowledge
@@ -101,32 +105,107 @@ export function createSaveToKnowledgeTool(knowledge: KnowledgeService): AgentToo
 }
 
 /**
- * Build the memory-capture tool. Memory entries are KB entries tagged "memory";
- * their index is injected into EVERY session prompt (query-free recall), so
- * user-specific facts — preferences, corrections, standing context — survive
- * across conversations. Same-title saves merge (update-over-append). `onSaved`
- * bumps the engine's prompt revision so live sessions pick up the new index.
+ * Build the memory-capture tool. Memory entries are scoped KB entries tagged
+ * "memory"; their index is injected into every relevant session (query-free
+ * recall). Scope/owner are derived SERVER-SIDE from the verified turn actor —
+ * the model can hint a wider scope but cannot name an owner or staffId, so a
+ * message/web/file can never write to another person's or group's memory.
+ *
+ *  - person (default): one platform identity, across that person's chats.
+ *  - conversation: one IM group; requires operator+. Only honored in a group.
+ *  - profile: whole-profile shared; requires admin (or the local console).
+ *
+ * Same (scope,owner,title) overwrites in place — a correction replaces the
+ * old fact. `onSaved` bumps the engine's prompt revision so live sessions pick
+ * up the new index.
  */
-export function createRememberTool(knowledge: KnowledgeService, onSaved?: () => void): AgentTool {
+export function createRememberTool(deps: {
+	knowledge: KnowledgeService;
+	/** Verified actor for the live turn (undefined in the local console). */
+	resolveActor: () => (InboundActor & { text?: string }) | undefined;
+	conversationId: string;
+	config: ConfigStore;
+	onSaved?: () => void;
+}): AgentTool {
 	return {
 		name: "remember",
 		label: "记住要点",
 		description:
-			"把关于当前用户/管理者的长期事实写入记忆：对方的偏好、对做法的纠正、自身或环境情况（「我是…」「以后…」「记住…」「别再…」）、进行中的重要状态。" +
-			"记忆之后每个会话自动携带，避免重复犯错、重复询问、重复自我介绍。同标题自动合并（重存即更新）。" +
-			"不要用于客观知识（规则/流程/地址 → save_to_knowledge）或操作步骤（→ save_to_skill）。",
+			"把长期事实写入记忆：对方的偏好、对做法的纠正、稳定环境情况（「我是…」「以后…」「记住…」「别再…」）。" +
+			"记忆默认按本人隔离（这个人在任何会话都生效）；明确说「本群/这个群记住」时按当前群隔离；明确要求「所有人/全局记住」时写入全配置共享记忆（仅管理员）。" +
+			"不要用于客观知识（规则/流程/地址 → save_to_knowledge）或操作步骤（→ save_to_skill）。同范围同标题重存会纠正覆盖旧记忆。",
 		parameters: Type.Object({
 			title: Type.String({ description: "记忆标题，简明点名主题（如「张工偏好：prompt 用可复制文本框交付」）" }),
-			content: Type.String({ description: "记忆正文：一到三句话写清事实与适用语境" }),
+			content: Type.String({ description: "记忆正文：一到三句话写清事实与适用语境；纠正时直接写新事实，不要包含已作废的旧说法" }),
+			summary: Type.Optional(Type.String({
+			description: "可选一行索引摘要（≤60字），用于每次会话自动携带；不填则只携带标题",
+			})),
+			scope: Type.Optional(Type.Union(
+				[Type.Literal("person"), Type.Literal("conversation"), Type.Literal("profile")],
+				{ description: "记忆范围：person=仅本人（默认）；conversation=当前群；profile=全配置共享（需管理员）" },
+			)),
 		}),
 		async execute(_toolCallId, params) {
-			const p = params as { title: string; content: string };
+			const p = params as { title: string; content: string; summary?: string; scope?: "person" | "conversation" | "profile" };
 			try {
-				const r = knowledge.saveMemory({ title: p.title, content: p.content });
-				onSaved?.();
+				const actor = deps.resolveActor();
+				const local = isLocalConversation(deps.conversationId);
+				const ctx = deriveMemoryContext(actor, deps.conversationId);
+				const role: Role = local ? "admin" : resolveRole(deps.config, actor?.senderId);
+				const isAdmin = (): boolean => role === "admin";
+				const isAtLeastOperator = (): boolean => role !== "viewer";
+
+				// Resolve the effective scope.
+				let scope: MemoryScope = "person";
+				let downgradedFrom: MemoryScope | undefined;
+				if (local) {
+					scope = "profile"; // console is the trusted admin surface
+				} else if (p.scope === "profile") {
+					if (!isAdmin()) {
+						// Fail safe by actually writing a person-scoped fact, not by
+						// returning success language without persisting anything.
+						downgradedFrom = "profile";
+						scope = "person";
+					} else {
+						scope = "profile";
+					}
+				} else if (p.scope === "conversation") {
+					if (!ctx.conversationOwner || actor?.chatType !== "group" || !isAtLeastOperator()) {
+						downgradedFrom = "conversation";
+						scope = "person";
+					} else {
+						scope = "conversation";
+					}
+				} // Default/explicit person stays owner-scoped; anonymous remote turns fail closed below.
+
+				const owner = ownerForScope(scope, ctx);
+				// A scope that needs an owner but has none must fail closed (never
+				// silently widen another person's memory into profile).
+				if (scope !== "profile" && !owner) {
+					return {
+						content: [{ type: "text", text: "当前缺少可验证的发送者身份，无法写入个人/群级记忆。" }],
+						details: { ok: false, reason: "no-verified-actor" },
+					};
+				}
+
+				const summary = p.summary?.trim().slice(0, 120) || p.title.trim().slice(0, 120);
+				const r = deps.knowledge.saveMemory({
+					title: p.title,
+					content: p.content,
+					scope: scope === "profile" ? null : scope,
+					owner,
+					summary,
+				});
+				deps.onSaved?.();
+				const scopeLabel = scope === "profile" ? "全配置共享" : scope === "conversation" ? "本群" : "你本人";
+				const downgradeNote = downgradedFrom
+					? downgradedFrom === "profile"
+						? "（你没有全配置共享记忆权限，已按你本人记忆保存；如需全员生效请管理员确认。）"
+						: "（当前会话不满足群级记忆条件，已按你本人记忆保存。）"
+					: "";
 				return {
-					content: [{ type: "text", text: r.merged ? `已更新记忆「${p.title}」。` : `已记住「${p.title}」，后续所有会话自动携带。` }],
-					details: { ok: true, id: r.id, merged: r.merged },
+					content: [{ type: "text", text: (r.merged ? `已更新${scopeLabel}记忆「${p.title}」（旧内容已纠正覆盖）。` : `已记住${scopeLabel}记忆「${p.title}」，之后相关会话自动携带。`) + downgradeNote }],
+					details: { ok: true, id: r.id, merged: r.merged, scope, owner, downgradedFrom },
 				};
 			} catch (err) {
 				return { content: [{ type: "text", text: `记忆保存失败：${(err as Error).message}` }], details: { ok: false } };

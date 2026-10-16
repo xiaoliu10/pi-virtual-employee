@@ -38,6 +38,14 @@ export interface InboundActor {
 	channel: string;
 	/** Admin operations are allowed only in a direct 1:1 chat. */
 	chatType: "single" | "group";
+	/**
+	 * Synthetic unattended turn (scheduled/autonomous work): the originating IM
+	 * conversation whose person/conversation memory this run belongs to. Lets a
+	 * creator's scheduled run read/write the same scoped memory as live turns.
+	 */
+	memoryConversationId?: string;
+	/** Original channel for a synthetic scheduler/work actor (used for stable scoped-memory owner). */
+	memoryChannel?: string;
 }
 
 export interface InboundMessage {

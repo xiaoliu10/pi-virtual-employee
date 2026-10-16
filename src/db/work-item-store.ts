@@ -33,6 +33,7 @@ export interface WorkItemRow {
 	kicked_off: number;
 	/** Verified confirming admin, not the conversation's proposer. */
 	created_by: string | null;
+	created_channel: string | null;
 	/** Retained until the first successful resumed send. */
 	answer: string | null;
 	created_at: number;
@@ -46,6 +47,7 @@ export interface CreateWorkItemInput {
 	originNote?: string | null;
 	status?: WorkItemStatus;
 	createdBy?: string | null;
+	createdChannel?: string | null;
 }
 
 export class WorkItemStore {
@@ -70,11 +72,12 @@ export class WorkItemStore {
 			origin_note: input.originNote ?? null, status: input.status ?? "proposed",
 			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0, fallback_streak: 0, last_remind_at: null, remind_count: 0, cadence_ms: null, kicked_off: 0,
 			created_by: input.createdBy ?? null,
+			created_channel: input.createdChannel ?? null,
 			answer: null, created_at: now, updated_at: now,
 		};
 		this.db.prepare(`INSERT INTO work_items
-			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, last_remind_at, remind_count, cadence_ms, kicked_off, created_by, answer, created_at, updated_at)
-			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @last_remind_at, @remind_count, @cadence_ms, @kicked_off, @created_by, @answer, @created_at, @updated_at)`).run(row);
+			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, last_remind_at, remind_count, cadence_ms, kicked_off, created_by, created_channel, answer, created_at, updated_at)
+			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @last_remind_at, @remind_count, @cadence_ms, @kicked_off, @created_by, @created_channel, @answer, @created_at, @updated_at)`).run(row);
 		this.changed(row.id);
 		return row;
 	}
@@ -228,10 +231,10 @@ export class WorkItemStore {
 			.run(...(expected === undefined ? [id] : [id, expected]));
 	}
 
-	confirm(id: string, createdBy: string): WorkItemRow | undefined {
+	confirm(id: string, createdBy: string, createdChannel?: string): WorkItemRow | undefined {
 		if (!createdBy.trim()) return undefined;
-		const result = this.db.prepare(`UPDATE work_items SET created_by = ?, status = 'queued', question = NULL, next_check_at = NULL, updated_at = ? WHERE id = ? AND status = 'proposed'`)
-			.run(createdBy, Date.now(), id);
+		const result = this.db.prepare(`UPDATE work_items SET created_by = ?, created_channel = COALESCE(created_channel, ?), status = 'queued', question = NULL, next_check_at = NULL, updated_at = ? WHERE id = ? AND status = 'proposed'`)
+			.run(createdBy, createdChannel ?? null, Date.now(), id);
 		if (!result.changes) return undefined;
 		this.changed(id);
 		return this.get(id);

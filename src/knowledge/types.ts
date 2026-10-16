@@ -39,6 +39,8 @@ export interface RetrievalHit {
 export interface SearchRequest {
 	query: string;
 	topK: number;
+	/** Verified scope context — person/conversation memory outside it is filtered out. */
+	memoryCtx?: { personOwner?: string; conversationOwner?: string };
 }
 
 export interface HealthStatus {

@@ -3,7 +3,10 @@ import { Type } from "@earendil-works/pi-ai";
 import type { KnowledgeService } from "../../knowledge/knowledge-service.js";
 
 /** Build the knowledge-base tool bound to a KnowledgeService instance. */
-export function createKnowledgeTool(knowledge: KnowledgeService): AgentTool {
+export function createKnowledgeTool(
+	knowledge: KnowledgeService,
+	resolveMemoryCtx?: () => { personOwner?: string; conversationOwner?: string },
+): AgentTool {
 	return {
 		name: "search_knowledge_base",
 		label: "知识库查询",
@@ -14,7 +17,7 @@ export function createKnowledgeTool(knowledge: KnowledgeService): AgentTool {
 		}),
 		async execute(_toolCallId, params) {
 			const { query } = params as { query: string };
-			const hits = await knowledge.search(query);
+			const hits = await knowledge.search(query, resolveMemoryCtx?.());
 			if (hits.length === 0) {
 				// Record the miss so the auto-research loop / UI can surface recurring gaps.
 				try {
