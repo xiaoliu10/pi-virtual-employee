@@ -62,6 +62,7 @@ export const ROOT_CATALOG: Record<string, string> = {
 	general: "通用（autostart/language/requestTimeoutMin/longTaskProgressMin/maxToolSteps/autoUpdate/oneOffRetentionDays；一次性会话保留天数：定时任务/自主任务/评测会话停止更新超过该天数自动删除，0=不清理，IM 与控制台会话永不自动删）；messageRetentionDays（对话记录保留天数，默认 30，0=不清理）：超龄的消息正文与 turn/tool 遥测自动删除，会话条目保留）",
 	browser: "浏览器自动化（enabled/headless/allowedDomains）",
 	computer: "Cua 桌面控制（enabled/driverPath/allowedApps/allowForeground/allowScheduled/connectTimeoutSec/actionTimeoutSec/sessionTimeoutSec；单位秒，总时限 0=不限时；allowedApps 空数组=拒绝全部，*=全部应用）",
+	environmentKernel: "会话内核（general.engineKernel）：legacy=裸 Agent 直驱（现行行为），pi-session=Agent 外包 pi AgentSession 会话壳（扩展运行时/插件宿主，需 pi runtime 已安装）。灰度开关，默认 legacy",
 	scheduler: "定时任务总开关（scheduler.enabled）",
 	prompt: "提示词追加（prompt.extra/prompt.rules；rules 为空时用内置默认）",
 	kb: "知识库（kb.enabled/kb.mode/kb.local.*/kb.embedding.* 等）",

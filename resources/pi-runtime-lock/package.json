@@ -1,0 +1,8 @@
+{
+  "name": "pi-virtual-employee-pi-runtime",
+  "private": true,
+  "description": "Version-locked pi runtime for the pi-session kernel (installed to userData by src/runtime/bootstrap.ts). Shipped as a lockfile only — the tree itself is installed on the user's machine from the source chain.",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.2.0"
+  }
+}

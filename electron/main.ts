@@ -462,13 +462,45 @@ async function main(): Promise<void> {
 	await applyPendingImport({ db, config, knowledge, skillsDir: userSkillsDir });
 
 	const initialCfg = config.all();
+
+	// Kernel migration gray switch (docs/design/ve-pi-session-migration.md §12):
+	// "pi-session" needs the pi runtime installed+verified before the engine
+	// exists — a failed bootstrap keeps the app on the legacy kernel (loud log,
+	// settings surface the state) instead of bricking the profile.
+	let kernel: "legacy" | "pi-session" = initialCfg.general.engineKernel ?? "legacy";
+	if (kernel === "pi-session") {
+		const { ensurePiRuntime } = await import("../src/runtime/bootstrap.js");
+		const result = await ensurePiRuntime({
+			lockDir: path.join(process.resourcesPath ?? "", "pi-runtime-lock"),
+			targetDir: path.join(userData, "pi-runtime"),
+			registries: [initialCfg.general.piRegistryUrl || "https://registry.npmmirror.com", "https://registry.gitee-mirror.com", "https://registry.npmjs.org"].filter(Boolean),
+			log: (line) => console.log(line),
+		}).catch((err) => ({ status: "failed" as const, attempted: [], errors: [String(err)] }));
+		// appendAppLog is declared later in main — tee through the same file the
+		// console tees to (teeConsoleToDisk ran above, so console IS the log).
+		const runtimeLog = (line: string) => console.log(line);
+		if (result.status === "ready") {
+			const { initPiRuntime } = await import("../src/engine/imports.js");
+			try {
+				await initPiRuntime(result.dir);
+				runtimeLog(`[runtime] pi runtime ready (pi ${result.version}, source ${result.source}${result.fresh ? ", freshly installed" : ""})`);
+			} catch (err) {
+				runtimeLog(`[runtime] pi runtime import failed — legacy kernel: ${err instanceof Error ? err.message : err}`);
+				kernel = "legacy";
+			}
+		} else {
+			runtimeLog(`[runtime] pi runtime bootstrap failed — legacy kernel; attempted: ${result.attempted.join(", ") || "(none)"}; errors: ${result.errors.join(" | ")}`);
+			kernel = "legacy";
+		}
+	}
+
 	const reportService = new ReportService(new ArtifactStore(db), config);
 	const engine = new EmployeeEngine(config, history, knowledge, browser, scheduler, documents, filesystem, reportService, downloadService, {
 		builtinSkillsDir,
 		userSkillsDir,
 		shellAuditLogPath: path.join(userData, "logs", "shell-audit.log"),
 		proposalsDir,
-	}, { timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000 });
+	}, { timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000, kernel });
 	engine.setComputerService(computer);
 	// Run telemetry: the employee's own record of how its turns went (my_stats tool;
 	// later, the input to a self-improvement proposal loop). Pruned at startup,
