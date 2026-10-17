@@ -61,6 +61,26 @@ function fixture(opts = {}) {
 	const store = {
 		get: (id) => rows.get(id),
 		list: () => [...rows.values()],
+		create(input) {
+			events.push("create");
+			const item = {
+				id: `new-${Math.random().toString(36).slice(2, 10)}`,
+				title: input.title, goal: input.goal, conditions: null, progress: null, lessons: null,
+				origin_conversation: input.originConversation ?? null, origin_note: input.originNote ?? null,
+				status: input.status ?? "proposed", question: null, next_check_at: null, next_check_reason: null,
+				fixed_streak: 0, fallback_streak: 0, last_remind_at: null, remind_count: 0, cadence_ms: null, kicked_off: 0,
+				created_by: input.createdBy ?? null, answer: null, created_at: 1, updated_at: 1,
+			};
+			rows.set(item.id, item);
+			return item;
+		},
+		setField(id, field, value) {
+			writes.push(["setField", id, field, value]);
+			const item = rows.get(id);
+			if (!item) return undefined;
+			item[field === "set_conditions" ? "conditions" : field === "set_progress" ? "progress" : field] = value;
+			return item;
+		},
 		confirm(id, createdBy) {
 			writes.push(["confirm", id, createdBy]);
 			events.push("confirm");
@@ -168,6 +188,44 @@ function refused(result, f) {
 	assert.deepEqual(f.cancelled, []);
 	assert.deepEqual(f.mined, []);
 }
+
+test("create: 管理员说「重建自主任务」一步建 work item（queued + created_by + fire）——不碰定时任务", async () => {
+	const f = fixture({ conversationId: GROUP, actor: actor({ text: "确认创建：重建每日对账异常巡检自主任务" }) });
+	const result = await f.items({
+		action: "create",
+		title: "每日对账异常动态巡检与群内汇报",
+		goal: "每天核对最近 3 天对账异常并推送本群",
+		conditions: "避开对账时段执行",
+	});
+	assert.equal(result.details.ok, true);
+	assert.equal(result.details.created, true);
+	assert.equal(result.details.fired, true);
+	const created = [...f.rows.values()].find((r) => r.title === "每日对账异常动态巡检与群内汇报");
+	assert.ok(created, "the item was persisted");
+	assert.equal(created.status, "queued", "queued so the runner picks it up");
+	assert.equal(created.created_by, "admin", "creator identity attached (permission follows the creator)");
+	assert.equal(created.conditions, "避开对账时段执行");
+	assert.deepEqual(f.events, ["create", "fire"]);
+	assert.equal(f.fired.length, 1);
+	assert.match(result.content[0].text, /不是定时任务/);
+});
+
+test("create: 非管理员被拒且不落库", async () => {
+	const f = fixture({ conversationId: GROUP, actor: actor({ senderId: "guest", text: "建个自主任务" }) });
+	const before = f.rows.size;
+	const result = await f.items({ action: "create", title: "x", goal: "y" });
+	assert.equal(result.details.ok, false);
+	assert.equal(result.details.refused, true);
+	assert.equal(f.rows.size, before, "refusal must not create anything");
+});
+
+test("create: 缺 title/goal 被拒", async () => {
+	const f = fixture({ conversationId: GROUP, actor: actor({ text: "确认创建" }) });
+	const before = f.rows.size;
+	const result = await f.items({ action: "create", title: "只有标题" });
+	assert.equal(result.details.ok, false);
+	assert.equal(f.rows.size, before, "incomplete create must not persist");
+});
 
 for (const chatType of ["group", "single"]) {
 	test(`${chatType} admin full access mode: confirm works WITHOUT 「确认创建」 in the message`, async () => {
