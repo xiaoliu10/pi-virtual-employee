@@ -11,8 +11,9 @@
  * base model of the matching api type and overriding id + baseUrl.
  */
 import { randomUUID } from "node:crypto";
-import { Agent } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import type { AgentEvent, AgentMessage, FinishTurn, StreamFn } from "@earendil-works/pi-agent-core";
+import { createSessionHost, type SessionHost } from "./session-host.js";
 import type { Skill } from "./skills/types.js";
 import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "./pi-compaction.js";
 import { createModels, ModelsError } from "@earendil-works/pi-ai";
@@ -208,6 +209,11 @@ function deriveTitle(message: string): string {
 
 export interface EngineOptions {
 	streamFn?: StreamFn;
+	/** Conversation kernel: "legacy" drives the bare Agent directly (current
+	 * field behavior); "pi-session" wraps each Agent in a pi AgentSession so
+	 * the extension runtime (plugins) and pi scaffolding attach. Default
+	 * "legacy" — the switch exists for the kernel migration gray rollout. */
+	kernel?: "legacy" | "pi-session";
 	/** Per-LLM-call timeout (ms). 0 = no timeout. */
 	timeoutMs?: number;
 	/** Test seam: the backoff sleep between transient retries (defaults to a
@@ -246,6 +252,11 @@ interface ActiveAuthLogin {
 export class EmployeeEngine implements EmployeeRuntime {
 	readonly profileId = "customer-service";
 	private readonly sessions = new Map<string, Agent>();
+	/** pi-session shell per conversation (only when opts.kernel === "pi-session").
+	 * Keyed alongside `sessions`; `hostByAgent` mirrors it for send()'s
+	 * agent-parameterized facade (the facade hands back Agents, not hosts). */
+	private readonly hosts = new Map<string, SessionHost>();
+	private readonly hostByAgent = new Map<Agent, SessionHost>();
 	/** Per-conversation abort timers bounding side LLM calls (compaction). */
 	private readonly sideCallTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly models: MutableModels;
@@ -253,7 +264,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * the pi agent dir's auth.json (shared with the pi CLI), so account logins
 	 * work everywhere; injectable for tests. */
 	private readonly credentialStore: CredentialStore;
-	private readonly opts: { timeoutMs: number; streamFn?: StreamFn; retrySleepFn?: (ms: number) => Promise<void> };
+	private readonly opts: { timeoutMs: number; streamFn?: StreamFn; retrySleepFn?: (ms: number) => Promise<void>; kernel: "legacy" | "pi-session" };
 	private readonly skillLoader: SkillLoader;
 	/** Authoring surface for declarative skills (save_to_skill). */
 	private readonly skillWriter: SkillWriter;
@@ -306,7 +317,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		private readonly paths: { builtinSkillsDir: string; userSkillsDir: string; shellAuditLogPath?: string; proposalsDir?: string },
 		options: EngineOptions = {},
 	) {
-		this.opts = { timeoutMs: options.timeoutMs ?? 0, streamFn: options.streamFn, retrySleepFn: options.retrySleepFn };
+		this.opts = { timeoutMs: options.timeoutMs ?? 0, streamFn: options.streamFn, retrySleepFn: options.retrySleepFn, kernel: options.kernel ?? "legacy" };
 		this.credentialStore = options.credentialStore ?? new FileCredentialStore();
 		this.models = createModels({ credentials: this.credentialStore });
 		for (const provider of builtinProviders()) this.models.setProvider(provider);
@@ -437,7 +448,16 @@ export class EmployeeEngine implements EmployeeRuntime {
 				/* session may already be gone */
 			}
 		}
+		for (const [, host] of this.hosts) {
+			try {
+				void host.session.dispose();
+			} catch {
+				/* host may already be disposed */
+			}
+		}
 		this.sessions.clear();
+		this.hosts.clear();
+		this.hostByAgent.clear();
 		this.skillsCacheKey = "";
 	}
 
@@ -889,6 +909,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 		if (cached) {
 			const builtAt = (cached as Agent & { __skillsRevision?: number }).__skillsRevision ?? 0;
 			if ((builtAt >= this.skillsRevision && builtAt >= this.memoryRevision && builtAt >= this.modelInfoRevision) || cached.state.isStreaming) return cached;
+			// Drop the pi-session shell too (only reached when idle, so dispose is safe):
+			// orphaning the old host here leaks an AgentSession across rebuilds.
+			this.dropHost(conversationId);
 			this.sessions.delete(conversationId);
 		}
 
@@ -916,6 +939,56 @@ export class EmployeeEngine implements EmployeeRuntime {
 		(agent as Agent & { __skillsRevision?: number }).__skillsRevision = revision;
 		this.sessions.set(conversationId, agent);
 		return agent;
+	}
+
+	/**
+	 * The pi-session shell for this conversation (kernel = "pi-session" only).
+	 * Created lazily on the first send (creation awaits extension discovery, and
+	 * the facade's getOrCreateSession must stay synchronous). The transcript
+	 * lives on the Agent — the session shell adds the extension runtime and
+	 * boundary events; a runtime failure falls back to legacy driving with a
+	 * loud error rather than bricking the conversation (kernel migration doc §12).
+	 */
+	private async ensureHost(agent: Agent, conversationId: string): Promise<SessionHost | undefined> {
+		if (this.opts.kernel !== "pi-session") return undefined;
+		const existing = this.hostByAgent.get(agent);
+		if (existing) return existing;
+		try {
+			const host = await createSessionHost(agent, { conversationId, tools: agent.state.tools as AgentTool[] });
+			this.hostByAgent.set(agent, host);
+			this.hosts.set(conversationId, host);
+			return host;
+		} catch (err) {
+			console.error(`[engine] pi-session host creation failed for ${conversationId} — driving legacy for this turn:`, err instanceof Error ? err.message : err);
+			return undefined;
+		}
+	}
+
+	/** Drive ONE turn: through the session shell (boundary events + plugins)
+	 * when a host exists, or the bare agent on the legacy path. Vision images
+	 * ride PromptOptions; prompt-template expansion is OFF — VE messages may
+	 * start with "/" and must never be mistaken for pi skill commands. */
+	private async driveTurn(host: SessionHost | undefined, agent: Agent, message: string, images?: ImageContent[]): Promise<void> {
+		if (host) {
+			await host.session.prompt(message, { images, expandPromptTemplates: false });
+			return;
+		}
+		await agent.prompt(message, images);
+	}
+
+	/** Abort whatever is active for this conversation's agent — through the
+	 * session shell when present (it also stops the post-run settle loop, which
+	 * a bare agent.abort() cannot reach). */
+	private abortDriven(host: SessionHost | undefined, agent: Agent): void {
+		if (host) {
+			void host.session.abort().catch(() => { /* already idle */ });
+			return;
+		}
+		try {
+			agent.abort();
+		} catch {
+			/* session may already be gone */
+		}
 	}
 
 	/**
@@ -1007,6 +1080,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 		}
 		// Never leak an unconsumed steer into a later /new or ordinary turn.
 		cached.clearSteeringQueue();
+		// The session shell ALSO owns a post-run settle loop a bare agent.abort()
+		// cannot reach — stop both layers (host abort is async; legacy stays sync).
+		const abortHost = this.hostByAgent.get(cached);
+		if (abortHost) void abortHost.session.abort().catch(() => { /* already idle */ });
 		try {
 			cached.abort();
 		} catch {
@@ -1026,6 +1103,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.history.deleteConversation(conversationId);
 		this.history.ensureConversation(conversationId, null);
 		if (override) this.history.setModelOverride(conversationId, override.supplierId, override.modelId);
+		this.dropHost(conversationId);
 		this.sessions.delete(conversationId);
 	}
 
@@ -1904,7 +1982,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 		let undeliveredSteer = false;
 		try {
 			const effectiveMessage = this.withTurnMemoryPrefix(conversationId, memoryCtx, message);
-			retries = await this.promptWithRetry(agent, conversationId, effectiveMessage, ctx?.images);
+			const host = await this.ensureHost(agent, conversationId);
+			retries = await this.promptWithRetry(agent, host, conversationId, effectiveMessage, ctx?.images);
 		} catch (err) {
 			// Login-shaped failures get actionable Chinese guidance (review H4) at
 			// this bubble-up point; everything else keeps its original message.
@@ -2378,7 +2457,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 *
 	 * Returns the number of retries performed (0 = first attempt succeeded).
 	 */
-	private async promptWithRetry(agent: Agent, conversationId: string, message: string, images?: { data: string; mimeType: string }[]): Promise<number> {
+	private async promptWithRetry(agent: Agent, host: SessionHost | undefined, conversationId: string, message: string, images?: { data: string; mimeType: string }[]): Promise<number> {
 		// Vision input: only pass images when the session's model actually accepts
 		// them — a non-vision model would reject the image block and fail the turn.
 		const visionImages: ImageContent[] | undefined =
@@ -2389,7 +2468,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		let threwTransient = false;
 		let emptyStreak = 0;
 		try {
-			await agent.prompt(message, visionImages);
+			await this.driveTurn(host, agent, message, visionImages);
 		} catch (err) {
 			const text = err instanceof Error ? err.message : String(err);
 			// Provider says the prompt is too long (our estimate was low, or one
@@ -2400,7 +2479,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				const recovered = await this.recoverFromContextOverflow(agent);
 				if (recovered) {
 					console.warn("[engine] context overflow: retrying the request on a compacted transcript");
-					await agent.prompt(message, visionImages);
+					await this.driveTurn(host, agent, message, visionImages);
 					return 0;
 				}
 				throw err;
@@ -2486,7 +2565,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				if (!text.startsWith("Cannot continue")) throw err;
 				// Last-resort: a transcript whose only resumable anchor is gone —
 				// replay the user message as a fresh turn instead of failing the request.
-				await agent.prompt(message, visionImages);
+				await this.driveTurn(host, agent, message, visionImages);
 			}
 		}
 	}
@@ -2618,7 +2697,20 @@ export class EmployeeEngine implements EmployeeRuntime {
 	dropSession(conversationId: string): boolean {
 		const agent = this.sessions.get(conversationId);
 		if (agent) agent.abort();
+		this.dropHost(conversationId);
 		return this.sessions.delete(conversationId);
+	}
+
+	private dropHost(conversationId: string): void {
+		const host = this.hosts.get(conversationId);
+		if (!host) return;
+		this.hosts.delete(conversationId);
+		this.hostByAgent.delete(host.agent);
+		try {
+			void host.session.dispose();
+		} catch {
+			/* already disposed */
+		}
 	}
 
 	activeSessionCount(): number {

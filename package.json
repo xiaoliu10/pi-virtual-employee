@@ -47,8 +47,8 @@
     "postinstall": "electron-rebuild -f -w better-sqlite3"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^1.1.0",
-    "@earendil-works/pi-ai": "^1.1.0",
+    "@earendil-works/pi-agent-core": "^1.2.0",
+    "@earendil-works/pi-ai": "^1.2.0",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@types/adm-zip": "^0.5.8",
     "adm-zip": "^0.6.0",
@@ -68,6 +68,7 @@
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.2.0",
     "@electron/rebuild": "^3.7.1",
     "@types/ali-oss": "^6.23.3",
     "@types/better-sqlite3": "^7.6.12",
@@ -128,6 +129,13 @@
           "filter": [
             "**/*"
           ]
+        },
+        {
+          "from": "resources/pi-runtime-lock",
+          "to": "pi-runtime-lock",
+          "filter": [
+            "**/*"
+          ]
         }
       ],
       "target": [
@@ -145,6 +153,13 @@
         {
           "from": "build/native-mac",
           "to": "native",
+          "filter": [
+            "**/*"
+          ]
+        },
+        {
+          "from": "resources/pi-runtime-lock",
+          "to": "pi-runtime-lock",
           "filter": [
             "**/*"
           ]
