@@ -25,6 +25,7 @@ import type { Agent, AgentTool } from "@earendil-works/pi-agent-core";
 
 import { getPiRuntime } from "./imports.js";
 import { toToolDefinition } from "./tools/tool-adapter.js";
+import { createVeSettleGateExtension } from "./extensions/ve-settle-gate.js";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 
 export interface SessionHost {
@@ -66,7 +67,12 @@ export async function createSessionHost(agent: Agent, opts: CreateSessionHostOpt
 		// The Agent carries VE's system prompt in its state — the loader's own
 		// prompt machinery is scaffolding we never read.
 		systemPrompt: "VE session host (system prompt lives on the agent).",
-		extensionFactories: (opts.extensionFactories ?? []) as never,
+		extensionFactories: [
+			// VE settle-gate: evidence-round self-verification on agent_before_settle.
+			// Re-delivered in plugin form after the kernel migration (closed #84).
+			{ name: "ve-settle-gate", factory: createVeSettleGateExtension() },
+			...(opts.extensionFactories ?? []),
+		] as never,
 	});
 	// Extensions load into the loader's cache ONLY here — the session snapshot
 	// (getExtensions) is taken in its constructor (spike-verified 2026-10-17).
