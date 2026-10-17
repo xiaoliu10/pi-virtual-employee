@@ -63,6 +63,9 @@ export interface SendResult {
 	 * content after retries). Chain runners pause-and-wait instead of looping. */
 	deterministic?: boolean;
 	error?: string;
+	/** Tool calls made during THIS turn — settle-verification evidence check
+	 * (a verify round with zero tool calls re-checked nothing). */
+	toolCalls?: number;
 }
 
 /** Delivers an image into the originating IM chat as an inline image message. */
@@ -2021,6 +2024,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			console.warn("[engine] compaction failed:", err);
 		}
 
+		const turnToolCallCount = this.turnToolCalls.get(conversationId) ?? 0;
 		this.recordTurnTelemetry({
 			conversationId,
 			turnId,
@@ -2041,7 +2045,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// retries; the reply is the canned apology). Chain runners use it to PAUSE
 		// and wait for an admin instead of burning budget on turns that will fail
 		// the same way (field 2026-10-05).
-		return { reply, error: hardError ?? (errorMessage ? loginGuidanceOf(errorMessage) ?? errorMessage : undefined), deterministic };
+		return { reply, error: hardError ?? (errorMessage ? loginGuidanceOf(errorMessage) ?? errorMessage : undefined), deterministic, toolCalls: turnToolCallCount };
 	}
 
 	/** One tool call, linked to the turn that made it. Never throws. */

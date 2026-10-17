@@ -62,7 +62,7 @@ export const ROOT_CATALOG: Record<string, string> = {
 	general: "通用（autostart/language/requestTimeoutMin/longTaskProgressMin/maxToolSteps/autoUpdate/oneOffRetentionDays；一次性会话保留天数：定时任务/自主任务/评测会话停止更新超过该天数自动删除，0=不清理，IM 与控制台会话永不自动删）；messageRetentionDays（对话记录保留天数，默认 30，0=不清理）：超龄的消息正文与 turn/tool 遥测自动删除，会话条目保留）",
 	browser: "浏览器自动化（enabled/headless/allowedDomains）",
 	computer: "Cua 桌面控制（enabled/driverPath/allowedApps/allowForeground/allowScheduled/connectTimeoutSec/actionTimeoutSec/sessionTimeoutSec；单位秒，总时限 0=不限时；allowedApps 空数组=拒绝全部，*=全部应用）",
-	scheduler: "定时任务总开关（scheduler.enabled）",
+	scheduler: "定时任务总开关（scheduler.enabled）；scheduler.verifyGate（布尔，默认 true）= 收尾验证门禁：自主任务/自主链声明完成后，系统强制一轮收尾验证（逐条对照目标、用工具重新核实、给证据，[[VERIFY_PASS]]/[[VERIFY_FAIL]]），不过则自动续跑修复，连续 2 轮不过放行并显式报告，false 关闭",
 	prompt: "提示词追加（prompt.extra/prompt.rules；rules 为空时用内置默认）",
 	kb: "知识库（kb.enabled/kb.mode/kb.local.*/kb.embedding.* 等）",
 	documents: "文档资源（documents.enabled/documents.dir）",

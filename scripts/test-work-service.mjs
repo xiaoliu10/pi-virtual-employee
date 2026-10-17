@@ -39,14 +39,23 @@ function fixture(t, overrides = {}) {
 		store: h.store, clock: h.clock, budget: { maxTurns: 3, maxMinutes: 30 },
 		isAdmin: id => h.admin && id === "admin",
 		open: (item, cid) => ({ id: item.id, cid, abort: () => h.aborted.push(item.id) }),
-		send: async (session, message, actor) => { h.sends.push({ session, message, actor }); return overrides.send ? overrides.send(h, session, message) : { reply: "成果\n[[TASK_DONE]]" }; },
+		send: async (session, message, actor) => {
+			h.sends.push({ session, message, actor });
+			if (overrides.send) return overrides.send(h, session, message);
+			// Settle-verify gate is OFF in the base fixture (gate tests opt in);
+			// when a test flips it on, the default verify round passes with evidence.
+			if (message.includes("【收尾验证")) return { reply: "目标逐条已复核：重新查询结果页，0 异常。\n[[VERIFY_PASS]]", toolCalls: 2 };
+			return { reply: "成果\n[[TASK_DONE]]" };
+		},
 		release: async cid => { h.released.push(cid); if (overrides.release) await overrides.release(h); },
 		push: async (cid, text) => { h.pushes.push({ cid, text }); if (overrides.push) await overrides.push(h); },
 		learn: (item, result) => { h.learned.push({ item, result }); },
 		onError: err => h.errors.push(err),
 		lastInboundAt: overrides.lastInboundAt ? (cid, sinceTs) => overrides.lastInboundAt(cid, sinceTs) : undefined,
+		verifyGate: () => h.verifyGateOn === true,
 		...overrides.options,
 	});
+	h.verifyGateOn = false;
 	h.create = (status = "queued", extra = {}) => h.store.create({ title: "月末对账", goal: "完成月末核对", status, createdBy: "admin", originConversation: "dt:source", ...extra });
 	h.gate = () => { const gate = deferred(); h.gates.push(gate); return gate; };
 	t.after(async () => { for (const gate of h.gates) gate.resolve({ reply: "[[TASK_DONE]]" }); await h.service.stop(); db.close(); });
@@ -879,4 +888,88 @@ test("fake clock + deferred gate exit cleanly: no leaked timers after an unlimit
 	assert.equal(h.released.length, 1, "the conversation was released");
 	await h.service.stop();
 	assert.equal(h.clock.timers.size, 0, "stop() leaves nothing behind");
+});
+
+// ── settle verification gate（borrowed verify-gate pattern，2026-10-16 设计）──
+
+const gateOn = { options: { verifyGate: () => true } };
+
+test("verify gate ON: done claim triggers an evidence verify round; PASS settles", async t => {
+	const h = fixture(t, { ...gateOn, send: (h, session, message) => {
+		if (h.sends.length === 1) return { reply: "核对全部完成\n[[TASK_DONE]]" };
+		assert.match(message, /收尾验证/);
+		assert.match(message, /完成月末核对/);
+		return { reply: "目标逐条已复核：重新查询对账结果页，0 异常。\n[[VERIFY_PASS]]", toolCalls: 2 };
+	} });
+	const item = h.create(); h.service.start(); await flush();
+	assert.equal(h.store.get(item.id).status, "done");
+	assert.equal(h.store.get(item.id).verify_streak, 0);
+	assert.equal(h.sends.length, 2, "work turn + verify turn only");
+	assert.doesNotMatch(h.pushes[0].text, /验证连续/);
+});
+
+test("verify FAIL → auto repair round (with the failure note) → done → PASS settles", async t => {
+	const h = fixture(t, { ...gateOn, send: (h, session, message) => {
+		if (h.sends.length === 1) return { reply: "全部完成\n[[TASK_DONE]]" };
+		if (h.sends.length === 2) return { reply: "[[VERIFY_FAIL]]: 金额未逐条核对", toolCalls: 1 };
+		if (h.sends.length === 3) {
+			assert.match(message, /收尾验证未通过/);
+			assert.match(message, /金额未逐条核对/);
+			assert.match(message, /继续修复/);
+			return { reply: "已补齐金额核对\n[[TASK_DONE]]" };
+		}
+		return { reply: "补核完成：128 条金额已逐条核对。\n[[VERIFY_PASS]]", toolCalls: 3 };
+	} });
+	const item = h.create(); h.service.start(); await flush();
+	assert.equal(h.store.get(item.id).status, "done");
+	assert.equal(h.store.get(item.id).verify_streak, 0, "pass resets the streak");
+	assert.equal(h.sends.length, 4);
+	assert.doesNotMatch(h.pushes[0].text, /验证连续/);
+});
+
+test("two consecutive verify FAILs force-settle with the explicit release report", async t => {
+	const h = fixture(t, { ...gateOn, send: (h, session, message) => {
+		if (h.sends.length === 1) return { reply: "完成\n[[TASK_DONE]]" };
+		if (h.sends.length === 2) return { reply: "[[VERIFY_FAIL]]: A 未达成", toolCalls: 1 };
+		if (h.sends.length === 4) return { reply: "[[VERIFY_FAIL]]: B 未达成", toolCalls: 1 };
+		return { reply: "修复完成\n[[TASK_DONE]]" };
+	} });
+	const item = h.create(); h.service.start(); await flush();
+	assert.equal(h.store.get(item.id).status, "done", "released, not looping");
+	assert.equal(h.store.get(item.id).verify_streak, 2);
+	assert.match(h.pushes[0].text, /⚠️ 收尾验证连续 2 轮未通过，已按防死循环策略放行：B 未达成/);
+});
+
+test("verify PASS without tool evidence counts as a fail (nothing was re-checked)", async t => {
+	const h = fixture(t, { ...gateOn, send: (h, session, message) => {
+		if (h.sends.length === 1) return { reply: "完成\n[[TASK_DONE]]" };
+		if (h.sends.length === 2) return { reply: "都完成了\n[[VERIFY_PASS]]", toolCalls: 0 };
+		if (h.sends.length === 3) {
+			assert.match(message, /实际核查|未达成/);
+			return { reply: "完成\n[[TASK_DONE]]" };
+		}
+		return { reply: "复核属实\n[[VERIFY_PASS]]", toolCalls: 1 };
+	} });
+	const item = h.create(); h.service.start(); await flush();
+	assert.equal(h.store.get(item.id).status, "done");
+	assert.equal(h.store.get(item.id).verify_streak, 0, "the eventual real pass resets");
+	assert.ok(h.sends.length >= 4);
+});
+
+test("gate OFF (default in fixture): done settles immediately, no verify round", async t => {
+	const h = fixture(t, { send: () => ({ reply: "完成\n[[TASK_DONE]]" }) });
+	const item = h.create(); h.service.start(); await flush();
+	assert.equal(h.store.get(item.id).status, "done");
+	assert.equal(h.sends.length, 1, "no verification round");
+});
+
+test("verify streak persists (crash mid-gate does not reset the meter)", async t => {
+	const h = fixture(t);
+	const item = h.create("queued");
+	h.store.setVerifyState(item.id, 1, "A 未达成");
+	assert.equal(h.store.get(item.id).verify_streak, 1);
+	assert.equal(h.store.get(item.id).verify_note, "A 未达成");
+	h.store.setVerifyState(item.id, 0, null);
+	assert.equal(h.store.get(item.id).verify_streak, 0);
+	assert.equal(h.store.get(item.id).verify_note, null);
 });

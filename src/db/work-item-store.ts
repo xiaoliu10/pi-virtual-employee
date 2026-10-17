@@ -34,6 +34,10 @@ export interface WorkItemRow {
 	/** Verified confirming admin, not the conversation's proposer. */
 	created_by: string | null;
 	created_channel: string | null;
+	/** Settle-verify gate: consecutive failed verification rounds (2 = forced release). */
+	verify_streak: number;
+	/** Last verification failure note (what the model said was unmet). */
+	verify_note: string | null;
 	/** Retained until the first successful resumed send. */
 	answer: string | null;
 	created_at: number;
@@ -73,11 +77,13 @@ export class WorkItemStore {
 			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0, fallback_streak: 0, last_remind_at: null, remind_count: 0, cadence_ms: null, kicked_off: 0,
 			created_by: input.createdBy ?? null,
 			created_channel: input.createdChannel ?? null,
+			verify_streak: 0,
+			verify_note: null,
 			answer: null, created_at: now, updated_at: now,
 		};
 		this.db.prepare(`INSERT INTO work_items
-			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, last_remind_at, remind_count, cadence_ms, kicked_off, created_by, created_channel, answer, created_at, updated_at)
-			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @last_remind_at, @remind_count, @cadence_ms, @kicked_off, @created_by, @created_channel, @answer, @created_at, @updated_at)`).run(row);
+			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, last_remind_at, remind_count, cadence_ms, kicked_off, created_by, created_channel, verify_streak, verify_note, answer, created_at, updated_at)
+			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @last_remind_at, @remind_count, @cadence_ms, @kicked_off, @created_by, @created_channel, @verify_streak, @verify_note, @answer, @created_at, @updated_at)`).run(row);
 		this.changed(row.id);
 		return row;
 	}
@@ -229,6 +235,15 @@ export class WorkItemStore {
 	clearAnswer(id: string, expected?: string): void {
 		this.db.prepare(`UPDATE work_items SET answer = NULL WHERE id = ? AND status = 'working'${expected === undefined ? "" : " AND answer = ?"}`)
 			.run(...(expected === undefined ? [id] : [id, expected]));
+	}
+
+	/** Settle-verify gate bookkeeping: consecutive failed rounds + last note
+	 * (streak 0 / null note = clear). Persisted so a crash mid-gate cannot
+	 * reset the anti-deadloop meter. */
+	setVerifyState(id: string, streak: number, note: string | null): void {
+		this.db
+			.prepare("UPDATE work_items SET verify_streak = ?, verify_note = ?, updated_at = ? WHERE id = ?")
+			.run(Math.max(0, Math.floor(streak)), note, Date.now(), id);
 	}
 
 	confirm(id: string, createdBy: string, createdChannel?: string): WorkItemRow | undefined {

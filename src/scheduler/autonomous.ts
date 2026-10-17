@@ -16,6 +16,15 @@
 
 export const AUTONOMOUS_DONE_MARK = "[[TASK_DONE]]";
 export const AUTONOMOUS_HUMAN_MARK = "[[NEED_HUMAN]]";
+/** Settle-verification marks (verify-gate, 2026-10-16): after a done claim the
+ * system runs ONE evidence round — the model must re-check the goal and write
+ * one of these. Both are system-protocol marks, never model-initiable settles. */
+export const AUTONOMOUS_VERIFY_PASS_MARK = "[[VERIFY_PASS]]";
+export const AUTONOMOUS_VERIFY_FAIL_MARK = "[[VERIFY_FAIL]]";
+/** Anti-deadloop: after this many consecutive FAILED verification rounds the
+ * gate releases the task anyway and reports the failure explicitly. The model
+ * is never told this number — it would hand it an exit to aim for. */
+export const VERIFY_GIVE_UP = 2;
 /** Immediate-sedimentation marker: the model emits it the moment a path to the
  * solution is found (after long exploration) — context compaction would
  * otherwise wipe the discovery before the task ends. Parsed, saved to the KB,
@@ -39,6 +48,11 @@ export interface AutonomousChainState {
 	question?: string;
 	/** The user's reply, staged by resume and consumed on the next turn 0. */
 	answer?: string;
+	/** Settle-verify gate: consecutive failed verification rounds (persisted —
+	 * a crash mid-gate must not reset the meter). */
+	verifyStreak?: number;
+	/** Last verification failure note (what the model said was unmet). */
+	verifyNote?: string;
 }
 
 export interface AutonomousBudget {
@@ -107,6 +121,8 @@ export function parseChainState(raw: string | null | undefined): AutonomousChain
 			stallCount: Number.isFinite(v.stallCount) ? Math.max(0, Math.floor(v.stallCount as number)) : 0,
 			question: typeof v.question === "string" ? v.question : undefined,
 			answer: typeof v.answer === "string" ? v.answer : undefined,
+			verifyStreak: Number.isFinite(v.verifyStreak) ? Math.max(0, Math.floor(v.verifyStreak as number)) : 0,
+			verifyNote: typeof v.verifyNote === "string" ? v.verifyNote : undefined,
 		};
 	} catch {
 		return null;
@@ -196,6 +212,39 @@ export function parseChainReply(reply: string): {
 	return { kind: "continue", text: stripMarkerLines(reply), remember: remembers };
 }
 
+/**
+ * The settle-verification round's user message. Evidence-based by design: the
+ * model must RE-CHECK the goal with real reads/queries and quote what it saw —
+ * "still done" from memory is exactly the rubber stamp this gate exists to
+ * prevent (field 2026-10-16: a degraded model declared done on fragment work).
+ */
+export function buildSettleVerifyPrompt(task: { title: string; goal?: string | null }): string {
+	const goal = (task.goal ?? "").trim();
+	return [
+		`【收尾验证（系统强制，非走过场）】你声明「${task.title}」已完成。放行前请验证一次：`,
+		goal ? `① 把目标逐条列出，逐条对照当前真实状态：${goal}` : "① 把本次要达成的结果逐条列出，逐条对照当前真实状态；",
+		"② 每条给出刚发生的证据——重新读取/查询了什么（页面、数据、文件、命令输出），把看到的关键结果原样摘录；凭记忆复述不算证据；",
+		"③ 没有重新核实过的条目，现在就用工具实际查一次再下结论。",
+		`最后一行单独写 ${AUTONOMOUS_VERIFY_PASS_MARK}（每条都有证据支持）或 ${AUTONOMOUS_VERIFY_FAIL_MARK}: 哪条未达成/存疑。`,
+	].join("\n");
+}
+
+/** Classify a verification round's reply. FAIL wins when both marks appear —
+ * a model claiming pass while admitting an unmet item is a fail. */
+export function parseVerifyReply(reply: string): { kind: "pass" | "fail" | "none"; note?: string } {
+	const failIdx = markerLineIndex(reply, AUTONOMOUS_VERIFY_FAIL_MARK);
+	const passIdx = markerLineIndex(reply, AUTONOMOUS_VERIFY_PASS_MARK);
+	if (failIdx >= 0 && (passIdx < 0 || failIdx > passIdx)) {
+		const raw = stripLineEmphasis(reply.split("\n")[failIdx]).trim();
+		const note = raw.startsWith(AUTONOMOUS_VERIFY_FAIL_MARK)
+			? raw.slice(AUTONOMOUS_VERIFY_FAIL_MARK.length).replace(/^[:：\s]+/, "").trim()
+			: "";
+		return { kind: "fail", note };
+	}
+	if (passIdx >= 0) return { kind: "pass" };
+	return { kind: "none" };
+}
+
 function stripMarkerLines(text: string): string {
 	return text
 		.split("\n")
@@ -245,7 +294,7 @@ export function buildAutonomousTurnPrefix(opts: {
 		: `预算：不限制轮数（时长上限 ${opts.budget.maxMinutes} 分钟）：没有「轮数用尽」这回事，不要因为假想轮数将尽而自行停下或草草收尾，是否结束只由收尾标记或时间上限决定；请高效推进，优先完成关键路径。`;
 	const protocol = [
 		`回合结束规则（必须遵守）：`,
-		`- 目标已全部完成 → 回复最后一行单独写 ${AUTONOMOUS_DONE_MARK}，并在它上面给出成果总结。`,
+		`- 目标已全部完成 → 回复最后一行单独写 ${AUTONOMOUS_DONE_MARK}，并在它上面给出成果总结。声明完成后系统会追加一轮收尾验证（逐条对照目标、用工具重新核实、给出证据，最后一行单独写 ${AUTONOMOUS_VERIFY_PASS_MARK} 或 ${AUTONOMOUS_VERIFY_FAIL_MARK}: 未达成项）——验证不过会自动继续修复，通过才算真正完成。`,
 		`- 卡住了必须问人（缺账号/权限/登录态失效等）→ ${kbSearch ? `先用 search_knowledge_base 查一遍（账号密码/地址入口/流程/规则大概率已有沉淀；明显只有人能当场提供的信息如验证码、口头确认可免查，问题里写明为什么没查），` : ""}最后一行单独写 ${AUTONOMOUS_HUMAN_MARK}: 要问的问题${kbSearch ? "，并写明「已查知识库（关键词 X），未找到」及已尝试的办法" : "，写明已尝试的办法"}。链条会暂停等人回复。`,
 		`- 还没完成也不需要问人 → 正常输出进展即可，不要写任何标记，系统会让你继续。`,
 		`- 无人值守：先检测登录状态再操作。${kbSearch ? `登录过期/账号异常 → 先 search_knowledge_base 搜「系统名 + 登录/账号」找最新的账号密码或登录指引，找得到就自己重新登录继续干；知识库确实没有才 ` : `登录过期直接 `}${AUTONOMOUS_HUMAN_MARK} 说明${kbSearch ? "（注明已查知识库无果）" : ""}，不要尝试索要验证码。`,

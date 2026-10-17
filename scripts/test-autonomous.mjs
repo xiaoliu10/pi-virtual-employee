@@ -36,6 +36,9 @@ const {
 	buildLearnTurnAsk,
 	normalizeBudget,
 	budgetPauseLabel,
+	buildSettleVerifyPrompt,
+	parseVerifyReply,
+	VERIFY_GIVE_UP,
 	turnLimited,
 	turnProgressLabel,
 	parseChainReply,
@@ -105,7 +108,7 @@ test("normalizeBudget: 0/absent/garbage maxTurns = UNLIMITED; explicit positives
 test("parseChainState round-trips and rejects corrupt payloads", () => {
 	const state = { convId: "sched:t1:123", turns: 4, startedAt: 1700000000000, pending: "human", question: "账号?" };
 	const parsed = parseChainState(JSON.stringify(state));
-	assert.deepEqual(parsed, { ...state, answer: undefined, stallCount: 0 });
+	assert.deepEqual(parsed, { ...state, answer: undefined, stallCount: 0, verifyStreak: 0, verifyNote: undefined });
 	assert.equal(parseChainState(null), null);
 	assert.equal(parseChainState("{not json"), null);
 	assert.equal(parseChainState(JSON.stringify({ turns: 3 })), null, "missing convId is not a chain");
@@ -211,4 +214,41 @@ test("nextStallStep: quiet retries first (with backoff), then escalate; parse ke
 	const state = parseChainState(JSON.stringify({ convId: "sched:1:1", turns: 3, stallCount: 2 }));
 	assert.equal(state?.stallCount, 2, "stallCount persists across fires");
 	assert.equal(parseChainState(JSON.stringify({ convId: "sched:1:1", turns: 1 }))?.stallCount, 0, "absent count defaults to 0");
+});
+
+// ── settle verification gate (verify-gate pattern, 2026-10-16) ──
+
+test("parseVerifyReply: FAIL wins over PASS; note extracted; missing marks = none", () => {
+	assert.equal(parseVerifyReply("逐条复核完毕，全部达成。\n[[VERIFY_PASS]]").kind, "pass");
+	const fail = parseVerifyReply("复查发现遗漏。\n[[VERIFY_PASS]]\n[[VERIFY_FAIL]]: 金额未核对");
+	assert.equal(fail.kind, "fail", "FAIL wins even after a PASS");
+	assert.equal(fail.note, "金额未核对");
+	const bare = parseVerifyReply("[[VERIFY_FAIL]]");
+	assert.equal(bare.kind, "fail");
+	assert.equal(bare.note, "", "empty note tolerated");
+	assert.equal(parseVerifyReply("继续推进中").kind, "none");
+	// Markdown-emphasis leading is tolerated, same as the other marks.
+	assert.equal(parseVerifyReply("**[[VERIFY_PASS]]**").kind, "pass");
+});
+
+test("buildSettleVerifyPrompt: carries title, goal, both marks, and the evidence demand", () => {
+	const p = buildSettleVerifyPrompt({ title: "月末对账", goal: "核对全部流水" });
+	assert.match(p, /月末对账/);
+	assert.match(p, /核对全部流水/);
+	assert.match(p, /\[\[VERIFY_PASS\]\]/);
+	assert.match(p, /\[\[VERIFY_FAIL\]\]/);
+	assert.match(p, /凭记忆复述不算证据/);
+	const noGoal = buildSettleVerifyPrompt({ title: "巡检" });
+	assert.match(noGoal, /巡检/);
+	assert.match(noGoal, /本次要达成的结果/);
+});
+
+test("chain state round-trips verifyStreak/verifyNote (crash mid-gate keeps the meter)", () => {
+	const state = { convId: "sched:t1", turns: 3, startedAt: 1000, verifyStreak: 1, verifyNote: "A 未达成" };
+	const restored = parseChainState(JSON.stringify(state));
+	assert.equal(restored.verifyStreak, 1);
+	assert.equal(restored.verifyNote, "A 未达成");
+	const clean = parseChainState(JSON.stringify({ convId: "sched:t1", turns: 1, startedAt: 1000 }));
+	assert.equal(clean.verifyStreak, 0);
+	assert.equal(clean.verifyNote, undefined);
 });

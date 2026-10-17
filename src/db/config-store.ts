@@ -273,7 +273,7 @@ export interface AppConfig {
 	browser: { enabled: boolean; headless: boolean; allowedDomains: string[]; downloadHost: string };
 	computer: ComputerConfig;
 	/** Scheduled tasks: the employee may create timed tasks in conversation; the scheduler runs them at their cron time. */
-	scheduler: { enabled: boolean };
+	scheduler: { enabled: boolean; verifyGate?: boolean };
 	prompt: {
 		/** Editable extra instructions appended after the base prompt. */
 		extra: string;
@@ -458,7 +458,7 @@ const DEFAULTS: AppConfig = {
 	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 30, turnTimeoutMin: 20, maxToolSteps: 20, autoUpdate: true, oneOffRetentionDays: 30, messageRetentionDays: 30 },
 	browser: { enabled: false, headless: true, allowedDomains: [], downloadHost: "" },
 	computer: DEFAULT_COMPUTER_CONFIG,
-	scheduler: { enabled: true },
+	scheduler: { enabled: true, verifyGate: true },
 	prompt: { extra: "", rules: "" },
 	documents: { enabled: false, dir: "" },
 	filesystem: { enabled: false, allowedDirs: ["~/Downloads"] },
@@ -981,6 +981,7 @@ export class ConfigStore {
 					security: normalizeSecurity(merged),
 					capabilities: normalizeCapabilities(merged),
 					computer: normalizeComputerConfig(merged.computer),
+					scheduler: { ...(merged.scheduler ?? {}), enabled: merged.scheduler?.enabled !== false, verifyGate: merged.scheduler?.verifyGate !== false },
 				};
 				if (JSON.stringify(normalized) !== JSON.stringify(parsed)) this.persist(normalized);
 				return normalized;

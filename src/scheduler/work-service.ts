@@ -1,4 +1,4 @@
-import { nextStallStep, STALL_QUIET_RETRIES } from "./autonomous.js";
+import { buildSettleVerifyPrompt, nextStallStep, parseVerifyReply, STALL_QUIET_RETRIES, VERIFY_GIVE_UP } from "./autonomous.js";
 /**
  * Persistent, single-window work dispatcher. No periodic polling: store lifecycle
  * events wake queued work; one timer wakes the earliest model-selected due time.
@@ -23,10 +23,13 @@ interface ActiveWindow<Session> {
 	prevKicked?: number;
 	session?: Session;
 	stopReason?: string;
+	/** Pending repair instruction from a failed settle-verification round —
+	 * consumed by the next turn's message instead of the bare 「继续。」. */
+	repairNote?: string;
 	deadline?: ReturnType<typeof setTimeout>;
 	settled: Promise<void>;
 }
-type Store = Pick<WorkItemStore, "get" | "listDue" | "listByStatus" | "nextWakeAt" | "claim" | "recoverWorking" | "subscribe" | "setStatus" | "setField" | "clearAnswer" | "setFixedStreak" | "setFallbackStreak" | "markReminded" | "setCadence">;
+type Store = Pick<WorkItemStore, "get" | "listDue" | "listByStatus" | "nextWakeAt" | "claim" | "recoverWorking" | "subscribe" | "setStatus" | "setField" | "clearAnswer" | "setFixedStreak" | "setFallbackStreak" | "markReminded" | "setCadence" | "setVerifyState">;
 interface Clock {
 	now(): number;
 	setTimeout(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
@@ -36,7 +39,7 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	store: Store;
 	isAdmin(senderId: string): boolean;
 	open(item: WorkItemRow, conversationId: string): Session;
-	send(session: Session, message: string, senderId: string, memoryConversationId?: string, memoryChannel?: string): Promise<{ reply?: string; error?: string; deterministic?: boolean }>;
+	send(session: Session, message: string, senderId: string, memoryConversationId?: string, memoryChannel?: string): Promise<{ reply?: string; error?: string; deterministic?: boolean; toolCalls?: number }>;
 	release(conversationId: string): Promise<void>;
 	push(conversationId: string, text: string): Promise<unknown>;
 	/** Live kb.enabled AND kb.learn.enabled, checked at completion. */
@@ -52,6 +55,10 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	 * reminder staleness guard: if the human already replied after the pause,
 	 * the sweep stays quiet instead of nagging about an answered question. */
 	lastInboundAt?(conversationId: string, sinceTs: number): number | null;
+	/** Settle-verify gate switch (live read; absent/true = ON). When on, a
+	 * [[TASK_DONE]] claim must survive one evidence verification round before
+	 * the item settles; 2 consecutive fails release it with an explicit report. */
+	verifyGate?: () => boolean;
 }
 
 export function workLessons(raw: string | null): string[] {
@@ -83,8 +90,10 @@ export class WorkService<Session extends WorkSession> {
 	private active?: ActiveWindow<Session>;
 	private readonly clock: Clock;
 	private readonly budget: { maxTurns: number; maxMinutes: number };
+	private readonly verifyGateOn: () => boolean;
 	constructor(private readonly opts: WorkServiceOptions<Session>) {
 		this.clock = opts.clock ?? { now: Date.now, setTimeout, clearTimeout };
+		this.verifyGateOn = opts.verifyGate ?? (() => true);
 		const b = opts.budget ?? DEFAULT_WINDOW_BUDGET;
 		this.budget = {
 			// maxTurns 0 = unlimited (the default, user ruling 2026-10-13). Invalid
@@ -244,6 +253,11 @@ export class WorkService<Session extends WorkSession> {
 		let nextStreak = 0;
 		let emptyReplies = 0;
 		let stallRetriedThisTurn = false;
+		// Settle-verify gate: set when the gate releases a task after
+		// VERIFY_GIVE_UP consecutive failed verification rounds — the done push
+		// must carry the explicit failure report, never a clean ✅.
+		let verifyReleased = false;
+		let verifyReleaseNote = "";
 		let outcome: "done" | "waiting_human" | "scheduled" = "waiting_human";
 		try {
 			if (!this.running) return;
@@ -298,7 +312,14 @@ export class WorkService<Session extends WorkSession> {
 				let stallAttempt = 0;
 				let result: { reply?: string; error?: string; deterministic?: boolean };
 				for (;;) {
-					result = await this.opts.send(active.session, prefix + (turn === 0 ? "请按目标与执行条件推进工作。" : "继续。"), fresh.created_by, fresh.origin_conversation ?? undefined, fresh.created_channel ?? undefined);
+					const repair = active.repairNote;
+					active.repairNote = undefined;
+					const turnInstruction = turn === 0
+						? "请按目标与执行条件推进工作。"
+						: repair
+							? `上一轮收尾验证未通过：${repair}。请针对未达成项继续修复，完成后重新声明完成。`
+							: "继续。";
+					result = await this.opts.send(active.session, prefix + turnInstruction, fresh.created_by, fresh.origin_conversation ?? undefined, fresh.created_channel ?? undefined);
 					if (!result.error && !result.deterministic) break;
 					stallAttempt += 1;
 					const step = nextStallStep(stallAttempt);
@@ -348,7 +369,46 @@ export class WorkService<Session extends WorkSession> {
 				lastText = decision.text;
 				console.log(`[work] ${item.id.slice(0, 8)} turn ${turn + 1} → ${decision.kind}${decision.kind === "next_check" ? ` raw="${(decision.nextCheckRaw ?? "").slice(0, 120)}" at=${decision.nextCheckAt ?? "invalid"}` : ""}`);
 				if (decision.kind === "human") { question = decision.question || lastText || "需要管理员协助并明确恢复。"; break; }
-				if (decision.kind === "done") { outcome = "done"; break; }
+				if (decision.kind === "done") {
+					// SETTLE VERIFICATION GATE — a done claim must survive one
+					// evidence round (re-check the goal with real reads, quote what
+					// was seen) before the item settles. 2 consecutive failed rounds
+					// release the task WITH an explicit failure report in the done
+					// push (anti-deadloop; the model is never told the limit).
+					if (!this.verifyGateOn()) { outcome = "done"; break; }
+					const streak = current.verify_streak ?? 0;
+					if (streak >= VERIFY_GIVE_UP) {
+						verifyReleased = true;
+						verifyReleaseNote = current.verify_note || "未达成项未记录";
+						outcome = "done";
+						break;
+					}
+					const vSend = await this.opts.send(active.session, buildSettleVerifyPrompt({ title: current.title, goal: current.goal }), fresh.created_by, fresh.origin_conversation ?? undefined, fresh.created_channel ?? undefined);
+					if (vSend.error) throw new Error(vSend.error);
+					if (vSend.deterministic) throw new Error("模型服务中断，未产出回复");
+					const verdict = parseVerifyReply(vSend.reply ?? "");
+					const hadEvidence = (vSend.toolCalls ?? 0) > 0;
+					if (verdict.kind === "pass" && hadEvidence) {
+						store.setVerifyState(item.id, 0, null);
+						outcome = "done";
+						break;
+					}
+					const note = (verdict.kind === "fail"
+						? (verdict.note || "未达成")
+						: verdict.kind === "pass"
+							? "验证未包含实际核查动作（没有用工具重新核实）"
+							: "验证轮没有给出明确结论").slice(0, 300);
+					store.setVerifyState(item.id, streak + 1, note);
+					if (streak + 1 >= VERIFY_GIVE_UP) {
+						verifyReleased = true;
+						verifyReleaseNote = note;
+						outcome = "done";
+						break;
+					}
+					console.warn(`[work] ${item.id.slice(0, 8)} settle verification failed (${streak + 1}/${VERIFY_GIVE_UP}): ${note}`);
+					active.repairNote = note;
+					continue;
+				}
 				if (decision.kind === "next_check") {
 					if (decision.nextCheckAt === undefined) {
 						// The model clearly WANTED a follow-up but the declared time was
@@ -429,7 +489,7 @@ export class WorkService<Session extends WorkSession> {
 			const scheduledReason = nowRow.next_check_reason ?? nextReason;
 			const streak = nowRow.fixed_streak ?? 0;
 			const text = nowRow.status === "done"
-				? `✅ **自主任务完成：${nowRow.title}**\n\n${lastText}`
+				? `✅ **自主任务完成：${nowRow.title}**\n\n${verifyReleased ? `⚠️ 收尾验证连续 ${VERIFY_GIVE_UP} 轮未通过，已按防死循环策略放行：${verifyReleaseNote}\n\n` : ""}${lastText}`
 				: nowRow.status === "scheduled"
 					? `🔁 **自主任务阶段进展：${nowRow.title}**\n\n${lastText.slice(-500)}\n\n下次跟进：${new Date(scheduledAt).toLocaleString("zh-CN", { hour12: false })}${scheduledReason ? `（${scheduledReason}）` : ""}${streak >= 3 ? `\n\n⚠️ 已连续 ${streak} 次只在相近的固定时间跟进这一个点。如果这是因为它有新信息可查（如某个批次在该时刻生成），写明依据可继续；但记得覆盖今天其他观察点。若这件工作每天只在这一处查、且查了也不需要判断动作，可建议管理员转成定时任务，自主任务留给需要判断力的跟进。` : ""}`
 					: `⏸️ **自主任务需要人工：${nowRow.title}**\n\n${nowRow.question}\n\n管理员在来源会话直接回复答复内容（如验证码、预计解决时间）即可继续；恢复前不会自动执行。`;

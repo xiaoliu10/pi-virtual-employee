@@ -30,10 +30,13 @@ import {
 	parseChainReply,
 	parseChainState,
 	buildLearnTurnAsk,
+	buildSettleVerifyPrompt,
+	parseVerifyReply,
 	budgetPauseLabel,
 	turnProgressLabel,
 	nextStallStep,
 	STALL_QUIET_RETRIES,
+	VERIFY_GIVE_UP,
 } from "../src/scheduler/autonomous.js";
 import { TelemetryStore } from "../src/db/telemetry-store.js";
 import { ProposalStore } from "../src/engine/proposals.js";
@@ -623,6 +626,11 @@ async function main(): Promise<void> {
 		let lastText = "";
 		let outcome: "done" | "human" | "budget" | "stalled" | "error" = "error";
 		let question: string | undefined;
+		// Settle-verify gate state (per fire): a failed verification queues this
+		// repair instruction for the next turn's message; consecutive failed
+		// rounds past VERIFY_GIVE_UP release the chain with an explicit report.
+		let chainRepairNote: string | undefined;
+		let chainReleaseNote = "";
 		try {
 			// True right after a silent stall-retry: the full prompt is already in
 			// history — resume with a short "继续。" instead of injecting it again.
@@ -644,7 +652,9 @@ async function main(): Promise<void> {
 				// for days, and a continuation turn after midnight (or a stall
 				// resume, which used to skip the stamp entirely) otherwise leaves
 				// the model anchoring "today" on history dates (field 2026-10-09).
-				const message = scheduledTimePrefix() + (chain.turns === 0 && !stallResumed ? prefix + answerBlock + task.prompt + resumeKbHint : prefix + "继续。");
+				const message = scheduledTimePrefix() + (chain.turns === 0 && !stallResumed
+					? prefix + answerBlock + task.prompt + resumeKbHint
+					: prefix + (chainRepairNote ? `上一轮收尾验证未通过：${chainRepairNote}。请针对未达成项继续修复，完成后重新声明完成。` : "继续。"));
 				const send = await engine.send(agent, message, {
 					// Same creator-identity re-attachment as single-turn runs: guarded
 					// tools authorize against the LIVE role on every turn.
@@ -721,6 +731,72 @@ async function main(): Promise<void> {
 					break;
 				}
 				if (decision.kind === "done") {
+					// SETTLE VERIFICATION GATE — same protocol as work items: one
+					// evidence round before the chain settles; 2 consecutive fails
+					// release with an explicit report (anti-deadloop).
+					if (config.all().scheduler?.verifyGate !== false) {
+						const streak = chain.verifyStreak ?? 0;
+						if (streak >= VERIFY_GIVE_UP) {
+							chainReleaseNote = chain.verifyNote || "未达成项未记录";
+							chain.verifyStreak = 0;
+							chain.verifyNote = undefined;
+							outcome = "done";
+							lastText = decision.text;
+							scheduledTaskStore.setChainState(task.id, null);
+							break;
+						}
+						chain.turns += 1;
+						persistChain();
+						const vPrefix = buildAutonomousTurnPrefix({
+							turn: chain.turns, budget,
+							kbEnabled: config.all().kb.enabled,
+							kbLearn: config.all().kb.enabled && config.all().kb.learn.enabled,
+						});
+						const actorOpts = task.created_by
+							? { actor: { senderId: task.created_by, channel: "scheduler" as const, chatType: "single" as const, ...(task.conversation_id ? { memoryConversationId: task.conversation_id } : {}), ...(task.created_channel ? { memoryChannel: task.created_channel } : {}) } }
+							: {};
+						const vSend = await engine.send(agent, scheduledTimePrefix() + vPrefix + buildSettleVerifyPrompt({ title: task.title }), {
+							...actorOpts,
+							onPersist: () => {
+								pushActivity(chain.convId);
+								if (task.conversation_id) pushActivity(task.conversation_id);
+							},
+						});
+						if (vSend.error) {
+							outcome = "error";
+							lastText = vSend.error;
+							scheduledTaskStore.setChainState(task.id, null);
+							break;
+						}
+						if (vSend.deterministic) {
+							outcome = "stalled";
+							chain.pending = "stalled";
+							chain.question = "收尾验证轮模型服务连续未返回内容";
+							persistChain();
+							break;
+						}
+						const verdict = parseVerifyReply(vSend.reply ?? "");
+						const hadEvidence = (vSend.toolCalls ?? 0) > 0;
+						if (verdict.kind === "pass" && hadEvidence) {
+							chain.verifyStreak = 0;
+							chain.verifyNote = undefined;
+							outcome = "done";
+							lastText = decision.text;
+							scheduledTaskStore.setChainState(task.id, null);
+							break;
+						}
+						const note = (verdict.kind === "fail"
+							? (verdict.note || "未达成")
+							: verdict.kind === "pass"
+								? "验证未包含实际核查动作（没有用工具重新核实）"
+								: "验证轮没有给出明确结论").slice(0, 300);
+						chain.verifyStreak = streak + 1;
+						chain.verifyNote = note;
+						chainRepairNote = note;
+						persistChain();
+						appendAppLog(`[sched] chain ${task.id} settle verification failed (${streak + 1}/${VERIFY_GIVE_UP}): ${note}`);
+						continue;
+					}
 					outcome = "done";
 					lastText = decision.text;
 					scheduledTaskStore.setChainState(task.id, null); // chain complete — no stale state
@@ -808,7 +884,7 @@ ${tailForProgress(decision.text)}`;
 			const stalledHint = `\n\n通常是模型服务或中转临时不可用，不是任务内容的问题。排查并处理后任务可从断点原地继续：\n① 检查模型服务状态，或在 设置 → 自定义模型 顶部把其他模型「设为默认」并保存；\n② 恢复任务（resume_scheduled_task 或回复「继续 ${task.title}」）；\n③ 恢复成功后会先检索知识库里的卡点记录再继续（本次卡点已自动沉淀）。`;
 			const pushText =
 				outcome === "done"
-					? `✅ **自主任务完成：${task.title}**（共 ${chain.turns} 轮）\n\n${lastText}`
+					? `✅ **自主任务完成：${task.title}**（共 ${chain.turns} 轮）\n\n${chainReleaseNote ? `⚠️ 收尾验证连续 ${VERIFY_GIVE_UP} 轮未通过，已按防死循环策略放行：${chainReleaseNote}\n\n` : ""}${lastText}`
 					: outcome === "human"
 						? `⏸️ **自主任务暂停（需要人工）:${task.title}**\n\n${question ?? lastText}\n\n回复「继续 ${task.title}」并附上答案，我会带着你的回复继续。`
 						: outcome === "budget"
@@ -870,6 +946,7 @@ ${tailForProgress(decision.text)}`;
 			const kb = config.all().kb;
 			return kb.enabled && kb.learn.enabled;
 		},
+		verifyGate: () => config.all().scheduler?.verifyGate !== false,
 		kbFeatures: () => {
 			const kb = config.all().kb;
 			return { search: kb.enabled, learn: kb.enabled && kb.learn.enabled };

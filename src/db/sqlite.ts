@@ -365,6 +365,8 @@ function migrate(db: DB): void {
 			kicked_off           INTEGER NOT NULL DEFAULT 0,
 			created_by           TEXT,
 			created_channel      TEXT,
+			verify_streak        INTEGER NOT NULL DEFAULT 0,
+			verify_note          TEXT,
 			created_at           INTEGER NOT NULL,
 			updated_at           INTEGER NOT NULL
 		);
@@ -376,6 +378,8 @@ function migrate(db: DB): void {
 	// Staged reply for a waiting_human resume — consumed by the next window's turn 0.
 	if (!workCols.has("answer")) db.exec("ALTER TABLE work_items ADD COLUMN answer TEXT");
 	if (!workCols.has("created_channel")) db.exec("ALTER TABLE work_items ADD COLUMN created_channel TEXT");
+	if (!workCols.has("verify_streak")) db.exec("ALTER TABLE work_items ADD COLUMN verify_streak INTEGER NOT NULL DEFAULT 0");
+	if (!workCols.has("verify_note")) db.exec("ALTER TABLE work_items ADD COLUMN verify_note TEXT");
 	// Adaptive-cadence bookkeeping: the last self-declared reason (re-injected as
 	// context) and how many consecutive windows picked the same daily slot
 	// (>=2 warns the model it is degenerating into a cron, >=3 suggests the

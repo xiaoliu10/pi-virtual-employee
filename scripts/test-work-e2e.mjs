@@ -186,9 +186,14 @@ function harness(t) {
 			assert.doesNotMatch(message, /【首个窗口：先出跟进计划】/);
 			return { reply: "需要审批号才能放行\n[[NEED_HUMAN]]: 需要审批号" };
 		}
+		if (isVerifyRound(message)) {
+			assert.match(message, /收尾验证（系统强制/);
+			return { reply: "逐条复核：审批状态已重新查询，P-778 生效。\n[[VERIFY_PASS]]", toolCalls: 1 };
+		}
 		assert.match(message, /用户对你上一轮问题的回复：审批号 P-778，已可以直接继续/);
 		return { reply: "审批完成，已提交\n[[TASK_DONE]]" };
 	};
+	const isVerifyRound = (message) => message.includes("【收尾验证");
 	// service is referenced by engine.workBridge.fireItem above; assign after.
 	const service = new WorkService({
 		store: workItems,
@@ -315,13 +320,15 @@ test("full lifecycle: seed → mine → confirm → 3 windows → done + learn",
 	assert.equal(row2c.answer, "审批号 P-778，已可以直接继续", "answer staged before the next window");
 	// Window 3 fires (resume re-queued the item; the service picks it up).
 	await flush();
-	assert.equal(h.sends.length, 3, "window 3 send happened");
+	assert.equal(h.sends.length, 4, "window 3 send + settle verification round");
+	assert.match(h.sends[3].message, /收尾验证（系统强制/);
 	const row3 = h.workItems.get(itemId);
 	assert.equal(row3.status, "done");
+	assert.equal(row3.verify_streak, 0, "verified pass resets the meter");
 	assert.equal(row3.answer, null, "answer consumed exactly once");
 	// The answer text must appear in exactly one send (window 3's prefix) and not
 	// in the earlier windows — i.e. consumed once, never re-injected.
-	assert.equal(h.sends.filter((s) => s.message.includes("审批号 P-778")).length, 1);
+	assert.equal(h.sends.filter((s) => s.message.includes("审批号 P-778")).length, 1, "the answer is never re-injected, not even into the verify round");
 	// The done push carries no protocol marker lines (markers are stripped).
 	assert.equal(h.servicePushes.length, 3);
 	const donePush = h.servicePushes[2];
