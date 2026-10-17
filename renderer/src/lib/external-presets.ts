@@ -1,8 +1,10 @@
 /**
- * Renderer-side mirror of src/knowledge/external/presets.ts — the provider
- * config is edited client-side then persisted via config:set, so the preset
- * templates must be available in the renderer to fill the form on type switch.
- * Keep in sync with the main-process copy (browser-safe randomUUID only).
+ * Provider preset templates for the knowledge-base external retrieval config.
+ *
+ * This file is the SINGLE SOURCE OF TRUTH since the old main-process copy
+ * (src/knowledge/external/presets.ts) was removed as dead code (the renderer
+ * was the only real consumer — config is edited client-side then persisted
+ * via config:set). No main-process mirror to keep in sync anymore.
  */
 import type {
 	ExternalDatasetsMapping,

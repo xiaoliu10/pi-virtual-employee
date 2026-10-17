@@ -370,7 +370,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 	/** Prompt lab (evaluation cases / variants / history for prompt.rules). */
 	private promptLab?: PromptLab;
-	setPromptLab(lab: PromptLab): void { this.promptLab = lab; }
+	setPromptLab(lab: PromptLab): void {
+		// Zombie-scan note: call this BEFORE the first session is created
+		// (main.ts does it at startup). We do not bump session revisions here —
+		// a late call would leave already-cached sessions without prompt_lab
+		// until the next skills/memory/model revision rebuild.
+		this.promptLab = lab;
+	}
 
 	/** Improvement-proposal store (written by propose_improvement). */
 	private proposals?: ProposalStore;
