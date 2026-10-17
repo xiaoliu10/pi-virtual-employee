@@ -123,6 +123,70 @@ const TABS: { id: Tab; label: string; icon: JSX.Element }[] = [
 	},
 ];
 
+/** 自主任务编辑弹窗（设置页 → 任务 → 自主任务）：改目标/执行条件。 */
+function WorkEditDialog({ item, onClose, onSaved }: { item: WorkItemView; onClose: () => void; onSaved: () => void }) {
+	const [goal, setGoal] = useState(item.goal ?? "");
+	const [conditions, setConditions] = useState(item.conditions ?? "");
+	const [busy, setBusy] = useState(false);
+	const [err, setErr] = useState("");
+	const save = async () => {
+		setBusy(true); setErr("");
+		const res = await api.workItemEdit(item.id, { goal, conditions });
+		setBusy(false);
+		if (res.ok) { onSaved(); onClose(); } else setErr(res.error ?? "保存失败");
+	};
+	return (
+		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-6" onClick={onClose}>
+			<div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl" onClick={(e) => e.stopPropagation()}>
+				<h3 className="text-[15px] font-semibold text-slate-800">编辑自主任务</h3>
+				<p className="mt-1 text-xs text-slate-400">{item.title} · 执行中请先暂停再改，避免覆盖在飞窗口的修改</p>
+				<label className="mt-4 block text-xs font-medium text-slate-600">目标</label>
+				<textarea value={goal} onChange={(e) => setGoal(e.target.value)} rows={4} className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-blue-400 focus:outline-none" />
+				<label className="mt-3 block text-xs font-medium text-slate-600">执行条件</label>
+				<textarea value={conditions} onChange={(e) => setConditions(e.target.value)} rows={2} className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-blue-400 focus:outline-none" />
+				{err && <p className="mt-2 text-xs text-rose-500">{err}</p>}
+				<div className="mt-4 flex justify-end gap-2">
+					<button type="button" onClick={onClose} className="rounded-lg px-4 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-50">取消</button>
+					<button type="button" onClick={() => void save()} disabled={busy} className="rounded-lg bg-slate-800 px-4 py-1.5 text-xs font-medium text-white hover:bg-slate-900 disabled:opacity-50">{busy ? "保存中…" : "保存"}</button>
+				</div>
+			</div>
+		</div>
+	);
+}
+
+/** 定时任务编辑弹窗（设置页 → 任务 → 定时任务）：改标题/prompt/cron。 */
+function SchedEditDialog({ task, onClose, onSaved }: { task: ScheduledTaskRow; onClose: () => void; onSaved: () => void }) {
+	const [title, setTitle] = useState(task.title);
+	const [prompt, setPrompt] = useState(task.prompt);
+	const [cron, setCron] = useState(task.cron);
+	const [busy, setBusy] = useState(false);
+	const [err, setErr] = useState("");
+	const save = async () => {
+		setBusy(true); setErr("");
+		const res = await api.editScheduledTask(task.id, { title, prompt, cron });
+		setBusy(false);
+		if (res.ok) { onSaved(); onClose(); } else setErr(res.error ?? "保存失败");
+	};
+	return (
+		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-6" onClick={onClose}>
+			<div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl" onClick={(e) => e.stopPropagation()}>
+				<h3 className="text-[15px] font-semibold text-slate-800">编辑定时任务</h3>
+				<label className="mt-4 block text-xs font-medium text-slate-600">标题</label>
+				<input value={title} onChange={(e) => setTitle(e.target.value)} className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-blue-400 focus:outline-none" />
+				<label className="mt-3 block text-xs font-medium text-slate-600">cron（分 时 日 月 周，本地时间）</label>
+				<input value={cron} onChange={(e) => setCron(e.target.value)} className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-sm focus:border-blue-400 focus:outline-none" />
+				<label className="mt-3 block text-xs font-medium text-slate-600">到点执行的指令</label>
+				<textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={4} className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:border-blue-400 focus:outline-none" />
+				{err && <p className="mt-2 text-xs text-rose-500">{err}</p>}
+				<div className="mt-4 flex justify-end gap-2">
+					<button type="button" onClick={onClose} className="rounded-lg px-4 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-50">取消</button>
+					<button type="button" onClick={() => void save()} disabled={busy} className="rounded-lg bg-slate-800 px-4 py-1.5 text-xs font-medium text-white hover:bg-slate-900 disabled:opacity-50">{busy ? "保存中…" : "保存"}</button>
+				</div>
+			</div>
+		</div>
+	);
+}
+
 function Field({ label, children, hint }: { label: string; children: JSX.Element; hint?: string }) {
 	return (
 		<label className="block">
@@ -184,6 +248,8 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 	const [taskTab, setTaskTab] = useState<"scheduled" | "work">("scheduled");
 	const [workItems, setWorkItems] = useState<WorkItemView[]>([]);
 	const refreshWork = () => api.listWorkItems().then(setWorkItems).catch(() => {});
+	const [workEdit, setWorkEdit] = useState<WorkItemView | null>(null);
+	const [schedEdit, setSchedEdit] = useState<ScheduledTaskRow | null>(null);
 	useEffect(() => {
 		if (tab !== "tasks") return;
 		void refreshSched();
@@ -474,6 +540,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 															静默
 															<input type="checkbox" checked={t.silent === 1} onChange={(e) => { void api.setScheduledTaskSilent(t.id, e.target.checked).then(refreshSched); }} className="h-4 w-4 accent-blue-500" />
 														</label>
+														<button type="button" onClick={() => setSchedEdit(t)} className="text-xs font-medium text-blue-600 hover:text-blue-700">编辑</button>
 														<button type="button" onClick={() => void api.deleteScheduledTask(t.id).then(refreshSched)} className="text-xs text-rose-400 hover:text-rose-600">删除</button>
 													</div>
 													<div className="mt-1 text-xs text-slate-500">cron <code className="rounded bg-slate-100 px-1">{t.cron}</code> · 下次 {t.next_run_at ? new Date(t.next_run_at).toLocaleString("zh-CN", { hour12: false }) : "—"} · 上次 {t.last_run_at ? new Date(t.last_run_at).toLocaleString("zh-CN", { hour12: false }) : "—"}{t.last_status ? ` · ${t.last_status}` : ""}</div>
@@ -484,6 +551,8 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 									</section>
 									</>
 									)}
+									{workEdit && <WorkEditDialog item={workEdit} onClose={() => setWorkEdit(null)} onSaved={() => void refreshWork()} />}
+									{schedEdit && <SchedEditDialog task={schedEdit} onClose={() => setSchedEdit(null)} onSaved={() => void refreshSched()} />}
 								</div>
 							</div>
 						) : (

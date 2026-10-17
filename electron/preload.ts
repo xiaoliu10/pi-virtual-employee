@@ -22,6 +22,12 @@ const api = {
 		ipcRenderer.invoke("tasks:schedToggle", id, enabled),
 	setScheduledTaskSilent: (id: string, silent: boolean) =>
 		ipcRenderer.invoke("tasks:schedSilent", id, silent),
+	editScheduledTask: (id: string, patch: { title?: string; prompt?: string; cron?: string; autonomous?: boolean; silent?: boolean }) =>
+		ipcRenderer.invoke("tasks:schedEdit", id, patch),
+	workItemAct: (id: string, action: "pause" | "resume" | "cancel") =>
+		ipcRenderer.invoke("tasks:workAct", id, action),
+	workItemEdit: (id: string, patch: { goal?: string; conditions?: string }) =>
+		ipcRenderer.invoke("tasks:workEdit", id, patch),
 
 	// Report / artifact center
 	testReportTarget: () => ipcRenderer.invoke("reports:test"),
