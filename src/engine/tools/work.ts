@@ -159,9 +159,11 @@ export function createWorkTools(deps: {
 		name: "manage_work_items",
 		label: "自主任务",
 		description:
-			"管理从对话挖掘、由管理员确认的自主任务。查询（list/get）：普通成员仅见本来源会话；管理员可跨会话读取全部自主任务（跨会话条目标注「来源：其他会话」）。变更（confirm/resume/update/pause/cancel）只能在任务来源会话中进行，且需管理员身份。" +
+			"管理从对话挖掘、由管理员确认的自主任务。查询（list/get）：普通成员仅见本来源会话；管理员可跨会话读取全部自主任务（跨会话条目标注「来源：其他会话」）。变更（create/confirm/resume/update/pause/cancel）只能在任务来源会话中进行，且需管理员身份。" +
+			"【术语边界，2026-10-17 现场教训】**自主任务 = 本工具管理的 work item**：员工自己决定观察点与节奏持续跟进，卡住暂停等人，没有固定 cron。**定时任务 = create_scheduled_task 管的东西**：到点执行固定 prompt。用户说「自主任务」时指前者——用本工具的 create/confirm/resume，绝不用 create_scheduled_task 顶替（其 autonomous 参数只是「到点后多跑几轮」，仍是定时任务）。" +
 			"action=list：列出当前来源会话的自主任务；action=get：查看完整目标、执行条件、进展、踩坑和待答问题；" +
 			"action=mine：管理员扫描近期对话并把待确认提案推送到各自来源会话；" +
+			"action=create：来源会话的管理员要求**直接创建**自主任务时一步到位（field 2026-10-17：说「重建自主任务」「建一个自主任务」就用这个，不要退而用 create_scheduled_task——那是定时任务，另一套东西）；需要 title + goal，可附 conditions；创建即入队开工；" +
 			"action=confirm：来源会话的管理员在当前消息明确「确认创建」后开工；可按管理员要求附带改写后的 title/goal/conditions（例如删掉「每天16:30」改为按需跟进），不必原样接受提案；" +
 			"action=resume：来源会话的管理员恢复等待人工/资源的任务——把答复直接告诉员工即可（无需确认口令），answer 持久化为下一轮输入；【铁律】当管理员在会话里直接提供了内容（验证码、账号、参数、决定），而本来源会话有任务正处于 waiting_human/等待人工，这条消息就是给那个任务的答复——直接 resume 它，**严禁** create_scheduled_task 另建任务接手（那会让原任务永远卡住、现场跑两份重复工作，2026-10-17 现场教训）；" +
 			"action=update：按管理员要求调整自主任务——title/goal/conditions 在非执行中状态（排队/等待人工/已计划/提案）可改；执行中请先 action=pause 暂停再调整（避免在飞窗口覆盖你的修改）；nextCheck 可改约下次跟进时间（距现在至少 15 分钟，仅排队/等待人工/已计划状态可改，执行中不能改期）；" +
@@ -170,7 +172,7 @@ export function createWorkTools(deps: {
 		parameters: Type.Object({
 			action: Type.Union([
 				Type.Literal("list"), Type.Literal("get"), Type.Literal("mine"),
-				Type.Literal("confirm"), Type.Literal("resume"), Type.Literal("cancel"),
+				Type.Literal("create"), Type.Literal("confirm"), Type.Literal("resume"), Type.Literal("cancel"),
 				Type.Literal("update"), Type.Literal("pause"),
 			]),
 			id: Type.Optional(Type.String({ description: "自主任务完整 id 或短前缀（list 里取；普通成员的前缀在本来源会话内唯一，管理员在全部会话内唯一）" })),
@@ -183,10 +185,10 @@ export function createWorkTools(deps: {
 		}),
 		async execute(_toolCallId, params) {
 			const p = params as {
-				action: "list" | "get" | "mine" | "confirm" | "resume" | "cancel" | "update" | "pause";
+				action: "list" | "get" | "mine" | "create" | "confirm" | "resume" | "cancel" | "update" | "pause";
 				id?: string; answer?: string; title?: string; goal?: string; conditions?: string; nextCheck?: string; reason?: string;
 			};
-			if (!["list", "get", "mine", "confirm", "resume", "cancel", "update", "pause"].includes(p.action)) return failure("未知的自主任务操作。");
+			if (!["list", "get", "mine", "create", "confirm", "resume", "cancel", "update", "pause"].includes(p.action)) return failure("未知的自主任务操作。");
 			const actor = resolveActor(conversationId);
 			if (!verifiedIMActor(actor, conversationId)) return failure("请在经过平台验证的任务来源 IM 单聊或群聊中管理自主任务。");
 			if (p.action !== "list" && p.action !== "get") {
@@ -195,7 +197,7 @@ export function createWorkTools(deps: {
 				// phrase stays only on confirm — the one deliberate act that starts
 				// unattended execution. Resume/update/pause/cancel rely on the verified
 				// source + live admin role checks.
-				const gate = adminGate(actor, p.action === "confirm");
+				const gate = adminGate(actor, p.action === "confirm" || p.action === "create");
 				if ("content" in gate) return gate;
 			}
 
@@ -209,6 +211,31 @@ export function createWorkTools(deps: {
 				return {
 					content: [{ type: "text", text: `扫描了 ${result.scanned} 个近期会话，提案已分别推送到各自来源会话等待管理员确认。当前会话 ${local.length} 个提案${lines.length ? `：\n${lines.join("\n")}` : "。"}\n管理员须在提案来源会话回复「确认创建」。` }],
 					details: { ok: true, proposals: local.length },
+				};
+			}
+
+			if (p.action === "create") {
+				// Direct creation (field 2026-10-17): the admin says 「重建自主任务」/
+				// 「建一个自主任务」 — the old two-step mine→confirm left the model
+				// with no one-shot entry and it reached for
+				// create_scheduled_task(autonomous:true) instead, which is a
+				// DIFFERENT thing (cron 到点执行 vs 员工自决节奏). One action,
+				// one term: 自主任务 lives in manage_work_items.
+				if (!p.title?.trim() || !p.goal?.trim()) return failure("create 需要 title 与 goal：写清要持续跟进的目标。");
+				const created = workItems.create({
+					title: p.title.trim().slice(0, 80),
+					goal: p.goal.trim().slice(0, 2000),
+					originConversation: conversationId,
+					originNote: `管理员要求直接创建：${p.title.trim().slice(0, 120)}`,
+					status: "queued",
+					createdBy: actor.senderId,
+					createdChannel: actor.channel,
+				});
+				if (p.conditions?.trim()) workItems.setField(created.id, "conditions", p.conditions.trim().slice(0, 1000));
+				const fired = fireItem(created.id);
+				return {
+					content: [{ type: "text", text: `✅ 已创建自主任务「${created.title}」${fired ? "，已开工" : "，已入队，稍后自动开工"}。这是自主任务（员工自己决定观察点与节奏，卡住会暂停等人），不是定时任务；进展会推送到本来源会话。` }],
+					details: { ok: true, created: true, id: created.id, fired, queued: !fired },
 				};
 			}
 
