@@ -1,4 +1,5 @@
-import { buildSettleVerifyPrompt, nextStallStep, parseVerifyReply, STALL_QUIET_RETRIES, VERIFY_GIVE_UP } from "./autonomous.js";
+import { buildSettleVerifyPrompt, nextStallStep, STALL_QUIET_RETRIES, VERIFY_GIVE_UP } from "./autonomous.js";
+import { judgeVerifyRound, settleReleaseReport, settleRepairInstruction } from "./settle-gate.js";
 /**
  * Persistent, single-window work dispatcher. No periodic polling: store lifecycle
  * events wake queued work; one timer wakes the earliest model-selected due time.
@@ -317,7 +318,7 @@ export class WorkService<Session extends WorkSession> {
 					const turnInstruction = turn === 0
 						? "请按目标与执行条件推进工作。"
 						: repair
-							? `上一轮收尾验证未通过：${repair}。请针对未达成项继续修复，完成后重新声明完成。`
+							? settleRepairInstruction(repair)
 							: "继续。";
 					result = await this.opts.send(active.session, prefix + turnInstruction, fresh.created_by, fresh.origin_conversation ?? undefined, fresh.created_channel ?? undefined);
 					if (!result.error && !result.deterministic) break;
@@ -372,41 +373,55 @@ export class WorkService<Session extends WorkSession> {
 				if (decision.kind === "done") {
 					// SETTLE VERIFICATION GATE — a done claim must survive one
 					// evidence round (re-check the goal with real reads, quote what
-					// was seen) before the item settles. 2 consecutive failed rounds
-					// release the task WITH an explicit failure report in the done
-					// push (anti-deadloop; the model is never told the limit).
+					// was seen) before the item settles. Judgment (evidence check,
+					// anti-deadloop cap, copy) lives in the shared settle-gate core;
+					// this shell only sends and persists.
 					if (!this.verifyGateOn()) { outcome = "done"; break; }
 					const streak = current.verify_streak ?? 0;
 					if (streak >= VERIFY_GIVE_UP) {
+						// Crash-resume path: the meter survived a previous window —
+						// release now with the old note, and CLEAR the meter (done is
+						// terminal; stale state must not leak into later windows).
 						verifyReleased = true;
 						verifyReleaseNote = current.verify_note || "未达成项未记录";
-						outcome = "done";
-						break;
-					}
-					const vSend = await this.opts.send(active.session, buildSettleVerifyPrompt({ title: current.title, goal: current.goal }), fresh.created_by, fresh.origin_conversation ?? undefined, fresh.created_channel ?? undefined);
-					if (vSend.error) throw new Error(vSend.error);
-					if (vSend.deterministic) throw new Error("模型服务中断，未产出回复");
-					const verdict = parseVerifyReply(vSend.reply ?? "");
-					const hadEvidence = (vSend.toolCalls ?? 0) > 0;
-					if (verdict.kind === "pass" && hadEvidence) {
 						store.setVerifyState(item.id, 0, null);
 						outcome = "done";
 						break;
 					}
-					const note = (verdict.kind === "fail"
-						? (verdict.note || "未达成")
-						: verdict.kind === "pass"
-							? "验证未包含实际核查动作（没有用工具重新核实）"
-							: "验证轮没有给出明确结论").slice(0, 300);
-					store.setVerifyState(item.id, streak + 1, note);
-					if (streak + 1 >= VERIFY_GIVE_UP) {
-						verifyReleased = true;
-						verifyReleaseNote = note;
+					// The verify round gets the SAME quiet backoff retries as a
+					// normal turn (review P1-3, 2026-10-16): the moment closest to
+					// completion is the worst place for a single-shot failure point.
+					// Only graded exhaustion reaches the honest pause below.
+					let vAttempt = 0;
+					let vSend: { reply?: string; error?: string; deterministic?: boolean; toolCalls?: number };
+					for (;;) {
+						vSend = await this.opts.send(active.session, buildSettleVerifyPrompt({ title: current.title, goal: current.goal }), fresh.created_by, fresh.origin_conversation ?? undefined, fresh.created_channel ?? undefined);
+						if (!vSend.error && !vSend.deterministic) break;
+						vAttempt += 1;
+						const step = nextStallStep(vAttempt);
+						if (step.action !== "retry" || active.stopReason || !this.running) break;
+						stallRetriedThisTurn = true;
+						console.warn(`[work] ${item.id.slice(0, 8)} settle verification: send produced no reply; silent retry ${vAttempt}/${STALL_QUIET_RETRIES} in ${Math.round(step.backoffMs / 1000)}s`);
+						await new Promise<void>((resolve) => { this.clock.setTimeout(resolve, step.backoffMs); });
+						if (active.stopReason || !this.running) break;
+					}
+					if (vSend.error) throw new Error(vSend.error);
+					if (vSend.deterministic) throw new Error("模型服务中断，未产出回复");
+					const gate = judgeVerifyRound({ reply: vSend.reply ?? "", toolCalls: vSend.toolCalls ?? 0 }, streak);
+					if (gate.action === "pass") {
+						store.setVerifyState(item.id, 0, null);
 						outcome = "done";
 						break;
 					}
-					console.warn(`[work] ${item.id.slice(0, 8)} settle verification failed (${streak + 1}/${VERIFY_GIVE_UP}): ${note}`);
-					active.repairNote = note;
+					store.setVerifyState(item.id, gate.streak, gate.action === "repair" ? gate.note : null);
+					if (gate.action === "release") {
+						verifyReleased = true;
+						verifyReleaseNote = gate.note;
+						outcome = "done";
+						break;
+					}
+					console.warn(`[work] ${item.id.slice(0, 8)} settle verification failed (${gate.streak}/${VERIFY_GIVE_UP}): ${gate.note}`);
+					active.repairNote = gate.note;
 					continue;
 				}
 				if (decision.kind === "next_check") {
@@ -489,7 +504,7 @@ export class WorkService<Session extends WorkSession> {
 			const scheduledReason = nowRow.next_check_reason ?? nextReason;
 			const streak = nowRow.fixed_streak ?? 0;
 			const text = nowRow.status === "done"
-				? `✅ **自主任务完成：${nowRow.title}**\n\n${verifyReleased ? `⚠️ 收尾验证连续 ${VERIFY_GIVE_UP} 轮未通过，已按防死循环策略放行：${verifyReleaseNote}\n\n` : ""}${lastText}`
+				? `✅ **自主任务完成：${nowRow.title}**\n\n${verifyReleased ? `${settleReleaseReport(verifyReleaseNote)}\n\n` : ""}${lastText}`
 				: nowRow.status === "scheduled"
 					? `🔁 **自主任务阶段进展：${nowRow.title}**\n\n${lastText.slice(-500)}\n\n下次跟进：${new Date(scheduledAt).toLocaleString("zh-CN", { hour12: false })}${scheduledReason ? `（${scheduledReason}）` : ""}${streak >= 3 ? `\n\n⚠️ 已连续 ${streak} 次只在相近的固定时间跟进这一个点。如果这是因为它有新信息可查（如某个批次在该时刻生成），写明依据可继续；但记得覆盖今天其他观察点。若这件工作每天只在这一处查、且查了也不需要判断动作，可建议管理员转成定时任务，自主任务留给需要判断力的跟进。` : ""}`
 					: `⏸️ **自主任务需要人工：${nowRow.title}**\n\n${nowRow.question}\n\n管理员在来源会话直接回复答复内容（如验证码、预计解决时间）即可继续；恢复前不会自动执行。`;

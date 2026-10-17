@@ -115,7 +115,7 @@ class Clock {
 	}
 }
 
-const MARKS = ["[[TASK_DONE]]", "[[NEED_HUMAN]]", "[[NEXT_CHECK]]"];
+const MARKS = ["[[TASK_DONE]]", "[[NEED_HUMAN]]", "[[NEXT_CHECK]]", "[[VERIFY_PASS]]", "[[VERIFY_FAIL]]"];
 
 /** Scripted LLM for mining: parse the (untrusted) prompt data line and return one
  *  valid proposal whose evidence + message id come from the actual seeded snippet

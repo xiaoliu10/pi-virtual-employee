@@ -936,7 +936,7 @@ test("two consecutive verify FAILs force-settle with the explicit release report
 	} });
 	const item = h.create(); h.service.start(); await flush();
 	assert.equal(h.store.get(item.id).status, "done", "released, not looping");
-	assert.equal(h.store.get(item.id).verify_streak, 2);
+	assert.equal(h.store.get(item.id).verify_streak, 0, "release clears the meter (P2-3)");
 	assert.match(h.pushes[0].text, /⚠️ 收尾验证连续 2 轮未通过，已按防死循环策略放行：B 未达成/);
 });
 
@@ -972,4 +972,45 @@ test("verify streak persists (crash mid-gate does not reset the meter)", async t
 	h.store.setVerifyState(item.id, 0, null);
 	assert.equal(h.store.get(item.id).verify_streak, 0);
 	assert.equal(h.store.get(item.id).verify_note, null);
+});
+
+// ── settle-gate 补充（独立审查 P1-1/P1-3/P2-3/P2-4，2026-10-16）──
+
+test("verify round transient failure is absorbed by the same quiet retries; PASS still settles", async t => {
+	let calls = 0;
+	const h = fixture(t, { options: { verifyGate: () => true }, send: () => {
+		calls += 1;
+		if (calls === 1) return { reply: "核对完成\n[[TASK_DONE]]" };
+		if (calls === 2) return { deterministic: true, reply: "很抱歉，刚才没有产出" };
+		if (calls === 3) return { error: "Connection error." };
+		return { reply: "逐条复核属实，0 异常。\n[[VERIFY_PASS]]", toolCalls: 1 };
+	} });
+	const item = h.create(); h.service.start(); await flush();
+	await h.clock.advance(10 * 60_000); await flush();
+	assert.equal(h.store.get(item.id).status, "done", "verify blips are absorbed, then PASS settles");
+	assert.equal(calls, 4, "work turn + 3 verify attempts (2 quiet retries)");
+	assert.ok(!h.pushes.some(p => /执行出错/.test(p.text)), "no execution-error surface for an absorbed blip");
+});
+
+test("verify round persistent failure reaches the honest pause with retry-aware copy", async t => {
+	const h = fixture(t, { options: { verifyGate: () => true }, send: () => {
+		if (h.sends.length === 1) return { reply: "完成\n[[TASK_DONE]]" };
+		return { deterministic: true, reply: "很抱歉，刚才没有产出" };
+	} });
+	const item = h.create(); h.service.start(); await flush();
+	await h.clock.advance(10 * 60_000); await flush();
+	await h.clock.advance(10 * 60_000); await flush();
+	assert.equal(h.store.get(item.id).status, "waiting_human");
+	assert.match(h.store.get(item.id).question ?? "", /静默重试仍失败/, "the pause says retries were tried");
+});
+
+test("crash-resume: persisted meter >= cap releases immediately with the OLD note and clears state", async t => {
+	const h = fixture(t, { options: { verifyGate: () => true } });
+	const item = h.create("queued");
+	h.store.setVerifyState(item.id, 2, "旧未达成项");
+	h.service.start(); await flush();
+	assert.equal(h.store.get(item.id).status, "done");
+	assert.equal(h.store.get(item.id).verify_streak, 0, "release clears the meter (P2-3)");
+	assert.equal(h.sends.length, 1, "no verify round — the meter already capped");
+	assert.match(h.pushes[0].text, /⚠️ 收尾验证连续 2 轮未通过，已按防死循环策略放行：旧未达成项/);
 });

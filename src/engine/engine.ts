@@ -2054,9 +2054,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 		event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string },
 	): void {
 		this.touchActivity(conversationId); // tool start/end — life, even without telemetry
+		// Settle-verify evidence counter: counted BEFORE the telemetry guard —
+		// the gate must not silently degrade when telemetry is absent (refused
+		// calls don't count: a rejected read is not evidence of anything).
+		if (!event.refused) this.turnToolCalls.set(conversationId, (this.turnToolCalls.get(conversationId) ?? 0) + 1);
 		if (!this.telemetry) return;
 		try {
-			this.turnToolCalls.set(conversationId, (this.turnToolCalls.get(conversationId) ?? 0) + 1);
 			this.telemetry.recordTool({ ...event, conversationId, turnId: this.turnIds.get(conversationId) });
 		} catch (err) {
 			console.warn("[engine] telemetry tool write failed:", err instanceof Error ? err.message : err);

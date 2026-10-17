@@ -250,7 +250,10 @@ function stripMarkerLines(text: string): string {
 		.split("\n")
 		.filter((line) => {
 			const t = stripLineEmphasis(line);
-			return !t.startsWith(AUTONOMOUS_DONE_MARK) && !t.startsWith(AUTONOMOUS_HUMAN_MARK) && !t.startsWith(AUTONOMOUS_REMEMBER_MARK);
+			return !t.startsWith(AUTONOMOUS_DONE_MARK) && !t.startsWith(AUTONOMOUS_HUMAN_MARK) && !t.startsWith(AUTONOMOUS_REMEMBER_MARK)
+			// Verify marks are system-round protocol: a model that scatters them
+			// into a work reply must not leak tokens into pushed text/progress.
+			|| t.startsWith(AUTONOMOUS_VERIFY_PASS_MARK) || t.startsWith(AUTONOMOUS_VERIFY_FAIL_MARK);
 		})
 		.join("\n")
 		.trimEnd();

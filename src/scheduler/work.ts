@@ -121,7 +121,7 @@ function stripMarkerLines(text: string, marks: string[]): string {
 		.trimEnd();
 }
 
-const ALL_MARKS = [AUTONOMOUS_DONE_MARK, AUTONOMOUS_HUMAN_MARK, AUTONOMOUS_NEXT_CHECK_MARK];
+const ALL_MARKS = [AUTONOMOUS_DONE_MARK, AUTONOMOUS_HUMAN_MARK, AUTONOMOUS_NEXT_CHECK_MARK, AUTONOMOUS_VERIFY_PASS_MARK, AUTONOMOUS_VERIFY_FAIL_MARK];
 
 /**
  * Parse a follow-up time. Accepted forms, strictest first:

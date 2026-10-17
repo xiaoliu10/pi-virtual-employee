@@ -229,6 +229,9 @@ test("parseVerifyReply: FAIL wins over PASS; note extracted; missing marks = non
 	assert.equal(parseVerifyReply("继续推进中").kind, "none");
 	// Markdown-emphasis leading is tolerated, same as the other marks.
 	assert.equal(parseVerifyReply("**[[VERIFY_PASS]]**").kind, "pass");
+	// FAIL BEFORE pass = last-mark-wins: the model first admitted failure, then
+	// reported fixing it — the later PASS governs (documented semantics, P2-4).
+	assert.equal(parseVerifyReply("[[VERIFY_FAIL]]: A 未达成\n修复后复核通过\n[[VERIFY_PASS]]").kind, "pass");
 });
 
 test("buildSettleVerifyPrompt: carries title, goal, both marks, and the evidence demand", () => {
