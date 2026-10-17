@@ -379,6 +379,23 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 			})),
 		);
 	}
+	// prompt_lab — the RSI step-4 evaluation loop. Every dep is plumbed from
+	// engine.ts (promptLab / runEvalTurn / buildPromptWithRules); the tool
+	// carries its own gates (single-chat actor + 管理员 + 确认口令 for apply),
+	// same convention as the admin tools — no extra RBAC capability needed.
+	// Zombie-scan 2026-10-17: the import existed since 0.2.66 but the
+	// registration call never did, so the model never had this tool.
+	if (options.promptLab && options.runEvalTurn && options.buildPromptWithRules) {
+		tools.push(createPromptLabTool({
+			config: options.config,
+			lab: options.promptLab,
+			resolveActor: options.resolveActor,
+			conversationId: options.conversationId,
+			onConfigChanged: options.onConfigChanged,
+			runTurn: options.runEvalTurn,
+			buildPrompt: options.buildPromptWithRules,
+		}));
+	}
 	// Instrument LAST so the wrapper sits outside every other wrapper (including
 	// the RBAC guard): a refusal is recorded as a refusal, not as a silent pass.
 	return options.onToolEvent ? tools.map((tool) => withTelemetry(tool, options.onToolEvent!)) : tools;
