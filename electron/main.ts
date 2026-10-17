@@ -1371,8 +1371,8 @@ ${tailForProgress(decision.text)}`;
 	// Autonomous tasks (settings UI): the store orders by updated_at DESC.
 	// Projected to the view fields the renderer shows (review L1) — answer /
 	// conditions / lessons stay on the main-process side.
-	ipcMain.handle("tasks:workList", () => (engine.workItems?.list() ?? []).map(({ id, title, goal, status, progress, question, next_check_at, remind_count, created_by, created_at, updated_at }) =>
-		({ id, title, goal, status, progress, question, next_check_at, remind_count, created_by, created_at, updated_at })));
+	ipcMain.handle("tasks:workList", () => (engine.workItems?.list() ?? []).map(({ id, title, goal, conditions, status, progress, question, next_check_at, remind_count, created_by, created_at, updated_at }) =>
+		({ id, title, goal, conditions, status, progress, question, next_check_at, remind_count, created_by, created_at, updated_at })));
 	ipcMain.handle("tasks:schedDelete", (_e, id: string) => {
 		scheduler.delete(id);
 		return true;
@@ -1384,6 +1384,47 @@ ${tailForProgress(decision.text)}`;
 	ipcMain.handle("tasks:schedToggle", (_e, id: string, enabled: boolean) => {
 		scheduler.setEnabled(id, enabled);
 		return true;
+	});
+	// Edit a scheduled task's content (title/prompt/cron/autonomous) — the
+	// settings UI could only toggle/delete before, so a wrong prompt meant
+	// delete-and-recreate (field 2026-10-17). cron is validated + next_run
+	// recomputed by the store; autonomous-only fields are ignored otherwise.
+	ipcMain.handle("tasks:schedEdit", async (_e, id: string, patch: { title?: string; prompt?: string; cron?: string; autonomous?: boolean; silent?: boolean }) => {
+		try {
+			if (patch.cron !== undefined) scheduler.validateCron(patch.cron);
+			const row = scheduler.update(id, patch);
+			return row ? { ok: true, nextRunAt: row.next_run_at } : { ok: false, error: "任务不存在" };
+		} catch (err) {
+			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+		}
+	});
+	// Autonomous-work actions from the settings UI (pause/resume/cancel + edit
+	// goal/conditions). Admin identity is enforced by the caller (renderer only
+	// exposes these to admins); the store guards terminal states.
+	ipcMain.handle("tasks:workAct", (_e, id: string, action: "pause" | "resume" | "cancel") => {
+		const store = engine.workItems;
+		if (!store) return { ok: false, error: "自主任务存储不可用" };
+		try {
+			if (action === "pause") return { ok: Boolean(store.pause(id, "管理员在设置页暂停")), status: store.get(id)?.status };
+			if (action === "resume") return { ok: Boolean(store.resume(id)), status: store.get(id)?.status };
+			return { ok: Boolean(store.cancel(id)), status: store.get(id)?.status };
+		} catch (err) {
+			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+		}
+	});
+	// Edit an autonomous work item's goal/conditions (non-running states only —
+	// pause first via tasks:workAct, matching the IM tool's own guard).
+	ipcMain.handle("tasks:workEdit", (_e, id: string, patch: { goal?: string; conditions?: string }) => {
+		const store = engine.workItems;
+		if (!store) return { ok: false, error: "自主任务存储不可用" };
+		try {
+			let ok = false;
+			if (patch.goal !== undefined) ok = Boolean(store.setField(id, "goal", patch.goal)) || ok;
+			if (patch.conditions !== undefined) ok = Boolean(store.setField(id, "conditions", patch.conditions)) || ok;
+			return { ok, status: store.get(id)?.status };
+		} catch (err) {
+			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+		}
 	});
 
 	// --- Report / artifact center ---

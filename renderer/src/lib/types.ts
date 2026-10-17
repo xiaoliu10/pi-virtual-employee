@@ -315,6 +315,7 @@ export interface WorkItemView {
 	id: string;
 	title: string;
 	goal: string | null;
+	conditions: string | null;
 	status: "proposed" | "queued" | "working" | "waiting_human" | "scheduled" | "done" | "cancelled";
 	progress: string | null;
 	/** waiting_human 时的卡点问题——管理员最需要看到的信息。 */
