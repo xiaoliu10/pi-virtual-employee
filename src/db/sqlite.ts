@@ -365,6 +365,7 @@ function migrate(db: DB): void {
 			kicked_off           INTEGER NOT NULL DEFAULT 0,
 			created_by           TEXT,
 			created_channel      TEXT,
+			resident             INTEGER NOT NULL DEFAULT 0,
 			created_at           INTEGER NOT NULL,
 			updated_at           INTEGER NOT NULL
 		);
@@ -376,6 +377,10 @@ function migrate(db: DB): void {
 	// Staged reply for a waiting_human resume — consumed by the next window's turn 0.
 	if (!workCols.has("answer")) db.exec("ALTER TABLE work_items ADD COLUMN answer TEXT");
 	if (!workCols.has("created_channel")) db.exec("ALTER TABLE work_items ADD COLUMN created_channel TEXT");
+	// Resident (常驻巡检) marker: the model may NOT terminate these with DONE —
+	// the runner defers instead (field 2026-10-17: a daily reconciliation patrol
+	// was killed by the model declaring DONE on a clean day).
+	if (!workCols.has("resident")) db.exec("ALTER TABLE work_items ADD COLUMN resident INTEGER NOT NULL DEFAULT 0");
 	// Adaptive-cadence bookkeeping: the last self-declared reason (re-injected as
 	// context) and how many consecutive windows picked the same daily slot
 	// (>=2 warns the model it is degenerating into a cron, >=3 suggests the

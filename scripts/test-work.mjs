@@ -326,3 +326,13 @@ test("window protocol: KB-first before escalation; login expiry searches KB; res
 	assert.doesNotMatch(noKb, /search_knowledge_base|save_to_knowledge/);
 	assert.match(noKb, /登录过期/);
 });
+
+test("window prefix: resident tasks forbid DONE and require NEXT_CHECK", () => {
+	const base = { title: "t", goal: "g", turn: 0, budget: { maxTurns: 0, maxMinutes: 30 } };
+	const resident = buildWorkWindowPrefix({ ...base, resident: true });
+	const plain = buildWorkWindowPrefix(base);
+	assert.match(resident, /常驻巡检/);
+	assert.match(resident, /禁止输出/);
+	assert.doesNotMatch(plain, /禁止输出/);
+	assert.match(plain, /目标全部完成/);
+});

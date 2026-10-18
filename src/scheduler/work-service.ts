@@ -21,6 +21,10 @@ interface ActiveWindow<Session> {
 	/** Pre-claim kickoff marker: claim() flips the row, so the FIRST-window
 	 * decision must read this snapshot, not the post-claim row. */
 	prevKicked?: number;
+	/** 常驻巡检标记（pre-claim snapshot）：DONE 被拦截为按节奏顺延。 */
+	prevResident?: number;
+	/** 上次自声明节奏（pre-claim snapshot）：DONE 拦截的顺延时长依据。 */
+	prevCadenceMs?: number | null;
 	session?: Session;
 	stopReason?: string;
 	deadline?: ReturnType<typeof setTimeout>;
@@ -224,6 +228,8 @@ export class WorkService<Session extends WorkSession> {
 				dueAt: due.next_check_at, prevReason: due.next_check_reason, prevStreak: due.fixed_streak ?? 0,
 				prevFallback: due.fallback_streak ?? 0,
 				prevKicked: due.kicked_off ?? 0,
+				prevResident: due.resident ?? 0,
+				prevCadenceMs: due.cadence_ms ?? null,
 			};
 			this.active = active;
 			active.settled = Promise.resolve().then(() => this.run(active)).catch((err) => this.opts.onError?.(err)).finally(() => {
@@ -279,7 +285,7 @@ export class WorkService<Session extends WorkSession> {
 				const prefix = buildWorkWindowPrefix({
 					title: fresh.title, goal: fresh.goal, conditions: fresh.conditions, progress: fresh.progress,
 					lessons: workLessons(fresh.lessons), turn, budget: this.budget, answer: answer ?? undefined,
-					firstWindow, lateByMs, kbSearchEnabled: kb.search, kbLearnEnabled: kb.learn,
+					firstWindow, lateByMs, resident: active.prevResident === 1, kbSearchEnabled: kb.search, kbLearnEnabled: kb.learn,
 					lastCheck: active.dueAt ? { at: active.dueAt, reason: active.prevReason, streak: active.prevStreak ?? 0 } : undefined,
 					now: this.clock.now(),
 				});
@@ -348,7 +354,40 @@ export class WorkService<Session extends WorkSession> {
 				lastText = decision.text;
 				console.log(`[work] ${item.id.slice(0, 8)} turn ${turn + 1} → ${decision.kind}${decision.kind === "next_check" ? ` raw="${(decision.nextCheckRaw ?? "").slice(0, 120)}" at=${decision.nextCheckAt ?? "invalid"}` : ""}`);
 				if (decision.kind === "human") { question = decision.question || lastText || "需要管理员协助并明确恢复。"; break; }
-				if (decision.kind === "done") { outcome = "done"; break; }
+				if (decision.kind === "done") {
+					// Resident (常驻巡检) tasks have no natural finish: a model DONE is
+					// treated as "this round clean" and deferred on the last declared
+					// cadence (field 2026-10-17: a daily reconciliation patrol was
+					// killed by the model declaring DONE on a clean day; the push tells
+					// the admin how to actually end it). Clamp [1h, 7d], default 24h.
+					if (active.prevResident === 1) {
+						// Cadence semantics: prevCadenceMs is the LAST SELF-DECLARED rhythm.
+						// A fresh resident task has none yet (NULL → 0) — default to 24h
+						// (review P1: Math.max(0, 1h) silently produced hourly wake-ups
+						// whose push then LIED about being 24h). Declared cadence is
+						// clamped to [1h, 7d].
+						const cadence = active.prevCadenceMs ?? 0;
+						const deferMs = cadence > 0 ? Math.min(Math.max(cadence, 60 * 60_000), 7 * 24 * 60 * 60_000) : 24 * 3_600_000;
+						outcome = "scheduled";
+						nextCheckAt = this.clock.now() + deferMs;
+						// The routine streak tracks the MODEL's same-daily-slot rhythm ONLY.
+						// An engine-side defer is not a model-declared slot: hold the streak
+						// (no +1 — a 24h defer would falsely trip the cron-degeneration
+						// warning; no reset either — prior model-declared rhythm survives)
+						// (review P2).
+						nextStreak = active.prevStreak ?? 0;
+						const cadenceText = cadence > 0
+							? (cadence < 2 * 3_600_000 ? `${Math.max(1, Math.round(cadence / 60_000))}分钟` : `${Math.round(cadence / 3_600_000)}小时`)
+							: "24小时";
+						nextReason = `模型宣布完成，但本任务是常驻巡检（不允许自行 DONE）——已按${cadence > 0 ? `上次节奏（${cadenceText}）` : "默认节奏（24小时）"}顺延；如确需结束，请管理员用 cancel 取消任务`;
+						// Same as a legitimate NEXT_CHECK (see below): a successful window
+						// clears the soft-fallback meter (review P3-3).
+						if ((active.prevFallback ?? 0) > 0) store.setFallbackStreak(item.id, 0);
+						break;
+					}
+					outcome = "done";
+					break;
+				}
 				if (decision.kind === "next_check") {
 					if (decision.nextCheckAt === undefined) {
 						// The model clearly WANTED a follow-up but the declared time was
