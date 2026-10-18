@@ -361,14 +361,28 @@ export class WorkService<Session extends WorkSession> {
 					// killed by the model declaring DONE on a clean day; the push tells
 					// the admin how to actually end it). Clamp [1h, 7d], default 24h.
 					if (active.prevResident === 1) {
+						// Cadence semantics: prevCadenceMs is the LAST SELF-DECLARED rhythm.
+						// A fresh resident task has none yet (NULL → 0) — default to 24h
+						// (review P1: Math.max(0, 1h) silently produced hourly wake-ups
+						// whose push then LIED about being 24h). Declared cadence is
+						// clamped to [1h, 7d].
 						const cadence = active.prevCadenceMs ?? 0;
-						const deferMs = Math.min(Math.max(cadence, 60 * 60_000), 7 * 24 * 60 * 60_000);
+						const deferMs = cadence > 0 ? Math.min(Math.max(cadence, 60 * 60_000), 7 * 24 * 60 * 60_000) : 24 * 3_600_000;
 						outcome = "scheduled";
 						nextCheckAt = this.clock.now() + deferMs;
-						// A clean-round report: the routine streak keeps accumulating so
-						// the model's own "降频" strategy stays available.
-						nextStreak = nextRoutineStreak(active.dueAt ?? undefined, active.prevStreak ?? 0, nextCheckAt);
-						nextReason = `模型宣布完成，但本任务是常驻巡检（不允许自行 DONE）——已按${cadence ? `上次节奏（${Math.round(cadence / 3600_000)}小时）` : "默认节奏（24小时）"}顺延；如确需结束，请管理员用 cancel 取消任务`;
+						// The routine streak tracks the MODEL's same-daily-slot rhythm ONLY.
+						// An engine-side defer is not a model-declared slot: hold the streak
+						// (no +1 — a 24h defer would falsely trip the cron-degeneration
+						// warning; no reset either — prior model-declared rhythm survives)
+						// (review P2).
+						nextStreak = active.prevStreak ?? 0;
+						const cadenceText = cadence > 0
+							? (cadence < 2 * 3_600_000 ? `${Math.max(1, Math.round(cadence / 60_000))}分钟` : `${Math.round(cadence / 3_600_000)}小时`)
+							: "24小时";
+						nextReason = `模型宣布完成，但本任务是常驻巡检（不允许自行 DONE）——已按${cadence > 0 ? `上次节奏（${cadenceText}）` : "默认节奏（24小时）"}顺延；如确需结束，请管理员用 cancel 取消任务`;
+						// Same as a legitimate NEXT_CHECK (see below): a successful window
+						// clears the soft-fallback meter (review P3-3).
+						if ((active.prevFallback ?? 0) > 0) store.setFallbackStreak(item.id, 0);
 						break;
 					}
 					outcome = "done";

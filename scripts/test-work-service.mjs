@@ -906,3 +906,25 @@ test("non-resident DONE still goes terminal (default unchanged)", async t => {
 	h.service.start(); await flush();
 	assert.equal(h.store.get(item.id).status, "done");
 });
+
+test("resident DONE with NO declared cadence defers 24h (review P1: was hourly + lying text)", async t => {
+	const h = fixture(t, { send: () => ({ reply: "无异常，完成\n[[TASK_DONE]]" }) });
+	const item = h.create("queued", { resident: true }); // cadence_ms stays NULL
+	h.service.start(); await flush();
+	const after = h.store.get(item.id);
+	assert.equal(after.status, "scheduled");
+	const deltaMs = after.next_check_at - h.clock.now();
+	assert.ok(Math.abs(deltaMs - 24 * 3_600_000) < 5_000, `expected ~24h defer, got ${Math.round(deltaMs / 60_000)}min`);
+	assert.match(after.next_check_reason, /默认节奏（24小时）/);
+});
+
+test("resident DONE defer does NOT accumulate the same-daily-slot streak (review P2: 24h cadence)", async t => {
+	const h = fixture(t, { send: () => ({ reply: "无异常\n[[TASK_DONE]]" }) });
+	const item = h.create("queued", { resident: true });
+	h.store.setCadence(item.id, 24 * 60 * 60_000); // daily rhythm — isSameDailySlot would fire
+	h.db.prepare("UPDATE work_items SET fixed_streak = 2 WHERE id = ?").run(item.id); // prior model-declared rhythm survives
+	h.service.start(); await flush();
+	// Engine defer must HOLD the streak (not +1 → no false cron warning, not reset
+	// → prior model-declared rhythm survives; review P2).
+	assert.equal(h.store.get(item.id).fixed_streak, 2);
+});

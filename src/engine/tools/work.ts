@@ -284,7 +284,7 @@ export function createWorkTools(deps: {
 			if (p.action === "get") {
 				const lessons = lessonsOf(item.lessons);
 				return {
-					content: [{ type: "text", text: `自主任务：${item.title}\nid：${item.id}\n状态：${STATUS_LABEL[item.status] ?? item.status}\n目标：\n${item.goal}\n执行条件：\n${item.conditions ?? "（未记录）"}\n进展：\n${item.progress ?? "（未记录）"}\n踩坑：\n${lessons.length ? lessons.map((lesson) => `- ${lesson}`).join("\n") : "（未记录）"}\n待答问题：\n${item.question ?? "（无）"}\n下次跟进：${fmtTime(item.next_check_at)}` }],
+					content: [{ type: "text", text: `自主任务：${item.title}${item.resident === 1 ? "（性质：常驻巡检）" : ""}\nid：${item.id}\n状态：${STATUS_LABEL[item.status] ?? item.status}\n目标：\n${item.goal}\n执行条件：\n${item.conditions ?? "（未记录）"}\n进展：\n${item.progress ?? "（未记录）"}\n踩坑：\n${lessons.length ? lessons.map((lesson) => `- ${lesson}`).join("\n") : "（未记录）"}\n待答问题：\n${item.question ?? "（无）"}\n下次跟进：${fmtTime(item.next_check_at)}` }],
 					details: { ok: true, item: { id: item.id, title: item.title, status: item.status, goal: item.goal, conditions: item.conditions, progress: item.progress, lessons, question: item.question, next_check_at: item.next_check_at } },
 				};
 			}
