@@ -246,4 +246,9 @@ test("delete only removes TERMINAL items; live items are refused (field 2026-10-
 	assert.equal(store.get(live.id).id, live.id);
 	// unknown id is a no-op, not a crash
 	assert.equal(store.delete("nope"), undefined);
+	// deleted rows ignore every later write (no zombie resurrection)
+	assert.equal(store.setField(done.id, "goal", "复活"), undefined);
+	assert.equal(store.addLesson(done.id, "复活"), undefined);
+	assert.equal(store.setStatus(done.id, "scheduled", null, null)?.id, undefined);
+	assert.equal(store.get(done.id), undefined);
 });
