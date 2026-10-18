@@ -219,3 +219,14 @@ test("setSchedule and pause notify subscribers so the service wakes immediately"
 	store.pause(item.id);
 	assert.deepEqual(events, [item.id, item.id]);
 });
+
+test("create persists resident flag (常驻巡检)", (t) => {
+	const { db, store } = fixture(t);
+	const plain = store.create({ title: "一次性修复", goal: "修完即止" });
+	const resident = store.create({ title: "每日对账巡检", goal: "持续巡检", resident: true });
+	assert.equal(plain.resident, 0);
+	assert.equal(resident.resident, 1);
+	// re-read from disk: column really persisted
+	const back = db.prepare("SELECT resident FROM work_items WHERE id = ?").get(resident.id);
+	assert.equal(back.resident, 1);
+});

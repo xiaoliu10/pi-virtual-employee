@@ -34,6 +34,7 @@ export interface WorkItemRow {
 	/** Verified confirming admin, not the conversation's proposer. */
 	created_by: string | null;
 	created_channel: string | null;
+	resident: number;
 	/** Retained until the first successful resumed send. */
 	answer: string | null;
 	created_at: number;
@@ -48,6 +49,8 @@ export interface CreateWorkItemInput {
 	status?: WorkItemStatus;
 	createdBy?: string | null;
 	createdChannel?: string | null;
+	/** 常驻巡检：无自然终点，模型 DONE 被拦截为按节奏顺延（field 2026-10-17）。 */
+	resident?: boolean;
 }
 
 export class WorkItemStore {
@@ -71,13 +74,14 @@ export class WorkItemStore {
 			origin_conversation: input.originConversation ?? null,
 			origin_note: input.originNote ?? null, status: input.status ?? "proposed",
 			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0, fallback_streak: 0, last_remind_at: null, remind_count: 0, cadence_ms: null, kicked_off: 0,
-			created_by: input.createdBy ?? null,
+				created_by: input.createdBy ?? null,
 			created_channel: input.createdChannel ?? null,
+			resident: input.resident ? 1 : 0,
 			answer: null, created_at: now, updated_at: now,
 		};
 		this.db.prepare(`INSERT INTO work_items
-			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, last_remind_at, remind_count, cadence_ms, kicked_off, created_by, created_channel, answer, created_at, updated_at)
-			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @last_remind_at, @remind_count, @cadence_ms, @kicked_off, @created_by, @created_channel, @answer, @created_at, @updated_at)`).run(row);
+			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, last_remind_at, remind_count, cadence_ms, kicked_off, created_by, created_channel, resident, answer, created_at, updated_at)
+			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @last_remind_at, @remind_count, @cadence_ms, @kicked_off, @created_by, @created_channel, @resident, @answer, @created_at, @updated_at)`).run(row);
 		this.changed(row.id);
 		return row;
 	}

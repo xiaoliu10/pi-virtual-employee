@@ -281,6 +281,8 @@ export interface WorkItemWindowContext {
 	 * (app closed/busy past the point). The prefix tells the model to
 	 * re-check what happened in between instead of trusting the timeline. */
 	lateByMs?: number;
+	/** 常驻巡检任务：无自然终点，DONE 被引擎拦截（field 2026-10-17）。 */
+	resident?: boolean;
 	/** KB tool availability (engine definition gates). Protocol must never
 	 * reference unregistered tools; undefined = enabled (tests/legacy). */
 	kbSearchEnabled?: boolean;
@@ -338,7 +340,9 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 		`窗口规则：`,
 		`- ${turnRule}，请优先推进关键路径，并把重要发现写入进展/踩坑。超时、执行出错或需要人协助会暂停等管理员明确恢复，不自动重试；写不出合法跟进时间时会按默认 1 小时顺延（连续 3 次除外）而不会暂停。`,
 		`- 收尾顺序：先写完所有正文（进展、发现、汇报），最后一行才是结束标记（${AUTONOMOUS_DONE_MARK} / ${AUTONOMOUS_HUMAN_MARK} / ${AUTONOMOUS_NEXT_CHECK_MARK}）。标记行被输出截断等于没有收尾，窗口会空转到时间上限。`,
-		`- 目标全部完成 → 最后一行单独写 ${AUTONOMOUS_DONE_MARK}，上方给出成果总结。`,
+		...(ctx.resident
+			? [`- 本任务是**常驻巡检**：没有「全部完成」的一天，禁止输出 ${AUTONOMOUS_DONE_MARK}（引擎不会接受——会被当作「本轮无异常」自动按节奏顺延并推送管理员）。本轮无异常/无事发生 → ${AUTONOMOUS_NEXT_CHECK_MARK} 按既定节奏顺延（连续正常可按你声明的策略降频）；只有管理员能 cancel 结束常驻任务。`]
+			: [`- 目标全部完成 → 最后一行单独写 ${AUTONOMOUS_DONE_MARK}，上方给出成果总结。`]),
 		needHumanBullet,
 		`- 本轮告一段落但目标未完成 → 最后一行单独写 ${AUTONOMOUS_NEXT_CHECK_MARK}: 下次跟进时间 | 原因。时间用以下三种写法之一：①「30分钟」「2小时」相对时间；②「2026-10-05 09:40」带年份的完整时间；③「9:40」「9点30」「明天 9:40」钟点。口语变体（「9点半」「上午9点」等）会尽量兼容，但解析不了会按默认 1 小时顺延（连续 3 次无法解析才会暂停；时间部分不能为空——先时间再「| 原因」；至少距现在 15 分钟；非法/过去/过近时间同样顺延不暂停）。下次时间完全由本次执行结果决定，不约定固定频率，一天可多次也可隔天：\n  · 有卡点（等第三方补数据、等对方处理、等资源）→ 不要盲目定时重试：如果不确定卡点何时解决，先写 ${AUTONOMOUS_HUMAN_MARK} 把问题抛出来问清楚（如「这个卡点大概什么时候能解决？」），按答复定下次时间；\n  · 时间常识：深夜/非工作时间对接方通常不会处理，把跟进推到对方可能处理的时间，不要空查；\n  · 按「观察点」安排：一天里哪些时刻会有新信息（数据生成、批次跑完、出结果）就在那些时刻查，一天可以多次（如 09:00 查昨日、12:30 查今日上午、15:00 查今日下午）；\n  · 发现异常可缩短间隔、提前再查；连续多轮全无异常且无新信息才拉长。时间必须写明依据，不要不加思考地默认「明天同一时间」。若写不出合法时间，系统会按默认 1 小时顺延并在推送里告知管理员，不会因格式问题暂停。`,
 		`- 工作过程中了解到执行条件（如「系统对账 08:00-09:30 自动跑，此时段勿手动对账」、依赖的单位/资源、账号权限边界）→ 立即用 manage_work 记录到条件里，后续窗口会带着这些条件工作。`,

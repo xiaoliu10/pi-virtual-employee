@@ -163,7 +163,7 @@ export function createWorkTools(deps: {
 			"【术语边界，2026-10-17 现场教训】**自主任务 = 本工具管理的 work item**：员工自己决定观察点与节奏持续跟进，卡住暂停等人，没有固定 cron。**定时任务 = create_scheduled_task 管的东西**：到点执行固定 prompt。用户说「自主任务」时指前者——用本工具的 create/confirm/resume，绝不用 create_scheduled_task 顶替（其 autonomous 参数只是「到点后多跑几轮」，仍是定时任务）。" +
 			"action=list：列出当前来源会话的自主任务；action=get：查看完整目标、执行条件、进展、踩坑和待答问题；" +
 			"action=mine：管理员扫描近期对话并把待确认提案推送到各自来源会话；" +
-			"action=create：来源会话的管理员要求**直接创建**自主任务时一步到位（field 2026-10-17：说「重建自主任务」「建一个自主任务」就用这个，不要退而用 create_scheduled_task——那是定时任务，另一套东西）；需要 title + goal，可附 conditions；创建即入队开工；" +
+			"action=create：来源会话的管理员要求**直接创建**自主任务时一步到位（field 2026-10-17：说「重建自主任务」「建一个自主任务」就用这个，不要退而用 create_scheduled_task——那是定时任务，另一套东西）；需要 title + goal，可附 conditions；创建即入队开工；巡检/监控/每日对账类**常驻任务**必须带 resident=true（无自然终点，不允许自行 DONE，field 2026-10-17：每日对账巡检被模型在无异常日宣布 DONE 杀死）；" +
 			"action=confirm：来源会话的管理员在当前消息明确「确认创建」后开工；可按管理员要求附带改写后的 title/goal/conditions（例如删掉「每天16:30」改为按需跟进），不必原样接受提案；" +
 			"action=resume：来源会话的管理员恢复等待人工/资源的任务——把答复直接告诉员工即可（无需确认口令），answer 持久化为下一轮输入；【铁律】当管理员在会话里直接提供了内容（验证码、账号、参数、决定），而本来源会话有任务正处于 waiting_human/等待人工，这条消息就是给那个任务的答复——直接 resume 它，**严禁** create_scheduled_task 另建任务接手（那会让原任务永远卡住、现场跑两份重复工作，2026-10-17 现场教训）；" +
 			"action=update：按管理员要求调整自主任务——title/goal/conditions 在非执行中状态（排队/等待人工/已计划/提案）可改；执行中请先 action=pause 暂停再调整（避免在飞窗口覆盖你的修改）；nextCheck 可改约下次跟进时间（距现在至少 15 分钟，仅排队/等待人工/已计划状态可改，执行中不能改期）；" +
@@ -182,11 +182,12 @@ export function createWorkTools(deps: {
 			conditions: Type.Optional(Type.String({ description: "confirm/update 时按管理员要求改写的执行条件（≤1000 字）；不修改则省略" })),
 			nextCheck: Type.Optional(Type.String({ description: "update 时改约下次跟进时间，如「30m」「明天09:40」（距现在至少 15 分钟）；仅排队/等待人工/已计划状态可改" })),
 			reason: Type.Optional(Type.String({ description: "update 时为改期写明依据（随 nextCheck 保存）；pause 时为暂停原因" })),
+			resident: Type.Optional(Type.Boolean({ description: "create 时声明任务性质：巡检/监控/每日对账这类**无自然终点**的常驻任务必须 true——此类任务不允许自行宣布完成（DONE 会被引擎拦截为按节奏顺延并推送管理员）；有明确完成标志的一次性任务省略或 false" })),
 		}),
 		async execute(_toolCallId, params) {
 			const p = params as {
 				action: "list" | "get" | "mine" | "create" | "confirm" | "resume" | "cancel" | "update" | "pause";
-				id?: string; answer?: string; title?: string; goal?: string; conditions?: string; nextCheck?: string; reason?: string;
+				id?: string; answer?: string; title?: string; goal?: string; conditions?: string; nextCheck?: string; reason?: string; resident?: boolean;
 			};
 			if (!["list", "get", "mine", "create", "confirm", "resume", "cancel", "update", "pause"].includes(p.action)) return failure("未知的自主任务操作。");
 			const actor = resolveActor(conversationId);
@@ -230,12 +231,13 @@ export function createWorkTools(deps: {
 					status: "queued",
 					createdBy: actor.senderId,
 					createdChannel: actor.channel,
+					resident: p.resident === true,
 				});
 				if (p.conditions?.trim()) workItems.setField(created.id, "conditions", p.conditions.trim().slice(0, 1000));
 				const fired = fireItem(created.id);
 				return {
-					content: [{ type: "text", text: `✅ 已创建自主任务「${created.title}」${fired ? "，已开工" : "，已入队，稍后自动开工"}。这是自主任务（员工自己决定观察点与节奏，卡住会暂停等人），不是定时任务；进展会推送到本来源会话。` }],
-					details: { ok: true, created: true, id: created.id, fired, queued: !fired },
+					content: [{ type: "text", text: `✅ 已创建自主任务「${created.title}」${fired ? "，已开工" : "，已入队，稍后自动开工"}。这是自主任务（员工自己决定观察点与节奏，卡住会暂停等人），不是定时任务；进展会推送到本来源会话。${p.resident === true ? "\n性质：常驻巡检——没有「全部完成」的一天，每轮以 NEXT_CHECK 顺延；如需结束由管理员 cancel。" : ""}` }],
+					details: { ok: true, created: true, id: created.id, fired, queued: !fired, resident: p.resident === true },
 				};
 			}
 

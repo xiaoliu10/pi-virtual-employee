@@ -69,7 +69,8 @@ function fixture(opts = {}) {
 				origin_conversation: input.originConversation ?? null, origin_note: input.originNote ?? null,
 				status: input.status ?? "proposed", question: null, next_check_at: null, next_check_reason: null,
 				fixed_streak: 0, fallback_streak: 0, last_remind_at: null, remind_count: 0, cadence_ms: null, kicked_off: 0,
-				created_by: input.createdBy ?? null, answer: null, created_at: 1, updated_at: 1,
+				created_by: input.createdBy ?? null, resident: input.resident ? 1 : 0,
+				answer: null, created_at: 1, updated_at: 1,
 			};
 			rows.set(item.id, item);
 			return item;
@@ -758,4 +759,14 @@ test("missing IDs and invalid actions cannot mutate", async () => {
 		const f = fixture();
 		refused(await f.items(params), f);
 	}
+});
+
+test("create resident:true persists the flag and says so", async () => {
+	const f = fixture();
+	const result = await f.items({ action: "create", title: "每日对账巡检", goal: "持续巡检", resident: true, actor: "确认创建：每日对账巡检" });
+	assert.equal(result.details.ok, true);
+	assert.equal(result.details.resident, true);
+	const row = [...f.rows.values()].find(r => r.title === "每日对账巡检");
+	assert.equal(row.resident, 1);
+	assert.match(result.content[0].text, /常驻巡检/);
 });

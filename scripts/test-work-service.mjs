@@ -880,3 +880,29 @@ test("fake clock + deferred gate exit cleanly: no leaked timers after an unlimit
 	await h.service.stop();
 	assert.equal(h.clock.timers.size, 0, "stop() leaves nothing behind");
 });
+
+test("resident task: model DONE is deferred on cadence, not terminal (field 2026-10-17)", async t => {
+	const h = fixture(t, { send: () => ({ reply: "本轮巡检无异常，任务完成\n[[TASK_DONE]]" }) });
+	const item = h.create("queued", { resident: true });
+	// give the defer a cadence to ride on (previous self-declared rhythm)
+	h.store.setCadence(item.id, 3 * 60 * 60_000); // 3h
+	h.service.start(); await flush();
+	const after = h.store.get(item.id);
+	assert.equal(after.status, "scheduled", "resident DONE must NOT go terminal");
+	assert.ok(after.next_check_at && after.next_check_at > h.clock.now(), "deferred into the future");
+	assert.match(after.next_check_reason, /常驻巡检/);
+	assert.match(after.next_check_reason, /cancel/);
+	// The routine streak tracks the MODEL's same-daily-slot rhythm only; an
+	// engine-side defer is not a model-declared slot, so it must NOT count
+	// toward the anti-cron degeneration meter.
+	assert.equal(after.fixed_streak ?? -1, 0);
+	// push tells the admin what happened and how to actually end it
+	assert.match(h.pushes[0].text, /常驻巡检/);
+});
+
+test("non-resident DONE still goes terminal (default unchanged)", async t => {
+	const h = fixture(t, { send: () => ({ reply: "全部完成\n[[TASK_DONE]]" }) });
+	const item = h.create();
+	h.service.start(); await flush();
+	assert.equal(h.store.get(item.id).status, "done");
+});
