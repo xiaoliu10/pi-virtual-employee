@@ -1377,6 +1377,13 @@ ${tailForProgress(decision.text)}`;
 		scheduler.delete(id);
 		return true;
 	});
+	// Delete a TERMINAL autonomous task (done/cancelled) from the settings list.
+	// The store enforces the terminal guard: a live item returns undefined and
+	// the renderer surfaces the refusal. No recycle bin — the row is history.
+	ipcMain.handle("tasks:workDelete", (_e, id: string) => {
+		const row = engine.workItems?.delete(id);
+		return row ? { ok: true } : { ok: false, error: "只能删除已完成/已取消的任务（进行中的任务请先取消）" };
+	});
 	ipcMain.handle("tasks:schedSilent", (_e, id: string, silent: boolean) => {
 		scheduler.update(id, { silent });
 		return true;

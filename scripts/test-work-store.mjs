@@ -230,3 +230,20 @@ test("create persists resident flag (常驻巡检)", (t) => {
 	const back = db.prepare("SELECT resident FROM work_items WHERE id = ?").get(resident.id);
 	assert.equal(back.resident, 1);
 });
+
+test("delete only removes TERMINAL items; live items are refused (field 2026-10-18)", (t) => {
+	const { db, store } = fixture(t);
+	const done = store.create({ title: "已完成", goal: "g", status: "done" });
+	const cancelled = store.create({ title: "已取消", goal: "g" });
+	store.cancel(cancelled.id);
+	const live = store.create({ title: "进行中", goal: "g", status: "scheduled" });
+	assert.equal(store.delete(live.id), undefined, "live items must not be deletable");
+	assert.equal(store.get(live.id).status, "scheduled");
+	assert.ok(store.delete(done.id), "done item deletable");
+	assert.ok(store.delete(cancelled.id), "cancelled item deletable");
+	assert.equal(store.get(done.id), undefined);
+	assert.equal(store.get(cancelled.id), undefined);
+	assert.equal(store.get(live.id).id, live.id);
+	// unknown id is a no-op, not a crash
+	assert.equal(store.delete("nope"), undefined);
+});

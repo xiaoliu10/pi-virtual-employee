@@ -154,6 +154,32 @@ function WorkEditDialog({ item, onClose, onSaved }: { item: WorkItemView; onClos
 	);
 }
 
+/** 删除确认（终态自主任务）：不可恢复，无回收站。 */
+function WorkDeleteDialog({ item, onClose, onDeleted }: { item: WorkItemView; onClose: () => void; onDeleted: () => void }) {
+	const [busy, setBusy] = useState(false);
+	const [err, setErr] = useState("");
+	const del = async () => {
+		setBusy(true); setErr("");
+		const res = await api.deleteWorkItem(item.id);
+		setBusy(false);
+		if (res.ok) { onDeleted(); onClose(); } else setErr(res.error ?? "删除失败");
+	};
+	return (
+		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-6" onClick={onClose}>
+			<div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl" onClick={(e) => e.stopPropagation()}>
+				<h3 className="text-[15px] font-semibold text-slate-800">删除自主任务</h3>
+				<p className="mt-2 text-sm text-slate-600">「{item.title}」将从任务列表中永久删除，<span className="font-medium text-rose-600">无法恢复</span>。</p>
+				<p className="mt-1 text-xs text-slate-400">任务执行中沉淀到知识库的经验已独立保存，不受影响。</p>
+				{err && <p className="mt-2 text-xs text-rose-500">{err}</p>}
+				<div className="mt-4 flex justify-end gap-2">
+					<button type="button" onClick={onClose} className="rounded-lg px-4 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-50">取消</button>
+					<button type="button" onClick={() => void del()} disabled={busy} className="rounded-lg bg-rose-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-rose-700 disabled:opacity-50">{busy ? "删除中…" : "确认删除"}</button>
+				</div>
+			</div>
+		</div>
+	);
+}
+
 /** 定时任务编辑弹窗（设置页 → 任务 → 定时任务）：改标题/prompt/cron。 */
 function SchedEditDialog({ task, onClose, onSaved }: { task: ScheduledTaskRow; onClose: () => void; onSaved: () => void }) {
 	const [title, setTitle] = useState(task.title);
@@ -249,6 +275,8 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 	const [workItems, setWorkItems] = useState<WorkItemView[]>([]);
 	const refreshWork = () => api.listWorkItems().then(setWorkItems).catch(() => {});
 	const [workEdit, setWorkEdit] = useState<WorkItemView | null>(null);
+	/** Delete confirmation for a TERMINAL autonomous task (field 2026-10-18). */
+	const [workDelete, setWorkDelete] = useState<WorkItemView | null>(null);
 	const [schedEdit, setSchedEdit] = useState<ScheduledTaskRow | null>(null);
 	useEffect(() => {
 		if (tab !== "tasks") return;
@@ -509,6 +537,21 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 																{w.remind_count > 0 ? ` · 已提醒 ${w.remind_count} 次` : ""}
 																{w.created_by ? ` · 确认创建 ${w.created_by}` : ""}
 															</div>
+															<div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+																<button type="button" onClick={() => setWorkEdit(w)} className="font-medium text-blue-600 hover:text-blue-700">编辑</button>
+																{(w.status === "done" || w.status === "cancelled") && (
+																	<button type="button" onClick={() => setWorkDelete(w)} className="font-medium text-rose-400 hover:text-rose-600">删除</button>
+																)}
+																{w.status === "scheduled" && (
+																	<button type="button" onClick={() => void api.workItemAct(w.id, "pause").then(refreshWork)} className="font-medium text-amber-600 hover:text-amber-700">暂停</button>
+																)}
+																{w.status === "waiting_human" && (
+																	<button type="button" onClick={() => void api.workItemAct(w.id, "resume").then(refreshWork)} className="font-medium text-emerald-600 hover:text-emerald-700">恢复</button>
+																)}
+																{(w.status === "queued" || w.status === "scheduled" || w.status === "waiting_human") && (
+																	<button type="button" onClick={() => void api.workItemAct(w.id, "cancel").then(refreshWork)} className="font-medium text-rose-400 hover:text-rose-600">取消</button>
+																)}
+															</div>
 														</div>
 													);
 												})}
@@ -552,6 +595,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 									</>
 									)}
 									{workEdit && <WorkEditDialog item={workEdit} onClose={() => setWorkEdit(null)} onSaved={() => void refreshWork()} />}
+									{workDelete && <WorkDeleteDialog item={workDelete} onClose={() => setWorkDelete(null)} onDeleted={() => void refreshWork()} />}
 									{schedEdit && <SchedEditDialog task={schedEdit} onClose={() => setSchedEdit(null)} onSaved={() => void refreshSched()} />}
 								</div>
 							</div>
