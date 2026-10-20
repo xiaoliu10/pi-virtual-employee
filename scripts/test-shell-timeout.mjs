@@ -70,24 +70,29 @@ function fixture(t) {
 	};
 }
 
-test("new and legacy configs persist the 60-second default without losing shell settings", (t) => {
+test("new and legacy configs persist the 300-second default without losing shell settings", (t) => {
 	const { db, config } = fixture(t);
-	assert.equal(config.all().capabilities.shell.timeoutSec, 60);
+	assert.equal(config.all().capabilities.shell.timeoutSec, 300);
 	const legacy = config.all();
 	delete legacy.capabilities.shell.timeoutSec;
 	db.prepare("UPDATE config SET value = ? WHERE key = 'appconfig'").run(JSON.stringify(legacy));
+	// A row with NO timeoutSec (legacy install) gets the NEW default, while the
+	// other shell settings survive untouched.
 	assert.deepEqual(new ConfigStore(db).all().capabilities.shell, {
-		enabled: true, allowedCommands: ["node"], timeoutSec: 60, backgroundTimeoutSec: 0, pollTimeoutSec: 30,
+		enabled: true, allowedCommands: ["node"], timeoutSec: 300, backgroundTimeoutSec: 0, pollTimeoutSec: 30,
 	});
-	const persisted = JSON.parse(db.prepare("SELECT value FROM config WHERE key = 'appconfig'").get().value);
-	assert.equal(persisted.capabilities.shell.timeoutSec, 60);
+	// An EXPLICIT value is never overwritten by the default (upgrade safety).
+	const explicit = config.all();
+	explicit.capabilities.shell.timeoutSec = 60;
+	db.prepare("UPDATE config SET value = ? WHERE key = 'appconfig'").run(JSON.stringify(explicit));
+	assert.equal(new ConfigStore(db).all().capabilities.shell.timeoutSec, 60, "an explicit value is never overwritten by the new default");
 });
 
 test("timeout values survive updates, reloads and imports, with safe invalid-value handling", (t) => {
 	const { config, db } = fixture(t);
 	for (const [value, expected] of [
 		[600, 600], [0, 0], [1, 1], [1.9, 1], [0.5, 1],
-		[-1, 60], [NaN, 60], [Infinity, 60], [null, 60], ["600", 60], [false, 60],
+		[-1, 300], [NaN, 300], [Infinity, 300], [null, 300], ["600", 300], [false, 300],
 		[2_147_483, 2_147_483], [Number.MAX_VALUE, 2_147_483],
 	]) {
 		config.update({ capabilities: { shell: { timeoutSec: value } } });
@@ -98,7 +103,7 @@ test("timeout values survive updates, reloads and imports, with safe invalid-val
 	assert.equal(config.all().capabilities.shell.timeoutSec, 600);
 	const exported = config.all();
 	config.replaceAll({});
-	assert.equal(config.all().capabilities.shell.timeoutSec, 60);
+	assert.equal(config.all().capabilities.shell.timeoutSec, 300);
 	config.replaceAll(exported);
 	assert.equal(config.all().capabilities.shell.timeoutSec, 600);
 });
@@ -133,7 +138,7 @@ test("timeout edits require a confirmed admin in an IM single chat", async (t) =
 		Object.assign(actor, patch);
 		const result = await settings.execute("denied-edit", { action: "set", path: "capabilities.shell.timeoutSec", value: 600 });
 		assert.equal(result.details.refused, true);
-		assert.equal(config.all().capabilities.shell.timeoutSec, 60);
+		assert.equal(config.all().capabilities.shell.timeoutSec, 300);
 	}
 });
 
@@ -212,11 +217,11 @@ test("background polling yields without killing the process and reads incrementa
 	assert.equal(hasActiveShellCommands(config), false);
 });
 
-test("the original 60-second limit does not terminate default background sessions", async (t) => {
+test("the synchronous 300-second default does not terminate background sessions", async (t) => {
 	const { background, processTool } = fixture(t);
 	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const started = await background(100);
-	t.mock.timers.tick(61_000);
+	t.mock.timers.tick(301_000); // past the SYNC limit; background has its own (0=unlimited)
 	const result = await processTool.execute("poll", { action: "poll", sessionId: started.details.sessionId, waitSec: 10 });
 	assert.equal(result.details.timedOut, false);
 	assert.equal(result.details.code, 0);

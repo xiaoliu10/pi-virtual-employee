@@ -690,7 +690,7 @@ const SETTINGS_OFF_DESCRIPTION =
 	"action=list 列出全部可配置的根块；action=get 按 path 读单个值（如 general.longTaskProgressMin、kb.local.topK、browser.headless、filesystem.allowedDirs）；" +
 	"action=dump 按 path 列出一个块的全部配置项及当前值（密钥自动打码；不传 path 默认 dump 全部根块的键名概览）；" +
 	"action=set 按 path 写入 value（数值段访问数组元素，如 im.channels.0.enabled）。" +
-	"run_command 同步命令超时用 capabilities.shell.timeoutSec（秒，默认 60，0=不限制）；后台命令时限用 capabilities.shell.backgroundTimeoutSec（默认 0=不限时）；单次轮询等待用 capabilities.shell.pollTimeoutSec（默认 30 秒，0=立即返回，等待结束不杀进程）；模型请求超时用 general.requestTimeoutMin（分钟）。" +
+	"run_command 同步命令超时用 capabilities.shell.timeoutSec（秒，默认 300，0=不限制）；后台命令时限用 capabilities.shell.backgroundTimeoutSec（默认 0=不限时）；单次轮询等待用 capabilities.shell.pollTimeoutSec（默认 30 秒，0=立即返回，等待结束不杀进程）；模型请求超时用 general.requestTimeoutMin（分钟）。" +
 	"自主提案后台挖掘：capabilities.autonomousMining.enabled（默认 false）与 capabilities.autonomousMining.intervalHours（默认 4，1-24 小时）；管理员单聊确认 set enabled=true 开启、false 关闭。manage_work_items action=mine 可随时按需扫描当前来源会话近 24 小时；提案需在来源会话「确认创建 <id/标题>」；任务等待人工时，管理员直接回复答复内容即可恢复（无需口令）。" +
 	`path 根块：${Object.keys(ROOT_CATALOG).join("、")}。` +
 	"安全边界：security 块不可通过本工具修改（用 manage_admin/update_identity）；apiKey/appSecret/Token 等可设置但回显自动打码。" +
