@@ -24,6 +24,7 @@ const api = {
 		ipcRenderer.invoke("tasks:schedSilent", id, silent),
 	editScheduledTask: (id: string, patch: { title?: string; prompt?: string; cron?: string; autonomous?: boolean; silent?: boolean }) =>
 		ipcRenderer.invoke("tasks:schedEdit", id, patch),
+	deleteWorkItem: (id: string) => ipcRenderer.invoke("tasks:workDelete", id),
 	workItemAct: (id: string, action: "pause" | "resume" | "cancel") =>
 		ipcRenderer.invoke("tasks:workAct", id, action),
 	workItemEdit: (id: string, patch: { goal?: string; conditions?: string }) =>

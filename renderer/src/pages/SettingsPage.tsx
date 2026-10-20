@@ -131,9 +131,14 @@ function WorkEditDialog({ item, onClose, onSaved }: { item: WorkItemView; onClos
 	const [err, setErr] = useState("");
 	const save = async () => {
 		setBusy(true); setErr("");
-		const res = await api.workItemEdit(item.id, { goal, conditions });
-		setBusy(false);
-		if (res.ok) { onSaved(); onClose(); } else setErr(res.error ?? "保存失败");
+		try {
+			const res = await api.workItemEdit(item.id, { goal, conditions });
+			if (res.ok) { onSaved(); onClose(); } else setErr(res.error ?? "保存失败");
+		} catch (e) {
+			setErr(e instanceof Error ? e.message : String(e));
+		} finally {
+			setBusy(false);
+		}
 	};
 	return (
 		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-6" onClick={onClose}>
@@ -148,6 +153,51 @@ function WorkEditDialog({ item, onClose, onSaved }: { item: WorkItemView; onClos
 				<div className="mt-4 flex justify-end gap-2">
 					<button type="button" onClick={onClose} className="rounded-lg px-4 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-50">取消</button>
 					<button type="button" onClick={() => void save()} disabled={busy} className="rounded-lg bg-slate-800 px-4 py-1.5 text-xs font-medium text-white hover:bg-slate-900 disabled:opacity-50">{busy ? "保存中…" : "保存"}</button>
+				</div>
+			</div>
+		</div>
+	);
+}
+
+/** 删除确认（终态自主任务）：不可恢复，无回收站。 */
+function WorkDeleteDialog({ item, onClose, onDeleted }: { item: WorkItemView; onClose: () => void; onDeleted: () => void }) {
+	const [busy, setBusy] = useState(false);
+	const [err, setErr] = useState("");
+	// Status snapshot at open: if the item was resumed between opening the dialog
+	// and confirming (rare race), the refusal must say "状态变了" rather than
+	// blaming a live task the user never saw (review P2-1).
+	const openedStatus = item.status;
+	const del = async () => {
+		setBusy(true); setErr("");
+		try {
+			const res = await api.deleteWorkItem(item.id);
+			if (res.ok) { onDeleted(); onClose(); }
+			else if (res.error === "任务不存在（可能已被删除）" || (res.error ?? "").includes("只能删除")) {
+				// The row moved since the dialog opened (e.g. resumed from the IM
+				// side while the dialog was up): say so instead of blaming a live
+				// task the user never saw (review P2-1).
+				const now = await api.listWorkItems().catch(() => []);
+				const current = now.find((r) => r.id === item.id);
+				setErr(current && current.status !== openedStatus
+					? `任务状态已变化（打开时是「${openedStatus}」，现在是「${current.status}」），请刷新后重试`
+					: res.error ?? "删除失败");
+			} else setErr(res.error ?? "删除失败");
+		} catch (e) {
+			setErr(e instanceof Error ? e.message : String(e));
+		} finally {
+			setBusy(false);
+		}
+	};
+	return (
+		<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-6" onClick={onClose}>
+			<div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl" onClick={(e) => e.stopPropagation()}>
+				<h3 className="text-[15px] font-semibold text-slate-800">删除自主任务</h3>
+				<p className="mt-2 text-sm text-slate-600">「{item.title}」将从任务列表中永久删除，<span className="font-medium text-rose-600">无法恢复</span>。</p>
+				<p className="mt-1 text-xs text-slate-400">任务执行中沉淀到知识库的经验已独立保存，不受影响（极少见的竞态下：删除恰好落在窗口收尾前，该轮经验可能未及沉淀）。</p>
+				{err && <p className="mt-2 text-xs text-rose-500">{err}</p>}
+				<div className="mt-4 flex justify-end gap-2">
+					<button type="button" onClick={onClose} className="rounded-lg px-4 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-50">取消</button>
+					<button type="button" onClick={() => void del()} disabled={busy} className="rounded-lg bg-rose-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-rose-700 disabled:opacity-50">{busy ? "删除中…" : "确认删除"}</button>
 				</div>
 			</div>
 		</div>
@@ -247,8 +297,21 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 	const refreshSched = () => api.listScheduledTasks().then(setSchedTasks).catch(() => {});
 	const [taskTab, setTaskTab] = useState<"scheduled" | "work">("scheduled");
 	const [workItems, setWorkItems] = useState<WorkItemView[]>([]);
+	const [workActErr, setWorkActErr] = useState("");
 	const refreshWork = () => api.listWorkItems().then(setWorkItems).catch(() => {});
+	/** Lifecycle actions with failure surfacing (review P3-2). */
+	const actWork = async (id: string, action: "pause" | "resume" | "cancel") => {
+		try {
+			const res = await api.workItemAct(id, action);
+			setWorkActErr(res.ok ? "" : res.error ?? "操作失败");
+			await refreshWork();
+		} catch (e) {
+			setWorkActErr(e instanceof Error ? e.message : String(e));
+		}
+	};
 	const [workEdit, setWorkEdit] = useState<WorkItemView | null>(null);
+	/** Delete confirmation for a TERMINAL autonomous task (field 2026-10-18). */
+	const [workDelete, setWorkDelete] = useState<WorkItemView | null>(null);
 	const [schedEdit, setSchedEdit] = useState<ScheduledTaskRow | null>(null);
 	useEffect(() => {
 		if (tab !== "tasks") return;
@@ -486,6 +549,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 												</div>
 												<button type="button" onClick={() => void refreshWork()} className="text-xs font-medium text-blue-600 hover:text-blue-700">刷新</button>
 											</div>
+											{workActErr && <p className="mb-2 text-xs text-rose-500">{workActErr}</p>}
 											<div className="space-y-2">
 												{workItems.length === 0 && <div className="text-xs text-slate-400">暂无自主任务。可在 IM 对话里描述一个需要持续跟进的目标让员工创建，例如「每天盯着对账异常，发现问题直接在群里说」。</div>}
 												{workItems.map((w) => {
@@ -508,6 +572,23 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 																{w.next_check_at ? `下次跟进 ${new Date(w.next_check_at).toLocaleString("zh-CN", { hour12: false })}` : "无排期"}
 																{w.remind_count > 0 ? ` · 已提醒 ${w.remind_count} 次` : ""}
 																{w.created_by ? ` · 确认创建 ${w.created_by}` : ""}
+															</div>
+															<div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+																{w.status !== "done" && w.status !== "cancelled" && (
+																	<button type="button" onClick={() => setWorkEdit(w)} className="font-medium text-blue-600 hover:text-blue-700">编辑</button>
+																)}
+																{(w.status === "done" || w.status === "cancelled") && (
+																	<button type="button" onClick={() => setWorkDelete(w)} className="font-medium text-rose-600 hover:text-rose-700">删除</button>
+																)}
+																{w.status === "scheduled" && (
+																	<button type="button" onClick={() => void actWork(w.id, "pause")} className="font-medium text-amber-600 hover:text-amber-700">暂停</button>
+																)}
+																{w.status === "waiting_human" && (
+																	<button type="button" onClick={() => void actWork(w.id, "resume")} className="font-medium text-emerald-600 hover:text-emerald-700">恢复</button>
+																)}
+																{(w.status === "proposed" || w.status === "queued" || w.status === "working" || w.status === "scheduled" || w.status === "waiting_human") && (
+																	<button type="button" onClick={() => void actWork(w.id, "cancel")} className="font-medium text-slate-500 hover:text-slate-700">取消</button>
+																)}
 															</div>
 														</div>
 													);
@@ -552,6 +633,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 									</>
 									)}
 									{workEdit && <WorkEditDialog item={workEdit} onClose={() => setWorkEdit(null)} onSaved={() => void refreshWork()} />}
+									{workDelete && <WorkDeleteDialog item={workDelete} onClose={() => setWorkDelete(null)} onDeleted={() => void refreshWork()} />}
 									{schedEdit && <SchedEditDialog task={schedEdit} onClose={() => setSchedEdit(null)} onSaved={() => void refreshSched()} />}
 								</div>
 							</div>

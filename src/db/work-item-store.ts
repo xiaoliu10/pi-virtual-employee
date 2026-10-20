@@ -255,4 +255,18 @@ export class WorkItemStore {
 	cancel(id: string): WorkItemRow | undefined {
 		return this.setStatus(id, "cancelled", null, null);
 	}
+
+	/** Hard-delete a TERMINAL item (done/cancelled only) — field 2026-10-18:
+	 * finished autonomous tasks had no way to leave the settings list. Learning
+	 * from a done item is already sedimented into the KB at completion (main.ts
+	 * auto-learn turn), and nothing references work_items by id, so the row is
+	 * pure history at this point. Live items must be cancelled first: deleting a
+	 * working item would kill it mid-flight. Returns the row when deleted. */
+	delete(id: string): WorkItemRow | undefined {
+		const row = this.get(id);
+		if (!row || (row.status !== "done" && row.status !== "cancelled")) return undefined;
+		this.db.prepare("DELETE FROM work_items WHERE id = ?").run(id);
+		this.changed(id);
+		return row;
+	}
 }

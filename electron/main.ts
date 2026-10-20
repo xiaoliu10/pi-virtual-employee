@@ -1377,6 +1377,24 @@ ${tailForProgress(decision.text)}`;
 		scheduler.delete(id);
 		return true;
 	});
+	// Delete a TERMINAL autonomous task (done/cancelled) from the settings list.
+	// The store enforces the terminal guard: a live item returns undefined and
+	// the renderer surfaces the refusal. No recycle bin — the row is history.
+	// Store-missing / not-found / live-refusal are DISTINCT conditions (review
+	// P2-2: one shared message made "系统坏了" indistinguishable from "这是活任务").
+	ipcMain.handle("tasks:workDelete", (_e, id: string) => {
+		const store = engine.workItems;
+		if (!store) return { ok: false, error: "自主任务存储不可用" };
+		try {
+			const row = store.get(id);
+			if (!row) return { ok: false, error: "任务不存在（可能已被删除）" };
+			if (row.status !== "done" && row.status !== "cancelled") return { ok: false, error: "只能删除已完成/已取消的任务（进行中的任务请先取消）" };
+			store.delete(id);
+			return { ok: true };
+		} catch (err) {
+			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+		}
+	});
 	ipcMain.handle("tasks:schedSilent", (_e, id: string, silent: boolean) => {
 		scheduler.update(id, { silent });
 		return true;
@@ -1418,6 +1436,8 @@ ${tailForProgress(decision.text)}`;
 		const store = engine.workItems;
 		if (!store) return { ok: false, error: "自主任务存储不可用" };
 		try {
+			const row = store.get(id);
+			if (row && (row.status === "done" || row.status === "cancelled")) return { ok: false, error: "已结束的任务不能编辑" };
 			let ok = false;
 			if (patch.goal !== undefined) ok = Boolean(store.setField(id, "goal", patch.goal)) || ok;
 			if (patch.conditions !== undefined) ok = Boolean(store.setField(id, "conditions", patch.conditions)) || ok;

@@ -18,6 +18,7 @@ export interface RendererApi {
 	toggleScheduledTask(id: string, enabled: boolean): Promise<boolean>;
 	setScheduledTaskSilent(id: string, silent: boolean): Promise<boolean>;
 	editScheduledTask(id: string, patch: { title?: string; prompt?: string; cron?: string; autonomous?: boolean; silent?: boolean }): Promise<{ ok: boolean; nextRunAt?: number; error?: string }>;
+	deleteWorkItem(id: string): Promise<{ ok: boolean; error?: string }>;
 	workItemAct(id: string, action: "pause" | "resume" | "cancel"): Promise<{ ok: boolean; status?: string; error?: string }>;
 	workItemEdit(id: string, patch: { goal?: string; conditions?: string }): Promise<{ ok: boolean; status?: string; error?: string }>;
 	testReportTarget(): Promise<{ ok: boolean; detail: string }>;
