@@ -319,7 +319,7 @@ export interface AppConfig {
 		shell: {
 			enabled: boolean;
 			allowedCommands: string[];
-			/** Synchronous-command runtime limit in seconds. Default 60; 0 = unlimited. */
+			/** Synchronous-command runtime limit in seconds. Default 300; 0 = unlimited. */
 			timeoutSec: number;
 			/** Background-command runtime limit in seconds. Default 0 = unlimited. */
 			backgroundTimeoutSec: number;
@@ -470,7 +470,7 @@ const DEFAULTS: AppConfig = {
 	documents: { enabled: false, dir: "" },
 	filesystem: { enabled: false, allowedDirs: ["~/Downloads"] },
 	capabilities: {
-		shell: { enabled: false, allowedCommands: ["tasklist", "taskkill", "ping", "ipconfig", "systeminfo", "whoami", "hostname", "netstat", "where"], timeoutSec: 60, backgroundTimeoutSec: 0, pollTimeoutSec: 30 },
+		shell: { enabled: false, allowedCommands: ["tasklist", "taskkill", "ping", "ipconfig", "systeminfo", "whoami", "hostname", "netstat", "where"], timeoutSec: 300, backgroundTimeoutSec: 0, pollTimeoutSec: 30 },
 		mcp: { enabled: false, servers: [] },
 		autonomousMining: { enabled: false, intervalHours: 4 },
 	},

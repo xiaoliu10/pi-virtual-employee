@@ -7,7 +7,8 @@
  * `cmd /c` on Windows (the target deployment is a locked-down Windows server
  * with no visible desktop). Every execution is audited (masked admin id +
  * command), truncated to avoid flooding the reply, and bounded by the
- * configured runtime limit (sync: 60 seconds; background: unlimited by default).
+ * configured runtime limit (sync: 300 seconds by default; background:
+ * unlimited by default).
  *
  * Safety posture:
  *  - Shell execution is OFF by default (`capabilities.shell.enabled=false`).
@@ -389,7 +390,7 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 			"admin 不受白名单与组合语法限制（完整 shell：可用 powershell -Command 管道、重定向、脚本串联等），仅工作目录仍须为不含引号的绝对路径。" +
 			"默认用于运维诊断：tasklist 查看进程、taskkill 按单个 PID 结束进程、systeminfo/whoami/hostname/netstat/ping/ipconfig 查看本机状态。" +
 			"Windows shell 命令已强制 UTF-8 代码页（cmd 内建命令与 powershell 输出正常；tasklist 等 System32 直连命令与 python 管道输出仍可能是 GBK，中文乱码时改用 list_directory 或脚本写文件再读）；含中文/空格的路径必须整体用双引号包住；列目录、查文件元数据优先用 list_directory（原生支持中文路径，无引号转义问题），run_command 留给真正需要执行程序的场景。" +
-			"长任务传 background=true：启动后立即返回 sessionId，用 manage_process poll 阻塞等待、log 增量读日志、kill 终止；等待超时只返回当前状态，不杀后台进程。同步命令运行时限用 capabilities.shell.timeoutSec（默认 60 秒）；后台进程时限用 backgroundTimeoutSec（默认 0=不限制），管理员可用 manage_settings 修改。" +
+			"**同步命令有硬超时（capabilities.shell.timeoutSec，默认 300 秒）**：预计更久一律传 background=true（启动即返回 sessionId，再用 manage_process 的 poll 阻塞等待 / log 增量读 / kill 终止；等待超时只返回当前状态，不杀后台进程）。被超时强杀后不要原样重试同一脚本——要么改后台方式跑，要么先把脚本本身改成分段/增量可续。playwright、数据拉取、大批量文件处理这类几乎必然超过 300 秒，直接 background。后台进程时限用 backgroundTimeoutSec（默认 0=不限制），管理员可用 manage_settings 修改。" +
 			"采集逻辑先写入 .ps1/.py 脚本，命令只用 powershell -File xxx.ps1 或 python xxx.py，参数通过本地文件传递；脚本先输出 observer start 与时间戳，首次 poll/log 检查启动日志，不能把返回 sessionId 当成任务完成。会话由本应用托管，应用退出会终止进程，重启后不可续接；不要再用 nohup 或自制脱管 launcher。" +
 			"powershell/node/npx 等解释器需管理员显式加入白名单（admin 角色无需）；安装 Chromium 请改用 manage_capabilities setup_browser。" +
 			"安全规则：默认关闭；operator 每次执行需在消息中明确包含「确认」/confirm/yes/ok；admin（平台验证身份）发起即授权，直接执行，全部审计留痕。命令以当前应用用户权限运行，不会自动提权。" +
