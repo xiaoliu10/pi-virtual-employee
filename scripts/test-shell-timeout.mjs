@@ -142,7 +142,7 @@ test("timeout edits require a confirmed admin in an IM single chat", async (t) =
 	}
 });
 
-test("longer and unlimited runs survive the former 60-second deadline", async (t) => {
+test("longer and unlimited sync limits let a 50ms command finish well past 60 seconds", async (t) => {
 	const { config, run } = fixture(t);
 	// Advance only the parent's timeout clock; real child processes finish normally.
 	t.mock.timers.enable({ apis: ["setTimeout"] });
