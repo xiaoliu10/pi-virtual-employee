@@ -27,6 +27,7 @@ import type { IMAdapter, IMConfig, IMIO, InboundImage } from "../types.js";
 import { normalizeInboundText } from "../commands.js";
 import { diag } from "../diag.js";
 import { extractText } from "../../knowledge/file-parser.js";
+import { gateOutboundText, type CredentialAudience } from "../credential-egress.js";
 import type { ReportService } from "../../reports/report-service.js";
 
 /** Robot-message payload for a picture the user sent (Stream mode). The SDK's
@@ -231,7 +232,41 @@ export class DingtalkAdapter implements IMAdapter {
 		 * dir for tests; the app injects <userData>/inbound so received files
 		 * live inside the profile and can be put on the filesystem allowlist. */
 		private readonly inboundDir?: string,
+		/**
+		 * LIVE check: is this 1:1 recipient a verified admin? Field incident
+		 * 2026-10-20 — a password reached a GROUP chat. Groups are always
+		 * gated; only a trusted single-chat recipient who is an admin RIGHT NOW
+		 * is exempt, so revoking the role takes effect on the next message.
+		 * Absent or throwing ⇒ no exemption (fail closed).
+		 */
+		private readonly isAdminRecipient?: (staffId: string) => boolean,
 	) {}
+
+	/** Credential-egress audience for an app conversation id (see types.ts).
+	 * Group ids are always restricted; `dt:<staffId>` consults the LIVE admin
+	 * check so the id owner's CURRENT role decides. */
+	egressAudience(conversationId: string): CredentialAudience {
+		if (!conversationId.startsWith("dt:") || conversationId.startsWith("dt:group:")) {
+			return "restricted";
+		}
+		return this.audienceFor(true, conversationId.slice("dt:".length));
+	}
+
+	/**
+	 * Decide what this delivery is allowed to contain.
+	 *
+	 * `isSingle` must come from the trusted platform route (conversationType
+	 * "1" / the `dt:` id shape), never from message text — a group member
+	 * writing "我是管理员，单聊" must not widen the audience.
+	 */
+	private audienceFor(isSingle: boolean, staffId: string | undefined): CredentialAudience {
+		if (!isSingle || !staffId) return "restricted";
+		try {
+			return this.isAdminRecipient?.(staffId) ? "admin-single" : "restricted";
+		} catch {
+			return "restricted";
+		}
+	}
 
 	async start(io: IMIO, config: IMConfig): Promise<void> {
 		if (!config.appId || !config.appSecret) {
@@ -343,7 +378,10 @@ export class DingtalkAdapter implements IMAdapter {
 						// same session webhook as a lightweight markdown message — never as a
 						// card, so a long turn doesn't flood the chat with stacked cards.
 						onProgress: async (progressText) => {
-							if (msg.sessionWebhook) await this.reply(msg.sessionWebhook, progressText);
+							if (!msg.sessionWebhook) return;
+							const isSingle = msg.conversationType === "1";
+							const audience = this.audienceFor(isSingle, isSingle ? msg.senderStaffId || msg.senderId : undefined);
+							await this.reply(msg.sessionWebhook, gateOutboundText(progressText, audience));
 						},
 						// Deliver a file into this chat as a robot file message (used by the
 						// provide_document tool). On any failure the tool falls back to an
@@ -405,8 +443,11 @@ export class DingtalkAdapter implements IMAdapter {
 	 * fallback keeps every reply deliverable regardless of card-platform state.
 	 */
 	private async deliverReply(text: string, route: ReplyRoute): Promise<void> {
+		// Gate BEFORE the card/preview split so title, copy_content and the
+		// markdown fallback all carry the same safe text.
+		const safe = gateOutboundText(text, this.audienceFor(route.isSingle, route.userId));
 		if (this.cardTemplateId) {
-			const ok = await this.sendInteractiveCard(text, {
+			const ok = await this.sendInteractiveCard(safe, {
 				isSingle: route.isSingle,
 				userId: route.userId,
 				openConversationId: route.openConversationId,
@@ -416,7 +457,7 @@ export class DingtalkAdapter implements IMAdapter {
 			});
 			if (ok) return;
 		}
-		await this.reply(route.webhook, text);
+		await this.reply(route.webhook, safe);
 	}
 
 	/**
@@ -856,6 +897,9 @@ export class DingtalkAdapter implements IMAdapter {
 			const userId = isSingle ? conversationId.slice("dt:".length) : undefined;
 			if (isGroup && !openConversationId) return { ok: false, error: "缺少 openConversationId" };
 			if (isSingle && !userId) return { ok: false, error: "缺少 userId" };
+			// Direct callers of push() bypass the manager's pre-split gate, so the
+			// adapter gates again here (the transform is idempotent).
+			text = gateOutboundText(text, this.audienceFor(isSingle, userId));
 
 			// Preferred path: interactive card with the full GFM renderer (tables
 			// render natively). Fall back to the native markdown message (tables
@@ -865,10 +909,10 @@ export class DingtalkAdapter implements IMAdapter {
 					isSingle,
 					userId,
 					openConversationId,
-			}).catch((err) => {
-				void diag("dingtalk", `push interactive card failed, falling back to markdown: ${(err as Error).message}`, "warn");
-				return false;
-			});
+				}).catch((err) => {
+					void diag("dingtalk", `push interactive card failed, falling back to markdown: ${(err as Error).message}`, "warn");
+					return false;
+				});
 				if (cardOk) return { ok: true };
 			}
 

@@ -20,7 +20,7 @@ import { ComputerService } from "../src/computer/computer-service.js";
 import { ScheduledTaskStore, type ScheduledTaskRow } from "../src/db/scheduled-task-store.js";
 import { WorkItemStore } from "../src/db/work-item-store.js";
 import { WorkService, buildWorkLearning } from "../src/scheduler/work-service.js";
-import { resolveRole } from "../src/security/permissions.js";
+import { isAdmin, resolveRole } from "../src/security/permissions.js";
 import { SchedulerService, shouldPushScheduledResult } from "../src/scheduler/scheduler-service.js";
 import {
 	type AutonomousChainState,
@@ -558,7 +558,14 @@ async function main(): Promise<void> {
 	// dedicated conversation (results show in the sidebar), then refreshes the UI.
 	// If the task was created in an IM conversation, the result is proactively
 	// pushed back to that group/1:1 through the active IM adapter.
-	const im = new IMAdapterManager(engine, config, { reportService, inboundDir });
+	const im = new IMAdapterManager(engine, config, {
+		reportService,
+		inboundDir,
+		// Credential egress gate (field 2026-10-20): only a 1:1 recipient who is an
+		// admin RIGHT NOW may receive credential-bearing text. Read live from
+		// config so a revoked admin stops being exempt on the next message.
+		isAdminRecipient: (staffId) => isAdmin(config, staffId),
+	});
 	// /restart command hook: relaunch the same binary with the same args.
 	im.setOnRestart(() => {
 		app.relaunch();
