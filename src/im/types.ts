@@ -103,4 +103,11 @@ export interface IMAdapter {
 	 * channel or the send fails, so callers can log and move on.
 	 */
 	push?(conversationId: string, text: string): Promise<{ ok: boolean; error?: string }>;
+	/**
+	 * Credential-egress audience for a conversation (who may see credential
+	 * text there). Optional — channels without the concept omit it and the
+	 * caller treats everything as restricted. Implementations must be
+	 * synchronous, cheap, and fail closed (throw ⇒ caller uses restricted).
+	 */
+	egressAudience?(conversationId: string): "admin-single" | "restricted";
 }

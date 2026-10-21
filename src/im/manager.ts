@@ -21,18 +21,27 @@ import { maskId } from "../engine/tools/admin.js";
 import { isAuthorizationPhrase } from "../engine/authorization.js";
 import { startStallWatchdog } from "./watchdog.js";
 import { splitForPush } from "./chunks.js";
+import { gateOutboundText } from "./credential-egress.js";
 
 /** Shared deps handed to adapter factories that need them (e.g. image hosting). */
 export interface AdapterDeps {
 	reportService?: ReportService;
 	/** Where inbound files received from channels are stored. */
 	inboundDir?: string;
+	/**
+	 * LIVE admin check used by the credential egress gate: a 1:1 recipient who
+	 * is an admin right now may see credential-bearing text; everyone else
+	 * (and every group) gets it withheld. Absent ⇒ no exemption.
+	 */
+	isAdminRecipient?: (staffId: string) => boolean;
 }
 
 /** channel type → factory. Add more real channels (feishu/wecom/…) here. */
 const REGISTRY = new Map<string, (deps: AdapterDeps) => IMAdapter>([
 	["echo", () => new EchoAdapter()],
-	["dingtalk", (deps) => new DingtalkAdapter(deps.reportService, deps.inboundDir)],
+	// The adapter needs a LIVE admin check for single-chat exemptions, so it is
+	// built through the manager's factory below rather than the static map.
+	["dingtalk", (deps) => new DingtalkAdapter(deps.reportService, deps.inboundDir, deps.isAdminRecipient)],
 ]);
 
 export function availableChannels(): string[] {
@@ -145,6 +154,19 @@ export class IMAdapterManager {
 	async pushToConversation(conversationId: string, text: string): Promise<{ ok: boolean; error?: string }> {
 		const adapter = this.adapterFor(conversationId);
 		if (!adapter?.push) return { ok: false, error: `没有可推送到 ${conversationId} 的在线渠道` };
+		// Scan the WHOLE text before splitting: a credential that lands across a
+		// split boundary would pass each half's per-message check (field incident
+		// 2026-10-20 — the leaking message was one long troubleshooting reply).
+		// The adapter resolves the destination audience (a verified admin 1:1 is
+		// exempt; everything else restricted) and MUST fail closed — any error
+		// or missing hook keeps the restricted audience.
+		let audience: "admin-single" | "restricted" = "restricted";
+		try {
+			audience = adapter.egressAudience?.(conversationId) ?? "restricted";
+		} catch {
+			audience = "restricted";
+		}
+		text = gateOutboundText(text, audience);
 		// Platform message caps (~4000 chars on DingTalk) mean a long report must
 		// ride as several messages — split at paragraph boundaries and deliver the
 		// full text in order (field 2026-09-20: daily reports hard-cut at 1200).
