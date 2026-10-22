@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | **English**
 
-A desktop **Virtual Employee** application powered by the `Agent` from the [pi agent SDK](https://github.com/earendil-works/pi) (`@earendil-works/pi-agent-core`), running in [Electron](https://www.electronjs.org/) and connected to IM channels such as DingTalk. It gives your team an AI employee that actually gets things done—using the tools at hand before replying, rather than handing the task back to a human.
+A desktop **Virtual Employee** application built on the [pi agent SDK](https://github.com/earendil-works/pi): a self-built `Agent` pipeline (`@earendil-works/pi-agent-core`) carries all field hardening, and can optionally wrap in pi-coding-agent's `AgentSession` shell to enable the extension runtime (see [Kernel and pi runtime](#kernel-and-pi-runtime)), running in [Electron](https://www.electronjs.org/) and connected to IM channels such as DingTalk. It gives your team an AI employee that actually gets things done—using the tools at hand before replying, rather than handing the task back to a human.
 
 The interface takes inspiration from [LobsterAI](https://github.com/netease-youdao/LobsterAI). The product centers on **one built-in employee**: a persistent, configurable digital employee that can chat and run scheduled tasks, not a multi-agent orchestration system.
 
@@ -29,7 +29,7 @@ The interface takes inspiration from [LobsterAI](https://github.com/netease-youd
 
 ## Quick Start
 
-Requirements: Node.js 20+ and npm.
+Requirements: Node.js 22.19+ and npm.
 
 ```bash
 # 1) Install dependencies (skip install scripts for better-sqlite3;
@@ -92,7 +92,8 @@ Limits: up to 12 sources per pass, 25 messages per source (user excerpts capped 
 ```text
 electron/            Main process (windows / IPC / update watchdog) + preload
 src/
-├─ engine/           Employee engine: Agent core + conversation management + prompt assembly + tools/
+├─ engine/           Employee engine: Agent core (optionally wrapped in an AgentSession shell) + conversation management + prompt assembly + tools/
+├─ runtime/          pi runtime bootstrap: installs pi-coding-agent from an npmmirror→Gitee→npmjs source chain with version self-check
 ├─ im/               IMAdapter abstraction + DingTalk adapter (Stream / AI cards / files) + command parsing + watchdog
 ├─ scheduler/        Task scheduling + unattended execution + permission inheritance
 ├─ knowledge/        Knowledge base (sqlite-vec vector search + memory layer)
@@ -103,6 +104,12 @@ src/
 └─ db/               better-sqlite3: config / conversations / telemetry
 renderer/src/        React + Vite + Tailwind console
 ```
+
+### Kernel and pi runtime
+
+The conversation kernel keeps the **self-built `Agent`** (pi-agent-core) pipeline — the field hardening (compaction policy, degenerate-reply gating, the retry ladder, session affinity, scoped memory, RBAC) all lives there. Since v0.2.149, a kernel switch (`general.engineKernel`) can wrap the Agent in a pi-coding-agent `AgentSession` shell, enabling the extension runtime (the pi plugin host); pi's built-in auto-retry / auto-compaction are explicitly disabled, so the behavior above is unchanged. **The default is `legacy`**, with zero field impact.
+
+pi-coding-agent is **not packaged**: the installer ships only a pinned `pi-runtime-lock` (the full dependency tree), and on first launch a bootstrap (`src/runtime/`) installs it into `userData/pi-runtime` from an **npmmirror → Gitee → npmjs** source chain (set `general.piRegistryUrl` for a private registry), followed by a version self-check. If installation fails the app stays on legacy — it never starts up broken.
 
 ## Tests and Guardrails
 
