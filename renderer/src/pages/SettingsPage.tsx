@@ -46,11 +46,19 @@ function timeAgo(ts: number): string {
 /** IM 渠道连接状态卡：displayName + 能力声明 + 连接/收发健康度（IMAdapter.status）。 */
 function ChannelStatusCard() {
 	const [statuses, setStatuses] = useState<ChannelStatus[]>([]);
-	const refresh = () => { void api.imChannelStatuses().then(setStatuses).catch(() => {}); };
+	const refresh = () => {
+		void api.imChannelStatuses().then((list) => {
+			setStatuses(list);
+			// IM disabled / no channels: stop the poll instead of burning an IPC
+			// round-trip every 30s against an empty list.
+			if (list.length === 0 && pollTimer) { clearInterval(pollTimer); pollTimer = undefined; }
+		}).catch(() => {});
+	};
+	let pollTimer: ReturnType<typeof setInterval> | undefined;
 	useEffect(() => {
 		refresh();
-		const t = setInterval(refresh, 30_000);
-		return () => clearInterval(t);
+		pollTimer = setInterval(refresh, 30_000);
+		return () => { if (pollTimer) clearInterval(pollTimer); };
 	}, []);
 	if (statuses.length === 0) return null;
 	return (

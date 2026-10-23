@@ -19,7 +19,7 @@ const workDir = await mkdtemp(join(root, "node_modules/.schedsvc-test-"));
 process.on("exit", () => { void rm(workDir, { recursive: true, force: true }); });
 const bundle = join(workDir, "schedsvc.mjs");
 await build({
-	stdin: { contents: 'export { SchedulerService, shouldPushScheduledResult } from "./src/scheduler/scheduler-service.ts";', resolveDir: root, loader: "ts" },
+	stdin: { contents: 'export { SchedulerService, shouldPushScheduledResult, annotateLatePush } from "./src/scheduler/scheduler-service.ts";', resolveDir: root, loader: "ts" },
 	outfile: bundle,
 	bundle: true,
 	platform: "node",
@@ -200,6 +200,9 @@ test("a timed-out LOSING run holds the re-entrancy guard until it settles (no ov
 
 	// The losing run is still executing: the next occurrence must be SKIPPED,
 	// not started on top of it (its late push would race the next run's).
+	// Note: this pins the guard itself, not wall-clock timing — in production
+	// the guard must survive the real 60s tick boundary until the run settles,
+	// which is exactly the release-on-settle seam (not a timer) in tick().
 	store.tasks[0].next_run_at = Date.now() - 1000;
 	await svc.tick();
 	assert.deepEqual(ran, ["loser"], "the guard is held past the timeout");
@@ -233,6 +236,15 @@ test("runCtx.isTimedOut flips true once the timeout raced the run away (late-pus
 	assert.equal(captured.isTimedOut(), true, "losing-run flag is visible to the runner");
 	resolveRun({ status: "late" });
 	await sleep(20);
+});
+
+test("annotateLatePush: only a losing run's push carries the 迟到结果 notice", async () => {
+	const { annotateLatePush } = await import(pathToFileURL(bundle).href);
+	const body = "⏰ **定时任务完成：日报**\n\n内容";
+	assert.equal(annotateLatePush(body, false), body, "a normal run's push is untouched");
+	const annotated = annotateLatePush(body, true);
+	assert.ok(annotated.startsWith("⏱ **迟到结果**"), "the notice leads the message");
+	assert.ok(annotated.endsWith(body), "the original body follows verbatim");
 });
 
 test("shouldPushScheduledResult: autonomous outcome mapping — only 'done' is silenceable", () => {

@@ -48,6 +48,16 @@ export function shouldPushScheduledResult(task: { conversation_id: string | null
 }
 
 const TICK_MS = 60_000;
+
+/**
+ * Prefix a losing run's late push so a stale result is never delivered as
+ * fresh. Pure + exported so the annotation itself is testable (the runner in
+ * electron/main is not unit-tested).
+ */
+export function annotateLatePush(text: string, timedOut: boolean): string {
+	if (!timedOut) return text;
+	return `⏱ **迟到结果**：本轮曾因超时被调度器记为失败，以下是该轮后台实际完成后的结果，内容可能已过时。\n\n${text}`;
+}
 /**
  * Hard ceiling on one task run. Field incident 2026-09-22: a scheduled run that
  * never settled (its turn sits OUTSIDE the IM watchdog, which only covers IM

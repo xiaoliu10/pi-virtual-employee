@@ -102,7 +102,9 @@ export interface AdapterHealth {
 	lastError?: string;
 	/** Epoch ms of the most recent inbound message received from the platform. */
 	lastInboundAt?: number;
-	/** Epoch ms of the most recent outbound delivery that reached a platform send. */
+	/** Epoch ms of the most recent outbound delivery ATTEMPT (set when the
+	 * request reached the platform send, before its response is validated —
+	 * check lastError to see whether it succeeded). */
 	lastOutboundAt?: number;
 }
 

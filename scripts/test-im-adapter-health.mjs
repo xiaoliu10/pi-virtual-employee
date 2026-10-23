@@ -52,7 +52,7 @@ await build({
 						constructor() { globalThis.__dwClientInstance = this; }
 						on() {}
 						registerCallbackListener(topic, cb) { this.cb = cb; }
-						async connect() {}
+						async connect() { if (globalThis.__dwFailConnect) throw new Error("boom"); }
 						disconnect() {}
 						socketCallBackResponse() {}
 					}
@@ -145,11 +145,20 @@ test("dingtalk status lifecycle: connect → inbound → outbound → stop", asy
 
 test("dingtalk records connect failure in lastError and stays disconnected", async () => {
 	const { restore } = stubFetch();
+	globalThis.__dwFailConnect = true;
 	try {
 		const adapter = new DingtalkAdapter();
-		// No credentials → start throws before any connection.
-		await assert.rejects(adapter.start({ async handle() {} }, { channel: "dingtalk", appId: "", appSecret: "" }));
+		// Credentials pass; the stream connect itself fails → lastError carries
+		// the connect failure and the adapter stays disconnected.
+		await assert.rejects(
+			adapter.start({ async handle() {} }, { channel: "dingtalk", appId: "ding-stub-app", appSecret: "ding-stub-secret" }),
+			/boom/,
+		);
+		const st = adapter.status();
+		assert.equal(st.connected, false);
+		assert.match(st.lastError, /connect failed: boom/);
 	} finally {
+		globalThis.__dwFailConnect = false;
 		restore();
 	}
 });

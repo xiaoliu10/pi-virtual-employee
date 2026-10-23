@@ -294,7 +294,13 @@ export class DingtalkAdapter implements IMAdapter {
 			keepAlive: true,
 		});
 		// Avoid an unhandled 'error' event crashing the process.
-		client.on("error", (err) => console.error("[im:dingtalk] client error", err));
+		client.on("error", (err) => {
+			// A dropped stream is the #1 cause of "机器人没反应" — surface it on
+			// the status card. keepAlive may reconnect on its own; the next
+			// successful start() clears this.
+			this.lastError = `stream error: ${(err as Error).message ?? String(err)}`;
+			console.error("[im:dingtalk] client error", err);
+		});
 
 		client.registerCallbackListener(TOPIC_ROBOT, async (res: DWClientDownStream) => {
 			// ACK the stream message immediately so DingTalk doesn't re-push it
@@ -421,6 +427,7 @@ export class DingtalkAdapter implements IMAdapter {
 		}
 		this.client = client;
 		this.connectedAt = Date.now();
+		this.lastError = undefined; // a fresh successful start clears stale errors
 		console.log("[im:dingtalk] stream connected");
 	}
 
