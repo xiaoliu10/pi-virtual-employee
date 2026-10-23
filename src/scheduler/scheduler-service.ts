@@ -19,9 +19,19 @@ import type {
 	ScheduledTaskStore,
 } from "../db/scheduled-task-store.js";
 
+/** Per-run context handed to the runner. */
+export interface SchedulerRunCtx {
+	/** Unique for one occurrence (task id + fire timestamp). */
+	runId: string;
+	/** True once the scheduler's timeout raced this run away — the run is a
+	 * "losing run": still executing but already recorded as failed. The runner
+	 * must annotate any late push so a stale result is never delivered as fresh. */
+	isTimedOut(): boolean;
+}
+
 export interface SchedulerRunner {
 	/** Execute one task; return a status string recorded on the task. */
-	runTask(task: ScheduledTaskRow): Promise<{ status: string }>;
+	runTask(task: ScheduledTaskRow, ctx?: SchedulerRunCtx): Promise<{ status: string }>;
 }
 
 /**
@@ -38,6 +48,16 @@ export function shouldPushScheduledResult(task: { conversation_id: string | null
 }
 
 const TICK_MS = 60_000;
+
+/**
+ * Prefix a losing run's late push so a stale result is never delivered as
+ * fresh. Pure + exported so the annotation itself is testable (the runner in
+ * electron/main is not unit-tested).
+ */
+export function annotateLatePush(text: string, timedOut: boolean): string {
+	if (!timedOut) return text;
+	return `⏱ **迟到结果**：本轮曾因超时被调度器记为失败，以下是该轮后台实际完成后的结果，内容可能已过时。\n\n${text}`;
+}
 /**
  * Hard ceiling on one task run. Field incident 2026-09-22: a scheduled run that
  * never settled (its turn sits OUTSIDE the IM watchdog, which only covers IM
@@ -195,13 +215,19 @@ export class SchedulerService {
 				}
 				this.inFlight.add(task.id);
 				const next = this.safeNext(task.cron);
+				const { raced, settled } = this.runWithTimeout(task);
 				try {
-					const { status } = await this.runWithTimeout(task);
-					this.store.markRun(task.id, status, next);
+					const outcome = await raced;
+					this.store.markRun(task.id, outcome.status, next);
 				} catch (err) {
 					this.store.markRun(task.id, "error:" + (err as Error).message.slice(0, 200), next);
 				} finally {
-					this.inFlight.delete(task.id);
+					// Release the re-entrancy guard when the UNDERLYING RUN settles,
+					// not when the timeout races it away: a losing run that keeps
+					// executing must never overlap the next occurrence (its late
+					// push would race the next run's — the double-delivery this
+					// guard exists to prevent).
+					void settled.then(() => this.inFlight.delete(task.id));
 				}
 			}
 		} finally {
@@ -216,23 +242,43 @@ export class SchedulerService {
 	 * timed-out while still working). The losing run keeps executing in the
 	 * background (an engine turn can't be meaningfully cancelled from here),
 	 * but its eventual rejection is swallowed — the recorded outcome is the
-	 * timeout, and the scheduler has already moved on.
+	 * timeout, and the scheduler has already moved on. The runner learns about
+	 * the timeout via ctx.isTimedOut() and must annotate its late push; the
+	 * task's re-entrancy guard is held until the run settles so a losing run
+	 * can never overlap the next occurrence.
 	 */
-	private runWithTimeout(task: ScheduledTaskRow): Promise<{ status: string }> {
+	private runWithTimeout(task: ScheduledTaskRow): {
+		raced: Promise<{ status: string }>;
+		/** Resolves when the underlying run settles — success, failure, or late. */
+		settled: Promise<void>;
+	} {
 		const autonomousMarginMs = 30 * 60_000;
 		const budget = normalizeBudget(task.max_turns, task.max_minutes);
 		const timeoutMs = task.autonomous ? budget.maxMinutes * 60_000 + autonomousMarginMs : this.runTimeoutMs;
+		let timedOut = false;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const timeout = new Promise<never>((_, reject) => {
 			timer = setTimeout(
-				() => reject(new Error(`run_timeout:运行超过 ${Math.round(timeoutMs / 60_000)} 分钟，被调度器强制记败（任务自身可能仍在后台执行）`)),
+				() => {
+					timedOut = true;
+					reject(new Error(`run_timeout:运行超过 ${Math.round(timeoutMs / 60_000)} 分钟，被调度器强制记败（任务自身可能仍在后台执行）`));
+				},
 				timeoutMs,
 			);
 			timer.unref?.();
 		});
-		const run = this.runner!.runTask(task);
+		// The context travels with the run: the runner can ask whether its attempt
+		// was already recorded as a timeout (losing run) and annotate its late
+		// push instead of delivering a stale result as fresh.
+		const ctx: SchedulerRunCtx = {
+			runId: `${task.id}:${Date.now()}`,
+			isTimedOut: () => timedOut,
+		};
+		const run = this.runner!.runTask(task, ctx);
+		const settled = run.then(() => {}, () => {});
 		run.catch(() => {}); // a late failure after a timeout must not become unhandled
-		return Promise.race([run, timeout]).finally(() => clearTimeout(timer));
+		const raced = Promise.race([run, timeout]).finally(() => clearTimeout(timer));
+		return { raced, settled };
 	}
 
 	private safeNext(cron: string): number | null {

@@ -22,6 +22,7 @@ import { isAuthorizationPhrase } from "../engine/authorization.js";
 import { startStallWatchdog } from "./watchdog.js";
 import { splitForPush } from "./chunks.js";
 import { gateOutboundText } from "./credential-egress.js";
+import type { AdapterCapabilities, AdapterHealth } from "./types.js";
 
 /** Shared deps handed to adapter factories that need them (e.g. image hosting). */
 export interface AdapterDeps {
@@ -154,6 +155,11 @@ export class IMAdapterManager {
 	async pushToConversation(conversationId: string, text: string): Promise<{ ok: boolean; error?: string }> {
 		const adapter = this.adapterFor(conversationId);
 		if (!adapter?.push) return { ok: false, error: `没有可推送到 ${conversationId} 的在线渠道` };
+		// Capability gate: a channel that declares itself non-proactive must not
+		// be pushed to even if a future implementation grows a push method.
+		if (!adapter.metadata.capabilities.proactive) {
+			return { ok: false, error: `渠道「${adapter.metadata.displayName}」不支持主动推送` };
+		}
 		// Scan the WHOLE text before splitting: a credential that lands across a
 		// split boundary would pass each half's per-message check (field incident
 		// 2026-10-20 — the leaking message was one long troubleshooting reply).
@@ -177,6 +183,24 @@ export class IMAdapterManager {
 			if (!pushed.ok) return pushed;
 		}
 		return { ok: true };
+	}
+
+	/** Per-channel connection/delivery health for the settings UI's status card.
+	 * Adapters without status() report a null health (idle). */
+	channelStatuses(): Array<{
+		id: string;
+		channel: string;
+		displayName: string;
+		capabilities: AdapterCapabilities;
+		health: AdapterHealth | null;
+	}> {
+		return [...this.active.entries()].map(([id, a]) => ({
+			id,
+			channel: a.channel,
+			displayName: a.metadata.displayName,
+			capabilities: a.metadata.capabilities,
+			health: a.status?.() ?? null,
+		}));
 	}
 
 	/** Map an app-internal conversation id to the active adapter that owns it. */

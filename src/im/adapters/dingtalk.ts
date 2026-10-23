@@ -28,6 +28,7 @@ import { normalizeInboundText } from "../commands.js";
 import { diag } from "../diag.js";
 import { extractText } from "../../knowledge/file-parser.js";
 import { gateOutboundText, type CredentialAudience } from "../credential-egress.js";
+import type { AdapterHealth, AdapterMetadata } from "../types.js";
 import type { ReportService } from "../../reports/report-service.js";
 
 /** Robot-message payload for a picture the user sent (Stream mode). The SDK's
@@ -212,7 +213,18 @@ export function ensureMarkdownTableBlankLines(text: string): string {
 
 export class DingtalkAdapter implements IMAdapter {
 	readonly channel = "dingtalk";
+	readonly metadata: AdapterMetadata = {
+		displayName: "钉钉",
+		capabilities: { streaming: true, proactive: true, groupMention: true, media: true },
+	};
 	private client?: DWClient;
+	// Connection/delivery health (surfaced via status(), rendered by the settings
+	// page's channel card — field request after "机器人没反应" was undiagnosable
+	// without timestamps).
+	private connectedAt?: number;
+	private lastError?: string;
+	private lastInboundAt?: number;
+	private lastOutboundAt?: number;
 	private appId = "";
 	private appSecret = "";
 	/** Cached OLD-oapi token (separate lifetime from the new-API token). */
@@ -282,12 +294,19 @@ export class DingtalkAdapter implements IMAdapter {
 			keepAlive: true,
 		});
 		// Avoid an unhandled 'error' event crashing the process.
-		client.on("error", (err) => console.error("[im:dingtalk] client error", err));
+		client.on("error", (err) => {
+			// A dropped stream is the #1 cause of "机器人没反应" — surface it on
+			// the status card. keepAlive may reconnect on its own; the next
+			// successful start() clears this.
+			this.lastError = `stream error: ${(err as Error).message ?? String(err)}`;
+			console.error("[im:dingtalk] client error", err);
+		});
 
 		client.registerCallbackListener(TOPIC_ROBOT, async (res: DWClientDownStream) => {
 			// ACK the stream message immediately so DingTalk doesn't re-push it
 			// while the (slow) model call runs.
 			client.socketCallBackResponse(res.headers.messageId, {});
+			this.lastInboundAt = Date.now();
 
 			let msg: AnyRobotMsg;
 			try {
@@ -400,14 +419,33 @@ export class DingtalkAdapter implements IMAdapter {
 			}
 		});
 
-		await client.connect();
+		try {
+			await client.connect();
+		} catch (err) {
+			this.lastError = `connect failed: ${(err as Error).message}`;
+			throw err;
+		}
 		this.client = client;
+		this.connectedAt = Date.now();
+		this.lastError = undefined; // a fresh successful start clears stale errors
 		console.log("[im:dingtalk] stream connected");
 	}
 
 	async stop(): Promise<void> {
 		this.client?.disconnect();
 		this.client = undefined;
+		this.connectedAt = undefined;
+	}
+
+	/** Live connection/delivery health (IMAdapter.status). */
+	status(): AdapterHealth {
+		return {
+			connected: this.connectedAt !== undefined,
+			startedAt: this.connectedAt,
+			lastError: this.lastError,
+			lastInboundAt: this.lastInboundAt,
+			lastOutboundAt: this.lastOutboundAt,
+		};
 	}
 
 	/** Reply through the robot's temporary session webhook (no access token).
@@ -421,7 +459,11 @@ export class DingtalkAdapter implements IMAdapter {
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ msgtype: "markdown", markdown: { title: digestTitle(text), text: flattenMarkdownTables(text) } }),
 		});
-		if (!res.ok) void diag("dingtalk", `reply failed: HTTP ${res.status}`, "warn");
+		this.lastOutboundAt = Date.now();
+		if (!res.ok) {
+			this.lastError = `reply HTTP ${res.status}`;
+			void diag("dingtalk", `reply failed: HTTP ${res.status}`, "warn");
+		}
 	}
 
 	/** Build the card/markdown routing info from an inbound stream message. */
@@ -573,6 +615,7 @@ export class DingtalkAdapter implements IMAdapter {
 		}
 		// Step 3b: commit the answer through the card instances update API — the
 		// only channel the V2 template actually renders (blockList loopArray).
+		this.lastOutboundAt = Date.now();
 		const commitRes = await fetch("https://api.dingtalk.com/v1.0/card/instances", {
 			method: "PUT",
 			headers: { "Content-Type": "application/json", "x-acs-dingtalk-access-token": token },
@@ -869,8 +912,10 @@ export class DingtalkAdapter implements IMAdapter {
 			headers: { "Content-Type": "application/json; charset=utf-8", "x-acs-dingtalk-access-token": token },
 			body: JSON.stringify(body),
 		});
+		this.lastOutboundAt = Date.now();
 		if (!res.ok) {
 			const detail = await res.text().catch(() => "");
+			this.lastError = `send HTTP ${res.status}`;
 			throw new Error(`消息发送失败 HTTP ${res.status}: ${detail.slice(0, 200)}`);
 		}
 	}

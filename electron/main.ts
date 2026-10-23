@@ -21,7 +21,7 @@ import { ScheduledTaskStore, type ScheduledTaskRow } from "../src/db/scheduled-t
 import { WorkItemStore } from "../src/db/work-item-store.js";
 import { WorkService, buildWorkLearning } from "../src/scheduler/work-service.js";
 import { isAdmin, resolveRole } from "../src/security/permissions.js";
-import { SchedulerService, shouldPushScheduledResult } from "../src/scheduler/scheduler-service.js";
+import { SchedulerService, shouldPushScheduledResult, annotateLatePush } from "../src/scheduler/scheduler-service.js";
 import {
 	type AutonomousChainState,
 	buildAutonomousTurnPrefix,
@@ -929,7 +929,7 @@ ${tailForProgress(decision.text)}`;
 	app.on("before-quit", () => { void stopWork(); });
 
 	scheduler.setRunner({
-		async runTask(task) {
+		async runTask(task, ctx) {
 			if (task.autonomous) return runAutonomousTask(task);
 			// Execute in an isolated background conversation, NOT the originating IM
 			// chat. Reusing the IM conversation's Agent would collide with a live IM
@@ -937,7 +937,10 @@ ${tailForProgress(decision.text)}`;
 			// IM conversation is only the push-back target, never the exec agent.
 			// Each run gets a unique id (task id + fire timestamp): no history bleed
 			// between runs, runs never share an agent.
-			const execConvId = `sched:${task.id}:${Date.now()}`;
+			// Derive from the run's ctx.runId when present so the conversation id,
+			// the scheduler's runId and any future push idempotency key all
+			// correlate to the same occurrence.
+			const execConvId = `sched:${ctx?.runId ?? `${task.id}:${Date.now()}`}`;
 			// Give the sidebar entry the task title instead of a prompt-derived title
 			// (engine.send keeps an existing title when re-ensuring the conversation).
 			history.ensureConversation(execConvId, `⏰ ${task.title}`);
@@ -1012,7 +1015,10 @@ ${tailForProgress(decision.text)}`;
 			const pushTarget = task.conversation_id;
 			if (pushTarget && shouldPushScheduledResult(task, error, reply)) {
 				const body = reportUrl ? `${reply}\n\n📎 查看报告：${reportUrl}` : reply;
-				const pushText = `⏰ **定时任务完成：${task.title}**\n\n${body}`;
+				// A timed-out losing run that eventually finished must not present
+				// its stale result as fresh — annotateLatePush adds the notice
+				// (pure helper, pinned by test-scheduler-service).
+				const pushText = annotateLatePush(`⏰ **定时任务完成：${task.title}**\n\n${body}`, ctx?.isTimedOut() === true);
 				const pushed = await im.pushToConversation(pushTarget, pushText);
 				if (!pushed.ok) {
 					pushError = pushed.error || "未知推送错误";
@@ -1158,6 +1164,7 @@ ${tailForProgress(decision.text)}`;
 		im.simulate(conversationId, text, actor),
 	);
 	ipcMain.handle("im:channels", () => availableChannels());
+	ipcMain.handle("im:channelStatuses", () => im.channelStatuses());
 
 	ipcMain.handle("model:list", () => engine.availableModels());
 	ipcMain.handle("model:test", async (_e, supplier: Supplier, modelId: string) => {

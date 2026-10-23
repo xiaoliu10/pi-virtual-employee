@@ -38,6 +38,13 @@ testOss(): Promise<{ ok: boolean; detail: string }>;
 	setAutostart(enabled: boolean): Promise<boolean>;
 	simulateIM(conversationId: string, text: string, actor?: { senderId: string; senderName?: string; channel: string; chatType: "single" | "group" }): Promise<string>;
 	imChannels(): Promise<string[]>;
+	imChannelStatuses(): Promise<Array<{
+		id: string;
+		channel: string;
+		displayName: string;
+		capabilities: { streaming: boolean; proactive: boolean; groupMention: boolean; media: boolean };
+		health: { connected: boolean; startedAt?: number; lastError?: string; lastInboundAt?: number; lastOutboundAt?: number } | null;
+	}>>;
 	onConfigChanged(cb: () => void): () => void;
 	onImActivity(cb: (conversationId: string) => void): () => void;
 	listModels(): Promise<import("./lib/types").ModelOption[]>;

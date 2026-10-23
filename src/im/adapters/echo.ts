@@ -7,15 +7,26 @@ import type { IMAdapter, IMConfig, IMIO, InboundActor } from "../types.js";
 
 export class EchoAdapter implements IMAdapter {
 	readonly channel = "echo";
+	readonly metadata = {
+		displayName: "Echo 测试通道",
+		capabilities: { streaming: false, proactive: false, groupMention: false, media: false },
+	};
 	private io?: IMIO;
+	private startedAt?: number;
 
 	async start(io: IMIO, _config: IMConfig): Promise<void> {
 		this.io = io;
+		this.startedAt = Date.now();
 		console.log("[im:echo] adapter started (test channel)");
 	}
 
 	async stop(): Promise<void> {
 		this.io = undefined;
+		this.startedAt = undefined;
+	}
+
+	status() {
+		return { connected: this.io !== undefined, startedAt: this.startedAt };
 	}
 
 	/** Simulate an inbound IM message; returns the employee reply.
