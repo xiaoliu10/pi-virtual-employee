@@ -269,6 +269,15 @@ export class WorkService<Session extends WorkSession> {
 		let nextStreak = 0;
 		let emptyReplies = 0;
 		let stallRetriedThisTurn = false;
+		// True only when THIS window settled via the timeout auto-defer (which
+		// persists an incremented streak). Every other close — done, a model-declared
+		// NEXT_CHECK, a human handover, a circuit-break pause, an error — is a normal
+		// close: "连续 N 次超时" counts consecutive timeouts, so a window that ended
+		// any other way must give the next hard timeout a fresh count (e.g. scan
+		// window hard-times out → defer → the follow-up window hands over via a
+		// normal NEXT_CHECK; a stale streak would falsely trip the breaker on the
+		// next single timeout).
+		let timeoutDeferred = false;
 		let outcome: "done" | "waiting_human" | "scheduled" = "waiting_human";
 		try {
 			if (!this.running) return;
@@ -300,6 +309,7 @@ export class WorkService<Session extends WorkSession> {
 							break;
 						}
 						store.setTimeoutStreak(item.id, streak);
+						timeoutDeferred = true;
 						outcome = "scheduled";
 						nextCheckAt = this.clock.now() + TIMEOUT_DEFER_MS;
 						nextReason = "窗口时间上限已到，未完成部分自动顺延（下一窗口从已保存进度继续）";
@@ -401,6 +411,7 @@ export class WorkService<Session extends WorkSession> {
 						break;
 					}
 					store.setTimeoutStreak(item.id, streak);
+					timeoutDeferred = true;
 					outcome = "scheduled";
 					nextCheckAt = this.clock.now() + TIMEOUT_DEFER_MS;
 					nextReason = "窗口时间上限已到，未完成部分自动顺延（下一窗口从已保存进度继续）";
@@ -503,6 +514,7 @@ export class WorkService<Session extends WorkSession> {
 					question = `已连续 ${streak} 次因时间上限（${this.budget.maxMinutes} 分钟）自动顺延仍未完成——这件工作装不进当前窗口预算。请用 update 调大 max_minutes，或把目标拆成多个自主任务，然后明确恢复。`;
 				} else {
 					store.setTimeoutStreak(item?.id ?? "", streak);
+					timeoutDeferred = true;
 					outcome = "scheduled";
 					nextCheckAt = this.clock.now() + TIMEOUT_DEFER_MS;
 					nextReason = "窗口时间上限已到，未完成部分自动顺延（下一窗口从已保存进度继续）";
@@ -524,6 +536,10 @@ export class WorkService<Session extends WorkSession> {
 			if (item && store.get(item.id)?.status === "working") {
 				store.setStatus(item.id, outcome, outcome === "waiting_human" ? question || active.stopReason || "请管理员明确恢复。" : null, nextCheckAt ?? null, nextReason);
 				if (outcome === "scheduled") store.setFixedStreak(item.id, nextStreak);
+				// A non-timeout close resets the consecutive-timeout meter: the breaker
+				// counts CONSECUTIVE hard timeouts, and a normal close (or the breaker
+				// pausing for the admin) starts a fresh count for the next window.
+				if (!timeoutDeferred && (active.prevTimeouts ?? 0) > 0) store.setTimeoutStreak(item.id, 0);
 			}
 			try { await this.opts.release(convId); } catch (err) { this.opts.onError?.(err); }
 		}

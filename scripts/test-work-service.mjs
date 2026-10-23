@@ -868,6 +868,52 @@ test("the wall-clock cap now DEFERS the window instead of pausing for the admin"
 	assert.ok(h.clock.timers.size <= 1, "the window deadline was cleared; at most the reminder timer remains");
 });
 
+test("two consecutive hard timeouts circuit-break to waiting_human with a resize/split ask", async t => {
+	// The breaker exists because "defer forever" is silent busywork: a task that
+	// cannot fit the budget twice in a row needs the admin to resize or split it.
+	// Each send advances the FAKE clock so the cap trips without spinning.
+	const h = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } }, send: h2 => { h2.clock.time += 6 * 60_000; return { reply: "持续推进，尚未完成" }; } });
+	const item = h.create();
+	h.service.start(); await flush();
+	let row = h.store.get(item.id);
+	assert.equal(row.status, "scheduled", "window 1 defers (streak 1)");
+	assert.equal(row.timeout_streak, 1);
+	await h.clock.advance(5 * 60_000 + 1); // ride the defer into window 2
+	await flush();
+	row = h.store.get(item.id);
+	assert.equal(row.status, "waiting_human", "2 consecutive hard timeouts must not defer forever");
+	assert.match(row.question ?? "", /调大 max_minutes/, "the pause says how to fix the budget");
+	assert.match(row.question ?? "", /拆成多个自主任务/, "…or split the task");
+	// The breaker pause itself starts a fresh count: after the admin resizes and
+	// resumes, ONE new timeout defers again instead of instantly re-breaking.
+	assert.equal(row.timeout_streak, 0, "the breaker pause resets the meter for the resumed chain");
+});
+
+test("a normal close clears the consecutive-timeout meter (stale streak must not false-trip)", async t => {
+	// Scan window hard-times out (streak 1) → the follow-up window hands over
+	// via a normal NEXT_CHECK / DONE. The meter counts CONSECUTIVE timeouts, so
+	// the normal close must reset it — otherwise the next single timeout would
+	// falsely read as "2 in a row" and pause the chain.
+	const nextCheck = fixture(t, {
+		options: { budget: { maxTurns: 0, maxMinutes: 30 } },
+		send: () => ({ reply: "扫描完成，已落盘；处理阶段下次继续\n[[NEXT_CHECK]]: 2 小时后" }),
+	});
+	const n = nextCheck.create();
+	nextCheck.db.prepare("UPDATE work_items SET timeout_streak = 1 WHERE id = ?").run(n.id);
+	nextCheck.service.start(); await flush();
+	let row = nextCheck.store.get(n.id);
+	assert.equal(row.status, "scheduled", "the model-declared NEXT_CHECK closed the window normally");
+	assert.equal(row.timeout_streak, 0, "a NEXT_CHECK close resets the timeout meter");
+
+	const done = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } } }); // default send → DONE
+	const d = done.create();
+	done.db.prepare("UPDATE work_items SET timeout_streak = 1 WHERE id = ?").run(d.id);
+	done.service.start(); await flush();
+	row = done.store.get(d.id);
+	assert.equal(row.status, "done");
+	assert.equal(row.timeout_streak, 0, "a DONE close resets the timeout meter too");
+});
+
 test("unlimited turns: a cancel and a need-human pause still win immediately", async t => {
 	// A pause must not need the turn counter to trip, and a cancelled item stays
 	// silent (no push) even when the window would otherwise keep looping.
