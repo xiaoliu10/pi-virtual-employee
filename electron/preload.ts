@@ -51,6 +51,7 @@ const api = {
 	simulateIM: (conversationId: string, text: string, actor?: { senderId: string; senderName?: string; channel: string; chatType: "single" | "group" }): Promise<string> =>
 		ipcRenderer.invoke("im:simulate", conversationId, text, actor),
 	imChannels: (): Promise<string[]> => ipcRenderer.invoke("im:channels"),
+	imChannelStatuses: (): Promise<unknown[]> => ipcRenderer.invoke("im:channelStatuses"),
 	/** Subscribe to config-change pushes (main → renderer): any writer of the config store
 	 * (settings save, IM manage_access/manage_settings, import) broadcasts this, so an
 	 * open settings page re-reads instead of showing a stale draft. Returns an unsubscribe. */

@@ -92,8 +92,44 @@ export interface IMIO {
 	handle(msg: InboundMessage, ctx?: InboundCtx): Promise<string>;
 }
 
+/** Live connection/delivery health for one channel (LobsterAI-style fields). */
+export interface AdapterHealth {
+	/** The stream/connection is up (start succeeded, stop not called). */
+	connected: boolean;
+	/** Epoch ms of the last successful start(). */
+	startedAt?: number;
+	/** Most recent connection or delivery error (diagnostic; may stay set after recovery). */
+	lastError?: string;
+	/** Epoch ms of the most recent inbound message received from the platform. */
+	lastInboundAt?: number;
+	/** Epoch ms of the most recent outbound delivery that reached a platform send. */
+	lastOutboundAt?: number;
+}
+
+/** What a channel can do — drives UI chips and the manager's push gating. */
+export interface AdapterCapabilities {
+	/** AI-card / streaming reply support. */
+	streaming: boolean;
+	/** Can deliver messages without an inbound trigger (scheduled results, heartbeats). */
+	proactive: boolean;
+	/** Group chats supported (incl. @mention flows). */
+	groupMention: boolean;
+	/** File/image delivery supported. */
+	media: boolean;
+}
+
+export interface AdapterMetadata {
+	/** Human-readable channel name for the settings UI. */
+	displayName: string;
+	capabilities: AdapterCapabilities;
+}
+
 export interface IMAdapter {
 	readonly channel: string;
+	/** Channel identity + capability declaration. The settings UI renders this
+	 * instead of hardcoding per-channel facts, and the manager consults
+	 * capabilities before pushing. */
+	readonly metadata: AdapterMetadata;
 	start(io: IMIO, config: IMConfig): Promise<void>;
 	stop(): Promise<void>;
 	/**
@@ -110,4 +146,7 @@ export interface IMAdapter {
 	 * synchronous, cheap, and fail closed (throw ⇒ caller uses restricted).
 	 */
 	egressAudience?(conversationId: string): "admin-single" | "restricted";
+	/** Live connection/delivery health. Optional — channels without meaningful
+	 * connection state may omit it; the UI then shows the channel as idle. */
+	status?(): AdapterHealth;
 }

@@ -31,6 +31,56 @@ const CHANNEL_LABELS: Record<string, string> = {
 };
 
 type Tab = "model" | "knowledge" | "content" | "skills" | "im" | "general" | "prompt" | "tasks" | "migrate";
+
+type ChannelStatus = Awaited<ReturnType<typeof api.imChannelStatuses>>[number];
+
+function timeAgo(ts: number): string {
+	const m = Math.round((Date.now() - ts) / 60_000);
+	if (m < 1) return "刚刚";
+	if (m < 60) return `${m} 分钟前`;
+	const h = Math.round(m / 60);
+	if (h < 24) return `${h} 小时前`;
+	return `${Math.round(h / 24)} 天前`;
+}
+
+/** IM 渠道连接状态卡：displayName + 能力声明 + 连接/收发健康度（IMAdapter.status）。 */
+function ChannelStatusCard() {
+	const [statuses, setStatuses] = useState<ChannelStatus[]>([]);
+	const refresh = () => { void api.imChannelStatuses().then(setStatuses).catch(() => {}); };
+	useEffect(() => {
+		refresh();
+		const t = setInterval(refresh, 30_000);
+		return () => clearInterval(t);
+	}, []);
+	if (statuses.length === 0) return null;
+	return (
+		<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
+			<div className="flex items-center justify-between">
+				<div className="text-sm font-medium text-slate-800">渠道连接状态</div>
+				<button onClick={refresh} className="text-xs text-slate-400 hover:text-slate-600">刷新</button>
+			</div>
+			<div className="mt-3 space-y-2">
+				{statuses.map((c) => (
+					<div key={c.id} className="flex items-center justify-between gap-3 rounded-lg bg-slate-50 px-3 py-2 text-xs">
+						<div className="flex min-w-0 items-center gap-2">
+							<span className={`inline-block h-2 w-2 shrink-0 rounded-full ${c.health?.connected ? "bg-emerald-500" : "bg-slate-300"}`} />
+							<span className="font-medium text-slate-700">{c.displayName}</span>
+							<span className="truncate text-slate-400">
+								{[c.capabilities.proactive ? "主动推送" : null, c.capabilities.groupMention ? "群 @" : null, c.capabilities.media ? "媒体" : null, c.capabilities.streaming ? "流式" : null].filter(Boolean).join(" · ") || "仅应答"}
+							</span>
+						</div>
+						<div className="shrink-0 text-right text-slate-400">
+							{c.health?.lastError ? <span className="text-red-500">{c.health.lastError} · </span> : null}
+							{c.health?.connected && c.health.startedAt ? `启动于 ${new Date(c.health.startedAt).toLocaleTimeString("zh-CN", { hour12: false })}` : "未启动"}
+							{c.health?.lastInboundAt ? ` · 收 ${timeAgo(c.health.lastInboundAt)}` : ""}
+							{c.health?.lastOutboundAt ? ` · 发 ${timeAgo(c.health.lastOutboundAt)}` : ""}
+						</div>
+					</div>
+				))}
+			</div>
+		</div>
+	);
+}
 /** Sub-tab inside the unified 内容中心. */
 type ContentTab = "resources" | "artifacts";
 
@@ -642,6 +692,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 								<div className="mx-auto max-w-2xl space-y-5">
 									{tab === "im" && (
 										<>
+											<ChannelStatusCard />
 											<label className="flex cursor-pointer items-center justify-between rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
 												<div><div className="text-sm font-medium text-slate-800">启用 IM 接入</div><div className="mt-1 text-xs text-slate-400">保存后立即启动所有已启用的渠道（可同时连多个）。</div></div>
 												<input type="checkbox" checked={draft.im.enabled} onChange={(event) => setIm({ enabled: event.target.checked })} className="h-5 w-5 accent-blue-500" />

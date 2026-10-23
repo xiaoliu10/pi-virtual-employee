@@ -929,7 +929,7 @@ ${tailForProgress(decision.text)}`;
 	app.on("before-quit", () => { void stopWork(); });
 
 	scheduler.setRunner({
-		async runTask(task) {
+		async runTask(task, ctx) {
 			if (task.autonomous) return runAutonomousTask(task);
 			// Execute in an isolated background conversation, NOT the originating IM
 			// chat. Reusing the IM conversation's Agent would collide with a live IM
@@ -1012,7 +1012,13 @@ ${tailForProgress(decision.text)}`;
 			const pushTarget = task.conversation_id;
 			if (pushTarget && shouldPushScheduledResult(task, error, reply)) {
 				const body = reportUrl ? `${reply}\n\n📎 查看报告：${reportUrl}` : reply;
-				const pushText = `⏰ **定时任务完成：${task.title}**\n\n${body}`;
+				// A timed-out losing run that eventually finished must not present
+				// its stale result as fresh: the run was already recorded as
+				// run_timeout, so the late delivery carries an explicit annotation.
+				const lateNote = ctx?.isTimedOut()
+					? "⏱ **迟到结果**：本轮曾因超时被调度器记为失败，以下是该轮后台实际完成后的结果，内容可能已过时。\n\n"
+					: "";
+				const pushText = `${lateNote}⏰ **定时任务完成：${task.title}**\n\n${body}`;
 				const pushed = await im.pushToConversation(pushTarget, pushText);
 				if (!pushed.ok) {
 					pushError = pushed.error || "未知推送错误";
@@ -1158,6 +1164,7 @@ ${tailForProgress(decision.text)}`;
 		im.simulate(conversationId, text, actor),
 	);
 	ipcMain.handle("im:channels", () => availableChannels());
+	ipcMain.handle("im:channelStatuses", () => im.channelStatuses());
 
 	ipcMain.handle("model:list", () => engine.availableModels());
 	ipcMain.handle("model:test", async (_e, supplier: Supplier, modelId: string) => {

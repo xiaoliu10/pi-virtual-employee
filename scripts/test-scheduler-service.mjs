@@ -177,6 +177,64 @@ test("shouldPushScheduledResult: silent + success = no push; everything else pus
 	assert.equal(shouldPushScheduledResult({ conversation_id: "dt:g1", silent: 0 }, undefined, ""), false, "an empty reply never pushes");
 });
 
+test("a timed-out LOSING run holds the re-entrancy guard until it settles (no overlapping next occurrence)", async (t) => {
+	const store = memoryStore();
+	store.create({ id: "loser", prompt: "x", cron: "* * * * *", next_run_at: Date.now() - 1000 });
+	const ran = [];
+	let resolveLoser;
+	const loser = new Promise((resolve) => { resolveLoser = resolve; });
+	t.after(() => resolveLoser?.({ status: "late" })); // never leave a pending handle
+	const svc = new SchedulerService(store, 50);
+	svc.setRunner({
+		async runTask(task) {
+			ran.push(task.id);
+			// Only the FIRST occurrence is the long-running loser; later
+			// occurrences (after the loser settles) complete normally.
+			if (task.id === "loser" && ran.length === 1) return loser;
+			return { status: "ok" };
+		},
+	});
+
+	await svc.tick(); // ~50ms: raced away, recorded as run_timeout — but the run is STILL executing
+	assert.match(store.tasks[0].last_status, /^error:run_timeout:/);
+
+	// The losing run is still executing: the next occurrence must be SKIPPED,
+	// not started on top of it (its late push would race the next run's).
+	store.tasks[0].next_run_at = Date.now() - 1000;
+	await svc.tick();
+	assert.deepEqual(ran, ["loser"], "the guard is held past the timeout");
+
+	// Losing run settles → guard released → the task fires again normally.
+	resolveLoser({ status: "late" });
+	await sleep(30);
+	store.tasks[0].next_run_at = Date.now() - 1000;
+	await svc.tick();
+	assert.deepEqual(ran, ["loser", "loser"], "the next occurrence runs after the loser settles");
+	assert.equal(store.tasks[0].last_status, "ok");
+});
+
+test("runCtx.isTimedOut flips true once the timeout raced the run away (late-push annotation hook)", async (t) => {
+	const store = memoryStore();
+	store.create({ id: "late", prompt: "x", cron: "* * * * *", next_run_at: Date.now() - 1000 });
+	let captured;
+	let resolveRun;
+	t.after(() => resolveRun?.({ status: "late" }));
+	const svc = new SchedulerService(store, 50);
+	svc.setRunner({
+		async runTask(task, ctx) {
+			captured = ctx;
+			return new Promise((resolve) => { resolveRun = resolve; });
+		},
+	});
+
+	await svc.tick(); // timeout fires at ~50ms
+	assert.ok(captured, "the runner received a run ctx");
+	assert.match(captured.runId, /^late:/, "runId = taskId:fireTimestamp");
+	assert.equal(captured.isTimedOut(), true, "losing-run flag is visible to the runner");
+	resolveRun({ status: "late" });
+	await sleep(20);
+});
+
 test("shouldPushScheduledResult: autonomous outcome mapping — only 'done' is silenceable", () => {
 	// main.ts passes attention = outcome !== "done" ? outcome : undefined.
 	const gate = (outcome, silent) => shouldPushScheduledResult(
