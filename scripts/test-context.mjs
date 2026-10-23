@@ -25,7 +25,7 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 			contents: `
-				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, lastAssistantTailOf, recentAssistantVisibleTexts, isCompactionTemplateText } from "./src/engine/context.ts";
+				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, turnMemoryPrefix, lastAssistantTailOf, recentAssistantVisibleTexts, isCompactionTemplateText } from "./src/engine/context.ts";
 				// pi 1.x moved the compaction primitives to the coding-agent package;
 				// the app vendors them in src/engine/pi-compaction.ts.
 				export { shouldCompact, DEFAULT_COMPACTION_SETTINGS, estimateTokens } from "./src/engine/pi-compaction.ts";
@@ -39,7 +39,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, lastAssistantTailOf, recentAssistantVisibleTexts, isCompactionTemplateText } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, turnMemoryPrefix, lastAssistantTailOf, recentAssistantVisibleTexts, isCompactionTemplateText } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -683,4 +683,37 @@ test("recentAssistantVisibleTexts: stopAt bounds evidence to the current task (r
 	// Template echoes between anchor and tail are still skipped under stopAt.
 	const template = assistant("## Goal x\n## Constraints & Preferences y");
 	assert.deepEqual(recentAssistantVisibleTexts([oldReport, anchor, template, narration], 8, anchor), ["已开始读取上周掉单明细，整理表格结构中。"]);
+});
+
+test("turnMemoryPrefix 注入块被 stripSyntheticPromptPrefix 完全剥除（现场 2026-10-23：记忆前缀泄漏进心跳进度汇报）", () => {
+	const lines = ["- 钉钉登录方式 — 扫码登录，验证码问管理员", "- 日报口径 — 昨日 18:00 后生成"];
+	const request = "帮我跑一下昨天的对账巡检";
+	const injected = turnMemoryPrefix(lines) + request;
+	assert.ok(injected.includes("本回合自动携带"), "fixture really carries the prefix");
+
+	// stripSyntheticPromptPrefix is what the heartbeat anchor uses to quote the
+	// real request — the memory block must not survive into that quote.
+	assert.equal(stripSyntheticPromptPrefix(injected), request, "the injected prefix is stripped, request survives verbatim");
+	assert.equal(stripSyntheticPromptPrefix(request), request, "a message without the prefix is untouched");
+
+	// substantialAnchorOf must quote the request, not the memory headlines.
+	const anchor = substantialAnchorOf([{ role: "user", content: injected }]);
+	assert.equal(anchor, request, "the heartbeat anchor quotes the real request");
+});
+
+test("记忆前缀后紧跟 runner 脚手架时两者都被剥（注入顺序无关）", () => {
+	const injected = turnMemoryPrefix(["- 偏好 — 简短"]) + "【系统注入的真实执行时间：2026-10-23 09:00】\n跑巡检";
+	assert.equal(stripSyntheticPromptPrefix(injected), "跑巡检");
+});
+
+test("progressContextSlice 剥掉用户消息里的记忆前缀（侧信道不得读到注入块）", () => {
+	const request = "帮我跑一下昨天的对账巡检";
+	const messages = [
+		{ role: "user", content: turnMemoryPrefix(["- 偏好 — 简短"]) + request },
+		{ role: "assistant", content: "已开始读取上周掉单明细。" },
+	];
+	const slice = progressContextSlice(messages);
+	const texts = slice.map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)));
+	assert.ok(texts.some((t) => t === request), "the real request survives");
+	assert.ok(!texts.some((t) => t.includes("本回合自动携带")), "no memory prefix reaches the side pass");
 });
