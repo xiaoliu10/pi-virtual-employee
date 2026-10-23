@@ -1,7 +1,7 @@
 # 同类 Agent 竞品调研与生态全景（Grok bot / Dots / 开源同类）
 
 > 真实意图：老板想了解同类 AI 员工/助理 agent（点名 Grok bot、Dots 等）都有什么能力、哪些值得借鉴进 VE；顺带产出一张 agent 生态架构/全景图供学习。
-> 日期：2026-10-21 ／ 状态：调研中（Phase 2 外部调研进行中）
+> 日期：2026-10-21 ／ 状态：完成（2.1 商业同类已于 2026-10-23 补核；dots 细节仍为二手来源）
 > 方法：auto-research 流程（内部摸底 → 外部调研 → 交叉综合）。事实标注来源；推断显式标注。
 
 ## 0. 问题定义（Phase 0）
@@ -60,6 +60,32 @@
 - [ ] 2.3 Dots 消歧（dots.ocr vs Dots agent）+ 协议生态（MCP/A2A/SKILL.md/pi packages）+ 通用 AI 员工（Manus 等）—— subagent C
 
 （Phase 3 综合与生态图待外部材料回收后补全）
+
+### 2.1 商业/闭源同类（2026-10-23 补核）
+
+**Grok Bot（xAI，官方一手：x.ai/news/introducing-grok-bot + docs.x.ai/grok-bot/*）**
+- 定位原文："Grok Bot is your team of always-on agents. They have their own computer, work inside tools and apps like you do, and keep working 24/7."——有名字/职责的「AI 队友」，上下文随合作累积；像给同事派活一样派工
+- 架构：**持久云电脑**（浏览器/命令行/文件/已连接工具），合盖不停工；账号级**一台共享电脑**——cookies/登录态/CLI 凭据全 Bot 共享，官方明示「屏幕是独立工作面，**不是安全边界**」，别放其他 Bot 不该碰的凭据/文件；每 Bot 一块屏幕，可并行但一次一个 computer-use 任务
+- **人工接管模式**：密码/passkey、2FA、CAPTCHA、支付/身份核验时 Bot 主动请人接管，做完交还；本地电脑策略三态（每次问/总是允许/从不），默认每次问；对话存电脑外，reset 电脑不丢对话
+- Beta：SuperGrok 三档 + Cursor 订阅可用，独立用量配额；企业 waitlist
+- Grok Tasks（X 内）：定时执行 prompt 并通知（二手日媒/评测，官方细节待补）
+- 适配判断：最像 VE 的对标（持久/主动/记忆/接管制）。「共享电脑不是安全边界」反证 VE 本机单员工 + 凭据出站门禁的隔离更干净；「敏感步骤人工接管」与 VE 的确认门是同一哲学
+
+**ChatGPT Tasks / Work（OpenAI，官方一手：help.openai.com）**
+- 演进：**agent mode 已下线**，长任务与交付物改由「ChatGPT Work」承接，浏览器流程走 cloud browser；scheduled tasks 已开放免费档（二手报道：最多 3 个任务、每日最多一次）
+- Tasks 能力：一次性/周期任务、监控网页变化、**事件触发任务**（webhook 基座，响应 Gmail/Slack/GitHub 事件，Plus/Pro/Business/Enterprise 可用）；chatgpt.com/schedules 统一管理；agent 用量按档限月（Plus 40/Pro 400/Business 40 条），**排程任务计入限额**
+- 安全模式原文要点：高影响动作要求确认、拒绝模式、**prompt injection 监控**、特定站点「监看模式」；官方建议「避免在消息里直接输入密码，敏感输入用接管模式」
+- 适配判断：与 VE 的确认门/prompt 注入防线/凭据门禁同向互证；「事件触发任务」是 VE 定时任务之外可考虑的增量（webhook → 触发 sched 会话）
+
+**钉钉 AI 助理（官方应用描述 + alizila 报道）**
+- DingTalk 8.0 定位「AI 原生生产力套件」（CEO 原话 "AI DingTalk 1.0"），十余个 agent 驱动功能；AI Assistant（A1）：自动摘要/To-Do 生成、与 AI Tables 同步；Docs AI（文档内嵌表格/脑图/工作流的活知识库）；Meeting AI
+- 知识库答员工问（行政制度/HR 政策）为标配场景【二手 awesome-deepseek 收录描述】
+- 适配判断：平台级「全家桶」（IM+文档+表格+会议全贯通），VE 无法也不必对标；VE 的错位在**跨组织自托管 + 开源可审计**。平台本身是 VE 的渠道层，AI 助理与 VE 是共存关系
+
+**扣子 Coze（字节，官方文档 llms.txt + 二手教程）**
+- 能力面：人设与提示词、插件（内置市场 + 自定义 API）、**工作流**（拖拽节点：意图识别/循环/选择器/HTTP/代码）、记忆库（对话细节 + 知识库文档分片 + 数据库自然语言增删改查 + 长期记忆）、**定时任务**（到点自动触发 bot 发消息）、多渠道发布（抖音/飞书/微信/掘金等）、开场白/问题建议/音色
+- 文档形态值得注意：docs.coze.cn 提供 llms.txt + markdown 直链（.md）——文档对 agent 友好正在成为行业惯例
+- 适配判断：零代码编排平台的「工作流节点类型清单」是 VE 工具体系做「组合任务」时的参考词汇表；但 VE 定位「一个真员工」而非「建 bot 的平台」，直接竞争弱
 
 ### 2.2 开源同类源码级（subagent B，已完成，产出存档：subagent-artifacts/94a5d567，方法：gh api 直读源码，无二手转述）
 
@@ -176,8 +202,8 @@
 ## 5. 盲区与待拍板
 
 **盲区（诚实标注）**
-1. **2.1 商业 IM 员工一手核验未完成**：web-search MCP 余额耗尽、A 线 subagent 连接错误、Bing 快照未渲染出结果——Grok bot / 钉钉 AI 助理 / Coze / ChatGPT Tasks 的能力清单目前只有【知识库级推断】，未写进矩阵正文；联网通道恢复后应补一轮（尤其 Grok Tasks 的定时机制与限制）。
-2. dots（OpenAI）细节（模型名/定价/可用地区）全部来自二手日媒交叉，openai.com 未直读成功。
+1. ~~2.1 商业 IM 员工一手核验~~ ✅ 2026-10-23 已补核（DeepSeek Search API，见 2.1 节）；本次调研同时沉淀了本地 `deepseek-websearch` MCP server（web_search/web_fetch，全会话可用）
+2. dots（OpenAI）细节（模型名/定价/可用地区）仍为二手日媒交叉，openai.com 未直读成功；Grok Tasks 定时机制细节为二手。
 3. Goose recipe/定时能力「未证实」（B 线标注）；OpenClaw 渠道文档清单读取被截断。
 
 **待用户拍板**
