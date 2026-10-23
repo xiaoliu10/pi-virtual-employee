@@ -13,9 +13,12 @@
  *   [[TASK_DONE]]                — goal fully met
  *   [[NEED_HUMAN]]: <question>   — blocked on a person / external resource
  *   [[NEXT_CHECK]]: <time> | <why> — self-scheduled follow-up
- * Budget exhausted and a genuinely blocked marker ([[NEED_HUMAN]]) wait for
- * explicit admin resume; an unusable NEXT_CHECK time soft-falls-back to the
- * default re-check so the chain stays alive.
+ * A wall-clock timeout is NOT a pause (user ruling 2026-10-23): the window
+ * defers itself on a short re-check so a long scan can finish across windows;
+ * only two CONSECUTIVE timeouts, a genuine blocked marker ([[NEED_HUMAN]]), an
+ * execution error or an admin pause wait for explicit admin resume. An unusable
+ * NEXT_CHECK time soft-falls-back to the default re-check so the chain stays
+ * alive.
  * Follow-ups must be at least 15 minutes away; no fixed polling cadence.
  */
 import { beijingNow } from "../engine/tools/time.js";
@@ -31,8 +34,15 @@ export type WorkItemStatus = "proposed" | "queued" | "working" | "waiting_human"
  * 2026-10-13): a window is bounded by its wall-clock cap and the marker
  * protocol, not a turn count — a hard 15-turn cap made long-running items
  * stall mid-work. maxMinutes stays a real, enforced limit. An explicit
- * positive maxTurns (WorkService constructor) still caps special windows. */
-export const DEFAULT_WINDOW_BUDGET = { maxTurns: 0, maxMinutes: 30 };
+ * positive maxTurns (WorkService constructor) still caps special windows.
+ *
+ * 90 minutes (user ruling 2026-10-23, field: the spay 7-day reconciliation
+ * patrol needs 25-30 min of pure scanning plus a re-reconcile + refresh wait
+ * per anomaly row — a 30-minute window timed out mid-scan and pushed
+ * NOTHING, so the whole window was wasted). The window prompt teaches the
+ * model to self-segment (scan → fix → push) and to defer with NEXT_CHECK
+ * when the budget is nearly spent instead of pushing half-done work. */
+export const DEFAULT_WINDOW_BUDGET = { maxTurns: 0, maxMinutes: 90 };
 /** Minimum model-selected follow-up interval (reject, never silently clamp). */
 export const MIN_NEXT_CHECK_MS = 15 * 60_000;
 /** Default re-check (a calm follow-up) used when a work window gives no usable
@@ -336,9 +346,15 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 	const turnRule = ctx.budget.maxTurns > 0
 		? `本窗口最多 ${ctx.budget.maxTurns} 轮 / ${ctx.budget.maxMinutes} 分钟`
 		: `本窗口不限轮数（时长上限 ${ctx.budget.maxMinutes} 分钟）：没有「轮数用尽」，不要因为假想轮数将尽而自行停下或草草收尾，是否结束只由收尾标记或时间上限决定`;
+	// Segmentation teaching (user ruling 2026-10-23): long scans + per-row fixes
+	// do not fit one window even at 90 minutes. The model must plan in segments
+	// and hand over cleanly when the budget runs low, rather than burning the
+	// whole window on the scan and pushing nothing.
+	const segmentRule = `- 长任务请自行分段推进：先把扫描跑完（结果写到文件，关键发现和进度用 manage_work 记下），再逐项处理，最后一次性给出结论。任一时点估计剩余时间装不下未完部分，就写 ${AUTONOMOUS_NEXT_CHECK_MARK} 顺延到下一窗口继续——不要自己把半成品结论发给群（引擎每轮会推送阶段进展，那是交接信息，不是结论）。「不要因假想轮数草草收尾」指的是别为想象中的轮数上限提前收工；时间真的不够且能干净交接时，就该按这里写 NEXT_CHECK 分段。`;
 	const protocol = [
 		`窗口规则：`,
-		`- ${turnRule}，请优先推进关键路径，并把重要发现写入进展/踩坑。超时、执行出错或需要人协助会暂停等管理员明确恢复，不自动重试；写不出合法跟进时间时会按默认 1 小时顺延（连续 3 次除外）而不会暂停。`,
+		`- ${turnRule}，请优先推进关键路径，并把重要发现写入进展/踩坑。超时会自动顺延到下一窗口继续（连续 2 次仍完不成会暂停，请管理员调大本任务的 maxMinutes 或收窄范围/拆分任务）；执行出错或需要人协助会暂停等管理员明确恢复，不自动重试；写不出合法跟进时间时会按默认 1 小时顺延（连续 3 次除外）而不会暂停。`,
+		segmentRule,
 		`- 收尾顺序：先写完所有正文（进展、发现、汇报），最后一行才是结束标记（${AUTONOMOUS_DONE_MARK} / ${AUTONOMOUS_HUMAN_MARK} / ${AUTONOMOUS_NEXT_CHECK_MARK}）。标记行被输出截断等于没有收尾，窗口会空转到时间上限。`,
 		...(ctx.resident
 			? [`- 本任务是**常驻巡检**：没有「全部完成」的一天，禁止输出 ${AUTONOMOUS_DONE_MARK}（引擎不会接受——会被当作「本轮无异常」自动按节奏顺延并推送管理员）。本轮无异常/无事发生 → ${AUTONOMOUS_NEXT_CHECK_MARK} 按既定节奏顺延（连续正常可按你声明的策略降频）；只有管理员能 cancel 结束常驻任务。`]

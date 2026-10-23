@@ -21,6 +21,10 @@ export interface WorkItemRow {
 	next_check_reason: string | null;
 	/** Consecutive windows that picked the same daily slot (cron degeneration meter). */
 	fixed_streak: number;
+	/** Consecutive wall-clock timeouts the window auto-deferred. */
+	timeout_streak: number;
+	/** Per-item window cap override (minutes); NULL → the service default. */
+	max_minutes: number | null;
 	/** Consecutive windows whose NEXT_CHECK was unusable (soft-fallback meter). */
 	fallback_streak: number;
 	/** waiting_human re-reminder bookkeeping (updated_at is the entry time). */
@@ -73,15 +77,15 @@ export class WorkItemStore {
 			conditions: null, progress: null, lessons: null,
 			origin_conversation: input.originConversation ?? null,
 			origin_note: input.originNote ?? null, status: input.status ?? "proposed",
-			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0, fallback_streak: 0, last_remind_at: null, remind_count: 0, cadence_ms: null, kicked_off: 0,
+			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0, fallback_streak: 0, timeout_streak: 0, max_minutes: null, last_remind_at: null, remind_count: 0, cadence_ms: null, kicked_off: 0,
 				created_by: input.createdBy ?? null,
 			created_channel: input.createdChannel ?? null,
 			resident: input.resident ? 1 : 0,
 			answer: null, created_at: now, updated_at: now,
 		};
 		this.db.prepare(`INSERT INTO work_items
-			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, last_remind_at, remind_count, cadence_ms, kicked_off, created_by, created_channel, resident, answer, created_at, updated_at)
-			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @last_remind_at, @remind_count, @cadence_ms, @kicked_off, @created_by, @created_channel, @resident, @answer, @created_at, @updated_at)`).run(row);
+			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, timeout_streak, max_minutes, last_remind_at, remind_count, cadence_ms, kicked_off, created_by, created_channel, resident, answer, created_at, updated_at)
+			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @timeout_streak, @max_minutes, @last_remind_at, @remind_count, @cadence_ms, @kicked_off, @created_by, @created_channel, @resident, @answer, @created_at, @updated_at)`).run(row);
 		this.changed(row.id);
 		return row;
 	}
@@ -142,6 +146,30 @@ export class WorkItemStore {
 	setFixedStreak(id: string, streak: number): void {
 		this.db.prepare("UPDATE work_items SET fixed_streak = ? WHERE id = ? AND status = 'scheduled'")
 			.run(Math.max(0, Math.floor(streak)), id);
+	}
+
+	/** Consecutive wall-clock timeouts the window auto-deferred. Written
+	 * mid-window (status 'working'), so it is unguarded like fallback_streak —
+	 * the guard variants only run from the post-window persistence.
+	 *
+	 * The meter counts CONSECUTIVE timeouts: every close that is not the timeout
+	 * auto-defer resets it to 0 — done, a model-declared NEXT_CHECK, NEED_HUMAN,
+	 * a soft fallback, an execution error, an admin pause, and the circuit-breaker
+	 * pause itself (see WorkService.run's non-timeout close). */
+	setTimeoutStreak(id: string, streak: number): void {
+		this.db.prepare("UPDATE work_items SET timeout_streak = ? WHERE id = ?").run(Math.max(0, Math.floor(streak)), id);
+	}
+
+	/** Per-item window budget override. Guarded like the other admin edits: a
+	 * running window keeps the cap it started with (the change lands on the next
+	 * window), and terminal items are never mutated. NULL clears the override. */
+	setMaxMinutes(id: string, minutes: number | null): WorkItemRow | undefined {
+		const value = minutes == null ? null : Math.max(1, Math.floor(minutes));
+		this.db.prepare("UPDATE work_items SET max_minutes = ?, updated_at = ? WHERE id = ? AND status IN ('queued', 'waiting_human', 'scheduled', 'proposed')")
+			.run(value, Date.now(), id);
+		const row = this.get(id);
+		if (row) this.changed(id);
+		return row;
 	}
 
 	/** Soft-fallback meter: consecutive unusable NEXT_CHECK declarations.
@@ -245,7 +273,11 @@ export class WorkItemStore {
 	}
 	/** Single atomic transition: only explicit resume may queue waiting_human. */
 	resume(id: string, answer?: string): WorkItemRow | undefined {
-		const result = this.db.prepare(`UPDATE work_items SET status = 'queued', question = NULL, next_check_at = NULL, fallback_streak = 0,
+		// timeout_streak is cleared too: a streak frozen by a pause/crash between the
+		// defer write and the status write would otherwise make the FIRST timeout
+		// after this resume read as "2 consecutive" and falsely trip the breaker
+		// (subagent review P2-3).
+		const result = this.db.prepare(`UPDATE work_items SET status = 'queued', question = NULL, next_check_at = NULL, fallback_streak = 0, timeout_streak = 0,
 			last_remind_at = NULL, remind_count = 0, answer = COALESCE(?, answer), updated_at = ? WHERE id = ? AND status = 'waiting_human'`)
 			.run(answer === undefined ? null : answer.slice(0, 2000), Date.now(), id);
 		if (!result.changes) return undefined;
