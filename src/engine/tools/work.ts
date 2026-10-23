@@ -166,7 +166,7 @@ export function createWorkTools(deps: {
 			"action=create：来源会话的管理员要求**直接创建**自主任务时一步到位（field 2026-10-17：说「重建自主任务」「建一个自主任务」就用这个，不要退而用 create_scheduled_task——那是定时任务，另一套东西）；需要 title + goal，可附 conditions；创建即入队开工；巡检/监控/每日对账类**常驻任务**必须带 resident=true（无自然终点，不允许自行 DONE，field 2026-10-17：每日对账巡检被模型在无异常日宣布 DONE 杀死）；" +
 			"action=confirm：来源会话的管理员在当前消息明确「确认创建」后开工；可按管理员要求附带改写后的 title/goal/conditions（例如删掉「每天16:30」改为按需跟进），不必原样接受提案；" +
 			"action=resume：来源会话的管理员恢复等待人工/资源的任务——把答复直接告诉员工即可（无需确认口令），answer 持久化为下一轮输入；【铁律】当管理员在会话里直接提供了内容（验证码、账号、参数、决定），而本来源会话有任务正处于 waiting_human/等待人工，这条消息就是给那个任务的答复——直接 resume 它，**严禁** create_scheduled_task 另建任务接手（那会让原任务永远卡住、现场跑两份重复工作，2026-10-17 现场教训）；" +
-			"action=update：按管理员要求调整自主任务——title/goal/conditions 在非执行中状态（排队/等待人工/已计划/提案）可改；执行中请先 action=pause 暂停再调整（避免在飞窗口覆盖你的修改）；nextCheck 可改约下次跟进时间（距现在至少 15 分钟，仅排队/等待人工/已计划状态可改，执行中不能改期）；" +
+			"action=update：按管理员要求调整自主任务——title/goal/conditions 在非执行中状态（排队/等待人工/已计划/提案）可改；执行中请先 action=pause 暂停再调整（避免在飞窗口覆盖你的修改）；nextCheck 可改约下次跟进时间（距现在至少 15 分钟，仅排队/等待人工/已计划状态可改，执行中不能改期）；maxMinutes 可调本任务的窗口时长上限（分钟，仅排队/等待人工/已计划状态可改；执行中不能改——当前窗口按开工时的上限跑完，改动对下一个窗口生效）——任务连续因时间上限顺延、装不进窗口时用它调大，比拆任务更顺手；" +
 			"action=pause：管理员暂停执行中/排队/计划中的任务，尽快中止当前窗口并等待管理员明确恢复；" +
 			"action=cancel：来源会话的管理员取消未完成任务。id 可用 list 中的唯一短前缀，歧义时必须提供完整 id。",
 		parameters: Type.Object({
@@ -182,12 +182,13 @@ export function createWorkTools(deps: {
 			conditions: Type.Optional(Type.String({ description: "confirm/update 时按管理员要求改写的执行条件（≤1000 字）；不修改则省略" })),
 			nextCheck: Type.Optional(Type.String({ description: "update 时改约下次跟进时间，如「30m」「明天09:40」（距现在至少 15 分钟）；仅排队/等待人工/已计划状态可改" })),
 			reason: Type.Optional(Type.String({ description: "update 时为改期写明依据（随 nextCheck 保存）；pause 时为暂停原因" })),
+			maxMinutes: Type.Optional(Type.Number({ description: "update 时调整本任务的工作窗口时长上限（分钟，正数；建议 30-480）。任务连续因时间上限自动顺延、装不进窗口时用它调大。仅非执行中状态可改，改动对下一个窗口生效；不修改则省略" })),
 			resident: Type.Optional(Type.Boolean({ description: "create 时声明任务性质：巡检/监控/每日对账这类**无自然终点**的常驻任务必须 true——此类任务不允许自行宣布完成（DONE 会被引擎拦截为按节奏顺延并推送管理员）；有明确完成标志的一次性任务省略或 false" })),
 		}),
 		async execute(_toolCallId, params) {
 			const p = params as {
 				action: "list" | "get" | "mine" | "create" | "confirm" | "resume" | "cancel" | "update" | "pause";
-				id?: string; answer?: string; title?: string; goal?: string; conditions?: string; nextCheck?: string; reason?: string; resident?: boolean;
+				id?: string; answer?: string; title?: string; goal?: string; conditions?: string; nextCheck?: string; reason?: string; resident?: boolean; maxMinutes?: number;
 			};
 			if (!["list", "get", "mine", "create", "confirm", "resume", "cancel", "update", "pause"].includes(p.action)) return failure("未知的自主任务操作。");
 			const actor = resolveActor(conversationId);
@@ -333,7 +334,7 @@ export function createWorkTools(deps: {
 				// silently overwrite the admin's new values (Copilot review 2026-10-02).
 				// Refuse mid-window rewrites instead of racing the active window:
 				// pause → update → resume is the safe path.
-				if (item.status === "working" && (p.title !== undefined || p.goal !== undefined || p.conditions !== undefined || p.nextCheck !== undefined))
+				if (item.status === "working" && (p.title !== undefined || p.goal !== undefined || p.conditions !== undefined || p.nextCheck !== undefined || p.maxMinutes !== undefined))
 					return failure("任务正在执行中，本轮已按旧目标/条件开工；为避免在飞窗口覆盖你的修改，请先 action=pause 暂停后再调整（或等本轮结束）。");
 				// Atomic adjust: validate every provided field before any write.
 				const rewrites = collectRewrites(p);
@@ -346,7 +347,12 @@ export function createWorkTools(deps: {
 					if (item.status === "working") return failure("任务正在执行中，不能修改跟进时间；请等本轮结束后再调整。");
 					nextCheckAt = at;
 				}
-				if (!rewrites.fields.length && nextCheckAt === undefined) return failure("请提供要调整的内容：title / goal / conditions / nextCheck。");
+				if (p.maxMinutes !== undefined) {
+					if (typeof p.maxMinutes !== "number" || !Number.isFinite(p.maxMinutes) || p.maxMinutes <= 0)
+						return failure("maxMinutes 必须是正数（分钟），如 180。");
+					if (p.maxMinutes > 1440) return failure("maxMinutes 上限 1440 分钟（24 小时）；更长的跨度请拆分任务。");
+				}
+				if (!rewrites.fields.length && nextCheckAt === undefined && p.maxMinutes === undefined) return failure("请提供要调整的内容：title / goal / conditions / nextCheck / maxMinutes。");
 				const applied: string[] = [];
 				for (const rewrite of rewrites.fields) {
 					const updated = workItems.setField(item.id, rewrite.field, rewrite.value);
@@ -358,6 +364,11 @@ export function createWorkTools(deps: {
 					const scheduled = workItems.setSchedule(item.id, nextCheckAt, reason);
 					if (!scheduled) return failure("调整跟进时间失败，任务可能正在执行中；请等本轮结束后再改期。");
 					applied.push(`下次跟进 → ${fmtTime(nextCheckAt)}${reason ? `（${reason}）` : ""}`);
+				}
+				if (p.maxMinutes !== undefined) {
+					const budgeted = workItems.setMaxMinutes(item.id, Math.round(p.maxMinutes));
+					if (!budgeted) return failure("调整窗口时长失败，任务可能正在执行中；请等本轮结束后再改。");
+					applied.push(`窗口时长上限 → ${Math.round(p.maxMinutes)} 分钟（下一个窗口生效）`);
 				}
 				// Re-read so the acknowledgement names the UPDATED title when the admin
 				// rewrote it (Copilot review 2026-10-02).

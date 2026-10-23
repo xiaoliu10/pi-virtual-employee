@@ -247,7 +247,7 @@ export class WorkService<Session extends WorkSession> {
 				prevFallback: due.fallback_streak ?? 0,
 				prevKicked: due.kicked_off ?? 0,
 				prevResident: due.resident ?? 0,
-					prevTimeouts: due.timeout_streak ?? 0,
+				prevTimeouts: due.timeout_streak ?? 0,
 				prevCadenceMs: due.cadence_ms ?? null,
 			};
 			this.active = active;
@@ -278,6 +278,8 @@ export class WorkService<Session extends WorkSession> {
 		// normal NEXT_CHECK; a stale streak would falsely trip the breaker on the
 		// next single timeout).
 		let timeoutDeferred = false;
+		// Declared OUTSIDE the try so the catch/finally paths read the same cap.
+		let budget = this.budget;
 		let outcome: "done" | "waiting_human" | "scheduled" = "waiting_human";
 		try {
 			if (!this.running) return;
@@ -285,12 +287,17 @@ export class WorkService<Session extends WorkSession> {
 			if (!item) return;
 			const initialProgress = item.progress;
 			const startedAt = this.clock.now();
-			active.deadline = this.clock.setTimeout(() => this.abortActive(TIMEOUT_STOP_REASON), this.budget.maxMinutes * 60_000);
-			for (let turn = 0; this.budget.maxTurns <= 0 || turn < this.budget.maxTurns; turn++) {
+			// Per-item cap wins over the service default (admin "调大 maxMinutes" — the
+			// circuit-breaker message promises this knob, so it must exist; subagent
+			// review P1 2026-10-23). Read ONCE at window start: a change mid-window
+			// lands on the next window, never retargeting a cap already running.
+			if (item.max_minutes && item.max_minutes > 0) budget = { ...this.budget, maxMinutes: item.max_minutes };
+			active.deadline = this.clock.setTimeout(() => this.abortActive(TIMEOUT_STOP_REASON), budget.maxMinutes * 60_000);
+			for (let turn = 0; budget.maxTurns <= 0 || turn < budget.maxTurns; turn++) {
 				// Fresh notebook and live identity on EVERY turn (including turn zero).
 				const fresh = store.get(item.id);
 				if (!fresh || fresh.status !== "working") return;
-				if (active.stopReason || !this.running || this.clock.now() - startedAt >= this.budget.maxMinutes * 60_000) {
+				if (active.stopReason || !this.running || this.clock.now() - startedAt >= budget.maxMinutes * 60_000) {
 					// Wall-clock cap reached. User ruling 2026-10-23: this used to pause
 					// for explicit admin recovery, so a window that ran out mid-scan
 					// pushed NOTHING and the admin had to babysit every window. The
@@ -299,13 +306,13 @@ export class WorkService<Session extends WorkSession> {
 					// on its own. Only a genuine error / admin pause / cancel keeps the
 					// waiting_human path.
 					const timedOut = active.stopReason === TIMEOUT_STOP_REASON
-						|| (!active.stopReason && this.clock.now() - startedAt >= this.budget.maxMinutes * 60_000);
+						|| (!active.stopReason && this.clock.now() - startedAt >= budget.maxMinutes * 60_000);
 					if (timedOut) {
 						const streak = (active.prevTimeouts ?? 0) + 1;
 						if (streak >= MAX_CONSECUTIVE_TIMEOUTS) {
 							// The budget does not fit this task. Stop looping and let
 							// the admin resize (raise max_minutes) or split it.
-							question = `已连续 ${streak} 次因时间上限（${this.budget.maxMinutes} 分钟）自动顺延仍未完成——这件工作装不进当前窗口预算。请用 update 调大 max_minutes，或把目标拆成多个自主任务，然后明确恢复。`;
+							question = `已连续 ${streak} 次因时间上限（${budget.maxMinutes} 分钟）自动顺延仍未完成——这件工作装不进当前窗口预算。请用 update 调大 maxMinutes（如 180），或收窄本轮范围/拆成多个任务，然后明确恢复。`;
 							break;
 						}
 						store.setTimeoutStreak(item.id, streak);
@@ -317,7 +324,7 @@ export class WorkService<Session extends WorkSession> {
 						question = "";
 						break;
 					}
-					question = active.stopReason ?? (this.budget.maxTurns > 0 ? "工作窗口预算已用尽，请管理员明确恢复。" : "工作窗口时间上限已到，请管理员明确恢复。");
+					question = active.stopReason ?? (budget.maxTurns > 0 ? "工作窗口预算已用尽，请管理员明确恢复。" : "工作窗口时间上限已到，请管理员明确恢复。");
 					break;
 				}
 				if (!fresh.created_by?.trim() || !this.opts.isAdmin(fresh.created_by)) {
@@ -338,7 +345,7 @@ export class WorkService<Session extends WorkSession> {
 				const lateByMs = active.dueAt != null ? Math.max(0, this.clock.now() - active.dueAt) : undefined;
 				const prefix = buildWorkWindowPrefix({
 					title: fresh.title, goal: fresh.goal, conditions: fresh.conditions, progress: fresh.progress,
-					lessons: workLessons(fresh.lessons), turn, budget: this.budget, answer: answer ?? undefined,
+					lessons: workLessons(fresh.lessons), turn, budget, answer: answer ?? undefined,
 					firstWindow, lateByMs, resident: active.prevResident === 1, kbSearchEnabled: kb.search, kbLearnEnabled: kb.learn,
 					lastCheck: active.dueAt ? { at: active.dueAt, reason: active.prevReason, streak: active.prevStreak ?? 0 } : undefined,
 					now: this.clock.now(),
@@ -407,7 +414,7 @@ export class WorkService<Session extends WorkSession> {
 				if (active.stopReason === TIMEOUT_STOP_REASON) {
 					const streak = (active.prevTimeouts ?? 0) + 1;
 					if (streak >= MAX_CONSECUTIVE_TIMEOUTS) {
-						question = `已连续 ${streak} 次因时间上限（${this.budget.maxMinutes} 分钟）自动顺延仍未完成——这件工作装不进当前窗口预算。请用 update 调大 max_minutes，或把目标拆成多个自主任务，然后明确恢复。`;
+						question = `已连续 ${streak} 次因时间上限（${budget.maxMinutes} 分钟）自动顺延仍未完成——这件工作装不进当前窗口预算。请用 update 调大 maxMinutes（如 180），或收窄本轮范围/拆成多个任务，然后明确恢复。`;
 						break;
 					}
 					store.setTimeoutStreak(item.id, streak);
@@ -511,7 +518,7 @@ export class WorkService<Session extends WorkSession> {
 				const streak = (active.prevTimeouts ?? 0) + 1;
 				if (streak >= MAX_CONSECUTIVE_TIMEOUTS) {
 					outcome = "waiting_human";
-					question = `已连续 ${streak} 次因时间上限（${this.budget.maxMinutes} 分钟）自动顺延仍未完成——这件工作装不进当前窗口预算。请用 update 调大 max_minutes，或把目标拆成多个自主任务，然后明确恢复。`;
+					question = `已连续 ${streak} 次因时间上限（${budget.maxMinutes} 分钟）自动顺延仍未完成——这件工作装不进当前窗口预算。请用 update 调大 maxMinutes（如 180），或收窄本轮范围/拆成多个任务，然后明确恢复。`;
 				} else {
 					store.setTimeoutStreak(item?.id ?? "", streak);
 					timeoutDeferred = true;

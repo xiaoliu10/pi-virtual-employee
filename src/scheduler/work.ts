@@ -13,9 +13,12 @@
  *   [[TASK_DONE]]                — goal fully met
  *   [[NEED_HUMAN]]: <question>   — blocked on a person / external resource
  *   [[NEXT_CHECK]]: <time> | <why> — self-scheduled follow-up
- * Budget exhausted and a genuinely blocked marker ([[NEED_HUMAN]]) wait for
- * explicit admin resume; an unusable NEXT_CHECK time soft-falls-back to the
- * default re-check so the chain stays alive.
+ * A wall-clock timeout is NOT a pause (user ruling 2026-10-23): the window
+ * defers itself on a short re-check so a long scan can finish across windows;
+ * only two CONSECUTIVE timeouts, a genuine blocked marker ([[NEED_HUMAN]]), an
+ * execution error or an admin pause wait for explicit admin resume. An unusable
+ * NEXT_CHECK time soft-falls-back to the default re-check so the chain stays
+ * alive.
  * Follow-ups must be at least 15 minutes away; no fixed polling cadence.
  */
 import { beijingNow } from "../engine/tools/time.js";
@@ -347,10 +350,10 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 	// do not fit one window even at 90 minutes. The model must plan in segments
 	// and hand over cleanly when the budget runs low, rather than burning the
 	// whole window on the scan and pushing nothing.
-	const segmentRule = `- 长任务请自行分段推进：先跑完扫描并落盘（结果文件+进度已由 manage_work 保存），再逐项处理，最后一次性推送结果；任一时点估计剩余时间装不下未完部分，就写 ${AUTONOMOUS_NEXT_CHECK_MARK} 顺延到下一窗口继续——不要把没做完的结果推成群，也不要在窗口末尾草率收尾。`;
+	const segmentRule = `- 长任务请自行分段推进：先把扫描跑完（结果写到文件，关键发现和进度用 manage_work 记下），再逐项处理，最后一次性给出结论。任一时点估计剩余时间装不下未完部分，就写 ${AUTONOMOUS_NEXT_CHECK_MARK} 顺延到下一窗口继续——不要自己把半成品结论发给群（引擎每轮会推送阶段进展，那是交接信息，不是结论）。「不要因假想轮数草草收尾」指的是别为想象中的轮数上限提前收工；时间真的不够且能干净交接时，就该按这里写 NEXT_CHECK 分段。`;
 	const protocol = [
 		`窗口规则：`,
-		`- ${turnRule}，请优先推进关键路径，并把重要发现写入进展/踩坑。超时会自动顺延到下一窗口继续（连续 2 次仍完不成会暂停请管理员调大预算或拆分任务）；执行出错或需要人协助会暂停等管理员明确恢复，不自动重试；写不出合法跟进时间时会按默认 1 小时顺延（连续 3 次除外）而不会暂停。`,
+		`- ${turnRule}，请优先推进关键路径，并把重要发现写入进展/踩坑。超时会自动顺延到下一窗口继续（连续 2 次仍完不成会暂停，请管理员调大本任务的 maxMinutes 或收窄范围/拆分任务）；执行出错或需要人协助会暂停等管理员明确恢复，不自动重试；写不出合法跟进时间时会按默认 1 小时顺延（连续 3 次除外）而不会暂停。`,
 		segmentRule,
 		`- 收尾顺序：先写完所有正文（进展、发现、汇报），最后一行才是结束标记（${AUTONOMOUS_DONE_MARK} / ${AUTONOMOUS_HUMAN_MARK} / ${AUTONOMOUS_NEXT_CHECK_MARK}）。标记行被输出截断等于没有收尾，窗口会空转到时间上限。`,
 		...(ctx.resident

@@ -31,6 +31,11 @@ class Clock {
 		this.time = end; await flush();
 	}
 }
+/** Fire every armed timer that is due at the earliest pending deadline. */
+function SENTINEL_DEADLINE(h) {
+	const next = [...h.clock.timers.values()].sort((a, b) => a.at - b.at)[0];
+	return next ? next.at : h.clock.time;
+}
 function fixture(t, overrides = {}) {
 	const db = new DatabaseSync(":memory:"); db.exec(schema);
 	if (!db.prepare("PRAGMA table_info(work_items)").all().some(c => c.name === "answer")) db.exec("ALTER TABLE work_items ADD COLUMN answer TEXT");
@@ -882,8 +887,8 @@ test("two consecutive hard timeouts circuit-break to waiting_human with a resize
 	await flush();
 	row = h.store.get(item.id);
 	assert.equal(row.status, "waiting_human", "2 consecutive hard timeouts must not defer forever");
-	assert.match(row.question ?? "", /调大 max_minutes/, "the pause says how to fix the budget");
-	assert.match(row.question ?? "", /拆成多个自主任务/, "…or split the task");
+	assert.match(row.question ?? "", /调大 maxMinutes/, "the pause names the per-item knob that actually exists");
+	assert.match(row.question ?? "", /拆成多个任务/, "…or narrow/split the work");
 	// The breaker pause itself starts a fresh count: after the admin resizes and
 	// resumes, ONE new timeout defers again instead of instantly re-breaking.
 	assert.equal(row.timeout_streak, 0, "the breaker pause resets the meter for the resumed chain");
@@ -912,6 +917,55 @@ test("a normal close clears the consecutive-timeout meter (stale streak must not
 	row = done.store.get(d.id);
 	assert.equal(row.status, "done");
 	assert.equal(row.timeout_streak, 0, "a DONE close resets the timeout meter too");
+});
+
+test("the CATCH timeout exit defers too (production's most common path)", async t => {
+	// Deadline fires while send is in flight → the real engine aborts and returns
+	// { error } → WorkService throws → the catch block. This was the ONLY untested
+	// of the three timeout exits (subagent review P2-2), yet it is the one real
+	// windows hit. The send trips the clock past the cap AND errors exactly once.
+	const h = fixture(t, {
+		options: { budget: { maxTurns: 0, maxMinutes: 30 } },
+		send: h2 => {
+			if (h2.sends.length === 1) {
+				// Reproduce the REAL ordering: the deadline timer fires first (it is what
+				// sets active.stopReason), and only then the in-flight send fails. That
+				// pairing is what routes the throw to the timeout branch of the catch.
+				// THROW, not { error }: an error-result enters the silent-retry chain
+				// (60s backoff on the fake clock, which never advances here).
+				const deadline = SENTINEL_DEADLINE(h2);
+				h2.clock.time = deadline;
+				for (const [id, timer] of [...h2.clock.timers]) {
+					if (timer.at <= h2.clock.time) { h2.clock.timers.delete(id); timer.fn(); }
+				}
+				throw new Error("Completion aborted");
+			}
+			return { reply: "本轮收尾\n[[NEED_HUMAN]]: 供后续窗口用" };
+		},
+	});
+	const item = h.create();
+	h.service.start(); await flush();
+	const row = h.store.get(item.id);
+	assert.equal(row.status, "scheduled", "a caught timeout must defer, not pause");
+	assert.match(row.next_check_reason ?? "", /自动顺延/);
+	assert.equal(row.timeout_streak, 1);
+	assert.deepEqual(h.errors, [], "an auto-deferred timeout is not an execution error");
+});
+
+test("a per-item maxMinutes overrides the service default for THAT window", async t => {
+	// The breaker tells the admin to raise maxMinutes — so the knob must actually
+	// change the cap (subagent review P1-1). Service default is 30; the item says
+	// 90, so the window must survive turns that push elapsed past 30 minutes and
+	// only trip at 90 (with 40-minute turns: 40 → 80 pass, 120 trips).
+	const h = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } }, send: h2 => { h2.clock.time += 40 * 60_000; return { reply: "继续推进" }; } });
+	const item = h.create();
+	h.store.setMaxMinutes(item.id, 90);
+	assert.equal(h.store.get(item.id).max_minutes, 90);
+	h.service.start(); await flush();
+	assert.ok(h.sends.length >= 2, `must survive past the 30-minute service default (sends=${h.sends.length})`);
+	const row = h.store.get(item.id);
+	assert.equal(row.status, "scheduled", "it still eventually defers — but at 90 minutes, not 30");
+	assert.match(row.next_check_reason ?? "", /自动顺延/);
 });
 
 test("unlimited turns: a cancel and a need-human pause still win immediately", async t => {
