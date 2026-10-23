@@ -358,6 +358,7 @@ function migrate(db: DB): void {
 			next_check_at        INTEGER,
 			next_check_reason    TEXT,
 			fixed_streak         INTEGER NOT NULL DEFAULT 0,
+			timeout_streak        INTEGER NOT NULL DEFAULT 0,
 			fallback_streak      INTEGER NOT NULL DEFAULT 0,
 			last_remind_at       INTEGER,
 			remind_count         INTEGER NOT NULL DEFAULT 0,
@@ -391,6 +392,7 @@ function migrate(db: DB): void {
 	// distinguishable even after a crash (firstWindow planning).
 	if (!workCols.has("kicked_off")) db.exec("ALTER TABLE work_items ADD COLUMN kicked_off INTEGER NOT NULL DEFAULT 0");
 	if (!workCols.has("fallback_streak")) db.exec("ALTER TABLE work_items ADD COLUMN fallback_streak INTEGER NOT NULL DEFAULT 0");
+	if (!workCols.has("timeout_streak")) db.exec("ALTER TABLE work_items ADD COLUMN timeout_streak INTEGER NOT NULL DEFAULT 0");
 	if (!workCols.has("last_remind_at")) db.exec("ALTER TABLE work_items ADD COLUMN last_remind_at INTEGER");
 	if (!workCols.has("remind_count")) db.exec("ALTER TABLE work_items ADD COLUMN remind_count INTEGER NOT NULL DEFAULT 0");
 	if (!workCols.has("cadence_ms")) db.exec("ALTER TABLE work_items ADD COLUMN cadence_ms INTEGER");

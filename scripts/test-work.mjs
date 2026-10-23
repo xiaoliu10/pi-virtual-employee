@@ -284,8 +284,11 @@ test("buildWorkWindowPrefix delay-awareness: notes only when late by ≥30min", 
 // User ruling 2026-10-13: the default work window has UNLIMITED turns (0);
 // the 30-minute cap stays the real limit. Pinned here so a future default
 // flip cannot silently re-bound windows.
-test("DEFAULT_WINDOW_BUDGET is unlimited turns (0) with the 30-minute cap kept", () => {
-	assert.deepEqual(DEFAULT_WINDOW_BUDGET, { maxTurns: 0, maxMinutes: 30 });
+test("DEFAULT_WINDOW_BUDGET is unlimited turns (0) with the 90-minute cap kept", () => {
+	// 90 minutes since the 2026-10-23 ruling: the spay 7-day reconciliation
+	// patrol needs 25-30 min of pure scanning plus per-row re-reconciles, and a
+	// 30-minute window timed out mid-scan without pushing anything.
+	assert.deepEqual(DEFAULT_WINDOW_BUDGET, { maxTurns: 0, maxMinutes: 90 });
 });
 
 test("unlimited-turn window prompt: no turn count, explicit no-early-stop rule, time cap stated", () => {
@@ -295,6 +298,15 @@ test("unlimited-turn window prompt: no turn count, explicit no-early-stop rule, 
 	assert.match(prefix, /收尾标记或时间上限/);
 	assert.doesNotMatch(prefix, /最多 0 轮/);
 	assert.ok(!prefix.includes("/0"), "no \"/0\" in the unlimited prompt");
+
+test("window prompt teaches segmentation and the auto-defer behaviour (2026-10-23 ruling)", () => {
+	const prefix = buildWorkWindowPrefix({ title: "spay 巡检", goal: "7 天对账巡检", turn: 0, budget: { maxTurns: 0, maxMinutes: 90 } });
+	assert.match(prefix, /长任务请自行分段推进/, "the model is told to segment long work");
+	assert.match(prefix, /先跑完扫描并落盘/, "scan-then-fix-then-push order is explicit");
+	assert.match(prefix, /不要把没做完的结果推成群/, "half-done results must not be pushed");
+	assert.match(prefix, /超时会自动顺延到下一窗口继续/, "the defer behaviour is stated honestly");
+	assert.match(prefix, /连续 2 次仍完不成会暂停/, "the circuit breaker is stated too");
+});
 	// The 30-minute cap remains a real, enforced limit in the same line.
 	assert.match(prefix, /时长上限 30 分钟/);
 });

@@ -23,6 +23,8 @@ interface ActiveWindow<Session> {
 	prevKicked?: number;
 	/** 常驻巡检标记（pre-claim snapshot）：DONE 被拦截为按节奏顺延。 */
 	prevResident?: number;
+	/** Consecutive auto-deferred wall-clock timeouts entering this window. */
+	prevTimeouts?: number;
 	/** 上次自声明节奏（pre-claim snapshot）：DONE 拦截的顺延时长依据。 */
 	prevCadenceMs?: number | null;
 	session?: Session;
@@ -30,7 +32,7 @@ interface ActiveWindow<Session> {
 	deadline?: ReturnType<typeof setTimeout>;
 	settled: Promise<void>;
 }
-type Store = Pick<WorkItemStore, "get" | "listDue" | "listByStatus" | "nextWakeAt" | "claim" | "recoverWorking" | "subscribe" | "setStatus" | "setField" | "clearAnswer" | "setFixedStreak" | "setFallbackStreak" | "markReminded" | "setCadence">;
+type Store = Pick<WorkItemStore, "get" | "listDue" | "listByStatus" | "nextWakeAt" | "claim" | "recoverWorking" | "subscribe" | "setStatus" | "setField" | "clearAnswer" | "setFixedStreak" | "setFallbackStreak" | "setTimeoutStreak" | "markReminded" | "setCadence">;
 interface Clock {
 	now(): number;
 	setTimeout(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
@@ -78,6 +80,22 @@ export function buildWorkLearning(item: WorkItemRow, result: string): { title: s
 	};
 	return hasMiningSecrets(input.title + "\n" + input.content) ? undefined : input;
 }
+
+/** stopReason used when the wall-clock cap fires (kept as a constant so the
+ * defer branches can recognise it — the deadline callback and the loop check
+ * must agree on the exact string). */
+const TIMEOUT_STOP_REASON = "工作窗口时间上限已到，已自动顺延；请核查已发生的操作。";
+/** How far a timed-out window defers itself (user ruling 2026-10-23): short
+ * enough that a multi-window task keeps moving, long enough that the next
+ * window starts after the current turn's teardown finishes. */
+const TIMEOUT_DEFER_MS = 5 * 60_000;
+/** Consecutive wall-clock timeouts before the chain stops auto-deferring and
+ * asks for the admin (user ruling 2026-10-23): an auto-defer that never
+ * terminates is a silent busy-loop — the model never finishes, the window
+ * keeps timing out, and nobody is told. Two deferrals mean the task genuinely
+ * does not fit the budget; a human must resize it (raise max_minutes) or
+ * split it. */
+const MAX_CONSECUTIVE_TIMEOUTS = 2;
 
 export class WorkService<Session extends WorkSession> {
 	private running = false;
@@ -229,6 +247,7 @@ export class WorkService<Session extends WorkSession> {
 				prevFallback: due.fallback_streak ?? 0,
 				prevKicked: due.kicked_off ?? 0,
 				prevResident: due.resident ?? 0,
+					prevTimeouts: due.timeout_streak ?? 0,
 				prevCadenceMs: due.cadence_ms ?? null,
 			};
 			this.active = active;
@@ -257,12 +276,37 @@ export class WorkService<Session extends WorkSession> {
 			if (!item) return;
 			const initialProgress = item.progress;
 			const startedAt = this.clock.now();
-			active.deadline = this.clock.setTimeout(() => this.abortActive("工作窗口超时，已请求中止；请核查操作后由管理员明确恢复。"), this.budget.maxMinutes * 60_000);
+			active.deadline = this.clock.setTimeout(() => this.abortActive(TIMEOUT_STOP_REASON), this.budget.maxMinutes * 60_000);
 			for (let turn = 0; this.budget.maxTurns <= 0 || turn < this.budget.maxTurns; turn++) {
 				// Fresh notebook and live identity on EVERY turn (including turn zero).
 				const fresh = store.get(item.id);
 				if (!fresh || fresh.status !== "working") return;
 				if (active.stopReason || !this.running || this.clock.now() - startedAt >= this.budget.maxMinutes * 60_000) {
+					// Wall-clock cap reached. User ruling 2026-10-23: this used to pause
+					// for explicit admin recovery, so a window that ran out mid-scan
+					// pushed NOTHING and the admin had to babysit every window. The
+					// window now defers itself (scheduled + a short NEXT_CHECK) and the
+					// push tells the admin what state it handed over — the chain resumes
+					// on its own. Only a genuine error / admin pause / cancel keeps the
+					// waiting_human path.
+					const timedOut = active.stopReason === TIMEOUT_STOP_REASON
+						|| (!active.stopReason && this.clock.now() - startedAt >= this.budget.maxMinutes * 60_000);
+					if (timedOut) {
+						const streak = (active.prevTimeouts ?? 0) + 1;
+						if (streak >= MAX_CONSECUTIVE_TIMEOUTS) {
+							// The budget does not fit this task. Stop looping and let
+							// the admin resize (raise max_minutes) or split it.
+							question = `已连续 ${streak} 次因时间上限（${this.budget.maxMinutes} 分钟）自动顺延仍未完成——这件工作装不进当前窗口预算。请用 update 调大 max_minutes，或把目标拆成多个自主任务，然后明确恢复。`;
+							break;
+						}
+						store.setTimeoutStreak(item.id, streak);
+						outcome = "scheduled";
+						nextCheckAt = this.clock.now() + TIMEOUT_DEFER_MS;
+						nextReason = "窗口时间上限已到，未完成部分自动顺延（下一窗口从已保存进度继续）";
+						nextStreak = active.prevStreak ?? 0;
+						question = "";
+						break;
+					}
 					question = active.stopReason ?? (this.budget.maxTurns > 0 ? "工作窗口预算已用尽，请管理员明确恢复。" : "工作窗口时间上限已到，请管理员明确恢复。");
 					break;
 				}
@@ -345,6 +389,25 @@ export class WorkService<Session extends WorkSession> {
 				// below and let the source conversation see why work stopped.
 				if (!current || current.status === "cancelled") return;
 				if (current.status !== "working") { outcome = "waiting_human"; break; }
+				// A wall-clock timeout is an auto-defer, not a stop-for-admin: it
+				// must not fall through to the waiting_human phrasing here (user
+				// ruling 2026-10-23 — this branch used to swallow the timeout and
+				// pause the chain even though the deadline callback had already
+				// marked the run as deferring).
+				if (active.stopReason === TIMEOUT_STOP_REASON) {
+					const streak = (active.prevTimeouts ?? 0) + 1;
+					if (streak >= MAX_CONSECUTIVE_TIMEOUTS) {
+						question = `已连续 ${streak} 次因时间上限（${this.budget.maxMinutes} 分钟）自动顺延仍未完成——这件工作装不进当前窗口预算。请用 update 调大 max_minutes，或把目标拆成多个自主任务，然后明确恢复。`;
+						break;
+					}
+					store.setTimeoutStreak(item.id, streak);
+					outcome = "scheduled";
+					nextCheckAt = this.clock.now() + TIMEOUT_DEFER_MS;
+					nextReason = "窗口时间上限已到，未完成部分自动顺延（下一窗口从已保存进度继续）";
+					nextStreak = active.prevStreak ?? 0;
+					question = "";
+					break;
+				}
 				if (active.stopReason || !this.running) { question = active.stopReason ?? "应用停止执行，请管理员明确恢复。"; break; }
 				if (answer !== null) store.clearAnswer(item.id, answer);
 				if (!current.created_by?.trim() || !this.opts.isAdmin(current.created_by)) {
@@ -430,12 +493,30 @@ export class WorkService<Session extends WorkSession> {
 			// Respect explicitly written progress; narration is only a fallback.
 			if (fresh?.status === "working" && fresh.progress === initialProgress && lastText.trim()) store.setField(item.id, "progress", lastText.trim().slice(-1200));
 		} catch (err) {
-			outcome = "waiting_human";
-			// Do not push raw exception strings (may include credentials/URLs).
-			question = active.stopReason ?? (stallRetriedThisTurn
-				? "执行出错（静默重试仍失败），可能已产生操作；请管理员核查后明确恢复。"
-				: "执行出错，可能已产生操作；请管理员核查后明确恢复（不会自动重试）。");
-			this.opts.onError?.(err);
+			// A window that ran out of wall clock mid-turn surfaces here as an
+			// abort — that is the auto-defer case, not a failure: hand the work over
+			// instead of pausing for the admin (user ruling 2026-10-23).
+			if (active.stopReason === TIMEOUT_STOP_REASON) {
+				const streak = (active.prevTimeouts ?? 0) + 1;
+				if (streak >= MAX_CONSECUTIVE_TIMEOUTS) {
+					outcome = "waiting_human";
+					question = `已连续 ${streak} 次因时间上限（${this.budget.maxMinutes} 分钟）自动顺延仍未完成——这件工作装不进当前窗口预算。请用 update 调大 max_minutes，或把目标拆成多个自主任务，然后明确恢复。`;
+				} else {
+					store.setTimeoutStreak(item?.id ?? "", streak);
+					outcome = "scheduled";
+					nextCheckAt = this.clock.now() + TIMEOUT_DEFER_MS;
+					nextReason = "窗口时间上限已到，未完成部分自动顺延（下一窗口从已保存进度继续）";
+					nextStreak = active.prevStreak ?? 0;
+					question = "";
+				}
+			} else {
+				outcome = "waiting_human";
+				// Do not push raw exception strings (may include credentials/URLs).
+				question = active.stopReason ?? (stallRetriedThisTurn
+					? "执行出错（静默重试仍失败），可能已产生操作；请管理员核查后明确恢复。"
+					: "执行出错，可能已产生操作；请管理员核查后明确恢复（不会自动重试）。");
+				this.opts.onError?.(err);
+			}
 		} finally {
 			if (active.deadline !== undefined) this.clock.clearTimeout(active.deadline);
 			active.deadline = undefined;

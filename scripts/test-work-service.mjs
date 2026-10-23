@@ -5,12 +5,12 @@ import { after, test } from "node:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { build } from "esbuild";
+import { buildSync } from "esbuild";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const tmp = await mkdtemp(join(root, "node_modules/.work-service-test-"));
 after(() => rm(tmp, { recursive: true, force: true }));
-await build({ stdin: { contents: 'export * from "./src/scheduler/work-service.ts"; export * from "./src/db/work-item-store.ts";', resolveDir: root, loader: "ts" }, outfile: join(tmp, "service.mjs"), bundle: true, platform: "node", format: "esm", packages: "external" });
+buildSync({ stdin: { contents: 'export * from "./src/scheduler/work-service.ts"; export * from "./src/db/work-item-store.ts";', resolveDir: root, loader: "ts" }, outfile: join(tmp, "service.mjs"), bundle: true, platform: "node", format: "esm", packages: "external" });
 const { WorkService, WorkItemStore, buildWorkLearning } = await import(pathToFileURL(join(tmp, "service.mjs")));
 const schema = (await readFile(join(root, "src/db/sqlite.ts"), "utf8")).match(/CREATE TABLE IF NOT EXISTS work_items \([\s\S]*?\);/)[0];
 const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(r => setImmediate(r)); };
@@ -49,7 +49,18 @@ function fixture(t, overrides = {}) {
 	});
 	h.create = (status = "queued", extra = {}) => h.store.create({ title: "月末对账", goal: "完成月末核对", status, createdBy: "admin", originConversation: "dt:source", ...extra });
 	h.gate = () => { const gate = deferred(); h.gates.push(gate); return gate; };
-	t.after(async () => { for (const gate of h.gates) gate.resolve({ reply: "[[TASK_DONE]]" }); await h.service.stop(); db.close(); });
+	t.after(async () => {
+		// stop() FIRST, then resolve gates: a resolved gate can let a still-running
+		// window finish and (since the timeout-defer ruling) schedule a follow-up
+		// whose tick would re-arm work AFTER cleanup — leaving the process waiting
+		// on a handle nobody clears. Settling the service before releasing the
+		// gates keeps teardown deterministic.
+		await h.service.stop();
+		await h.service.whenIdle();
+		for (const gate of h.gates) gate.resolve({ reply: "[[TASK_DONE]]" });
+		await flush();
+		db.close();
+	});
 	return h;
 }
 
@@ -274,15 +285,21 @@ test("later turns, resumed, progress-carrying and scheduled wakes skip the plan 
 });
 
 test("deadline actually aborts a hung send, never races it with a new send", async t => {
-	const h = fixture(t, { send: h => h.sends.length === 1 ? gate.promise : { reply: "[[TASK_DONE]]" } });
+	// Explicit 30-minute budget: this test drives the DEADLINE timer, and the
+	// default window budget is a separate concern (pinned by its own test).
+	const h = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } }, send: h => h.sends.length === 1 ? gate.promise : { reply: "[[TASK_DONE]]" } });
 	const gate = h.gate(); const first = h.create("waiting_human"); h.store.resume(first.id, "已审批，请核查");
 	h.service.start(); await flush(); const second = h.create();
 	await h.clock.advance(30 * 60_000);
-	assert.deepEqual(h.aborted, [first.id]);
-	assert.equal(h.sends.length, 1);
+	assert.deepEqual(h.aborted, [first.id], "the hung send was aborted at the deadline");
+	assert.equal(h.sends.length, 1, "no new send was raced in");
 	gate.resolve({ reply: "[[TASK_DONE]]" }); await flush();
-	assert.equal(h.store.get(first.id).status, "waiting_human");
-	assert.match(h.store.get(first.id).question, /超时/);
+	// User ruling 2026-10-23: a timed-out window defers itself instead of
+	// pausing for the admin — the chain resumes on its own timer. The deferred
+	// time comes from the FAKE clock (advanced past the deadline above).
+	const firstRow = h.store.get(first.id);
+	assert.equal(firstRow.status, "scheduled", "the timeout defers, does not pause");
+	assert.match(h.store.get(first.id).next_check_reason ?? "", /时间上限已到.*自动顺延/);
 	assert.equal(h.store.get(first.id).answer, "已审批，请核查", "aborted send is not a successful delivery");
 	assert.equal(h.store.get(second.id).status, "done");
 	assert.equal(h.sends.length, 2);
@@ -647,7 +664,9 @@ test("reminder cadence follows the task's own rhythm (high-frequency task is not
 
 test("cadence floor: a 30-minute rhythm task gets 30-minute reminders; EMA damps outliers", async t => {
 	let stall = false;
-	const h = fixture(t, { send: h => {
+	// Explicit 30-minute window budget: this test is about the REMINDER/EMA
+	// rhythm, not the default window length.
+	const h = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } }, send: h => {
 		if (stall) return { reply: "卡\n[[NEED_HUMAN]]: 等权限" };
 		return { reply: "进展\n[[NEXT_CHECK]]: 30分钟 | 快节奏" };
 	} });
@@ -804,18 +823,18 @@ test("a stop landing during backoff does not fire another send (review H1)", asy
 
 // ── unlimited-turn windows (user ruling 2026-10-13: 自主任务默认不限轮数) ──
 // The default budget (maxTurns 0) must NOT bound a window by turn count: the
-// 30-minute wall clock is the real limit, and a hard cap made long-running items
+// 90-minute wall clock is the real limit, and a hard cap made long-running items
 // stall mid-work. These pin the loop contract through the REAL WorkService.
 
 test("default budget (fixture passes none) keeps working past 25 turns and reaches DONE", async t => {
-	// budget undefined → DEFAULT_WINDOW_BUDGET { maxTurns: 0, maxMinutes: 30 }.
+	// budget undefined → DEFAULT_WINDOW_BUDGET { maxTurns: 0, maxMinutes: 90 }.
 	// The model only finishes on turn 26: any turn cap below that would pause it.
 	const h = fixture(t, { options: { budget: undefined }, send: h => h.sends.length < 26 ? { reply: "推进中" } : { reply: "全部完成\n[[TASK_DONE]]" } });
 	const item = h.create();
 	h.service.start(); await flush();
 	assert.equal(h.sends.length, 26, "no turn ceiling stopped the window at 15/20/25");
 	assert.equal(h.store.get(item.id).status, "done");
-	assert.match(h.sends.at(-1).message, /本窗口不限轮数（时长上限 30 分钟）/);
+	assert.match(h.sends.at(-1).message, /本窗口不限轮数（时长上限 90 分钟）/);
 	assert.doesNotMatch(h.sends[0].message, /本窗口最多 \d+ 轮/);
 });
 
@@ -827,18 +846,22 @@ test("explicit maxTurns 0 also means unlimited (0 is a ruling, not a falsy bug)"
 	assert.equal(h.store.get(h.store.list()[0].id).status, "done");
 });
 
-test("unlimited turns still hit the wall-clock deadline and say it was the TIME cap", async t => {
-	// Each send advances the FAKE clock: an unlimited window with a frozen fake
-	// clock would spin in microtasks forever (the loop's time check never trips
-	// and no macrotask ever runs) — the exact starvation this test must avoid.
+test("the wall-clock cap now DEFERS the window instead of pausing for the admin", async t => {
+	// User ruling 2026-10-23: the spay 7-day patrol needs 25-30 min of pure
+	// scanning plus per-row re-reconciles; the old behaviour (pause and wait for
+	// explicit admin recovery) wasted whole windows and pushed nothing. Each
+	// send advances the FAKE clock so the loop's time check trips without
+	// spinning in microtasks.
 	const h = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } }, send: h2 => { h2.clock.time += 6 * 60_000; return { reply: "持续推进，尚未完成" }; } });
 	const item = h.create();
 	h.service.start(); await flush();
 	assert.ok(h.sends.length >= 5, "several turns ran inside the window");
 	const row = h.store.get(item.id);
-	assert.equal(row.status, "waiting_human", "the time cap still stops the window");
-	assert.match(row.question, /时间上限已到/, "the pause must name the real limit, not a turn budget");
-	assert.doesNotMatch(row.question, /预算已用尽/);
+	assert.equal(row.status, "scheduled", "the time cap defers the window — no admin babysitting");
+	assert.match(row.next_check_reason ?? "", /时间上限已到.*自动顺延/, "the defer must say why");
+	// The fixture runs on a FAKE clock: compare against it, never Date.now().
+	assert.equal(row.next_check_at, h.clock.time + 5 * 60_000, "a next check is scheduled 5 minutes out");
+	assert.equal(row.question, null, "no waiting_human question is left behind");
 	// The DEADLINE timer is cleared on exit; what remains (≤1) is the
 	// waiting_human REMINDER timer — a pause must never go silent (field
 	// 2026-10-04), so its timer surviving the window is correct behavior.
