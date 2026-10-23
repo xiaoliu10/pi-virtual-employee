@@ -716,4 +716,22 @@ test("progressContextSlice 剥掉用户消息里的记忆前缀（侧信道不�
 	const texts = slice.map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)));
 	assert.ok(texts.some((t) => t === request), "the real request survives");
 	assert.ok(!texts.some((t) => t.includes("本回合自动携带")), "no memory prefix reaches the side pass");
+	// The anchor is inside the tail window here — it must appear EXACTLY ONCE.
+	// The map produces a clone for scaffolded messages, so identity dedup has to
+	// compare the stripped clone (regression: the request reached the side pass
+	// twice, back to back).
+	assert.equal(slice.filter((m) => m.role === "user").length, 1, "the current request is not duplicated");
+
+	// A prefix-free message keeps its object identity (no-op strip returns self).
+	const plain = { role: "user", content: "普通请求" };
+	assert.equal(progressContextSlice([plain])[0], plain, "a scaffold-free message is returned as-is");
+
+	// Multimodal turn: the image part survives the strip (text-only rewrite).
+	const vision = {
+		role: "user",
+		content: [{ type: "text", text: turnMemoryPrefix(["- 偏好"]) + request }, { type: "image", source: { type: "base64", data: "AAA" } }],
+	};
+	const out = progressContextSlice([vision]).find((m) => Array.isArray(m.content));
+	assert.equal(out.content.length, 2, "image part preserved");
+	assert.equal(out.content[0].text, request);
 });

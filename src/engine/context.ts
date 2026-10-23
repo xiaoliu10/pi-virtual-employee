@@ -667,22 +667,39 @@ export function progressContextSlice(messages: AgentMessage[], keepRecentTokens 
 	const stripUserScaffold = (m: AgentMessage): AgentMessage => {
 		if (m.role !== "user") return m;
 		const content = (m as { content?: unknown }).content;
-		const raw = typeof content === "string"
-			? content
-			: Array.isArray(content)
-				? (content as { type?: string; text?: string }[]).filter((part) => part?.type === "text").map((part) => part.text ?? "").join(" ")
-				: "";
-		if (!raw) return m;
-		const stripped = stripSyntheticPromptPrefix(raw);
-		return stripped === raw ? m : { ...m, content: stripped };
+		if (typeof content === "string") {
+			const stripped = stripSyntheticPromptPrefix(content);
+			return stripped === content ? m : { ...m, content: stripped };
+		}
+		if (!Array.isArray(content)) return m;
+		// Multimodal turns: rebuild the parts array with ONLY the text part
+		// rewritten — flattening to a string would silently drop image parts
+		// (review P2 of the 2026-10-23 fix).
+		const parts = content as { type?: string; text?: string }[];
+		if (!parts.some((part) => part?.type === "text")) return m;
+		let changed = false;
+		const next = parts.map((part) => {
+			if (part?.type !== "text") return part;
+			const stripped = stripSyntheticPromptPrefix(part.text ?? "");
+			if (stripped === (part.text ?? "")) return part;
+			changed = true;
+			return { ...part, text: stripped };
+		});
+		return changed ? ({ ...m, content: next } as AgentMessage) : m;
 	};
+	const anchor = taskAnchorOf(messages);
+	// The stripped anchor is computed ONCE and shared with the mapped tail: the
+	// map produces a CLONE for scaffolded messages, so dedup must compare against
+	// that clone — comparing against the ORIGINAL anchor used to fail identity
+	// and prepend a second copy of the current request to the side pass (review
+	// of the 2026-10-23 memory-prefix fix).
+	const anchorOut = anchor ? stripUserScaffold(anchor) : undefined;
 	const tail = messages
 		.slice(cut)
-		.map(stripUserScaffold)
+		.map((m) => (anchorOut && m === anchor ? anchorOut : stripUserScaffold(m)))
 		.filter((m) => m.role !== "compactionSummary" && m.role !== "branchSummary")
 		.filter((m) => m.role !== "assistant" || !isCompactionTemplateText(assistantVisibleText(m)));
-	const anchor = taskAnchorOf(messages);
-	if (anchor && !tail.some((m) => m === anchor)) return [stripUserScaffold(anchor), ...tail];
+	if (anchorOut && !tail.some((m) => m === anchorOut)) return [anchorOut, ...tail];
 	return tail;
 }
 
