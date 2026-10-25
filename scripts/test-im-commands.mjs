@@ -64,6 +64,12 @@ test("the full command set parses, and /model keeps its argument", () => {
 		["@小派 /perm", "perm", undefined],
 		["/whoami", "perm", undefined],
 		["/version", "version", undefined],
+		["/reload", "reload", undefined],
+		["@机器人 /reload", "reload", undefined],
+		["@机器人／reload", "reload", undefined], // full-width slash glued to mention
+		["／reload", "reload", undefined],
+		["/reload 一下", "reload", undefined], // trailing words ignored
+		["/RELOAD", "reload", undefined],
 		["/ver", "version", undefined],
 		["/models", "models", undefined],
 		["/model", "models", undefined],
