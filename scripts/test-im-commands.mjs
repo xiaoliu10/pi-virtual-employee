@@ -88,6 +88,8 @@ test("ordinary text is never mistaken for a command", () => {
 	const text = [
 		"帮我看看 /new 这个命令是怎么实现的",
 		"/news", // not a command word
+		"/reloads", // near-miss of /reload
+		"/reloadx", // near-miss of /reload
 		"/新的一轮", // ambiguous-looking, but not one of ours
 		"请 /new 一下",
 		"列一下 /models 里的模型", // slash word not at the start of the line
