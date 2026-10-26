@@ -425,6 +425,14 @@ function sweepOldInstallBackups(): void {
 	}
 }
 
+/** Test hook: attach the event wiring without setupAutoUpdater's Windows-only
+ * filesystem/probe steps, so the packaged-module regression test can drive
+ * checkNow against a stubbed autoUpdater. */
+export function initUpdaterEventsForTest(): void {
+	wireEvents();
+}
+
+
 /** Wire electron-updater events → UpdateState. Called once at setup. */
 function wireEvents(): void {
 	autoUpdater.on("checking-for-update", () => {
@@ -1129,6 +1137,18 @@ export function quitAndInstall(): void {	if (!enabled() || installing) return;
 // reset on any successful check.
 let feedRetryStreak = 0;
 let feedRetryTimer: NodeJS.Timeout | undefined;
+/** Hard wall-clock ceiling for ONE metadata check. electron-updater's promise
+ * can hang with no terminal event (feed/CDN stall, redirect chain dying
+ * silently); when that happened the `checking` flag stayed true forever and
+ * EVERY later check — the manual button or the 6h schedule — early-returned
+ * the frozen 「检查中」 state (field 2026-10-26: a 0.2.153 client sat on the
+ * stuck button for days). The deadline converts a silent hang into the
+ * ordinary transient-failure path below (error state + bounded retries). A
+ * late event from the abandoned check still produces a self-consistent state
+ * transition, so no generation tracking is needed. Both timings are env-
+ * overridable so the regression test runs in milliseconds. */
+const CHECK_TIMEOUT_MS = Number(process.env.VE_UPDATE_CHECK_TIMEOUT_MS) || 90_000;
+const CHECK_RETRY_DELAY_MS = Number(process.env.VE_UPDATE_RETRY_DELAY_MS) || 90_000;
 
 export async function checkNow(): Promise<UpdateState> {
 	if (!enabled()) return lastState;
@@ -1146,21 +1166,48 @@ export async function checkNow(): Promise<UpdateState> {
 	// temp file from another profile's in-flight file. electron-updater clears its
 	// own pending directory on failed downloads. Keep only install-dir backup cleanup.
 	sweepOldInstallBackups();
+	let retryNeeded = false;
 	try {
-		await autoUpdater.checkForUpdates();
+		await new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(
+				() => reject(new Error(`检查更新超时（timeout）：更新源 ${Math.round(CHECK_TIMEOUT_MS / 1000)} 秒无响应`)),
+				CHECK_TIMEOUT_MS,
+			);
+			autoUpdater.checkForUpdates().then(
+				() => { clearTimeout(timer); resolve(); },
+				(err: unknown) => { clearTimeout(timer); reject(err instanceof Error ? err : new Error(String(err))); },
+			);
+		});
 		feedRetryStreak = 0;
 	} catch (err) {
 		const message = (err as Error).message || String(err);
 		setState({ phase: "error", currentVersion: app.getVersion(), message });
-		// Transient feed failure (publish-window 404, Gitee/CDN hiccup)? Retry
-		// after 90s instead of waiting out the 6h schedule.
+		// Transient feed failure (publish-window 404, Gitee/CDN hiccup, or the
+		// deadline above)? Retry after a short delay instead of waiting out the
+		// 6h schedule.
 		if (/404|403|429|5\d\d|timeout|ENOTFOUND|ECONNRESET/i.test(message) && feedRetryStreak < 2) {
 			feedRetryStreak += 1;
+			retryNeeded = true;
+			log("WARN", `update check failed transiently (${message}) — rechecking in ${Math.round(CHECK_RETRY_DELAY_MS / 1000)}s (attempt ${feedRetryStreak}/2)`);
+		}
+	} finally {
+		// The check window this call owned is over — resolved, rejected, or timed
+		// out — whether or not electron-updater emitted a terminal event. Without
+		// this, one hung check leaves `checking` true forever and the guard at the
+		// top serves the frozen 「检查中」 state to every later click. Resetting
+		// after the normal path is harmless: the terminal-event handlers already
+		// set it false.
+		checking = false;
+		// Schedule the retry only AFTER the window closed. Scheduling it from the
+		// catch (while the old check is still in flight) used to let two retries
+		// overlap and defeat the bounded-retry count (observed 4 calls where 3
+		// were expected: the second retry fires while the first is still running).
+		if (retryNeeded) {
 			if (feedRetryTimer) clearTimeout(feedRetryTimer);
 			feedRetryTimer = setTimeout(() => {
+				feedRetryTimer = undefined;
 				void checkNow().catch(() => {});
-			}, 90_000);
-			log("WARN", `update check failed transiently (${message}) — rechecking in 90s (attempt ${feedRetryStreak}/2)`);
+			}, CHECK_RETRY_DELAY_MS);
 		}
 	}
 	return lastState;
