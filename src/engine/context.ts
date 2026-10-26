@@ -421,7 +421,27 @@ const SYNTHETIC_USER_PREFIX = "现在请不要调用任何工具，直接用一�
 export function isSyntheticUserMessage(message: AgentMessage): boolean {
 	if (message.role !== "user") return false;
 	const content = (message as { content?: unknown }).content;
-	return typeof content === "string" && content.replace(/\s+/g, " ").trim().startsWith(SYNTHETIC_USER_PREFIX);
+	// Multimodal turns carry an ARRAY of parts; read the text the same way
+	// substantialAnchorOf and progressContextSlice do, so all three consumers
+	// agree on what "the user's words" are (review P2-2: the array path used to
+	// bypass every synthetic check and could be picked as the task anchor).
+	const text = typeof content === "string"
+		? content
+		: Array.isArray(content)
+			? (content as { type?: string; text?: string }[]).filter((part) => part?.type === "text").map((part) => part?.text ?? "").join(" ")
+			: "";
+	// A live-turn memory block is scaffolding: the real request always FOLLOWS the
+	// block. After stripping it, whatever remains is the user's own words — so the
+	// message is synthetic only when nothing survives. This keeps the truncated
+	// block (no tail ⇒ nothing survives) and the complete PURE block (tail, then
+	// nothing) on ONE rule, while a block + real request stays a real message
+	// (review P2-4: taskAnchorOf used to pick a complete pure-memory block that
+	// stripSyntheticPromptPrefix emptied and substantialAnchorOf skipped —
+	// three-way inconsistency). Without this, a scaffolded turn counts as the
+	// "latest real user message" and the heartbeat quotes the memory headline as
+	// the current task (field 2026-10-23).
+	if (text.replace(/\s+/g, " ").trim().startsWith(TURN_MEMORY_HEAD)) return !stripSyntheticPromptPrefix(text).trim();
+	return text.replace(/\s+/g, " ").trim().startsWith(SYNTHETIC_USER_PREFIX);
 }
 
 /** The task anchor for progress reports: the LATEST real (non-synthetic) user
@@ -498,7 +518,14 @@ function stripOnePromptLayer(raw: string): string {
 	// the tail text can never over-consume the real request.
 	if (text.startsWith(TURN_MEMORY_HEAD)) {
 		const at = text.indexOf(TURN_MEMORY_TAIL);
-		if (at >= 0) text = text.slice(at + TURN_MEMORY_TAIL.length).trim();
+		// HEAD without TAIL = the text was truncated INSIDE the memory block
+		// (the real request always comes AFTER the tail, so nothing user-written
+		// can survive such a cut). Field 2026-10-23: a truncated prefix slipped
+		// through the tail-anchored strip and the heartbeat quoted the memory
+		// headline as 「当前请求」. Everything visible is synthetic memory content
+		// — drop it all instead of leaking it; the anchor then falls through to
+		// the next real user message (or the curated goal).
+		text = at >= 0 ? text.slice(at + TURN_MEMORY_TAIL.length).trim() : "";
 	}
 	if (AUTONOMOUS_HEAD_RE.test(text)) text = text.replace(AUTONOMOUS_HEAD_RE, "").trim();
 	else if (AUTONOMOUS_CONTINUE_RE.test(text)) text = text.replace(AUTONOMOUS_CONTINUE_RE, "").trim();

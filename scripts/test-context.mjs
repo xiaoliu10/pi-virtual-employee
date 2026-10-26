@@ -25,7 +25,7 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 			contents: `
-				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, turnMemoryPrefix, lastAssistantTailOf, recentAssistantVisibleTexts, isCompactionTemplateText } from "./src/engine/context.ts";
+				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, turnMemoryPrefix, TURN_MEMORY_TAIL, lastAssistantTailOf, recentAssistantVisibleTexts, isCompactionTemplateText } from "./src/engine/context.ts";
 				// pi 1.x moved the compaction primitives to the coding-agent package;
 				// the app vendors them in src/engine/pi-compaction.ts.
 				export { shouldCompact, DEFAULT_COMPACTION_SETTINGS, estimateTokens } from "./src/engine/pi-compaction.ts";
@@ -39,7 +39,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, turnMemoryPrefix, lastAssistantTailOf, recentAssistantVisibleTexts, isCompactionTemplateText } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, turnMemoryPrefix, TURN_MEMORY_TAIL, lastAssistantTailOf, recentAssistantVisibleTexts, isCompactionTemplateText } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -695,6 +695,46 @@ test("turnMemoryPrefix 注入块被 stripSyntheticPromptPrefix 完全剥除（�
 	// real request — the memory block must not survive into that quote.
 	assert.equal(stripSyntheticPromptPrefix(injected), request, "the injected prefix is stripped, request survives verbatim");
 	assert.equal(stripSyntheticPromptPrefix(request), request, "a message without the prefix is untouched");
+
+	// Truncated prefix (TAIL lost): the real request always lives AFTER the tail,
+	// so nothing user-written can survive — the whole visible text is synthetic
+	// memory content and must be dropped, not quoted as 「当前请求」 (field
+	// 2026-10-23, the leak #99's tail-anchored strip still missed).
+	const truncated = injected.slice(0, injected.indexOf("与对方当前") - 2);
+	assert.ok(truncated.startsWith("【本回合自动携带") && !truncated.includes(TURN_MEMORY_TAIL), "fixture really is head-only");
+	assert.equal(stripSyntheticPromptPrefix(truncated), "", "a truncated memory block is dropped wholesale");
+	const truncatedAnchor = substantialAnchorOf([{ role: "user", content: truncated }]);
+	assert.equal(truncatedAnchor, "", "the heartbeat anchor skips the truncated block instead of quoting it");
+	// …and falls through to the NEXT real user message.
+	const anchoredToNext = substantialAnchorOf([
+		{ role: "user", content: truncated },
+		{ role: "assistant", content: "好的。" },
+		{ role: "user", content: request },
+	]);
+	assert.equal(anchoredToNext, request, "the anchor falls through to the next real request");
+
+	// taskAnchorOf must not treat the truncated block as "the latest real user
+	// message" either — otherwise the brief would still be headed by it.
+	const truncatedMsg = { role: "user", content: truncated };
+	assert.equal(isSyntheticUserMessage(truncatedMsg), true, "a truncated memory block is synthetic, not a user request");
+	assert.notEqual(taskAnchorOf([truncatedMsg])?.content, truncated, "taskAnchorOf skips it");
+	assert.equal(taskAnchorOf([truncatedMsg, { role: "user", content: request }])?.content, request);
+
+	// P2-2: multimodal turns carry an array of parts — the same judgement must
+	// apply (the array path used to bypass every synthetic check).
+	const truncatedArray = { role: "user", content: [{ type: "text", text: truncated }, { type: "image", data: "AA==", mimeType: "image/png" }] };
+	assert.equal(isSyntheticUserMessage(truncatedArray), true, "array content is judged by its text part");
+
+	// P2-4: a COMPLETE pure-memory block (head + tail, no request) is equally
+	// synthetic — strip empties it and the anchor must skip it, not pick it.
+	const pureBlock = { role: "user", content: turnMemoryPrefix(["- 偏好 — 简短"]) };
+	assert.equal(stripSyntheticPromptPrefix(pureBlock.content), "", "a pure block strips to nothing");
+	assert.equal(isSyntheticUserMessage(pureBlock), true, "a pure block is synthetic (matches strip)");
+	assert.equal(substantialAnchorOf([pureBlock]), "", "no request survives");
+	// …but a block WITH a real request after the tail stays a real message.
+	const withRequest = { role: "user", content: turnMemoryPrefix(["- 偏好 — 简短"]) + request };
+	assert.equal(isSyntheticUserMessage(withRequest), false, "block + real request is a real message");
+	assert.equal(substantialAnchorOf([withRequest]), request);
 
 	// substantialAnchorOf must quote the request, not the memory headlines.
 	const anchor = substantialAnchorOf([{ role: "user", content: injected }]);
