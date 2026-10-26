@@ -720,6 +720,22 @@ test("turnMemoryPrefix 注入块被 stripSyntheticPromptPrefix 完全剥除（�
 	assert.notEqual(taskAnchorOf([truncatedMsg])?.content, truncated, "taskAnchorOf skips it");
 	assert.equal(taskAnchorOf([truncatedMsg, { role: "user", content: request }])?.content, request);
 
+	// P2-2: multimodal turns carry an array of parts — the same judgement must
+	// apply (the array path used to bypass every synthetic check).
+	const truncatedArray = { role: "user", content: [{ type: "text", text: truncated }, { type: "image", data: "AA==", mimeType: "image/png" }] };
+	assert.equal(isSyntheticUserMessage(truncatedArray), true, "array content is judged by its text part");
+
+	// P2-4: a COMPLETE pure-memory block (head + tail, no request) is equally
+	// synthetic — strip empties it and the anchor must skip it, not pick it.
+	const pureBlock = { role: "user", content: turnMemoryPrefix(["- 偏好 — 简短"]) };
+	assert.equal(stripSyntheticPromptPrefix(pureBlock.content), "", "a pure block strips to nothing");
+	assert.equal(isSyntheticUserMessage(pureBlock), true, "a pure block is synthetic (matches strip)");
+	assert.equal(substantialAnchorOf([pureBlock]), "", "no request survives");
+	// …but a block WITH a real request after the tail stays a real message.
+	const withRequest = { role: "user", content: turnMemoryPrefix(["- 偏好 — 简短"]) + request };
+	assert.equal(isSyntheticUserMessage(withRequest), false, "block + real request is a real message");
+	assert.equal(substantialAnchorOf([withRequest]), request);
+
 	// substantialAnchorOf must quote the request, not the memory headlines.
 	const anchor = substantialAnchorOf([{ role: "user", content: injected }]);
 	assert.equal(anchor, request, "the heartbeat anchor quotes the real request");

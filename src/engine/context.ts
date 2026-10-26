@@ -421,15 +421,27 @@ const SYNTHETIC_USER_PREFIX = "现在请不要调用任何工具，直接用一�
 export function isSyntheticUserMessage(message: AgentMessage): boolean {
 	if (message.role !== "user") return false;
 	const content = (message as { content?: unknown }).content;
-	if (typeof content !== "string") return false;
-	const text = content.replace(/\s+/g, " ").trim();
-	// A truncated live-turn memory block carries NOTHING the user wrote (the real
-	// request always follows the block's tail, so a cut inside the block leaves
-	// synthetic content only). Without this, such a turn would count as the
-	// "latest real user message" and the heartbeat would quote the memory
-	// headline as the current task (field 2026-10-23).
-	if (text.startsWith(TURN_MEMORY_HEAD) && !content.includes(TURN_MEMORY_TAIL)) return true;
-	return text.startsWith(SYNTHETIC_USER_PREFIX);
+	// Multimodal turns carry an ARRAY of parts; read the text the same way
+	// substantialAnchorOf and progressContextSlice do, so all three consumers
+	// agree on what "the user's words" are (review P2-2: the array path used to
+	// bypass every synthetic check and could be picked as the task anchor).
+	const text = typeof content === "string"
+		? content
+		: Array.isArray(content)
+			? (content as { type?: string; text?: string }[]).filter((part) => part?.type === "text").map((part) => part?.text ?? "").join(" ")
+			: "";
+	// A live-turn memory block is scaffolding: the real request always FOLLOWS the
+	// block. After stripping it, whatever remains is the user's own words — so the
+	// message is synthetic only when nothing survives. This keeps the truncated
+	// block (no tail ⇒ nothing survives) and the complete PURE block (tail, then
+	// nothing) on ONE rule, while a block + real request stays a real message
+	// (review P2-4: taskAnchorOf used to pick a complete pure-memory block that
+	// stripSyntheticPromptPrefix emptied and substantialAnchorOf skipped —
+	// three-way inconsistency). Without this, a scaffolded turn counts as the
+	// "latest real user message" and the heartbeat quotes the memory headline as
+	// the current task (field 2026-10-23).
+	if (text.replace(/\s+/g, " ").trim().startsWith(TURN_MEMORY_HEAD)) return !stripSyntheticPromptPrefix(text).trim();
+	return text.replace(/\s+/g, " ").trim().startsWith(SYNTHETIC_USER_PREFIX);
 }
 
 /** The task anchor for progress reports: the LATEST real (non-synthetic) user
