@@ -64,6 +64,12 @@ test("the full command set parses, and /model keeps its argument", () => {
 		["@小派 /perm", "perm", undefined],
 		["/whoami", "perm", undefined],
 		["/version", "version", undefined],
+		["/reload", "reload", undefined],
+		["@机器人 /reload", "reload", undefined],
+		["@机器人／reload", "reload", undefined], // full-width slash glued to mention
+		["／reload", "reload", undefined],
+		["/reload 一下", "reload", undefined], // trailing words ignored
+		["/RELOAD", "reload", undefined],
 		["/ver", "version", undefined],
 		["/models", "models", undefined],
 		["/model", "models", undefined],
@@ -82,6 +88,8 @@ test("ordinary text is never mistaken for a command", () => {
 	const text = [
 		"帮我看看 /new 这个命令是怎么实现的",
 		"/news", // not a command word
+		"/reloads", // near-miss of /reload
+		"/reloadx", // near-miss of /reload
 		"/新的一轮", // ambiguous-looking, but not one of ours
 		"请 /new 一下",
 		"列一下 /models 里的模型", // slash word not at the start of the line

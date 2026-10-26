@@ -30,7 +30,7 @@
  * exactly what a long-running task blocks (field 2026-10-10). */
 export const QUEUE_BYPASS_COMMANDS = ["new", "stop", "steer"] as const;
 
-export type CommandName = "new" | "stop" | "steer" | "version" | "models" | "model" | "compact" | "help" | "perm" | "restart";
+export type CommandName = "new" | "stop" | "steer" | "version" | "models" | "model" | "compact" | "help" | "perm" | "restart" | "reload";
 
 export interface ParsedCommand {
 	name: CommandName;
@@ -99,6 +99,10 @@ export function parseCommand(raw: string): ParsedCommand | null {
 			return { name: "perm" };
 		case "restart":
 			return { name: "restart" };
+		case "reload":
+			// Reload session resources (skills) from disk. Args are ignored on
+			// purpose: /reload has no parameters today.
+			return { name: "reload" };
 		case "help":
 		case "?":
 			return { name: "help" };

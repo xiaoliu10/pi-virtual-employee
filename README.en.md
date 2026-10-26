@@ -70,7 +70,7 @@ All configuration is stored in SQLite. You can edit it in **Settings**, or an ad
 
 ### IM Commands
 
-@mention the bot in a group chat, or send commands directly in a direct chat: `/new` starts a new conversation, `/compact` compacts context, `/stop` stops the current task, `/model` switches models, and `/perm` shows permissions. Create scheduled tasks in natural language (for example, “Every day at 9 AM, …”). They run automatically and deliver results back to the originating conversation.
+@mention the bot in a group chat, or send commands directly in a direct chat: `/new` starts a new conversation, `/compact` compacts context, `/stop` stops the current task, `/model` switches models, `/perm` shows permissions, and `/reload` reloads the skill list. Create scheduled tasks in natural language (for example, “Every day at 9 AM, …”). They run automatically and deliver results back to the originating conversation.
 
 ### Autonomous Work: Propose First, Confirm Before Execution
 

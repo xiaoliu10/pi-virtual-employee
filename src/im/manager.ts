@@ -453,6 +453,7 @@ export class IMAdapterManager {
 				"/stop — 中断当前回合（上下文保留）",
 				"/steer <内容> — 在当前步骤边界把话交给正在执行的任务，让它据此收尾/调整（不保证立即停下），例如 /steer 先保存结果收尾",
 				"/perm — 查看我在当前会话的权限（角色 + 各项能力是否放行）",
+				"/reload — 重新从磁盘加载技能列表（技能导入/修改后立即生效，不打断进行中的任务）",
 				"/restart — 重启应用（仅管理员，单聊）",
 				"/version — 查看应用版本",
 				"/models — 列出可用模型",
@@ -482,6 +483,19 @@ export class IMAdapterManager {
 			// Let the reply flush to the channel before the process exits.
 			setTimeout(() => this.onRestart?.(), 1200);
 			return "🔄 收到，应用将在 1~2 秒后自动重启（进程退出并自动拉起）。半分钟后即可继续使用。";
+		}
+		if (cmd.name === "reload") {
+			// runCommand is deliberately sync-signatured (string | Promise<string>);
+			// /reload is the one command that does real async work here, so it
+			// returns the promise instead of awaiting.
+			return this.engine
+				.reloadSkills()
+				.then(({ count }) =>
+					count === 0
+						? "🔄 技能列表已重新加载，当前没有已加载的技能。"
+						: `🔄 技能列表已重新加载，当前共 ${count} 个技能，从下一条消息起生效。`,
+				)
+				.catch((err: unknown) => `技能重载失败：${err instanceof Error ? err.message : String(err)}`);
 		}
 		if (cmd.name === "compact") {
 			return this.engine.compactSession(conversationId);

@@ -1240,6 +1240,19 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/**
+	 * IM `/reload`: reload skills from disk NOW (same path as the refresh_skills
+	 * tool / the admin UI button) and report what loaded, so the sender sees the
+	 * effect without asking the employee to call a tool. Non-aborting by design —
+	 * in-flight turns finish on the old list; every session rebuilds with the new
+	 * list on its next message.
+	 */
+	async reloadSkills(): Promise<{ count: number; names: string[] }> {
+		await this.markSkillsChanged();
+		const { skills, info } = await this.listSkills();
+		return { count: skills.length, names: info.map((i) => i.name) };
+	}
+
+	/**
 	 * A memory entry was written (remember tool) — bump the revision so cached
 	 * sessions rebuild with the fresh always-on memory index on their next turn.
 	 */
