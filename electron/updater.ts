@@ -293,6 +293,15 @@ let window: BrowserWindow | null = null;
 let recheckTimer: NodeJS.Timeout | undefined;
 let idlePollTimer: NodeJS.Timeout | undefined;
 let checking = false;
+/** True only while a checkNow() invocation owns the check window. Event
+ * handlers use it to tell a LIVE check's terminal event from a ZOMBIE one: a
+ * check abandoned by the 90s deadline can still emit update-available / error
+ * minutes later, and those must not start a download or clobber the download
+ * state machine (subagent review 2026-10-26 — the window this very fix opened
+ * by releasing `checking`). */
+let checkWindowOpen = false;
+/** Guards double-wiring (the test hook throws instead of attaching twice). */
+let eventsWired = false;
 let downloading = false;
 /** True only between downloadNow() and its terminal downloaded/error/cancelled event.
  *  The same autoUpdater "error" event reports check failures and download failures;
@@ -429,12 +438,14 @@ function sweepOldInstallBackups(): void {
  * filesystem/probe steps, so the packaged-module regression test can drive
  * checkNow against a stubbed autoUpdater. */
 export function initUpdaterEventsForTest(): void {
+	if (eventsWired) throw new Error("updater events already wired");
 	wireEvents();
 }
 
 
 /** Wire electron-updater events → UpdateState. Called once at setup. */
 function wireEvents(): void {
+	eventsWired = true;
 	autoUpdater.on("checking-for-update", () => {
 		checking = true;
 		setState({ phase: "checking", currentVersion: app.getVersion() });
@@ -452,12 +463,26 @@ function wireEvents(): void {
 			releaseNotes: pendingReleaseNotes,
 			manualUrl: manualUrl(info.version ?? ""),
 		});
-		// Download without a click when unattended is on, or an IM admin asked for it.
-		if (unattendedEnabled() || requestedInstall) void downloadNow().catch(() => {});
+		// Download without a click when unattended is on, or an IM admin asked for it
+		// — but ONLY while a check window is still open. A zombie check that the
+		// deadline already abandoned must not start a 97MB download minutes after
+		// the user was told the check timed out: it just records the fact and lets
+		// the next manual/scheduled check (or the user) pick it up.
+		if (!checkWindowOpen) {
+			log("WARN", `late update-available for ${info.version ?? "?"} arrived after its check window closed — recording it without auto-download`);
+		} else if (unattendedEnabled() || requestedInstall) void downloadNow().catch(() => {});
 	});
 	autoUpdater.on("update-not-available", () => {
 		checking = false;
 		lastCheckAt = Date.now();
+		// A zombie not-available (window already closed by the deadline) must not
+		// erase an admin's one-shot install intent or the download retry ladder —
+		// it only reports what it found (review 2026-10-26).
+		if (!checkWindowOpen) {
+			log("WARN", "late update-not-available arrived after its check window closed — not touching install intent or download retries");
+			setState({ phase: "none", currentVersion: app.getVersion() });
+			return;
+		}
 		downloadRetries.reset();
 		requestedInstall = false;
 		setState({ phase: "none", currentVersion: app.getVersion() });
@@ -513,10 +538,21 @@ function wireEvents(): void {
 		scheduleIdleRestart();
 	});
 	autoUpdater.on("error", (err: Error) => {
+		const message = err.message || String(err);
+		// Two very different errors share this event: a CHECK error and a DOWNLOAD
+		// error. A check error arriving after its window closed (the deadline
+		// already reported it) must not clear `downloading`/`downloadInFlight` or
+		// overwrite a live download's state — that would wedge the download state
+		// machine while electron-updater's own downloadPromise keeps running
+		// (review 2026-10-26).
+		const isZombieCheckError = !checkWindowOpen && !downloadInFlight && lastState.phase !== "downloading";
+		if (isZombieCheckError) {
+			log("WARN", `late check error arrived after its window closed (${message}) — leaving download state untouched`);
+			return;
+		}
 		checking = false;
 		downloading = false;
 		endDrain?.();
-		const message = err.message || String(err);
 		setState({ phase: "error", currentVersion: app.getVersion(), message });
 		const wasDownloadAttempt = downloadInFlight;
 		downloadInFlight = false;
@@ -1167,6 +1203,7 @@ export async function checkNow(): Promise<UpdateState> {
 	// own pending directory on failed downloads. Keep only install-dir backup cleanup.
 	sweepOldInstallBackups();
 	let retryNeeded = false;
+	checkWindowOpen = true;
 	try {
 		await new Promise<void>((resolve, reject) => {
 			const timer = setTimeout(
@@ -1202,6 +1239,7 @@ export async function checkNow(): Promise<UpdateState> {
 		// catch (while the old check is still in flight) used to let two retries
 		// overlap and defeat the bounded-retry count (observed 4 calls where 3
 		// were expected: the second retry fires while the first is still running).
+		checkWindowOpen = false;
 		if (retryNeeded) {
 			if (feedRetryTimer) clearTimeout(feedRetryTimer);
 			feedRetryTimer = setTimeout(() => {
@@ -1277,6 +1315,11 @@ export function getUpdateState(): UpdateState {
 /** Stop the periodic recheck timer (called from will-quit). */
 export function stopUpdater(): void {
 	downloadRetries.stop();
+	if (feedRetryTimer) {
+		clearTimeout(feedRetryTimer);
+		feedRetryTimer = undefined;
+	}
+	checkWindowOpen = false;
 	if (recheckTimer) {
 		clearInterval(recheckTimer);
 		recheckTimer = undefined;
@@ -1323,9 +1366,6 @@ export function setupAutoUpdater(win: BrowserWindow): void {
 
 	// Broken-install probe: per-user NSIS must have an HKCU uninstall entry.
 	inspectInstallHealth();
-	// Sweep a watchdog scheduled task the previous run may have left behind
-	// (the script deletes its own task, this covers crash paths).
-	cleanupWatchdogTask();
 	// Sweep a watchdog scheduled task the previous run may have left behind
 	// (the script deletes its own task, this covers crash paths).
 	cleanupWatchdogTask();

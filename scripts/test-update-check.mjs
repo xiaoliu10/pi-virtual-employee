@@ -47,6 +47,8 @@ class AutoUpdaterStub extends EventEmitter {
 		return h.check(h);
 	}
 	async downloadUpdate() {
+		const h = globalThis.__autoUpdaterHarnesses[${harnessKey}];
+		h.calls.push("download");
 		return [];
 	}
 	quitAndInstall() {}
@@ -70,7 +72,10 @@ export default { autoUpdater };
 	// Fake packaged-Windows and inject the test timings AFTER the esbuild call
 	// (platform-dependent binary resolution) and BEFORE importing the bundle
 	// (the updater reads the timings at module load).
-	Object.defineProperty(process, "platform", { value: "win32" });
+	const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+	const originalTimeoutEnv = process.env.VE_UPDATE_CHECK_TIMEOUT_MS;
+	const originalRetryEnv = process.env.VE_UPDATE_RETRY_DELAY_MS;
+	Object.defineProperty(process, "platform", { value: "win32", configurable: true });
 	process.env.VE_UPDATE_CHECK_TIMEOUT_MS = String(checkTimeoutMs);
 	process.env.VE_UPDATE_RETRY_DELAY_MS = String(retryDelayMs);
 	const updater = await import(pathToFileURL(join(workDir, "updater.mjs")).href + `?t=${Math.random()}`);
@@ -80,6 +85,16 @@ export default { autoUpdater };
 	globalThis.__autoUpdaterHarnesses[workDir] = harness;
 	const autoUpdater = globalThis.__autoUpdater;
 	const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+	// Leave the process as we found it: this file relies on node's per-file
+	// process isolation today, but a future single-process glob runner must not
+	// inherit a faked platform or injected timings.
+	process.on("exit", () => {
+		if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+		if (originalTimeoutEnv === undefined) delete process.env.VE_UPDATE_CHECK_TIMEOUT_MS;
+		else process.env.VE_UPDATE_CHECK_TIMEOUT_MS = originalTimeoutEnv;
+		if (originalRetryEnv === undefined) delete process.env.VE_UPDATE_RETRY_DELAY_MS;
+		else process.env.VE_UPDATE_RETRY_DELAY_MS = originalRetryEnv;
+	});
 	return { updater, harness, autoUpdater, settle, callsOf: (name) => harness.calls.filter((c) => c === name).length };
 }
 
@@ -129,6 +144,44 @@ test("a transient feed failure still arms the bounded auto-retry (2 extra attemp
 	assert.equal(s.phase, "error");
 });
 
+test("a zombie update-available (window closed) records but does NOT auto-download", async () => {
+	const { updater, harness, autoUpdater, settle, callsOf } = await makeUpdater();
+	// The check hangs past the deadline, then reports an update LATER. Unattended
+	// mode is the dangerous case: without the window gate this would start a 97MB
+	// download minutes after the user was told the check timed out.
+	updater.setupUnattended({ enabled: () => true, isIdle: () => true });
+	harness.check = () => new Promise((resolve) => {
+		setTimeout(() => {
+			autoUpdater.emit("checking-for-update");
+			autoUpdater.emit("update-available", { version: "9.9.9" });
+			resolve();
+		}, 450);
+	});
+	await updater.checkNow(); // times out at 300ms
+	await settle(450); // beyond the zombie at ~450ms
+	assert.equal(callsOf("download"), 0, "a closed window must never auto-start a download");
+	// The information itself is real and kept (better than hiding it).
+	const state = updater.getUpdateState();
+	assert.ok(["available", "error"].includes(state.phase), `unexpected phase ${state.phase}`);
+	assert.notEqual(state.phase, "checking");
+});
+
+test("a zombie check error (window closed) leaves a live download's state intact", async () => {
+	const { updater, harness, autoUpdater, settle } = await makeUpdater();
+	// Simulate: check times out → a real download is running → the abandoned
+	// check finally errors. That late error must not clear download state.
+	harness.check = () => new Promise((resolve, reject) => {
+		setTimeout(() => reject(new Error("HTTP 500: zombie")), 450);
+	});
+	await updater.checkNow(); // times out at 300ms → error state
+	// Pretend a download is in flight (the state machine's view).
+	autoUpdater.emit("download-progress", { percent: 40 });
+	const before = updater.getUpdateState();
+	assert.equal(before.phase, "downloading", "fixture: a download is in progress");
+	await settle(400); // zombie error lands at ~450ms
+	assert.equal(updater.getUpdateState().phase, "downloading", "a zombie check error must not clobber the download state");
+});
+
 test("a late zombie event cannot resurrect the checking phase", async () => {
 	const { updater, harness, autoUpdater, settle } = await makeUpdater();
 	// A check that hangs past the deadline, then eventually settles with
@@ -142,6 +195,6 @@ test("a late zombie event cannot resurrect the checking phase", async () => {
 		}, 450);
 	});
 	await updater.checkNow(); // times out at 300ms → error
-	await settle(400); // let the zombie settle at ~450ms
+	await settle(700); // let the zombie settle at ~450ms (2.3x margin, not 1.5x)
 	assert.notEqual(updater.getUpdateState().phase, "checking", "no path may leave the renderer stuck on 「检查中」");
 });
