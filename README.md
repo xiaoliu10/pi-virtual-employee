@@ -2,7 +2,7 @@
 
 **简体中文** | [English](README.en.md)
 
-桌面形态的**虚拟员工（Virtual Employee）**应用：以 [pi agent SDK](https://github.com/earendil-works/pi)（`@earendil-works/pi-agent-core`）的 `Agent` 为对话内核，[Electron](https://www.electronjs.org/) 承载，接入钉钉等 IM 渠道，让一个真正动手干活的 AI 员工为团队服务——先用手头的工具把事情办成，再回复，而不是把任务推回给人。
+桌面形态的**虚拟员工（Virtual Employee）**应用：对话内核以 [pi agent SDK](https://github.com/earendil-works/pi) 为底座——自建 `Agent` 管线（`@earendil-works/pi-agent-core`）承载全部现场加固，可切换外包 pi-coding-agent 的 `AgentSession` 会话壳启用扩展运行时（详见[内核与 pi runtime](#内核与-pi-runtime)），[Electron](https://www.electronjs.org/) 承载，接入钉钉等 IM 渠道，让一个真正动手干活的 AI 员工为团队服务——先用手头的工具把事情办成，再回复，而不是把任务推回给人。
 
 界面参考 [LobsterAI](https://github.com/netease-youdao/LobsterAI) 风格。产品定位是**单一内置员工**：一个持久在线、可配置、可对话、可定时干活的数字员工，不做多 agent 编排。
 
@@ -29,7 +29,7 @@
 
 ## 快速开始
 
-环境要求：Node.js 20+，npm。
+环境要求：Node.js 22.19+，npm。
 
 ```bash
 # 1) 安装依赖（better-sqlite3 跳过 install 脚本，稍后对 Electron ABI 重编译）
@@ -90,7 +90,8 @@ npm run build
 ```
 electron/            主进程（窗口 / IPC / 自动更新 watchdog）+ preload
 src/
-├─ engine/           员工引擎：Agent 内核 + 会话管理 + prompt 装配 + tools/
+├─ engine/           员工引擎：Agent 内核（可包 AgentSession 会话壳）+ 会话管理 + prompt 装配 + tools/
+├─ runtime/          pi runtime 引导器：npmmirror→Gitee→npmjs 源链装机 + 版本自检
 ├─ im/               IMAdapter 抽象 + 钉钉适配器（Stream / AI 卡片 / 文件）+ 命令解析 + 看门狗
 ├─ scheduler/        定时任务调度 + 无人值守运行 + 权限继承
 ├─ knowledge/        知识库（sqlite-vec 向量检索 + 记忆层）
@@ -101,6 +102,12 @@ src/
 └─ db/               better-sqlite3：config / conversations / telemetry
 renderer/src/        React + Vite + Tailwind 控制台
 ```
+
+### 内核与 pi runtime
+
+会话内核保留**自建 `Agent`**（pi-agent-core）管线——现场加固（压缩口径、退化门禁、重试梯子、会话亲和、scoped memory、RBAC）都在这一层。自 v0.2.149 起可经 `general.engineKernel` 灰度开关切到 `pi-session`：在 Agent 外包一层 pi-coding-agent 的 `AgentSession`，启用扩展运行时（pi 插件宿主）；pi 自带的 auto-retry / auto-compaction 显式关闭，上述行为零改变。**默认 `legacy`**，现场零影响。
+
+pi-coding-agent **不进安装包**：安装包只内置锁定版本的 `pi-runtime-lock`（钉住全依赖树），首启由引导器（`src/runtime/`）按 **npmmirror → Gitee → npmjs** 源链装到 `userData/pi-runtime`（`general.piRegistryUrl` 可指定私有源），装完做版本自检；安装失败留在 legacy，不带病启动。
 
 ## 测试与护栏
 
