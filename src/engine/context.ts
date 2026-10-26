@@ -421,7 +421,15 @@ const SYNTHETIC_USER_PREFIX = "现在请不要调用任何工具，直接用一�
 export function isSyntheticUserMessage(message: AgentMessage): boolean {
 	if (message.role !== "user") return false;
 	const content = (message as { content?: unknown }).content;
-	return typeof content === "string" && content.replace(/\s+/g, " ").trim().startsWith(SYNTHETIC_USER_PREFIX);
+	if (typeof content !== "string") return false;
+	const text = content.replace(/\s+/g, " ").trim();
+	// A truncated live-turn memory block carries NOTHING the user wrote (the real
+	// request always follows the block's tail, so a cut inside the block leaves
+	// synthetic content only). Without this, such a turn would count as the
+	// "latest real user message" and the heartbeat would quote the memory
+	// headline as the current task (field 2026-10-23).
+	if (text.startsWith(TURN_MEMORY_HEAD) && !content.includes(TURN_MEMORY_TAIL)) return true;
+	return text.startsWith(SYNTHETIC_USER_PREFIX);
 }
 
 /** The task anchor for progress reports: the LATEST real (non-synthetic) user
@@ -498,7 +506,14 @@ function stripOnePromptLayer(raw: string): string {
 	// the tail text can never over-consume the real request.
 	if (text.startsWith(TURN_MEMORY_HEAD)) {
 		const at = text.indexOf(TURN_MEMORY_TAIL);
-		if (at >= 0) text = text.slice(at + TURN_MEMORY_TAIL.length).trim();
+		// HEAD without TAIL = the text was truncated INSIDE the memory block
+		// (the real request always comes AFTER the tail, so nothing user-written
+		// can survive such a cut). Field 2026-10-23: a truncated prefix slipped
+		// through the tail-anchored strip and the heartbeat quoted the memory
+		// headline as 「当前请求」. Everything visible is synthetic memory content
+		// — drop it all instead of leaking it; the anchor then falls through to
+		// the next real user message (or the curated goal).
+		text = at >= 0 ? text.slice(at + TURN_MEMORY_TAIL.length).trim() : "";
 	}
 	if (AUTONOMOUS_HEAD_RE.test(text)) text = text.replace(AUTONOMOUS_HEAD_RE, "").trim();
 	else if (AUTONOMOUS_CONTINUE_RE.test(text)) text = text.replace(AUTONOMOUS_CONTINUE_RE, "").trim();
