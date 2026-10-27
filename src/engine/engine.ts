@@ -1282,11 +1282,21 @@ export class EmployeeEngine implements EmployeeRuntime {
 		if (!ctx.personOwner && !ctx.conversationOwner) return message;
 		// Relevance-ranked against THIS message: only facts the turn can plausibly
 		// need ride along, so a long-lived memory does not tax every turn or get
-		// silently truncated by a flat cap.
-		const lines = this.knowledge
-			.listMemoryIndex(ctx, MEMORY_RECALL_LIMIT, message)
-			.filter((m) => m.scope === "person" || m.scope === "conversation")
-			.map((m) => `- ${m.title}${m.snippet ? ` — ${m.snippet}` : ""}`);
+		// silently truncated by a flat cap. Profile memory is excluded BEFORE the
+		// budget is applied (it rides the cached system prompt) — filtering after
+		// truncation let twelve matching profile rows consume the whole per-turn
+		// scoped budget and starve person memory entirely.
+		// Memory injection is an enhancement: a recall failure must never poison
+		// the turn (an unhandled throw here re-enters the retry ladder).
+		let lines: string[] = [];
+		try {
+			lines = this.knowledge
+				.listScopedMemoryIndex(ctx, MEMORY_RECALL_LIMIT, message)
+				.map((m) => `- ${m.title}${m.snippet ? ` — ${m.snippet}` : ""}`);
+		} catch (err) {
+			console.warn("[engine] scoped memory recall failed — continuing without it:", (err as Error).message);
+			return message;
+		}
 		if (lines.length === 0) return message;
 		return turnMemoryPrefix(lines) + message;
 	}

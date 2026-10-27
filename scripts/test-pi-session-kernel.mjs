@@ -61,7 +61,7 @@ function makeEngine(t, { streamFn, kernel } = {}) {
 		try { rmSync(`${authPath}.lock`, { force: true }); } catch { /* best effort */ }
 	});
 	const toolEvents = [];
-	const knowledgeStub = { listMemoryIndex: () => [] };
+	const knowledgeStub = { listMemoryIndex: () => [], listScopedMemoryIndex: () => [] };
 	const stub = {};
 	const engine = new EmployeeEngine(config, history, knowledgeStub, stub, stub, stub, stub, stub, stub, {
 		builtinSkillsDir: dir,

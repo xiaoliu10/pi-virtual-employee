@@ -102,6 +102,14 @@ export function docSource(displayName: string): string {
 	return "doc:" + displayName;
 }
 
+/**
+ * Relevance floor for query-driven recall. A row must cover at least this
+ * fraction of the query's tokens to be injected at all. Tuned low enough that a
+ * short message with one strong overlap still recalls, high enough that a
+ * long message does not drag in every loosely-related row.
+ */
+const DEFAULT_MIN_RELEVANCE = 0.12;
+
 export class KnowledgeContentStore {
 	private readonly ftsSupported: boolean;
 	private readonly hooks: StoreHooks;
@@ -166,28 +174,32 @@ export class KnowledgeContentStore {
 	}
 
 	/**
-	 * Relevance-ranked recall for prompt injection — the replacement for
-	 * "dump the newest 30 rows every turn".
+	 * Relevance-ranked recall for prompt injection — replaces "dump the newest
+	 * 30 rows every turn".
 	 *
-	 * Why this exists: the flat index paid a fixed token cost per turn AND
-	 * silently truncated the oldest rows once a person exceeded `limit`, so a
-	 * durable fact ("交付报告时用可复制文本框") could be crowded out by a week of
-	 * trivial ones. Recall now scores each candidate against the CURRENT user
-	 * message and injects only what the turn can plausibly need.
+	 * Why: the flat index paid a fixed token cost per turn AND silently truncated
+	 * the oldest rows once a person exceeded `limit`, so a durable fact could be
+	 * crowded out by a week of trivial ones. Worse, ranking alone is not enough —
+	 * filling every slot with the *least irrelevant* memory still spends the full
+	 * budget on memories the turn does not need.
 	 *
-	 * Scoring (a small additive prior + text relevance):
-	 *   - text relevance: distinct query tokens present in title+summary+content,
-	 *     weighted higher for title hits. Deliberately not BM25/FTS: memory rows
-	 *     are few (tens), the query is a chat message, and a plain token tally
-	 *     keeps the behavior explainable in tests.
-	 *   - update-overwrite memories carry "the current truth", so a recent row
-	 *     keeps a small recency prior; heavily-recalled rows keep a usage prior.
-	 *   - decay: rows untouched for `staleDays` lose their priors, so a forgotten
-	 *     fact stops competing for the fixed budget. Nothing is deleted — it stays
-	 *     reachable by an explicit search and comes back if edited.
+	 * Two separate signals, deliberately not mixed:
+	 *   - `relevance` (0..1): fraction of the query's tokens this row covers, with
+	 *     title hits weighted. This is the ADMISSION signal.
+	 *   - `prior` (0..~1.5): recency + usage, decayed past `staleDays`.
 	 *
-	 * scope-first ordering survives as a tiebreak: conversation > person >
-	 * profile, because the more specific scope is the likelier intent.
+	 * With a query, only rows whose relevance clears `minRelevance` are admitted,
+	 * so an off-topic turn carries NO memory at all instead of twelve unrelated
+	 * ones. Priors then only ORDER the admitted set — they can never promote an
+	 * irrelevant row into the budget (the earlier version let a fresh unrelated
+	 * fact outscore a relevant old one, which is exactly the pollution the user
+	 * asked to remove). Without a query the priors ARE the signal, reproducing the
+	 * old recency index.
+	 *
+	 * `scopeFilter` restricts candidates BEFORE ranking and truncation: profile
+	 * memory already rides the cached system prompt, so it must not consume the
+	 * per-turn scoped budget (a reviewer probe lost all person memory to twelve
+	 * matching profile rows).
 	 */
 	recallMemory(input: {
 		ctx: { personOwner?: string; conversationOwner?: string };
@@ -196,62 +208,88 @@ export class KnowledgeContentStore {
 		limit?: number;
 		/** Rows older than this many days lose their priors (default 90). */
 		staleDays?: number;
+		/**
+		 * Only admit rows whose text relevance clears this floor. Ignored when
+		 * there is no query. Default keeps one solid token overlap out of many.
+		 */
+		minRelevance?: number;
+		/** Restrict to these scopes BEFORE ranking/truncation (e.g. scoped-only). */
+		scopeFilter?: Array<"profile" | "person" | "conversation">;
+		/** Skip the usage feedback write (read-only callers, e.g. conflict preview). */
+		recordFeedback?: boolean;
 		now?: number;
-	}): Array<KnowledgeEntry & { recallScore: number }> {
+	}): Array<KnowledgeEntry & { recallScore: number; relevance: number }> {
 		const limit = Math.max(1, input.limit ?? 30);
 		const now = input.now ?? Date.now();
 		const staleMs = Math.max(1, input.staleDays ?? 90) * 24 * 60 * 60 * 1000;
-		const rows = this.listMemoryCandidates(input.ctx);
+		const allow = input.scopeFilter ? new Set(input.scopeFilter) : undefined;
+		const rows = this.listMemoryCandidates(input.ctx).filter(
+			(row) => !allow || allow.has((row.memory_scope ?? "profile") as "profile" | "person" | "conversation"),
+		);
 		if (rows.length === 0) return [];
 
 		const tokens = recallTokens(input.query ?? "");
+		const hasQuery = tokens.length > 0;
+		const minRelevance = input.minRelevance ?? DEFAULT_MIN_RELEVANCE;
+
 		const scored = rows.map((row) => {
 			const age = Math.max(0, now - (row.updated_at || 0));
 			const fresh = age <= staleMs;
-			// Priors are small on purpose: relevance must dominate. Without a query
-			// the priors ARE the whole signal, which reproduces the old
-			// "most recent first" behavior (backwards compatible).
-			let score = 0;
+			let prior = 0;
 			if (fresh) {
-				score += 1 / (1 + age / (24 * 60 * 60 * 1000)); // ≤1, halves per day
-				if ((row.hit_count ?? 0) > 0) score += Math.min(0.5, Math.log1p(row.hit_count ?? 0) / 4);
+				prior += 1 / (1 + age / (24 * 60 * 60 * 1000)); // ≤1, halves per day
+				if ((row.hit_count ?? 0) > 0) prior += Math.min(0.5, Math.log1p(row.hit_count ?? 0) / 4);
 			}
-			if (tokens.length) {
+			let relevance = 0;
+			if (hasQuery) {
 				const hay = `${row.title} ${row.memory_summary ?? ""} ${row.content}`.toLowerCase();
 				const titleHay = row.title.toLowerCase();
-				let hits = 0;
 				let covered = 0;
+				let titleHits = 0;
 				for (const token of tokens) {
-					const inTitle = titleHay.includes(token);
-					const anywhere = inTitle || hay.includes(token);
-					if (anywhere) covered += 1;
-					if (inTitle) hits += 2; // a title hit is a stronger signal
-					else if (anywhere) hits += 1;
+					if (titleHay.includes(token)) {
+						covered += 1;
+						titleHits += 1;
+					} else if (hay.includes(token)) {
+						covered += 1;
+					}
 				}
-				// COVERAGE, not raw hit volume, is what separates a real match from an
-				// incidental one: a single shared bigram ("事" in 「杂事7」) used to
-				// score the same per-token as a genuine topical match, so trivia could
-				// outrank the fact the message was actually about. Score on the
-				// fraction of the query's tokens this memory covers, then let title
-				// hits add a bounded bonus.
-				const coverage = covered / Math.max(1, tokens.length);
-				score += Math.min(6, coverage * 6) + Math.min(1.5, (hits / Math.max(1, tokens.length)) * 1.5);
+				// COVERAGE, not raw hit volume: a single shared bigram must not look
+				// like a topical match (「事」 in 「杂事7」 used to tie a real one).
+				relevance = covered / tokens.length;
+				// A title hit is a deliberate topical match, not incidental overlap:
+				// give it enough weight that a short message naming the topic recalls.
+				if (titleHits) relevance = Math.min(1, relevance + 0.25);
 			}
-			return { ...row, recallScore: score };
+			return { ...row, prior, relevance, recallScore: 0 };
 		});
+
+		// Admission: with a query, off-topic rows never enter the budget.
+		const admitted = hasQuery ? scored.filter((row) => row.relevance >= minRelevance) : scored;
+		for (const row of admitted) {
+			row.recallScore = hasQuery ? row.relevance * 10 + row.prior : row.prior;
+		}
 
 		const scopeRank = (scope: string | null | undefined): number =>
 			scope === "conversation" ? 0 : scope === "person" ? 1 : 2;
-		scored.sort((a, b) => {
-			// With a query, relevance first; without one, scope+recency (old order).
-			if (tokens.length && b.recallScore !== a.recallScore) return b.recallScore - a.recallScore;
+		admitted.sort((a, b) => {
+			// Admission already filtered; priors only tiebreak/order here.
+			if (hasQuery && b.recallScore !== a.recallScore) return b.recallScore - a.recallScore;
 			const byScope = scopeRank(a.memory_scope) - scopeRank(b.memory_scope);
 			if (byScope !== 0) return byScope;
 			return (b.updated_at || 0) - (a.updated_at || 0);
 		});
-		const picked = scored.slice(0, limit);
-		// Telemetry: only rows actually injected count as recalled.
-		if (picked.length) this.markRecalled(picked.map((r) => r.id), now);
+		const picked = admitted.slice(0, limit);
+		// Telemetry: only rows actually injected count as recalled, and a read-only
+		// caller (conflict preview) must not inflate the usage prior.
+		if (picked.length && input.recordFeedback !== false) {
+			try {
+				this.markRecalled(picked.map((r) => r.id), now);
+			} catch (err) {
+				// Feedback is telemetry: losing it must never cost the turn its memory.
+				console.warn("[memory] recall feedback write failed:", (err as Error).message);
+			}
+		}
 		return picked;
 	}
 
@@ -927,15 +965,30 @@ function unionTags(...parts: string[]): string {
 	return [...new Set(all)].join(",");
 }
 
-/** Latin word / CJK bigram tokens for memory recall scoring. */
+/**
+ * CJK bigrams made only of function characters carry no topical information but
+ * DO dilute the coverage ratio: 「帮我把这次的分析整理成报告」 yields 帮我/我把/
+ * 次的/… so one real hit ("报告") looked like 1/14 coverage and fell below the
+ * admission floor. A bigram is dropped when BOTH characters are function words.
+ */
+const CJK_STOP_CHARS = new Set(
+	"的了是我你他她它们这那和与及或在吗呢吧啊呀哦嗯就不都很也还又要把被给让对于之其所以为从到会能可该将已更没么什么怎怎样如何个些".split(""),
+);
+
+/** Latin word / CJK content-bigram tokens for memory recall scoring. */
 export function recallTokens(query: string): string[] {
 	if (!query) return [];
 	const lower = query.toLowerCase();
 	const tokens = new Set<string>();
 	for (const word of lower.match(/[a-z0-9_]{2,}/g) ?? []) tokens.add(word);
-	// CJK has no spaces: bigrams are the standard cheap proxy.
+	// CJK has no spaces: bigrams are the standard cheap proxy, minus the ones made
+	// entirely of function characters (see CJK_STOP_CHARS).
 	for (const run of lower.match(/[\u4e00-\u9fff]{2,}/g) ?? []) {
-		for (let i = 0; i + 2 <= run.length; i += 1) tokens.add(run.slice(i, i + 2));
+		for (let i = 0; i + 2 <= run.length; i += 1) {
+			const gram = run.slice(i, i + 2);
+			if (CJK_STOP_CHARS.has(gram[0]) && CJK_STOP_CHARS.has(gram[1])) continue;
+			tokens.add(gram);
+		}
 	}
 	return [...tokens].slice(0, 40);
 }

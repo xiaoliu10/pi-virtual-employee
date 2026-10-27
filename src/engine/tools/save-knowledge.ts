@@ -201,8 +201,10 @@ export function createRememberTool(deps: {
 				// failure must not block persisting a fact the user asked to remember.
 				const siblings = (() => {
 					try {
+						// Read-only preview: a title comparison must not be recorded as a
+						// real recall (it would inflate the usage prior).
 						return deps.knowledge
-							.listMemoryIndex({ personOwner: ctx.personOwner, conversationOwner: ctx.conversationOwner }, 50)
+							.peekMemoryTitles({ personOwner: ctx.personOwner, conversationOwner: ctx.conversationOwner }, 50)
 							.map((m) => ({ id: m.id, title: m.title, summary: m.snippet }));
 					} catch {
 						return [];

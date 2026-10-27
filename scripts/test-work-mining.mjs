@@ -309,7 +309,7 @@ test("work: is nonlocal; missing actor fails privileged capability checks", t =>
 	}
 	assert.equal(checkPermission(config, undefined, "console-uuid", "settings").ok, true);
 	const engine = Object.create(EmployeeEngine.prototype);
-	Object.assign(engine, { config, promptOverrides: new Map(), knowledge: { listMemoryIndex: () => [] }, getCachedSkills: () => [] });
+	Object.assign(engine, { config, promptOverrides: new Map(), knowledge: { listMemoryIndex: () => [], listScopedMemoryIndex: () => [] }, getCachedSkills: () => [] });
 	assert.equal(engine.promptPartsFor("work:task-1").isScheduledRun, true);
 	assert.equal(engine.promptPartsFor("sched:task-1").isScheduledRun, true);
 	assert.equal(engine.promptPartsFor("dt:group:orders").isScheduledRun, false);

@@ -129,7 +129,11 @@ export function findTitleConflict(
 	let bestScore = 0;
 	const incomingKey = memoryTitleKey(incomingTitle);
 	for (const row of existing) {
-		if (memoryTitleKey(row.title) === incomingKey) continue; // exact overwrite, not a conflict
+		// Skip ONLY the exact raw title: that is what saveMemory overwrites in
+		// place. A normalized-equal-but-different raw title ("报告交付方式" vs
+		// "报告 交付方式") does NOT overwrite, so treating it as "same" silently
+		// produced two competing facts with no advisory (review P2).
+		if (row.title.trim() === incomingTitle.trim()) continue;
 		const score = titleSimilarity(incomingTitle, row.title);
 		if (score > bestScore) {
 			bestScore = score;

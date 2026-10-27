@@ -100,7 +100,8 @@ test("recall ranks by relevance to the current message, not by recency", (t) => 
 
 	const ctx = { personOwner: PERSON };
 	const withQuery = store.recallMemory({ ctx, query: "帮我把这次的分析整理成报告发我", limit: 2 });
-	assert.equal(withQuery.length, 2);
+	// Admission, not just ordering: only the report-related row is relevant here.
+	assert.equal(withQuery.length, 1, `off-topic rows are not admitted, got ${withQuery.map((r) => r.title).join(" / ")}`);
 	assert.equal(withQuery[0].title, "报告交付方式", `relevance must win, got ${withQuery.map((r) => r.title).join(" / ")}`);
 
 	// No query → backwards compatible: most recent first.
@@ -153,11 +154,11 @@ test("scope filtering still fails closed: another person's memory is never recal
 	write(store, "别人的秘密", "staff-2 的私人事实", { owner: "person:dingtalk:staff-2" });
 	write(store, "共享规则", "全配置共享事实", { scope: null, owner: null });
 
-	const mine = store.recallMemory({ ctx: { personOwner: PERSON }, query: "秘密", limit: 10 });
+	const mine = store.recallMemory({ ctx: { personOwner: PERSON }, query: "私人事实", limit: 10, minRelevance: 0 });
 	assert.ok(!mine.some((r) => r.title === "别人的秘密"), "cross-owner memory must never be recalled");
 	assert.ok(mine.some((r) => r.title === "共享规则"), "profile memory stays visible");
 	// And with no verified actor at all:
-	const anon = store.recallMemory({ ctx: {}, query: "秘密", limit: 10 });
+	const anon = store.recallMemory({ ctx: {}, query: "私人事实", limit: 10, minRelevance: 0 });
 	assert.deepEqual(anon.map((r) => r.title), ["共享规则"], "anonymous turns see profile memory only");
 });
 
@@ -196,4 +197,92 @@ test("write-time: short-lived facts are flagged, and ambiguity stays durable", (
 	assert.ok(looksShortLived(`计划 ${soon} 上线`, now), "a date within 7 days is short-lived");
 	assert.equal(looksShortLived("对方偏好周报在周一发", now), null, "a standing preference stays durable");
 	assert.equal(looksShortLived("系统地址是 https://example.com", now), null, "a stable environment fact stays durable");
+});
+
+// ── Review fixes (2026-10-27 second pass) ─────────────────────────────
+
+test("P1: an off-topic turn carries NO memory instead of filling the budget", (t) => {
+	const store = freshStore(t);
+	for (let i = 0; i < 15; i += 1) write(store, `午饭偏好${i}`, `午饭喜欢吃第 ${i} 家`, { summary: `午饭 ${i}` });
+
+	const hits = store.recallMemory({ ctx: { personOwner: PERSON }, query: "Kubernetes deployment rollout", limit: 12 });
+	assert.equal(hits.length, 0, `off-topic turns must admit nothing, got ${hits.length} rows`);
+});
+
+test("P1: relevance admits, priors only order — a fresh unrelated fact cannot outrank a relevant old one", (t) => {
+	const store = freshStore(t);
+	write(store, "部署流程", "上线前先跑 runlogs 检查，再执行部署脚本", { summary: "部署前查 runlogs", ageDays: 120 });
+	write(store, "无关新事", "今天换了新的办公椅", { summary: "办公椅", ageDays: 0 });
+
+	const hits = store.recallMemory({ ctx: { personOwner: PERSON }, query: "部署上线流程是什么", limit: 5 });
+	assert.equal(hits.length, 1, `only the relevant row is admitted, got ${hits.map((h) => h.title).join(" / ")}`);
+	assert.equal(hits[0].title, "部署流程");
+});
+
+test("P1b: profile memory cannot consume the per-turn scoped budget", (t) => {
+	const store = freshStore(t);
+	for (let i = 0; i < 12; i += 1) {
+		write(store, `共享规范${i}`, `全公司规范条目 ${i} 关于部署`, { scope: null, owner: null, summary: `规范 ${i}` });
+	}
+	write(store, "个人部署偏好", "部署时我习惯先看 runlogs", { summary: "部署先看 runlogs" });
+
+	const scoped = store.recallMemory({
+		ctx: { personOwner: PERSON },
+		query: "部署怎么做",
+		limit: 12,
+		scopeFilter: ["person", "conversation"],
+	});
+	assert.ok(
+		scoped.some((r) => r.title === "个人部署偏好"),
+		`scoped recall must surface person memory despite 12 matching profile rows, got ${scoped.map((r) => r.title).join(" / ")}`,
+	);
+	assert.ok(scoped.every((r) => r.memory_scope !== null && r.memory_scope !== "profile"), "profile rows never enter the scoped budget");
+});
+
+test("P2: a failing feedback write never costs the turn its memory", (t) => {
+	const store = freshStore(t);
+	write(store, "部署流程", "上线前先跑 runlogs", { summary: "查 runlogs" });
+	store.markRecalled = () => { throw new Error("feedback write failed"); };
+	const hits = store.recallMemory({ ctx: { personOwner: PERSON }, query: "部署流程", limit: 5 });
+	assert.equal(hits.length, 1, "recall still returns rows when telemetry write throws");
+});
+
+test("P2: a read-only preview never inflates hit_count", (t) => {
+	const store = freshStore(t);
+	const row = write(store, "部署流程", "上线前先跑 runlogs", { summary: "查 runlogs" });
+	store.recallMemory({ ctx: { personOwner: PERSON }, limit: 50, recordFeedback: false });
+	const after = store.db.prepare("SELECT hit_count FROM kb_entries WHERE id = ?").get(row.id);
+	assert.equal(after.hit_count, 0, "a conflict preview must not be recorded as a real recall");
+});
+
+test("P2: decay is observable across the stale threshold and usage feeds the prior", (t) => {
+	const now = Date.now();
+	const store = freshStore(t);
+	const old = write(store, "旧事实", "很久以前记下的事", { summary: "旧", ageDays: 200 });
+	const fresh = write(store, "新事实", "刚刚记下的事", { summary: "新", ageDays: 0 });
+	store.db.prepare("UPDATE kb_entries SET hit_count = 20 WHERE id = ?").run(old.id);
+
+	const ranked = store.recallMemory({ ctx: { personOwner: PERSON }, query: "", limit: 5, staleDays: 90, now });
+	const oldRow = ranked.find((r) => r.id === old.id);
+	const freshRow = ranked.find((r) => r.id === fresh.id);
+	// Mutation guard: forcing `fresh = true` makes these equal (both keep priors).
+	assert.equal(oldRow.recallScore, 0, "past the stale threshold the prior is gone entirely");
+	assert.ok(freshRow.recallScore > 0, "a fresh row keeps its recency prior");
+	// And a within-threshold row with usage beats one without.
+	const used = write(store, "常用事实", "经常被想起的事", { summary: "常用", ageDays: 1 });
+	store.db.prepare("UPDATE kb_entries SET hit_count = 9 WHERE id = ?").run(used.id);
+	const plain = write(store, "少用事实", "很少被想起的事", { summary: "少用", ageDays: 1 });
+	const again = store.recallMemory({ ctx: { personOwner: PERSON }, query: "", limit: 10, staleDays: 90, now });
+	assert.ok(
+		again.find((r) => r.id === used.id).recallScore > again.find((r) => r.id === plain.id).recallScore,
+		"usage prior is real (mutating it to 0 must fail this)",
+	);
+});
+
+test("P2: a normalized-equal-but-different raw title still raises a conflict", () => {
+	const existing = [{ id: "1", title: "报告交付方式", summary: "文本框" }];
+	// The store does NOT overwrite across raw titles, so this must be flagged.
+	assert.equal(findTitleConflict("报告 交付方式", existing)?.title, "报告交付方式");
+	// The exact raw title IS the sanctioned overwrite path.
+	assert.equal(findTitleConflict("报告交付方式", existing), null);
 });

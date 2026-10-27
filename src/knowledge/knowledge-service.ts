@@ -57,6 +57,8 @@ export interface VectorStatus {
 
 /** Max retrieval slots a single query may spend on memory hits (see applySourceQuota). */
 const MEMORY_SEARCH_CAP = 3;
+/** Extra candidates fetched so the source quota can see past a wall of memory hits. */
+const QUOTA_OVERSCAN = 12;
 
 export class KnowledgeService {
 	private readonly store: KnowledgeContentStore;
@@ -150,6 +152,39 @@ export class KnowledgeService {
 	 * flat "newest 30" index paid a fixed token cost every turn and silently
 	 * truncated older durable facts once the cap was reached.
 	 */
+	/**
+	 * Scoped-only variant for the per-turn injection: person + conversation
+	 * memory, filtered BEFORE the budget so profile rows (already in the cached
+	 * system prompt) cannot consume the per-turn slots.
+	 */
+	listScopedMemoryIndex(
+		ctx: { personOwner?: string; conversationOwner?: string },
+		limit = 12,
+		query?: string,
+	): { id: string; title: string; snippet: string; updatedAt: number; scope: string | null }[] {
+		return this.store.recallMemory({ ctx, limit, query, scopeFilter: ["person", "conversation"] }).map((e) => ({
+			id: e.id,
+			title: e.title,
+			snippet: e.memory_summary?.trim() || "",
+			updatedAt: e.updated_at,
+			scope: e.memory_scope,
+		}));
+	}
+
+	/**
+	 * Read-only memory preview for write-time conflict checks: same visibility
+	 * rules, but NO usage feedback — a title comparison must not be recorded as a
+	 * real recall (review probe: one remember bumped hit_count by 12).
+	 */
+	peekMemoryTitles(
+		ctx: { personOwner?: string; conversationOwner?: string },
+		limit = 50,
+	): { id: string; title: string; snippet: string }[] {
+		return this.store
+			.recallMemory({ ctx, limit, recordFeedback: false })
+			.map((e) => ({ id: e.id, title: e.title, snippet: e.memory_summary?.trim() || "" }));
+	}
+
 	listMemoryIndex(
 		ctx: { personOwner?: string; conversationOwner?: string } = {},
 		limit = 30,
@@ -250,12 +285,14 @@ export class KnowledgeService {
 	private applySourceQuota(hits: RetrievalHit[], topK: number): RetrievalHit[] {
 		const memory = hits.filter((h) => this.isMemoryHit(h));
 		const others = hits.filter((h) => !this.isMemoryHit(h));
-		const allowedMemory = Math.min(memory.length, MEMORY_SEARCH_CAP);
-		// Knowledge fills the rest; when knowledge is scarce, unused memory slots
-		// are handed back rather than returned empty.
-		const allowedOther = Math.max(0, Math.min(others.length, topK - Math.min(allowedMemory, topK)));
-		const memoryBudget = Math.min(memory.length, Math.max(allowedMemory, topK - allowedOther));
-		const keep = new Set([...memory.slice(0, memoryBudget), ...others.slice(0, allowedOther)].map((h) => h.id));
+		// Knowledge keeps a guaranteed floor; memory takes at most its own cap.
+		// Slots are only handed back to memory when knowledge genuinely has
+		// nothing left to fill them (checked against the overscanned candidate
+		// list, not against an already-truncated window).
+		const knowledgeFloor = Math.min(others.length, Math.max(0, topK - MEMORY_SEARCH_CAP));
+		const knowledgeCount = Math.max(knowledgeFloor, Math.min(others.length, topK - Math.min(memory.length, MEMORY_SEARCH_CAP)));
+		const memoryCount = Math.min(memory.length, topK - Math.min(knowledgeCount, topK));
+		const keep = new Set([...memory.slice(0, memoryCount), ...others.slice(0, knowledgeCount)].map((h) => h.id));
 		return hits.filter((h) => keep.has(h.id)).slice(0, topK);
 	}
 
@@ -279,7 +316,12 @@ export class KnowledgeService {
 	async search(query: string, memoryCtx?: { personOwner?: string; conversationOwner?: string }): Promise<RetrievalHit[]> {
 		const kb = this.kb();
 		const topK = kb.local.topK;
-		const localHits = await this.local.search({ query, topK: topK + MEMORY_SEARCH_CAP, memoryCtx });
+		// Ask for MORE than topK: the quota below must be able to see knowledge
+		// hits that rank below a wall of memory hits. Taking only topK+cap meant a
+		// run of memory hits pushed knowledge out of the candidate window entirely,
+		// and the quota then misread "no knowledge in window" as "knowledge is
+		// scarce" and handed every slot back to memory (review P2).
+		const localHits = await this.local.search({ query, topK: topK + MEMORY_SEARCH_CAP + QUOTA_OVERSCAN, memoryCtx });
 		const tiered = this.applySourceQuota(localHits, topK);
 		if (kb.mode !== "external") return tiered;
 		const localHitsRaw = tiered;
