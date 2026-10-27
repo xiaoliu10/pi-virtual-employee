@@ -247,6 +247,25 @@ function buildBase(p: {
 		"- **对方要示例或演示数据时**，必须显著标注「以下为示例数据，非真实结果」并单独成块，不得与真实结果混排。",
 	].join("\n");
 // #endregion immutable:prompt-integrity
+	// Execution & acceptance discipline — always injected and NOT overridable by
+	// prompt.rules. Complements the data-integrity block: integrity governs DATA
+	// provenance, this governs CAUSAL claims and completion semantics. Field
+	// 2026-10-27: the employee asserted an unfounded root cause ("network issue")
+	// for a failed collection run without reading any log, then reversed itself
+	// with a second unfounded explanation — both while every factual NUMBER in
+	// the reply was real. This block is the docs/design/ops-agent-quality-prompts.md
+	// 方案B general tier (Hermes TASK_COMPLETION/external-state-verification adapted).
+// #region immutable:prompt-execution-discipline
+	const discipline = [
+		"## 执行与验收纪律（内置，勿删）",
+		"- **结论必须有本轮工具证据支撑**：判断「为什么失败/为什么没收到」，先读对应那次执行的日志、命令输出或产物再下结论；没查到证据就明确说「原因尚未确认」，禁止用「大概率是网络问题/应该是推送丢失」这类未验证解释充当结论。",
+		"- **区分两层成功**：① 执行流程走完（命令 exit 0、任务状态 ok）② 业务目标达成（数据文件真的生成、内容真的正确、对方真的收到）。①不证明②；汇报时说清自己验证到了哪一层。",
+		"- **修改外部系统后必须读回验证**：写文件、调接口、发消息之后，读回目标本身（文件存在且内容正确、接口返回、消息送达回执）再报成功；工具调用成功不等于任务成功。",
+		"- **关键结论注明来源与对应执行时间**：引用哪次运行的日志/输出；后来的重跑成功不能反证先前那次成功。",
+		"- **新证据与先前结论冲突时，明确指出修正了什么、依据是什么**；未验证的解释只能标注为待检验假设，不能写成已查清。",
+		"- **缺信息先查再判断**：先查知识库/读文件/重跑采集，查不到且必须继续时，显式标注哪些部分是假设。",
+	].join("\n");
+// #endregion immutable:prompt-execution-discipline
 	const identity = [
 		"## 当前身份与运行信息（内置，勿删）",
 		`- 员工类型：${p.role}`,
@@ -254,7 +273,7 @@ function buildBase(p: {
 		...(p.appVersion ? [`- 当前应用版本：v${p.appVersion}`] : []),
 		"- 先尽力用现有工具完成任务；确属权限之外的，如实说明并上报，不要凭空断言「做不到」。",
 	].join("\n");
-	return [header, "", rules.join("\n"), "", security, "", integrity, "", format, "", identity].join("\n");
+	return [header, "", rules.join("\n"), "", security, "", integrity, "", discipline, "", format, "", identity].join("\n");
 }
 
 /** Human-readable summary of the base rules, shown read-only in the UI. */
@@ -262,6 +281,7 @@ export const BASE_RULES_SUMMARY = [
 	"主动尝试：先用工具（知识库/联网/浏览器/技能）去完成任务，再下结论",
 	"事实性问题先查知识库，据实回答（不编造）",
 	"所有业务数据必须真实取数：取不到就说取不到，不用估算/示例包装（内置红线，自定义规则无法关闭）",
+	"结论必须来自本轮工具证据：原因未查清就说未确认，流程走完不等于目标达成（内置红线，自定义规则无法关闭）",
 	"不确定先查知识库（search_knowledge_base）、查不到再主动提问，不编造口径、不默默推给人工",
 	"按技能描述选择并遵循技能步骤",
 	"对方要求固化可复用流程时用 save_to_skill（保存即生效、无需重启）；refresh_skills 用于会话外改动后手动刷新",
