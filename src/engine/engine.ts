@@ -2415,10 +2415,22 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * transcript is too small to be worth it.
 	 */
 	async progressBrief(agent: Agent, conversationId?: string): Promise<string> {
-		const fallback = () => this.briefProgress(agent);
+		return (await this.progressBriefDetailed(agent, conversationId)).text;
+	}
+
+	/**
+	 * progressBrief with a degraded flag: `degraded: true` means the four-field
+	 * text came from the deterministic fallback rather than the side LLM pass
+	 * (transcript too small, relay failure, or an unusable report shape). The
+	 * scheduled-task progress broadcaster uses this to back off when the relay
+	 * is down — without it, a dead relay would push a 「暂未确认」 shell every
+	 * interval (v0.2.145 field complaint: "没有任何有效信息").
+	 */
+	async progressBriefDetailed(agent: Agent, conversationId?: string): Promise<{ text: string; degraded: boolean }> {
+		const fallback = async (): Promise<{ text: string; degraded: boolean }> => ({ text: await this.briefProgress(agent), degraded: true });
 		try {
 			const msgs = agent.state.messages;
-			if (estimateTokensSafe(msgs) < 2_000) return fallback();
+			if (estimateTokensSafe(msgs) < 2_000) return await fallback();
 			const context = progressContextSlice(msgs);
 			const model = agent.state.model;
 			// The side pass goes directly through models, so without tracking it is
@@ -2454,7 +2466,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			} finally {
 				if (conversationId) this.endSideLlmCall(conversationId);
 			}
-			if (!raw?.trim()) return fallback();
+			if (!raw?.trim()) return await fallback();
 			// Normalize through the shared four-field helper (progress.ts). The raw
 			// value is NOT whitespace-flattened beforehand: the template signature
 			// and the Chinese markdown headings are line-anchored, and the parser
@@ -2467,12 +2479,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 			const standardized = standardizeProgressReport(raw);
 			if (!standardized) {
 				console.warn("[engine] progress brief is not a usable four-field report — falling back to the deterministic brief");
-				return fallback();
+				return await fallback();
 			}
-			return `⏳ 任务仍在进行中。${standardized}`;
+			return { text: `⏳ 任务仍在进行中。${standardized}`, degraded: false };
 		} catch (err) {
 			console.warn("[engine] progress summary failed:", err instanceof Error ? err.message : err);
-			return fallback();
+			return await fallback();
 		}
 	}
 

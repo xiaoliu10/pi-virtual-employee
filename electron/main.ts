@@ -22,6 +22,7 @@ import { WorkItemStore } from "../src/db/work-item-store.js";
 import { WorkService, buildWorkLearning } from "../src/scheduler/work-service.js";
 import { isAdmin, resolveRole } from "../src/security/permissions.js";
 import { SchedulerService, shouldPushScheduledResult, annotateLatePush } from "../src/scheduler/scheduler-service.js";
+import { createProgressNotifier, normalizeProgressIntervalMin } from "../src/scheduler/progress-notify.js";
 import {
 	type AutonomousChainState,
 	buildAutonomousTurnPrefix,
@@ -961,6 +962,30 @@ ${tailForProgress(decision.text)}`;
 				trigger: "cron",
 				inputRef: task.prompt,
 			});
+			// Long single-shot runs stream for up to the hard timeout with ZERO
+			// feedback until the final report lands. Broadcast side-LLM progress
+			// notes every longTaskProgressMin (the autonomous chain already had a
+			// heartbeat; this closes the gap for the far more common single-shot
+			// runner). Silent tasks stay silent; timed-out losing runs stop
+			// broadcasting — the scheduler already recorded the failure, and a
+			// later "still working" note would contradict it.
+			const progressIntervalMin = normalizeProgressIntervalMin(config.all().general.longTaskProgressMin);
+			const notifier = createProgressNotifier({
+				title: task.title,
+				target: task.conversation_id,
+				intervalMin: progressIntervalMin,
+				summarize: () => engine.progressBriefDetailed(agent, execConvId),
+				push: (cid, text) => im.pushToConversation(cid, text),
+				isRunning: () => agent.state.isStreaming,
+				suppress: () => ctx?.isTimedOut() === true,
+				// Static gate BEFORE the side LLM call: a silent task's notes can
+				// never be pushed, so summarize would burn a call every interval
+				// for a push that is always dropped (review P3-1).
+				preflight: () => shouldPushScheduledResult(task, undefined, ""),
+				mayPush: (note) => shouldPushScheduledResult(task, undefined, note),
+				log: (level, msg) => console.warn(`[sched:progress] ${level} ${msg}`),
+			});
+			notifier.start();
 			let sendResult: Awaited<ReturnType<typeof engine.send>>;
 			try {
 				sendResult = await engine.send(agent, scheduledTimePrefix() + task.prompt, {
@@ -979,6 +1004,15 @@ ${tailForProgress(decision.text)}`;
 					},
 				});
 			} finally {
+				// Stop the progress broadcaster on EVERY exit path (reply, error,
+				// throw): a live timer would keep side LLM calls running against a
+				// settled run. Then wait (bounded) for an on-the-wire progress push
+				// to settle BEFORE the completion report below — the proactive push
+				// path is not per-conversation serialized, so a slow progress note
+				// would otherwise land AFTER 「定时任务完成」 in the same chat
+				// (review P2-1, probe ["FINAL","PROGRESS"]).
+				notifier.stop();
+				await notifier.drain(5_000);
 				// Scheduled runs are fire-and-forget: each run uses a unique
 				// conversation id, so its browser page can never be reused. Close it
 				// to avoid leaking a Page (and its tab) per fire.
