@@ -90,6 +90,40 @@ for (const label of [...SECRET_LABELS_ZH, ...SECRET_LABELS_EN]) {
 const URL_TOKEN_PARAM_SOURCE_BODY =
 	"(?:password|passwd|pwd|secret|token|api_?key|apikey|access_?token|access_?key|OSSAccessKeyId|Signature|X-Amz-Signature|X-Amz-Credential)";
 
+/**
+ * Presigned object-storage URLs (report links the system itself generates via
+ * save_report → OSS signatureUrl) are an exception to the query-param redaction:
+ * their query IS the access grant. OSSAccessKeyId is a key ID (not the secret),
+ * Signature is an HMAC over the request — the AccessKeySecret never travels in
+ * a URL — so the triple is a bearer access credential, not a leaked password.
+ * Field 2026-10-27: redacting Signature/AccessKeyId in group pushes delivered
+ * dead report links (private chats were exempt, hence "works for me" reports).
+ * A Gitee raw_with_token URL is the OPPOSITE case and stays redacted: its
+ * access_token is a long-lived personal token with API-wide scope.
+ */
+function isPresignedObjectUrl(url: string): boolean {
+	return (
+		(/[?&]OSSAccessKeyId=/.test(url) && /[?&]Signature=/.test(url)) ||
+		(/[?&]X-Amz-Signature=/.test(url) && /[?&]X-Amz-Credential=/.test(url))
+	);
+}
+
+/** URL spans: everything up to whitespace or an angle/quote delimiter. */
+const OBJECT_URL_SPAN_PATTERN = /https?:\/\/[^\s<>"']+/g;
+/** CJK/bracket punctuation that glues onto a URL in prose but is not part of it. */
+const URL_TRAILING_NOISE = /[)\]}>，。；！？、）】」』”’…]+$/;
+
+function presignedUrlSpans(text: string): Array<[number, number]> {
+	const spans: Array<[number, number]> = [];
+	if (!text) return spans;
+	for (const match of text.matchAll(OBJECT_URL_SPAN_PATTERN)) {
+		const url = match[0].replace(URL_TRAILING_NOISE, "");
+		const end = match.index + url.length;
+		if (url && isPresignedObjectUrl(url)) spans.push([match.index, end]);
+	}
+	return spans;
+}
+
 /** Known credential shapes that need no label. */
 const SHAPE_PATTERNS: RegExp[] = [
 	/\bsk-[A-Za-z0-9_-]{16,}\b/,                                     // OpenAI-style keys
@@ -118,12 +152,35 @@ const SHAPE_PATTERNS: RegExp[] = [
  * shapes above already cover the field failure (`密码还是 <value> 吗`).
  */
 export function containsConcreteCredential(text: string): boolean {
+	return containsConcreteCredentialIn(text, []);
+}
+
+/**
+ * Detection over text with certain spans pre-cleared (the presigned-URL spans):
+ * the query params inside a protected URL are an access grant, not a credential
+ * leak, so they must not trip the detector either — otherwise gateOutboundText
+ * would withhold the whole message for the link it just chose to deliver.
+ * Spans are masked with a hazard-free filler of the same length so offsets and
+ * surrounding context stay intact.
+ */
+function containsConcreteCredentialIn(text: string, protectedSpans: Array<[number, number]>): boolean {
 	if (!text) return false;
+	let masked = text;
+	if (protectedSpans.length) {
+		const parts: string[] = [];
+		let cursor = 0;
+		for (const [start, end] of protectedSpans) {
+			parts.push(text.slice(cursor, start), "\u0002".repeat(end - start));
+			cursor = end;
+		}
+		parts.push(text.slice(cursor));
+		masked = parts.join("");
+	}
 	for (const pattern of SHAPE_PATTERNS) {
-		if (pattern.test(text)) return true;
+		if (pattern.test(masked)) return true;
 	}
 	for (const pattern of LABEL_VALUE_PATTERNS) {
-		const match = pattern.exec(text);
+		const match = pattern.exec(masked);
 		if (!match) continue;
 		// A labelled mention only counts when the following token looks like a
 		// real value, not prose such as 「密码已变更」/「密码忘记就重置」.
@@ -152,16 +209,27 @@ const URL_TOKEN_PARAM_GLOBAL = new RegExp(
  * raw_with_token report link) and keep the rest of the message: the surrounding
  * prose is a report body, not a re-statement of the secret, so whole-message
  * suppression here would only destroy scheduled-report delivery without making
- * anyone safer. Anything else that still trips the detector after this removal
- * falls through to the full withhold.
+ * anyone safer. Presigned object-storage URLs are left intact (see
+ * isPresignedObjectUrl — redacting their signature destroys the link itself).
+ * Anything else that still trips the detector after this removal falls through
+ * to the full withhold.
  */
 function redactUrlCredentialParams(text: string): string {
-	return text.replace(URL_TOKEN_PARAM_GLOBAL, (_m, prefix: string) => `${prefix}***`);
+	const spans = presignedUrlSpans(text);
+	if (!spans.length) return text.replace(URL_TOKEN_PARAM_GLOBAL, (_m, prefix: string) => `${prefix}***`);
+	const inPresigned = (offset: number) => spans.some(([start, end]) => offset >= start && offset < end);
+	return text.replace(URL_TOKEN_PARAM_GLOBAL, (match, prefix: string, _value: string, offset: number) =>
+		inPresigned(offset) ? match : `${prefix}***`);
 }
 
 export function gateOutboundText(text: string, audience: CredentialAudience): string {
 	if (audience === "admin-single") return text;
 	const redacted = redactUrlCredentialParams(text);
-	if (redacted !== text && !containsConcreteCredential(redacted)) return redacted;
-	return containsConcreteCredential(text) ? CREDENTIAL_WITHHELD_NOTICE : text;
+	// Presigned spans are recomputed on the REDACTED text: redaction may have
+	// shifted offsets (spans were computed against the original), and the
+	// presigned URLs themselves are untouched by the redaction.
+	if (containsConcreteCredentialIn(redacted, presignedUrlSpans(redacted))) {
+		return CREDENTIAL_WITHHELD_NOTICE;
+	}
+	return redacted !== text ? redacted : text;
 }

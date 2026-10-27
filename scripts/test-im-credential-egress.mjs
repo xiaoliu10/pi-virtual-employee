@@ -305,6 +305,30 @@ test("a share-link token is redacted in place — the report text survives", asy
 	assert.equal(gateOutboundText(mixed, "restricted"), CREDENTIAL_WITHHELD_NOTICE);
 });
 
+test("an OSS presigned report link survives group egress intact (field 2026-10-27)", () => {
+	const link = "https://wengine-ai-workbench.oss-cn-hangzhou.aliyuncs.com/reports/d19746b2/880a35e5.html?OSSAccessKeyId=LTAIZHYtKQegFGXe&Expires=1795654871&Signature=N9him7VHYYIEdIftaIY5iHWf2iU%3D";
+	const msg = `\u2705 查看报告：${link}`;
+	const delivered = gateOutboundText(msg, "restricted");
+	assert.equal(delivered, msg, "the system-generated link IS the deliverable — signature/key id/expiry all survive");
+	// Trailing CJK punctuation glued to the URL must not break the protection.
+	const punctuated = gateOutboundText(`查看报告：${link}。请查收`, "restricted");
+	assert.ok(punctuated.includes("Signature=N9him7VHYYIEdIftaIY5iHWf2iU%3D"), "signature survives prose punctuation");
+	// AWS SigV4 presigned shape is protected the same way.
+	const aws = gateOutboundText("https://s3.us-east-1.amazonaws.com/r/a.txt?X-Amz-Credential=AKIAEX%2F20261027%2Fus-east-1%2Fs3&X-Amz-Signature=abcdef0123456789abcdef0123456789", "restricted");
+	assert.ok(aws.includes("X-Amz-Signature=abcdef0123456789abcdef0123456789"), "SigV4 signature survives");
+	// Idempotent: re-gating an already-delivered message is a no-op.
+	assert.equal(gateOutboundText(delivered, "restricted"), delivered);
+});
+
+test("a presigned link does not exempt a REAL credential elsewhere in the message", () => {
+	const link = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.html?OSSAccessKeyId=LTAIZHYtKQegFGXe&Expires=1795654871&Signature=N9him7VHYYIEdIftaIY5iHWf2iU%3D";
+	assert.equal(
+		gateOutboundText(`密码是 Abc_123456 查看报告：${link}`, "restricted"),
+		CREDENTIAL_WITHHELD_NOTICE,
+		"presigned protection is per-URL, never a whole-message exemption",
+	);
+});
+
 test("egressAudience: live admin check over the dt: id shape, failing closed", async () => {
 	let adminNow = true;
 	const { adapter } = await startAdapter((staffId) => adminNow && staffId === "staff-admin");
