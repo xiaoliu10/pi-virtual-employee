@@ -38,6 +38,13 @@ function createdIn(
 	return { label: `其它会话 ${maskId(id)}`, mine: false };
 }
 
+/** Runaway guard for chain creation: a task that spawns further tasks on every
+ * run could multiply without bound. Each creator may hold this many LIVE
+ * scheduler-spawned (created_channel="scheduler") tasks; beyond it creation is
+ * refused with an actionable message. High enough that no legitimate follow-up
+ * chain hits it; low enough that a runaway prompt cannot farm the scheduler. */
+const SPAWNED_TASK_CAP = 20;
+
 export function createSchedulerTools(
 	scheduler: SchedulerService,
 	conversationId: string,
@@ -66,7 +73,7 @@ export function createSchedulerTools(
 		description:
 			"创建一个定时任务：到点后系统会自动执行 prompt 并保存结果；如果任务是在钉钉群聊或单聊中创建，执行结果会主动推送回创建任务的原会话，无需用户手动查询。cron 为标准 5 字段（分 时 日 月 周，本地时间），如 \"0 9 * * *\"=每天9点、\"*/30 * * * *\"=每30分钟、\"0 9 * * 1\"=每周一9点。prompt 写清到点要做什么。" +
 			"**任务默认跟随创建人的权限**：不论在单聊还是群聊里创建，系统都会记录创建人（平台验证的身份），到点执行时以创建人**当前**的角色判定——创建人能用什么工具，任务就能用什么（operator 可用浏览器/文件/白名单命令，admin 才有完整命令与系统设置）。创建人被降权或移出管理员后，任务立即跟着失去相应能力，不需要删任务重建。" +
-			"因此：不要向对方索要任何 ID；也不要声称群聊里创建的任务需要另外授权——那是不对的。任务创建本身需要 operator 及以上角色（会受会话门槛约束）。" +
+			"因此：不要向对方索要任何 ID；也不要声称群聊里创建的任务需要另外授权——那是不对的。任务创建本身需要 operator 及以上角色（会受会话门槛约束）。**无人值守回合（定时任务执行中）创建的跟进任务会自动沿用任务链源头管理员的身份**，同样无需补授权（每名管理员名下此类链式任务上限 20 个，防失控）；只有控制台/旧版本创建的遗留任务才需要 authorize_scheduled_task。" +
 			"【术语边界，2026-10-17 现场教训】本工具创建的是**定时任务**（到点执行固定 prompt）。用户说「自主任务」时指的是另一套东西——由 manage_work_items 管理的 work item（员工自己决定观察点与节奏持续跟进，卡住暂停等人，无固定 cron）。用户说「重建自主任务」「自主任务继续」时**必须**用 manage_work_items 的 create/resume，严禁用本工具的 autonomous 参数顶替（那只是「到点后多跑几轮」，仍是定时任务，会让真正的自主任务永远缺失）。" +
 			"凡是「N 分钟/小时后执行」「到 X 点再查/再跟一次」这类**明确了时间**的一次性延迟请求，也必须创建定时任务（cron 写具体时刻，下一个触发点即目标时间），当前回合只确认创建结果并回复触发时间——严禁在回合内 sleep/轮询等到点，回合内长阻塞会卡死会话队列，对方后续消息进不来。【自主任务/定时任务边界铁律（2026-10-17 现场修复）】这两类是**不同的东西，不可互相顶替**：自主任务（需要持续判断、卡住暂停等人的工作）由员工自己提议、管理员确认后创建，它的等待人工恢复机制是「管理员在来源会话直接回复内容即自动继续」；定时任务是到点执行固定 prompt。**当你在处理一个正在等待人工的自主任务卡点（⏸️）时，管理员在会话里提供的答复（验证码、登录信息、参数）是给那个自主任务恢复用的，严禁用 create_scheduled_task 新建任务来「接手」或「重建」它**——那会让原任务永远等待、现场同时跑两份重复工作。正确做法：确认答复内容，告知原自主任务会据此自动恢复。时刻模糊（「之后/回头」）的先报建议时间、对方确认后再建。注意 cron 是循环语义：任务到点执行后仍保留、明年同日还会再触发，一次性任务请在 prompt 末尾写明「任务完成后用 delete_scheduled_task 删除本任务」自我清理；提醒类任务不要开 silent；cron 最小粒度为分钟，秒级延迟无法精确表达。",
 		parameters: Type.Object({
@@ -91,13 +98,34 @@ export function createSchedulerTools(
 			// Identity: the platform-verified sender of THIS request, whatever the chat
 			// type. A task may never exceed its creator's role, so attaching their own
 			// id is not an elevation — it is the definition of "任务跟随创建人权限".
-			// A scheduler actor is excluded so a task cannot spawn further tasks
-			// unattended (creation stays an interactive act).
+			//
+			// Unattended-run creation (field 2026-10-26: a task's follow-up probe was
+			// born identity-less and could not run_command at fire time) INHERITS the
+			// chain identity instead of staying null: when a scheduled task fires,
+			// main.ts re-attaches its creator as {channel:"scheduler", senderId} —
+			// that senderId IS the human the chain anchors to. Recording it keeps the
+			// anchor human end-to-end (the chain's root is always a real admin whose
+			// LIVE role gates every link) while follow-up probes just work. The
+			// runaway guard below bounds what a runaway prompt could farm.
 			let createdBy: string | null = null;
 			let createdChannel: string | null = null;
+			let inheritedFromChain = false;
 			if (resolveActor) {
 				const actor = resolveActor(conversationId);
-				if (actor?.senderId && !isSchedulerActor(actor)) {
+				if (actor?.senderId && isSchedulerActor(actor)) {
+					createdBy = actor.senderId;
+					createdChannel = actor.channel;
+					inheritedFromChain = true;
+					const spawned = scheduler.list().filter(
+						(r) => r.enabled === 1 && r.created_by === createdBy && r.created_channel === "scheduler",
+					);
+					if (spawned.length >= SPAWNED_TASK_CAP) {
+						return {
+							content: [{ type: "text", text: `无人值守链式创建的定时任务已达上限（${SPAWNED_TASK_CAP} 个，创建人 ${maskId(createdBy)} 名下仍启用）。请管理员清理不再需要的任务后重试。` }],
+							details: { ok: false, cap: SPAWNED_TASK_CAP },
+						};
+					}
+				} else if (actor?.senderId) {
 					createdBy = actor.senderId;
 					createdChannel = actor.channel;
 				}
@@ -134,7 +162,10 @@ export function createSchedulerTools(
 										: role === "operator"
 											? "浏览器、文件系统、文档、定时任务、白名单内的命令"
 											: "仅对话与知识库";
-									return `该任务**跟随创建人的权限**：以 ${maskId(createdBy)}（当前 ${role}）的身份无人值守执行，可用范围是${scope}。你的角色被调整后它会立即跟着变，无需重建。`;
+									const chain = inheritedFromChain
+										? "（本任务在无人值守回合创建，身份沿用了任务链源头的创建人——同一「跟随创建人权限」规则，无需补授权）"
+										: "";
+									return `该任务**跟随创建人的权限**${chain}：以 ${maskId(createdBy)}（当前 ${role}）的身份无人值守执行，可用范围是${scope}。你的角色被调整后它会立即跟着变，无需重建。`;
 								})(),
 							}]
 						: [{

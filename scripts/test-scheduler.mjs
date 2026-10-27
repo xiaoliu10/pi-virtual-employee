@@ -57,6 +57,7 @@ function fakeScheduler(t, rows) {
 		conversation_id: r.conversation_id ?? null,
 		origin: r.origin ?? "im",
 		created_by: r.created_by ?? null,
+		created_channel: r.created_channel ?? null,
 		last_run_at: null,
 		next_run_at: Date.now() + 3_600_000,
 		last_status: null,
@@ -74,7 +75,7 @@ function fakeScheduler(t, rows) {
 			return found;
 		},
 		create: (input) => {
-			const row = { ...tasks[0], ...input, id: `t${tasks.length + 1}`, created_by: input.createdBy ?? null };
+			const row = { ...tasks[0], ...input, id: `t${tasks.length + 1}`, created_by: input.createdBy ?? null, created_channel: input.createdChannel ?? null };
 			tasks.push(row);
 			return row;
 		},
@@ -479,4 +480,66 @@ test("list_scheduled_tasks marks silent tasks; get_scheduled_task detail shows t
 	assert.match(listed.content[0].text, /推送: 静默执行/);
 	const detail = await tool(tools, "get_scheduled_task").execute("g1", { id: "s1" });
 	assert.match(detail.content[0].text, /静默执行：成功不推送，出错才通知/);
+});
+
+
+// ── 链式身份继承（field 2026-10-26：无人值守创建的跟进任务没有执行身份）──
+
+const schedulerActor = (senderId) => ({ senderId, chatType: "single", channel: "scheduler" });
+
+test("a task created during an unattended run inherits the chain identity", async (t) => {
+	const { tools, scheduler } = build1(t, {}, [], schedulerActor("boss001"));
+	const create = tool(tools, "create_scheduled_task");
+	const out = await create.execute("id1", { title: "跟进", prompt: "查进度", cron: "*/30 * * * *" });
+	assert.equal(out.details.ok, true);
+	const row = scheduler.tasks.at(-1);
+	assert.equal(row.created_by, "boss001", "the task anchors to the chain's human creator");
+	assert.equal(row.created_channel, "scheduler", "channel marks it as scheduler-spawned");
+	const text = out.content[0].text + (out.content[1]?.text ?? "");
+	assert.match(text, /沿用了任务链源头/, "the reply must state the inheritance explicitly");
+});
+
+test("a scheduler actor WITHOUT a senderId still creates an identity-less task (legacy chain)", async (t) => {
+	const { tools, scheduler } = build1(t, {}, [], schedulerActor(undefined));
+	const create = tool(tools, "create_scheduled_task");
+	const out = await create.execute("id1", { title: "跟进", prompt: "查进度", cron: "*/30 * * * *" });
+	assert.equal(out.details.ok, true);
+	assert.equal(scheduler.tasks.at(-1).created_by, null, "nothing to inherit — stays identity-less");
+});
+
+test("runaway cap: refused at 20 live scheduler-spawned tasks; disabled ones do not count", async (t) => {
+	// 19 live + 1 disabled: the next creation is the 20th LIVE one — allowed.
+	const rows19 = Array.from({ length: 19 }, (_, i) => ({
+		title: `链式${i + 1}`,
+		enabled: 1,
+		created_by: "boss001",
+		created_channel: "scheduler",
+	}));
+	rows19.push({ title: "已停用", enabled: 0, created_by: "boss001", created_channel: "scheduler" });
+	const ok = build1(t, {}, rows19, schedulerActor("boss001"));
+	const outOk = await tool(ok.tools, "create_scheduled_task").execute("id-ok", { title: "第20个", prompt: "查进度", cron: "*/30 * * * *" });
+	assert.equal(outOk.details.ok, true, "19 live + 1 disabled → the 20th live one is allowed");
+	assert.match(outOk.content[0].text + (outOk.content[1]?.text ?? ""), /沿用了任务链源头/);
+
+	// 20 live: the next is the 21st — refused, and nothing is persisted.
+	const rows20 = rows19.map((r) => ({ ...r, enabled: 1 }));
+	const capped = build1(t, {}, rows20, schedulerActor("boss001"));
+	const out = await tool(capped.tools, "create_scheduled_task").execute("id-cap", { title: "再建一个", prompt: "查进度", cron: "*/30 * * * *" });
+	assert.equal(out.details.ok, false, "the 21st live one is over the cap — refused");
+	assert.match(out.content[0].text, /上限（20 个/);
+	assert.equal(capped.scheduler.tasks.length, 20, "a capped creation is not written");
+
+	// A different creator is unaffected by boss001's cap.
+	const other = build1(t, {}, rows20, schedulerActor("boss002"));
+	const out2 = await tool(other.tools, "create_scheduled_task").execute("id-cap2", { title: "别人的", prompt: "查进度", cron: "*/30 * * * *" });
+	assert.equal(out2.details.ok, true);
+});
+
+test("human-created tasks are unaffected by the chain cap", async (t) => {
+	const { tools } = build1(t, {}, [], actor("boss001"));
+	const create = tool(tools, "create_scheduled_task");
+	const out = await create.execute("id1", { title: "人建的", prompt: "查进度", cron: "0 9 * * *" });
+	assert.equal(out.details.ok, true);
+	assert.match(out.content[0].text + (out.content[1]?.text ?? ""), /跟随创建人的权限/);
+	assert.doesNotMatch(out.content[0].text + (out.content[1]?.text ?? ""), /沿用了任务链源头/);
 });
