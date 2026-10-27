@@ -38,6 +38,10 @@ export interface ProgressNotifierOptions {
 	mayPush?: (note: string) => boolean;
 	/** Hard ceiling on pushes per run — a runaway interval must not spam. */
 	maxPushes?: number;
+	/** Zero-cost gate checked BEFORE the side LLM call: a run whose notes can
+	 *  never be pushed (silent task) must not burn a summarize per interval
+	 *  (review P3-1). Unlike mayPush this does not see the note text. */
+	preflight?: () => boolean;
 	log?: (level: "WARN" | "ERROR", msg: string) => void;
 }
 
@@ -50,6 +54,14 @@ const BACKOFF_CAP_MS = 60 * 60_000;
 export interface ProgressNotifier {
 	start: () => void;
 	stop: () => void;
+	/**
+	 * Resolve when the in-flight push (if any) has settled, or after
+	 * `timeoutMs` — whichever first. Call this after stop() and BEFORE the
+	 * completion report is pushed: a slow in-flight progress note otherwise
+	 * lands AFTER the completion report in the same chat (review P2-1 — the
+	 * proactive push path is not per-conversation serialized).
+	 */
+	drain: (timeoutMs?: number) => Promise<void>;
 	/** Test/observability hook: pushes actually performed. */
 	pushedCount: () => number;
 }
@@ -68,6 +80,10 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 	const intervalMs = normalizeProgressIntervalMin(opts.intervalMin) * 60_000;
 
 	let timer: NodeJS.Timeout | undefined;
+	/** Set while a push HTTP round-trip is on the wire (drain waits for it). */
+	let pushInFlight = false;
+	/** Resolves when the current push settles (deferred — no polling). */
+	let pushSettled: Promise<void> = Promise.resolve();
 	let inFlight = false;
 	let stopped = false;
 	let pushes = 0;
@@ -98,6 +114,9 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 		// Settled or suppressed (timed-out losing run / turn-boundary window):
 		// a "still working" note would contradict the scheduler's own record.
 		if (!opts.isRunning() || opts.suppress?.()) return;
+		// Notes that can never be pushed cost an LLM call per interval — check
+		// the static gate (e.g. silent task) before spending anything.
+		if (opts.preflight && !opts.preflight()) return;
 		const target = opts.target;
 		if (!target) return;
 		if (Date.now() < backoffUntil) return;
@@ -108,7 +127,11 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 			// The run may have settled while the side pass was in flight — the
 			// note is now a stale snapshot, and the final report is about to land
 			// anyway. Drop it instead of racing the completion push.
-			if (stopped || !opts.isRunning()) return;
+			// Re-check BOTH live gates now that the side pass is over: the run may
+			// have settled, AND the timed-out flag may have flipped mid-summarize
+			// (review P2-2 — a losing run must not broadcast "still working" after
+			// the scheduler recorded its failure).
+			if (stopped || !opts.isRunning() || opts.suppress?.()) return;
 			// Exponential backoff while the side pass keeps degrading: 2 generic
 			// lines are informative ("still alive"), 12 are spam. Any healthy
 			// (LLM-backed) note resets the streak.
@@ -123,21 +146,33 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 				degradedStreak = 0;
 				backoffUntil = 0;
 			}
-			// The engine prefixes ⏳ itself; the autonomous-chain heartbeat used
-			// to double it (v0.2.109). Normalize once, here, for every caller.
-			const note = text.startsWith("⏳") ? text : `⏳ ${text}`;
+			// Normalize to exactly one ⏳ and name the task: two different tasks
+			// sharing a group chat can broadcast within milliseconds of each
+			// other, and an untitled 「⏳ 任务仍在进行中」 cannot be attributed
+			// (review P3-2). The engine's own prefix is stripped and rebuilt.
+			const body = text.replace(/^⏳\s*/, "");
+			const note = opts.title ? `⏳ **${opts.title}** ${body}` : `⏳ ${body}`;
 			if (opts.mayPush && !opts.mayPush(note)) return;
 			if (pushes >= maxPushes) {
 				log("WARN", `progress push cap (${maxPushes}) reached — further notes suppressed until the run settles`);
 				return;
 			}
 			pushes += 1;
-			try {
-				await opts.push(target, note);
-			} catch (err) {
-				// A failed push must never kill the timer or the run.
-				log("WARN", `progress push failed: ${err instanceof Error ? err.message : err}`);
-			}
+			pushInFlight = true;
+			pushSettled = new Promise<void>((resolve) => {
+				void (async () => {
+					try {
+						await opts.push(target, note);
+					} catch (err) {
+						// A failed push must never kill the timer or the run.
+						log("WARN", `progress push failed: ${err instanceof Error ? err.message : err}`);
+					} finally {
+						pushInFlight = false;
+						resolve();
+					}
+				})();
+			});
+			await pushSettled;
 		} catch (err) {
 			// summarize() itself should already fall back internally; this is the
 			// last-resort guard against an unhandled rejection in the timer.
@@ -147,5 +182,18 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 		}
 	};
 
-	return { start, stop, pushedCount: () => pushes };
+	return {
+		start,
+		stop,
+		drain: (timeoutMs = 5_000) => {
+			// Bounded: a hung 30s DingTalk retry must not stall the run's finish.
+			if (!pushInFlight) return Promise.resolve();
+			const timeout = new Promise<void>((resolve) => {
+				const t = setTimeout(resolve, timeoutMs);
+				t.unref?.();
+			});
+			return Promise.race([pushSettled, timeout]);
+		},
+		pushedCount: () => pushes,
+	};
 }

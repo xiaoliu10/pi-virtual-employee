@@ -922,7 +922,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 												/>
 											</Field>
 
-											<Field label="长任务进度提醒（分钟）" hint="IM 会话与定时任务执行中，某轮任务超过该时长仍未完成时，主动推送一条简短的当前进度（旁路总结，不占用对话上下文）。0 = 关闭。默认 15。">
+											<Field label="长任务进度提醒（分钟）" hint="IM 会话与定时任务执行中，某轮任务超过该时长仍未完成时，主动推送一条简短的当前进度（旁路总结，不占用对话上下文）。0 = 关闭；低于 5 按 5 生效。默认 15。">
 												<input
 													type="number"
 													min={0}

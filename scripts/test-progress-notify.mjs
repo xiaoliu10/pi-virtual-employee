@@ -325,3 +325,70 @@ test("normalizeProgressIntervalMin: 0 disables, sub-5 clamps up, negatives disab
 	assert.equal(normalizeProgressIntervalMin(4), 5);
 	assert.equal(normalizeProgressIntervalMin(15), 15);
 });
+
+test("R: a note names its task (two tasks sharing a chat are distinguishable)", async (t) => {
+	mock.timers.reset();
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	let pushedText = "";
+	const { notifier } = make({
+		push: async (_cid, text) => { pushedText = text; return { ok: true }; },
+	});
+	notifier.start();
+	await advance(INTERVAL);
+	assert.ok(pushedText.includes("**对账任务**"), `the note must carry the task title, got ${pushedText.slice(0, 40)}`);
+	assert.equal(pushedText.split("⏳").length - 1, 1, "exactly one ⏳");
+	notifier.stop();
+	mock.timers.reset();
+});
+
+test("R: suppress flipping mid-summarize still blocks the push (review P2-2)", async (t) => {
+	mock.timers.reset();
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	let release;
+	let timedOut = false;
+	const { notifier, calls } = make({
+		suppress: () => timedOut,
+		summarize: () => { calls.summarize += 1; return new Promise((r) => { release = () => r({ text: "⏳ late-run progress", degraded: false }); }); },
+	});
+	notifier.start();
+	await advance(INTERVAL); // tick enters, summarize hangs
+	assert.equal(calls.summarize, 1);
+	timedOut = true; // the 60min deadline fires WHILE the side pass is in flight
+	release();
+	await advance(0);
+	assert.equal(calls.push, 0, "a losing run must not broadcast after the scheduler recorded its failure");
+	notifier.stop();
+	mock.timers.reset();
+});
+
+test("R: preflight=false (silent task) never even calls summarize (review P3-1)", async (t) => {
+	mock.timers.reset();
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	const { notifier, calls } = make({ preflight: () => false });
+	notifier.start();
+	await advance(INTERVAL * 3);
+	assert.equal(calls.summarize, 0, "an unpunnable run must not burn a side LLM call per interval");
+	assert.equal(calls.push, 0);
+	notifier.stop();
+	mock.timers.reset();
+});
+
+test("R: drain resolves only after the in-flight push settles (review P2-1)", async (t) => {
+	mock.timers.reset();
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	let release;
+	const { notifier } = make({
+		push: () => new Promise((r) => { release = () => r({ ok: true }); }),
+	});
+	notifier.start();
+	await advance(INTERVAL); // push starts, hangs on the wire
+	let drained = false;
+	const draining = notifier.drain(60_000).then(() => { drained = true; });
+	await new Promise((r) => setImmediate(r));
+	assert.equal(drained, false, "drain must wait while the push is on the wire");
+	release();
+	await draining;
+	assert.equal(drained, true, "drain resolves once the push settles");
+	notifier.stop();
+	mock.timers.reset();
+});
