@@ -69,7 +69,7 @@
 			"path": "scripts/test-prompt.mjs",
 			"kind": "file",
 			"why": "守护提示词红线的断言本身（改测试而不是改行为是 RSI 最经典的失败模式）",
-			"sha256": "3a5a6ee1d3e544624d7cfc6ffc3c43fe14b28cb943477a5a057d84e02fdc19e8"
+			"sha256": "6b72d81d03b92a17b2c1ff550db81add29c9362e41f6f7694fd8b48691246d58"
 		},
 		{
 			"id": "test-permissions",

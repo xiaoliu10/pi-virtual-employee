@@ -49,13 +49,18 @@ const INTEGRITY_MARKERS = [
 	"以下为示例数据，非真实结果",
 ];
 
+// One semantic marker per discipline line (review P3): a dropped line must
+// fail these assertions, so every one of the six lines is individually pinned.
 const DISCIPLINE_MARKERS = [
 	"## 执行与验收纪律（内置，勿删）",
 	"结论必须有本轮工具证据支撑",
 	"原因尚未确认",
 	"区分两层成功",
 	"工具调用成功不等于任务成功",
+	"关键结论注明来源与对应执行时间",
 	"后来的重跑成功不能反证先前那次成功",
+	"新证据与先前结论冲突时",
+	"显式标注哪些部分是假设",
 ];
 
 test("execution-discipline rules are present in a default prompt", () => {
