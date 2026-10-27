@@ -265,6 +265,7 @@ function migrate(db: DB): void {
 	// every session, so NULL preserves that visibility; no risky auto-attribution.
 	if (!entryCols.has("memory_scope")) db.exec("ALTER TABLE kb_entries ADD COLUMN memory_scope TEXT");
 	if (!entryCols.has("memory_owner")) db.exec("ALTER TABLE kb_entries ADD COLUMN memory_owner TEXT");
+
 	if (!entryCols.has("memory_summary")) {
 		db.exec("ALTER TABLE kb_entries ADD COLUMN memory_summary TEXT");
 		// Backfill the always-on hook for pre-existing memory entries from the

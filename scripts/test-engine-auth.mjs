@@ -264,7 +264,7 @@ function makeEngine(t, { extraProviders = [], opts = {} } = {}) {
 	// them (e.g. promptPartsFor asks knowledge for the memory index). Providing
 	// the few no-op hooks keeps the real send() path usable in this harness
 	// without standing up KB/browser/scheduler services.
-	const knowledgeStub = { listMemoryIndex: () => [] };
+	const knowledgeStub = { listMemoryIndex: () => [], listScopedMemoryIndex: () => [] };
 	const streamCalls = [];
 	const stub = {};
 	const engine = new EmployeeEngine(config, history, knowledgeStub, stub, stub, stub, stub, stub, stub, {

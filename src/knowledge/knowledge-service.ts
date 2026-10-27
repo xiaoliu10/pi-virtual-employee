@@ -21,7 +21,7 @@ import { LocalRetrievalProvider } from "./retrieval/local-retrieval.js";
 import { reciprocalRankFuse } from "./retrieval/rrf.js";
 import { webSearch, type WebSearchHit } from "./research/web-search.js";
 import type { EntryWithSnippet, KbGap, KnowledgeDoc, KnowledgeEntry, PendingChunk } from "./store.js";
-import { KnowledgeContentStore } from "./store.js";
+import { KnowledgeContentStore, hasMemoryTag } from "./store.js";
 import { clusterBySimilarity } from "./clustering.js";
 import type { ReindexReport, RetrievalHit } from "./types.js";
 import { VecStore } from "./vec-store.js";
@@ -54,6 +54,10 @@ export interface VectorStatus {
 	indexed: number;
 	failed: number;
 }
+
+/** Max retrieval slots a single query may spend on memory hits (see applySourceQuota). */
+const MEMORY_SEARCH_CAP = 3;
+/** Extra candidates fetched so the source quota can see past a wall of memory hits. */
 
 export class KnowledgeService {
 	private readonly store: KnowledgeContentStore;
@@ -139,9 +143,53 @@ export class KnowledgeService {
 		return result;
 	}
 
-	/** Compact memory index for prompt injection (one line per entry), scope-filtered. */
-	listMemoryIndex(ctx: { personOwner?: string; conversationOwner?: string } = {}, limit = 30): { id: string; title: string; snippet: string; updatedAt: number; scope: string | null }[] {
-		return this.store.listMemoryForContext(ctx, limit).map((e) => ({
+	/**
+	 * Compact memory index for prompt injection (one line per entry), scope-filtered.
+	 *
+	 * `query`: the current user message. When present, recall is RELEVANCE
+	 * ranked and only what the turn can plausibly need is injected — the old
+	 * flat "newest 30" index paid a fixed token cost every turn and silently
+	 * truncated older durable facts once the cap was reached.
+	 */
+	/**
+	 * Scoped-only variant for the per-turn injection: person + conversation
+	 * memory, filtered BEFORE the budget so profile rows (already in the cached
+	 * system prompt) cannot consume the per-turn slots.
+	 */
+	listScopedMemoryIndex(
+		ctx: { personOwner?: string; conversationOwner?: string },
+		limit = 12,
+		query?: string,
+	): { id: string; title: string; snippet: string; updatedAt: number; scope: string | null }[] {
+		return this.store.recallMemory({ ctx, limit, query, scopeFilter: ["person", "conversation"] }).map((e) => ({
+			id: e.id,
+			title: e.title,
+			snippet: e.memory_summary?.trim() || "",
+			updatedAt: e.updated_at,
+			scope: e.memory_scope,
+		}));
+	}
+
+	/**
+	 * Read-only memory preview for write-time conflict checks: same visibility
+	 * rules, but NO usage feedback — a title comparison must not be recorded as a
+	 * real recall (review probe: one remember bumped hit_count by 12).
+	 */
+	peekMemoryTitles(
+		ctx: { personOwner?: string; conversationOwner?: string },
+		limit = 50,
+	): { id: string; title: string; snippet: string }[] {
+		return this.store
+			.recallMemory({ ctx, limit, recordFeedback: false })
+			.map((e) => ({ id: e.id, title: e.title, snippet: e.memory_summary?.trim() || "" }));
+	}
+
+	listMemoryIndex(
+		ctx: { personOwner?: string; conversationOwner?: string } = {},
+		limit = 30,
+		query?: string,
+	): { id: string; title: string; snippet: string; updatedAt: number; scope: string | null }[] {
+		return this.store.recallMemory({ ctx, limit, query }).map((e) => ({
 			id: e.id,
 			title: e.title,
 			// Independent summary hook when present; otherwise fall back to title
@@ -228,16 +276,60 @@ export class KnowledgeService {
 		return chunks;
 	}
 
+	/**
+	 * Reserve retrieval slots per source kind: memory is capped so it cannot own
+	 * the whole topK, and knowledge keeps at least the remainder. Order is
+	 * preserved (the fusion already ranked them); this only drops overflow.
+	 */
+	private applySourceQuota(hits: RetrievalHit[], topK: number): RetrievalHit[] {
+		if (topK <= 0) return [];
+		const memory = hits.filter((h) => this.isMemoryHit(h));
+		const others = hits.filter((h) => !this.isMemoryHit(h));
+		// Knowledge keeps a guaranteed slot whenever it has anything to offer —
+		// including topK 1..3, where "topK - cap" used to be zero and memory owned
+		// every slot even though matching knowledge existed.
+		const knowledgeFloor = others.length > 0 ? Math.min(others.length, topK <= MEMORY_SEARCH_CAP ? 1 : topK - MEMORY_SEARCH_CAP) : 0;
+		const memoryCap = Math.min(memory.length, MEMORY_SEARCH_CAP);
+		// Knowledge takes its floor, then whatever memory does not claim.
+		const knowledgeCount = Math.min(others.length, Math.max(knowledgeFloor, topK - memoryCap));
+		const memoryCount = Math.min(memory.length, Math.max(0, topK - knowledgeCount));
+		const keep = new Set([...memory.slice(0, memoryCount), ...others.slice(0, knowledgeCount)].map((h) => h.id));
+		return hits.filter((h) => keep.has(h.id)).slice(0, topK);
+	}
+
+	/** Whether a hit came from a memory entry (memory-tagged rows only). */
+	private isMemoryHit(hit: RetrievalHit): boolean {
+		return hasMemoryTag(hit.tags);
+	}
+
 	// --- retrieval ---
+	/**
+	 * Layered retrieval over knowledge + memory.
+	 *
+	 * Memory used to compete with knowledge for the SAME topK slots, so personal
+	 * facts could crowd out the document that answered the question. The two are
+	 * now recalled in SEPARATE passes and interleaved under a per-kind budget.
+	 *
+	 * Separate passes, rather than one pass plus a candidate window: memory and
+	 * knowledge score on different scales, so one ranking can place an arbitrary
+	 * number of memory hits ahead of every knowledge hit. In that arrangement
+	 * knowledge falls outside ANY fixed overscan and the quota mistakes it for
+	 * absent — exactly the reviewer probe that returned six memory rows while a
+	 * matching document existed.
+	 */
 	async search(query: string, memoryCtx?: { personOwner?: string; conversationOwner?: string }): Promise<RetrievalHit[]> {
 		const kb = this.kb();
 		const topK = kb.local.topK;
-		const localHits = await this.local.search({ query, topK, memoryCtx });
-		if (kb.mode !== "external") return localHits;
+		const [memoryHits, knowledgeHits] = await Promise.all([
+			this.local.search({ query, topK, memoryCtx, kindFilter: "memory" }),
+			this.local.search({ query, topK, memoryCtx, kindFilter: "knowledge" }),
+		]);
+		const tiered = this.applySourceQuota([...memoryHits, ...knowledgeHits], topK);
+		if (kb.mode !== "external") return tiered;
 
 		// mode is additive: local is primary, external source(s) extend coverage.
 		const externals = this.activeExternalProviders(kb);
-		if (externals.length === 0) return localHits;
+		if (externals.length === 0) return tiered;
 
 		const externalLists = await Promise.all(
 			externals.map(async (cfg) => {
@@ -253,10 +345,7 @@ export class KnowledgeService {
 		// 内置为主、外接仅作扩展：本地权重高于外接。外接 snippet 由对方服务端返回、
 		// 可能被截断，完整的本地内容应优先；本地命中不足 topK 时外接才补位。
 		const fused = reciprocalRankFuse<RetrievalHit>(
-			[
-				{ list: localHits, weight: 1 },
-				...externalLists.map((list) => ({ list, weight: 0.5 })),
-			],
+			[{ list: tiered, weight: 1 }, ...externalLists.map((list) => ({ list, weight: 0.5 }))],
 			(h) => h.chunkId,
 		);
 		return [...fused.values()]
@@ -343,7 +432,7 @@ export class KnowledgeService {
 			})) continue;
 			// Partition BEFORE clustering or LLM calls. A combined model reply could
 			// otherwise carry another owner's facts even when output ids are split.
-			const memory = entry.tags.split(/[,，]/).some((t) => t.trim() === "memory");
+			const memory = hasMemoryTag(entry.tags);
 			const key = JSON.stringify([memory, entry.memory_scope ?? "profile", entry.memory_owner ?? ""]);
 			const entries = partitions.get(key) ?? [];
 			entries.push(entry);
@@ -376,7 +465,7 @@ export class KnowledgeService {
 					if (!entry || consumed.has(id)) continue;
 					// Durable facts are corrected explicitly via remember or archived
 					// by their administrator, not silently forgotten by a background LLM.
-					if (entry.tags.split(/[,，]/).some((t) => t.trim() === "memory")) continue;
+					if (hasMemoryTag(entry.tags)) continue;
 					if (extractCriticalValues(entry.content).length > 0) continue;
 					this.store.archiveEntry(id);
 					report.archived += 1;

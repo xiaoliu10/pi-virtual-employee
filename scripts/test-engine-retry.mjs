@@ -171,7 +171,7 @@ function makeEngine(t, { streamFn, retrySleepFn } = {}) {
 	t.after(() => {
 		try { rmSync(`${authPath}.lock`, { force: true }); } catch { /* best effort */ }
 	});
-	const knowledgeStub = { listMemoryIndex: () => [] };
+	const knowledgeStub = { listMemoryIndex: () => [], listScopedMemoryIndex: () => [] };
 	const stub = {};
 	const delays = [];
 	const engine = new EmployeeEngine(config, history, knowledgeStub, stub, stub, stub, stub, stub, stub, {

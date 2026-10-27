@@ -54,6 +54,16 @@ import { fetchModelInfo, resolveEffectiveLimits, type RemoteModelInfo } from "./
 
 /** Default single-reply output cap for relay (custom baseUrl) models without an explicit per-model override. */
 const RELAY_DEFAULT_MAX_OUTPUT = 32_768;
+
+/**
+ * Memory index budgets. Profile memory rides the cached system prompt (no query
+ * to rank against, so recency-decayed top-N); person/conversation memory is
+ * relevance-ranked per turn against the incoming message. Both are deliberately
+ * small: a durable fact competes on relevance now, not on a flat "newest 30"
+ * that taxed every turn and truncated the oldest entries.
+ */
+const PROFILE_MEMORY_LIMIT = 20;
+const MEMORY_RECALL_LIMIT = 12;
 import { SkillLoader, pickActiveSkills } from "./skills/skill-loader.js";
 import { SkillWriter } from "./skills/skill-writer.js";
 import { formatInlineSkills } from "./skills/skills-prompt.js";
@@ -1270,10 +1280,23 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 */
 	private withTurnMemoryPrefix(conversationId: string, ctx: { personOwner?: string; conversationOwner?: string }, message: string): string {
 		if (!ctx.personOwner && !ctx.conversationOwner) return message;
-		const lines = this.knowledge
-			.listMemoryIndex(ctx, 30)
-			.filter((m) => m.scope === "person" || m.scope === "conversation")
-			.map((m) => `- ${m.title}${m.snippet ? ` — ${m.snippet}` : ""}`);
+		// Relevance-ranked against THIS message: only facts the turn can plausibly
+		// need ride along, so a long-lived memory does not tax every turn or get
+		// silently truncated by a flat cap. Profile memory is excluded BEFORE the
+		// budget is applied (it rides the cached system prompt) — filtering after
+		// truncation let twelve matching profile rows consume the whole per-turn
+		// scoped budget and starve person memory entirely.
+		// Memory injection is an enhancement: a recall failure must never poison
+		// the turn (an unhandled throw here re-enters the retry ladder).
+		let lines: string[] = [];
+		try {
+			lines = this.knowledge
+				.listScopedMemoryIndex(ctx, MEMORY_RECALL_LIMIT, message)
+				.map((m) => `- ${m.title}${m.snippet ? ` — ${m.snippet}` : ""}`);
+		} catch (err) {
+			console.warn("[engine] scoped memory recall failed — continuing without it:", (err as Error).message);
+			return message;
+		}
 		if (lines.length === 0) return message;
 		return turnMemoryPrefix(lines) + message;
 	}
@@ -2259,7 +2282,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// Profile-shared memory only (scope NULL/'profile'). Person/conversation
 			// memory is per-turn (a group conversation serves many senders) and is
 			// injected as a turn prefix in send(), not in the cached system prompt.
-			memoryLines: this.knowledge.listMemoryIndex({}, 30)
+			memoryLines: this.knowledge.listMemoryIndex({}, PROFILE_MEMORY_LIMIT)
 				.map((m) => `${m.title}${m.snippet ? ` — ${m.snippet}` : ""}`),
 			rules: rulesOverride ?? this.promptOverrides.get(conversationId) ?? cfg.prompt.rules,
 			extra: cfg.prompt.extra,

@@ -94,7 +94,7 @@ function makeEngine(t) {
 	const config = new ConfigStore(db);
 	const history = new HistoryStore(db);
 	const stub = {};
-	const engine = new EmployeeEngine(config, history, { listMemoryIndex: () => [] }, stub, stub, stub, stub, stub, stub, {
+	const engine = new EmployeeEngine(config, history, { listMemoryIndex: () => [], listScopedMemoryIndex: () => [] }, stub, stub, stub, stub, stub, stub, {
 		builtinSkillsDir: dir, userSkillsDir: dir,
 	}, {
 		streamFn: async () => ({ async *[Symbol.asyncIterator]() {}, result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }) }),
