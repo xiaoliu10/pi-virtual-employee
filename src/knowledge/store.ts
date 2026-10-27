@@ -115,6 +115,22 @@ const DEFAULT_MIN_RELEVANCE = 0.12;
  * sharing 2 bigrams is a precise match. Two distinct tokens is enough to mean
  * "this is about the same thing".
  */
+/**
+ * Specificity floor applied to IDF weights. A token that appears in EVERY fact
+ * has zero discriminative power, but it is still evidence that the ask is
+ * about this fact rather than unrelated — so it contributes a little rather
+ * than nothing.
+ */
+const IDF_FLOOR = 0.08;
+
+/**
+ * When exactly one ask token matches, that token alone must carry the match.
+ * A rare token (high IDF) clears this easily; a common one ("分析", "报告")
+ * does not — which is the whole point: one generic word is not a topic.
+ */
+const MIN_SINGLE_TOKEN_RELEVANCE = 0.45;
+
+/** Relevance floor for a row matching several ask tokens. */
 const MIN_MATCHED_TOKENS = 2;
 
 export class KnowledgeContentStore {
@@ -235,7 +251,7 @@ export class KnowledgeContentStore {
 		);
 		if (rows.length === 0) return [];
 
-		const tokens = recallTokens(input.query ?? "");
+		const { all: tokens, tail: askTokens } = recallTokenDetail(input.query ?? "");
 		// Distinguish "no query" (index mode: recency order) from "query provided
 		// but nothing searchable in it" (e.g. 「如何」「？」). The latter must NOT
 		// fall back to dumping every memory — that reopened the pollution this
@@ -243,6 +259,31 @@ export class KnowledgeContentStore {
 		const hasQuery = (input.query ?? "").trim().length > 0;
 		const searchable = tokens.length > 0;
 		const minRelevance = input.minRelevance ?? DEFAULT_MIN_RELEVANCE;
+
+		// Term specificity (IDF over the candidate corpus): a token appearing in
+		// many facts ("分析", "报告") says little about which fact the user means;
+		// a token appearing in exactly one ("Zeiss", "香菜", "kubernetes") is
+		// almost always the discriminator. This is the signal the earlier
+		// admission rules kept approximating with title position and raw hit
+		// counts — both are proxies that let a single common word through while
+		// rejecting a single rare one.
+		const docFreq = new Map<string, number>();
+		for (const row of rows) {
+			const hay = `${row.title} ${row.memory_summary ?? ""} ${row.content}`.toLowerCase();
+			for (const token of tokens) if (hay.includes(token)) docFreq.set(token, (docFreq.get(token) ?? 0) + 1);
+		}
+		const idf = (token: string): number => {
+			const df = docFreq.get(token) ?? 0;
+			// 0 for a token nothing matches; ~1 for a token unique to one fact.
+			return df <= 0 ? 0 : Math.log(1 + rows.length / df) / Math.log(1 + rows.length);
+		};
+		// The ask is the trailing sentence. When the message carries a real tail,
+		// admission is decided on the tail alone — scoring against a pasted log
+		// dilutes a clear question into "no match" (the reviewer's regression:
+		// a 662-char stack trace plus 「这个报告怎么交付」 scored 0.105 and dropped
+		// below the 0.12 floor). Without a distinguishable tail (short message,
+		// or tail == whole message) the full token list is used.
+		const scoringTokens = askTokens.length > 0 ? askTokens : tokens;
 
 		const scored = rows.map((row) => {
 			const age = Math.max(0, now - (row.updated_at || 0));
@@ -259,57 +300,53 @@ export class KnowledgeContentStore {
 			if (hasQuery && searchable) {
 				const hay = `${row.title} ${row.memory_summary ?? ""} ${row.content}`.toLowerCase();
 				const titleHay = row.title.toLowerCase();
-				let covered = 0;
-				let titleHits = 0;
-				for (const token of tokens) {
+				// Weight by specificity rather than counting equally: matching the
+				// rare word is what identifies the fact, matching filler is not.
+				let totalWeight = 0;
+				let coveredWeight = 0;
+				let titleWeight = 0;
+				for (const token of scoringTokens) {
+					const weight = Math.max(idf(token), IDF_FLOOR);
+					totalWeight += weight;
 					if (titleHay.includes(token)) {
-						// A title token is the deliberate subject of the fact: it counts
-						// double toward the absolute-overlap floor (one shared title
-						// bigram such as 「报告」 is a real match, a body-only one is not).
-						covered += 2;
-						titleHits += 1;
+						coveredWeight += weight;
+						titleWeight += weight;
+						matchedTokens += 1;
+						titleHitsCount += 1;
 					} else if (hay.includes(token)) {
-						covered += 1;
+						coveredWeight += weight;
+						matchedTokens += 1;
 					}
 				}
-				// COVERAGE, not raw hit volume: a single shared bigram must not look
-				// like a topical match (「事」 in 「杂事7」 used to tie a real one).
-				relevance = Math.min(1, covered / tokens.length);
-				matchedTokens = covered;
-				// The title bonus only RANKS admitted rows — it must not admit on its
-				// own. Adding it to relevance let one common word in a title (「分析」)
-				// clear the floor for a completely unrelated message.
-				titleBonus = titleHits ? Math.min(0.2, (titleHits / tokens.length) * 0.4) : 0;
-				titleHitsCount = titleHits;
+				relevance = totalWeight > 0 ? coveredWeight / totalWeight : 0;
+				// Ranking-only: a title match orders equally relevant rows higher,
+				// it never lifts a row over the admission floor by itself.
+				titleBonus = totalWeight > 0 ? Math.min(0.2, (titleWeight / totalWeight) * 0.3) : 0;
 			}
 			return { ...row, prior, relevance, titleBonus, matchedTokens, titleHits: titleHitsCount, recallScore: 0 };
 		});
 
 		// Admission.
-		//   no query        → index mode, priors only (old behavior)
+		//   no query        → index mode, priors only
 		//   query, no token → nothing searchable: admit nothing rather than dump all
-		//   query + tokens  → only rows clearing the coverage floor
-		// Admission rules, derived from measured scenarios rather than a bare ratio:
+		//   query + tokens  → coverage of the ASK's specificity-weighted tokens
 		//
-		//   case                         cov  ratio  titleHits   want
-		//   短查询命中标题                  2   0.167     1         admit
-		//   长查询正文单点                   2   0.061     0         admit
-		//   无关但共用标题里的常见词            2   0.077     1         reject
-		//   强命中                        8   0.615     3         admit
-		//
-		// A ratio floor alone admits the third case and rejects the second; an
-		// absolute floor alone admits the third. What actually separates them:
-		// a TITLE hit is only meaningful when the message also covers a real
-		// share of the topic (otherwise any memory titled with a common word
-		// becomes self-admitting), while a BODY hit needs no such corroboration
-		// because incidental body overlap is far rarer than an incidental title
-		// word.
+		// A fact is recalled when the user's ask is substantially ABOUT it. Two
+		// failure modes bound the rule from both sides, and the earlier
+		// single-metric versions each fell into one of them:
+		//   too loose — any memory sharing a common word ("分析") with an
+		//               unrelated question got injected (context pollution).
+		//   too tight — a genuine one-word ask ("Zeiss", "香菜") or a question
+		//               buried in a pasted log recalled nothing at all.
+		// Specificity weighting separates these: a rare shared token is a strong
+		// signal by itself, a common one needs company.
 		const admitted = hasQuery
 			? searchable
 				? scored.filter((row) => {
-						if (row.matchedTokens < MIN_MATCHED_TOKENS) return false;
-						if (row.titleHits > 0) return row.relevance >= minRelevance;
-						return true; // body-only overlap: dilution is expected in long queries
+						if (row.matchedTokens === 0) return false;
+						// A single rare token is decisive; a single common token is not.
+						if (row.matchedTokens === 1) return row.relevance >= MIN_SINGLE_TOKEN_RELEVANCE;
+						return row.relevance >= minRelevance;
 					})
 				: []
 			: scored;
@@ -998,8 +1035,17 @@ function stripMemoryTag(tags: string | null | undefined): string {
 		.join(",");
 }
 
-function hasMemoryTag(tags: string | null | undefined): boolean {
-	return (tags ?? "").split(/[,，]/).some((tag) => tag.trim() === "memory");
+/**
+ * Whether a comma-separated tag string carries the memory tag.
+ *
+ * Case-insensitive on purpose: `tags` originates from an LLM tool argument, so
+ * "Memory"/"MEMORY" are reachable. The SQL side (LIKE) is already
+ * case-insensitive, so a case-sensitive check here put the same row in the
+ * memory partition on the FTS path and the knowledge partition on the vector
+ * path — one record with two identities.
+ */
+export function hasMemoryTag(tags: string | null | undefined): boolean {
+	return (tags ?? "").split(/[,，]/).some((tag) => tag.trim().toLowerCase() === "memory");
 }
 
 /** Normalize one or more comma-separated tag lists into a de-duplicated comma list. */
@@ -1026,22 +1072,58 @@ const CJK_STOP_CHARS = new Set(
 /** Token budget per recall query, and the share the trailing ask may reserve. */
 const RECALL_TOKEN_BUDGET = 40;
 const RECALL_TAIL_RESERVE = 24;
-/** Characters of trailing text treated as "the ask" (a paragraph, not a document). */
-const RECALL_TAIL_CHARS = 200;
+/**
+ * Characters of trailing text treated as "the ask". The tail is the last
+ * paragraph the user typed, which is where the question lives; it must be big
+ * enough to hold a multi-line closing question (verified: a 40-frame stack
+ * trace ends with a 3-line question that a 200-char window cut in half).
+ */
+const RECALL_TAIL_CHARS = 400;
 
 export function recallTokens(query: string): string[] {
-	if (!query) return [];
+	return recallTokenDetail(query).all;
+}
+
+/**
+ * Tokenize a recall query into the whole list plus the subset that came from
+ * the trailing "ask" — the priority-region tokens used by admission scoring.
+ *
+ * Long inputs are normal in this product: users paste an error log or a whole
+ * document and then ask at the END. Taking the first N tokens let that pasted
+ * body consume the budget so the actual question never reached the scorer
+ * (verified: a 60-line log plus 「这个报告交付时应该用可复制文本框吗」 produced a
+ * token list with 报告/交付/文本 all absent). The tail is therefore tokenized
+ * first and reserves a share of the budget.
+ *
+ * The tail cut is aligned BACK to a character that cannot be inside a word
+ * (whitespace/punctuation, or a CJK character, which is its own boundary in
+ * bigram tokenization). Without that, an English keyword straddling the cut
+ * was shredded into garbage tokens (「kubernetessync」) and silently lost.
+ */
+export function recallTokenDetail(query: string): { all: string[]; tail: string[] } {
+	if (!query) return { all: [], tail: [] };
 	const text = query.toLowerCase();
-	// Long inputs are normal here: users paste an error log or a whole document
-	// and then ask a question at the END. Taking the first N tokens (or ranking
-	// every token by rarity) let that pasted body consume the budget and the
-	// actual ask never reached the scorer — verified: with a 60-line log plus
-	// 「这个报告交付时应该用可复制文本框吗」, 报告/交付/文本 were all absent from
-	// the 40-token list. So the trailing ask is tokenized FIRST and reserves a
-	// share of the budget; the body fills the remainder by frequency (its
-	// dominant vocabulary is its topic).
-	const tail = text.slice(-RECALL_TAIL_CHARS);
-	const body = text.slice(0, Math.max(0, text.length - RECALL_TAIL_CHARS));
+	let cut = Math.max(0, text.length - RECALL_TAIL_CHARS);
+	if (cut > 0) {
+		// Walk forward to a safe boundary so no word is split across the cut.
+		while (cut < text.length && /[a-z0-9_]/.test(text[cut - 1] ?? "") && /[a-z0-9_]/.test(text[cut] ?? "")) cut += 1;
+		// A fixed-size window is the wrong shape for a pasted stack trace: the
+		// trailing N characters can be nothing BUT frames, and the question the
+		// user typed sits just beyond them (verified: a 20-frame trace put the
+		// entire 400-char tail inside  at fn13…fn16 , losing 「这个报告怎么交付」).
+		// So snap forward to the last paragraph break that still leaves a real
+		// sentence: the question is its own paragraph.
+		const rest = text.slice(cut);
+		const lastBreak = rest.search(/\n\s*\n[^\n]*$/);
+		if (lastBreak > 0) {
+			const candidate = rest.slice(lastBreak).trim();
+			// Only trust a paragraph break when what follows looks like prose
+			// rather than more log/stack noise.
+			if (candidate.length >= 4 && !/^(?:at\s|\s*\d{4}-)/.test(candidate)) cut += lastBreak;
+		}
+	}
+	const tail = text.slice(cut);
+	const body = text.slice(0, cut);
 	const tokenize = (chunk: string): string[] => {
 		const out: string[] = [];
 		for (const word of chunk.match(/[a-z0-9_]{2,}/g) ?? []) out.push(word);
@@ -1054,6 +1136,7 @@ export function recallTokens(query: string): string[] {
 		}
 		return out;
 	};
+	const tailTokens = tokenize(tail);
 	const wanted = new Set<string>();
 	const fill = (list: string[], cap: number) => {
 		for (const token of list) {
@@ -1061,13 +1144,17 @@ export function recallTokens(query: string): string[] {
 			wanted.add(token);
 		}
 	};
-	fill(tokenize(tail), RECALL_TAIL_RESERVE);
+	fill(tailTokens, RECALL_TAIL_RESERVE);
 	const bodyTokens = tokenize(body);
 	if (bodyTokens.length) {
 		const freq = new Map<string, number>();
 		for (const token of bodyTokens) freq.set(token, (freq.get(token) ?? 0) + 1);
 		fill([...new Set(bodyTokens)].sort((a, b) => (freq.get(b) ?? 0) - (freq.get(a) ?? 0) || a.localeCompare(b)), RECALL_TOKEN_BUDGET);
 	}
-	fill(tokenize(tail), RECALL_TOKEN_BUDGET);
-	return [...wanted].slice(0, RECALL_TOKEN_BUDGET);
+	fill(tailTokens, RECALL_TOKEN_BUDGET);
+	const all = [...wanted].slice(0, RECALL_TOKEN_BUDGET);
+	// The tail tokens that actually made the budget: these are what the user is
+	// asking about, so they carry the admission decision.
+	const tailSet = new Set(tailTokens);
+	return { all, tail: all.filter((t) => tailSet.has(t)) };
 }

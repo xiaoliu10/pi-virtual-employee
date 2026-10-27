@@ -7,6 +7,7 @@
  */
 import type { DB } from "../../db/sqlite.js";
 import { isMemoryVisible } from "../memory-scope.js";
+import { hasMemoryTag } from "../store.js";
 import type { ChunkRow, KnowledgeContentStore } from "../store.js";
 import type {
 	EmbedProvider,
@@ -228,7 +229,7 @@ function kindClause(tagsColumn: string, kindFilter?: "memory" | "knowledge"): st
 
 function kindMatches(tags: string | null | undefined, kindFilter?: "memory" | "knowledge"): boolean {
 	if (!kindFilter) return true;
-	const isMemory = ("," + (tags ?? "") + ",").includes(",memory,");
+	const isMemory = hasMemoryTag(tags);
 	return kindFilter === "memory" ? isMemory : !isMemory;
 }
 

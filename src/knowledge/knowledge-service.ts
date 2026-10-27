@@ -21,7 +21,7 @@ import { LocalRetrievalProvider } from "./retrieval/local-retrieval.js";
 import { reciprocalRankFuse } from "./retrieval/rrf.js";
 import { webSearch, type WebSearchHit } from "./research/web-search.js";
 import type { EntryWithSnippet, KbGap, KnowledgeDoc, KnowledgeEntry, PendingChunk } from "./store.js";
-import { KnowledgeContentStore } from "./store.js";
+import { KnowledgeContentStore, hasMemoryTag } from "./store.js";
 import { clusterBySimilarity } from "./clustering.js";
 import type { ReindexReport, RetrievalHit } from "./types.js";
 import { VecStore } from "./vec-store.js";
@@ -58,7 +58,6 @@ export interface VectorStatus {
 /** Max retrieval slots a single query may spend on memory hits (see applySourceQuota). */
 const MEMORY_SEARCH_CAP = 3;
 /** Extra candidates fetched so the source quota can see past a wall of memory hits. */
-const QUOTA_OVERSCAN = 12;
 
 export class KnowledgeService {
 	private readonly store: KnowledgeContentStore;
@@ -300,21 +299,10 @@ export class KnowledgeService {
 
 	/** Whether a hit came from a memory entry (memory-tagged rows only). */
 	private isMemoryHit(hit: RetrievalHit): boolean {
-		return (hit.tags ?? "").split(",").some((t) => t.trim() === "memory");
+		return hasMemoryTag(hit.tags);
 	}
 
 	// --- retrieval ---
-	/**
-	 * Hybrid retrieval over knowledge + memory.
-	 *
-	 * Memory used to compete with knowledge for the SAME topK slots, so a pile
-	 * of personal facts could crowd out the technical document that answered the
-	 * question (and vice versa). Slots are now reserved per kind: memory is
-	 * capped at `MEMORY_SEARCH_CAP` per query with the remainder going to
-	 * knowledge. Over-quota memory hits are dropped rather than displacing
-	 * knowledge, because memory is also injected as a turn prefix — losing a
-	 * memory hit here costs recall, losing a knowledge hit costs the answer.
-	 */
 	/**
 	 * Layered retrieval over knowledge + memory.
 	 *
@@ -444,7 +432,7 @@ export class KnowledgeService {
 			})) continue;
 			// Partition BEFORE clustering or LLM calls. A combined model reply could
 			// otherwise carry another owner's facts even when output ids are split.
-			const memory = entry.tags.split(/[,，]/).some((t) => t.trim() === "memory");
+			const memory = hasMemoryTag(entry.tags);
 			const key = JSON.stringify([memory, entry.memory_scope ?? "profile", entry.memory_owner ?? ""]);
 			const entries = partitions.get(key) ?? [];
 			entries.push(entry);
@@ -477,7 +465,7 @@ export class KnowledgeService {
 					if (!entry || consumed.has(id)) continue;
 					// Durable facts are corrected explicitly via remember or archived
 					// by their administrator, not silently forgotten by a background LLM.
-					if (entry.tags.split(/[,，]/).some((t) => t.trim() === "memory")) continue;
+					if (hasMemoryTag(entry.tags)) continue;
 					if (extractCriticalValues(entry.content).length > 0) continue;
 					this.store.archiveEntry(id);
 					report.archived += 1;
