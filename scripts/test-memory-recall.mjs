@@ -129,7 +129,7 @@ test("recall records hit_count/last_used_at only for injected rows (decay feed)"
 	const a = write(store, "甲", "关于报表的偏好", { summary: "报表" });
 	const b = write(store, "乙", "关于排班的偏好", { summary: "排班" });
 
-	store.recallMemory({ ctx: { personOwner: PERSON }, query: "报表怎么做", limit: 1 });
+	store.recallMemory({ ctx: { personOwner: PERSON }, query: "这个报表的偏好是怎么样的", limit: 1 });
 	const rows = store.db.prepare("SELECT id, hit_count, last_used_at FROM kb_entries WHERE id IN (?, ?)").all(a.id, b.id);
 	const byId = new Map(rows.map((r) => [r.id, r]));
 	assert.equal(byId.get(a.id).hit_count, 1, "the injected row is counted");
@@ -151,15 +151,15 @@ test("stale rows lose their priors (decay) but are never deleted", (t) => {
 
 test("scope filtering still fails closed: another person's memory is never recalled", (t) => {
 	const store = freshStore(t);
-	write(store, "别人的秘密", "staff-2 的私人事实", { owner: "person:dingtalk:staff-2" });
-	write(store, "共享规则", "全配置共享事实", { scope: null, owner: null });
+	write(store, "别人的私人事实", "staff-2 的私人事实记录", { owner: "person:dingtalk:staff-2", ageDays: 1 });
+	write(store, "共享私人事实规则", "全配置共享的私人事实处理规则", { scope: null, owner: null, ageDays: 1 });
 
-	const mine = store.recallMemory({ ctx: { personOwner: PERSON }, query: "私人事实", limit: 10, minRelevance: 0 });
-	assert.ok(!mine.some((r) => r.title === "别人的秘密"), "cross-owner memory must never be recalled");
-	assert.ok(mine.some((r) => r.title === "共享规则"), "profile memory stays visible");
+	const mine = store.recallMemory({ ctx: { personOwner: PERSON }, query: "私人事实怎么处理", limit: 10 });
+	assert.ok(!mine.some((r) => r.title === "别人的私人事实"), "cross-owner memory must never be recalled");
+	assert.ok(mine.some((r) => r.title === "共享私人事实规则"), "profile memory stays visible");
 	// And with no verified actor at all:
-	const anon = store.recallMemory({ ctx: {}, query: "私人事实", limit: 10, minRelevance: 0 });
-	assert.deepEqual(anon.map((r) => r.title), ["共享规则"], "anonymous turns see profile memory only");
+	const anon = store.recallMemory({ ctx: {}, query: "私人事实怎么处理", limit: 10 });
+	assert.deepEqual(anon.map((r) => r.title), ["共享私人事实规则"], "anonymous turns see profile memory only");
 });
 
 test("recallTokens: CJK bigrams + latin words, bounded", () => {
@@ -285,4 +285,43 @@ test("P2: a normalized-equal-but-different raw title still raises a conflict", (
 	assert.equal(findTitleConflict("报告 交付方式", existing)?.title, "报告交付方式");
 	// The exact raw title IS the sanctioned overwrite path.
 	assert.equal(findTitleConflict("报告交付方式", existing), null);
+});
+
+// ── Review round 2 (2026-10-27) ───────────────────────────────────────
+
+test("R2-P1: a common word in the title cannot admit an unrelated message", (t) => {
+	const store = freshStore(t);
+	// Reviewer's probe: 「分析仪采购」 + a sports query sharing only 「分析」.
+	write(store, "分析仪采购", "采购需要审批", { summary: "分析仪采购需审批" });
+	const hits = store.recallMemory({
+		ctx: { personOwner: PERSON },
+		query: "请帮我分析昨天比赛的比分以及球员表现并预测下场比赛的胜负走势",
+		limit: 5,
+	});
+	assert.equal(hits.length, 0, `one shared word must not admit, got: ${hits.map((h) => `${h.title}(${h.relevance.toFixed(2)})`).join(", ")}`);
+});
+
+test("R2-P2: a query with no searchable tokens admits nothing (no dump-everything fallback)", (t) => {
+	const store = freshStore(t);
+	write(store, "午饭偏好", "午饭吃第 1 家", { summary: "午饭" });
+	write(store, "报告交付方式", "用可复制文本框", { summary: "文本框" });
+	for (const query of ["我能如何", "如何", "？", "可能", "不会"]) {
+		const hits = store.recallMemory({ ctx: { personOwner: PERSON }, query, limit: 10 });
+		assert.equal(hits.length, 0, `「${query}」 has no searchable tokens and must admit nothing, got ${hits.length}`);
+	}
+	// An EMPTY query still means "index mode" (recency), unchanged.
+	const indexed = store.recallMemory({ ctx: { personOwner: PERSON }, query: "", limit: 10 });
+	assert.equal(indexed.length, 2, "an empty query is still the recency index");
+});
+
+test("R2-P2: body-only relevance is admitted — content matches count", (t) => {
+	const store = freshStore(t);
+	// Title says "格式偏好" (no overlap); the body carries the题.
+	write(store, "格式偏好", "报告用可复制文本框交付", { summary: "报告用文本框" });
+	const hits = store.recallMemory({
+		ctx: { personOwner: PERSON },
+		query: "请梳理客户访谈纪要中的预算限制采购流程审批负责人交付节点然后输出报告",
+		limit: 5,
+	});
+	assert.ok(hits.length > 0, "a memory whose BODY matches the request must be admitted");
 });

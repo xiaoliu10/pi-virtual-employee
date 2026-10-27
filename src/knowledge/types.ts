@@ -41,6 +41,13 @@ export interface SearchRequest {
 	topK: number;
 	/** Verified scope context — person/conversation memory outside it is filtered out. */
 	memoryCtx?: { personOwner?: string; conversationOwner?: string };
+	/**
+	 * Restrict results to one source kind. The layered quota recalls memory and
+	 * knowledge in SEPARATE passes: a single pass whose candidate window happens
+	 * to be filled with memory hits cannot see knowledge at all, and the quota
+	 * then misreads "knowledge is scarce" and hands the slots to memory.
+	 */
+	kindFilter?: "memory" | "knowledge";
 }
 
 export interface HealthStatus {

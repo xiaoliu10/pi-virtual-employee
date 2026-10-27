@@ -283,15 +283,17 @@ export class KnowledgeService {
 	 * preserved (the fusion already ranked them); this only drops overflow.
 	 */
 	private applySourceQuota(hits: RetrievalHit[], topK: number): RetrievalHit[] {
+		if (topK <= 0) return [];
 		const memory = hits.filter((h) => this.isMemoryHit(h));
 		const others = hits.filter((h) => !this.isMemoryHit(h));
-		// Knowledge keeps a guaranteed floor; memory takes at most its own cap.
-		// Slots are only handed back to memory when knowledge genuinely has
-		// nothing left to fill them (checked against the overscanned candidate
-		// list, not against an already-truncated window).
-		const knowledgeFloor = Math.min(others.length, Math.max(0, topK - MEMORY_SEARCH_CAP));
-		const knowledgeCount = Math.max(knowledgeFloor, Math.min(others.length, topK - Math.min(memory.length, MEMORY_SEARCH_CAP)));
-		const memoryCount = Math.min(memory.length, topK - Math.min(knowledgeCount, topK));
+		// Knowledge keeps a guaranteed slot whenever it has anything to offer —
+		// including topK 1..3, where "topK - cap" used to be zero and memory owned
+		// every slot even though matching knowledge existed.
+		const knowledgeFloor = others.length > 0 ? Math.min(others.length, topK <= MEMORY_SEARCH_CAP ? 1 : topK - MEMORY_SEARCH_CAP) : 0;
+		const memoryCap = Math.min(memory.length, MEMORY_SEARCH_CAP);
+		// Knowledge takes its floor, then whatever memory does not claim.
+		const knowledgeCount = Math.min(others.length, Math.max(knowledgeFloor, topK - memoryCap));
+		const memoryCount = Math.min(memory.length, Math.max(0, topK - knowledgeCount));
 		const keep = new Set([...memory.slice(0, memoryCount), ...others.slice(0, knowledgeCount)].map((h) => h.id));
 		return hits.filter((h) => keep.has(h.id)).slice(0, topK);
 	}
@@ -313,18 +315,29 @@ export class KnowledgeService {
 	 * knowledge, because memory is also injected as a turn prefix — losing a
 	 * memory hit here costs recall, losing a knowledge hit costs the answer.
 	 */
+	/**
+	 * Layered retrieval over knowledge + memory.
+	 *
+	 * Memory used to compete with knowledge for the SAME topK slots, so personal
+	 * facts could crowd out the document that answered the question. The two are
+	 * now recalled in SEPARATE passes and interleaved under a per-kind budget.
+	 *
+	 * Separate passes, rather than one pass plus a candidate window: memory and
+	 * knowledge score on different scales, so one ranking can place an arbitrary
+	 * number of memory hits ahead of every knowledge hit. In that arrangement
+	 * knowledge falls outside ANY fixed overscan and the quota mistakes it for
+	 * absent — exactly the reviewer probe that returned six memory rows while a
+	 * matching document existed.
+	 */
 	async search(query: string, memoryCtx?: { personOwner?: string; conversationOwner?: string }): Promise<RetrievalHit[]> {
 		const kb = this.kb();
 		const topK = kb.local.topK;
-		// Ask for MORE than topK: the quota below must be able to see knowledge
-		// hits that rank below a wall of memory hits. Taking only topK+cap meant a
-		// run of memory hits pushed knowledge out of the candidate window entirely,
-		// and the quota then misread "no knowledge in window" as "knowledge is
-		// scarce" and handed every slot back to memory (review P2).
-		const localHits = await this.local.search({ query, topK: topK + MEMORY_SEARCH_CAP + QUOTA_OVERSCAN, memoryCtx });
-		const tiered = this.applySourceQuota(localHits, topK);
+		const [memoryHits, knowledgeHits] = await Promise.all([
+			this.local.search({ query, topK, memoryCtx, kindFilter: "memory" }),
+			this.local.search({ query, topK, memoryCtx, kindFilter: "knowledge" }),
+		]);
+		const tiered = this.applySourceQuota([...memoryHits, ...knowledgeHits], topK);
 		if (kb.mode !== "external") return tiered;
-		const localHitsRaw = tiered;
 
 		// mode is additive: local is primary, external source(s) extend coverage.
 		const externals = this.activeExternalProviders(kb);
@@ -344,10 +357,7 @@ export class KnowledgeService {
 		// 内置为主、外接仅作扩展：本地权重高于外接。外接 snippet 由对方服务端返回、
 		// 可能被截断，完整的本地内容应优先；本地命中不足 topK 时外接才补位。
 		const fused = reciprocalRankFuse<RetrievalHit>(
-			[
-				{ list: localHitsRaw, weight: 1 },
-				...externalLists.map((list) => ({ list, weight: 0.5 })),
-			],
+			[{ list: tiered, weight: 1 }, ...externalLists.map((list) => ({ list, weight: 0.5 }))],
 			(h) => h.chunkId,
 		);
 		return [...fused.values()]

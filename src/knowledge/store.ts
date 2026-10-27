@@ -109,6 +109,13 @@ export function docSource(displayName: string): string {
  * long message does not drag in every loosely-related row.
  */
 const DEFAULT_MIN_RELEVANCE = 0.12;
+/**
+ * Absolute-overlap floor that works alongside the coverage ratio: 「报告」 inside
+ * a 33-token request is 3% coverage but the right memory, and a short query
+ * sharing 2 bigrams is a precise match. Two distinct tokens is enough to mean
+ * "this is about the same thing".
+ */
+const MIN_MATCHED_TOKENS = 2;
 
 export class KnowledgeContentStore {
 	private readonly ftsSupported: boolean;
@@ -229,7 +236,12 @@ export class KnowledgeContentStore {
 		if (rows.length === 0) return [];
 
 		const tokens = recallTokens(input.query ?? "");
-		const hasQuery = tokens.length > 0;
+		// Distinguish "no query" (index mode: recency order) from "query provided
+		// but nothing searchable in it" (e.g. 「如何」「？」). The latter must NOT
+		// fall back to dumping every memory — that reopened the pollution this
+		// whole change exists to close.
+		const hasQuery = (input.query ?? "").trim().length > 0;
+		const searchable = tokens.length > 0;
 		const minRelevance = input.minRelevance ?? DEFAULT_MIN_RELEVANCE;
 
 		const scored = rows.map((row) => {
@@ -241,14 +253,20 @@ export class KnowledgeContentStore {
 				if ((row.hit_count ?? 0) > 0) prior += Math.min(0.5, Math.log1p(row.hit_count ?? 0) / 4);
 			}
 			let relevance = 0;
-			if (hasQuery) {
+			let titleBonus = 0;
+			let matchedTokens = 0;
+			let titleHitsCount = 0;
+			if (hasQuery && searchable) {
 				const hay = `${row.title} ${row.memory_summary ?? ""} ${row.content}`.toLowerCase();
 				const titleHay = row.title.toLowerCase();
 				let covered = 0;
 				let titleHits = 0;
 				for (const token of tokens) {
 					if (titleHay.includes(token)) {
-						covered += 1;
+						// A title token is the deliberate subject of the fact: it counts
+						// double toward the absolute-overlap floor (one shared title
+						// bigram such as 「报告」 is a real match, a body-only one is not).
+						covered += 2;
 						titleHits += 1;
 					} else if (hay.includes(token)) {
 						covered += 1;
@@ -256,18 +274,47 @@ export class KnowledgeContentStore {
 				}
 				// COVERAGE, not raw hit volume: a single shared bigram must not look
 				// like a topical match (「事」 in 「杂事7」 used to tie a real one).
-				relevance = covered / tokens.length;
-				// A title hit is a deliberate topical match, not incidental overlap:
-				// give it enough weight that a short message naming the topic recalls.
-				if (titleHits) relevance = Math.min(1, relevance + 0.25);
+				relevance = Math.min(1, covered / tokens.length);
+				matchedTokens = covered;
+				// The title bonus only RANKS admitted rows — it must not admit on its
+				// own. Adding it to relevance let one common word in a title (「分析」)
+				// clear the floor for a completely unrelated message.
+				titleBonus = titleHits ? Math.min(0.2, (titleHits / tokens.length) * 0.4) : 0;
+				titleHitsCount = titleHits;
 			}
-			return { ...row, prior, relevance, recallScore: 0 };
+			return { ...row, prior, relevance, titleBonus, matchedTokens, titleHits: titleHitsCount, recallScore: 0 };
 		});
 
-		// Admission: with a query, off-topic rows never enter the budget.
-		const admitted = hasQuery ? scored.filter((row) => row.relevance >= minRelevance) : scored;
+		// Admission.
+		//   no query        → index mode, priors only (old behavior)
+		//   query, no token → nothing searchable: admit nothing rather than dump all
+		//   query + tokens  → only rows clearing the coverage floor
+		// Admission rules, derived from measured scenarios rather than a bare ratio:
+		//
+		//   case                         cov  ratio  titleHits   want
+		//   短查询命中标题                  2   0.167     1         admit
+		//   长查询正文单点                   2   0.061     0         admit
+		//   无关但共用标题里的常见词            2   0.077     1         reject
+		//   强命中                        8   0.615     3         admit
+		//
+		// A ratio floor alone admits the third case and rejects the second; an
+		// absolute floor alone admits the third. What actually separates them:
+		// a TITLE hit is only meaningful when the message also covers a real
+		// share of the topic (otherwise any memory titled with a common word
+		// becomes self-admitting), while a BODY hit needs no such corroboration
+		// because incidental body overlap is far rarer than an incidental title
+		// word.
+		const admitted = hasQuery
+			? searchable
+				? scored.filter((row) => {
+						if (row.matchedTokens < MIN_MATCHED_TOKENS) return false;
+						if (row.titleHits > 0) return row.relevance >= minRelevance;
+						return true; // body-only overlap: dilution is expected in long queries
+					})
+				: []
+			: scored;
 		for (const row of admitted) {
-			row.recallScore = hasQuery ? row.relevance * 10 + row.prior : row.prior;
+			row.recallScore = hasQuery ? row.relevance * 10 + row.titleBonus + row.prior : row.prior;
 		}
 
 		const scopeRank = (scope: string | null | undefined): number =>

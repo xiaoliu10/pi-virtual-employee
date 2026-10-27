@@ -50,11 +50,11 @@ export class LocalRetrievalProvider implements RetrievalProvider {
 
 		// BM25 recall — always available (the fallback floor).
 		const bm25Rows = this.ftsEnabled()
-			? this.ftsSearch(trimmed, limit)
-			: this.likeSearch(trimmed, limit);
+			? this.ftsSearch(trimmed, limit, req.kindFilter)
+			: this.likeSearch(trimmed, limit, req.kindFilter);
 
 		// Vector recall — optional, degrades to BM25-only on any failure.
-		const vectorRows = await this.vectorRecall(trimmed, limit, cfg);
+		const vectorRows = await this.vectorRecall(trimmed, limit, cfg, req.kindFilter);
 
 		// Compute per-component RRF contributions so callers see real scores
 		// (instead of the previous hardcoded { bm25: 1 }).
@@ -148,6 +148,7 @@ export class LocalRetrievalProvider implements RetrievalProvider {
 		query: string,
 		limit: number,
 		cfg: LocalRetrievalConfig,
+		kindFilter?: "memory" | "knowledge",
 	): Promise<ChunkRow[]> {
 		const vec = this.opts.vec;
 		if (cfg.vectorWeight <= 0 || !vec?.isAvailable() || !cfg.embed) return [];
@@ -159,7 +160,8 @@ export class LocalRetrievalProvider implements RetrievalProvider {
 			// Preserve KNN order (already sorted by distance) for RRF ranking.
 			return knn
 				.map((h) => byId.get(h.chunkId))
-				.filter((r): r is ChunkRow => !!r);
+				.filter((r): r is ChunkRow => !!r)
+				.filter((r) => kindMatches(r.tags, kindFilter));
 		} catch (err) {
 			console.warn("[knowledge] vector recall failed, using BM25 only:", (err as Error).message);
 			return [];
@@ -182,7 +184,7 @@ export class LocalRetrievalProvider implements RetrievalProvider {
 		return this.opts.store.ftsEnabled();
 	}
 
-	private ftsSearch(query: string, limit: number): ChunkRow[] {
+	private ftsSearch(query: string, limit: number, kindFilter?: "memory" | "knowledge"): ChunkRow[] {
 		const ftsQuery = toFtsQuery(query);
 		return this.opts.db
 			.prepare(
@@ -191,24 +193,43 @@ export class LocalRetrievalProvider implements RetrievalProvider {
 				        c.metadata AS metadata, c.embed_status AS embed_status,
 				        c.embedding_model AS embedding_model
 				 FROM kb_chunks_fts JOIN kb_chunks c ON c.rowid = kb_chunks_fts.rowid
-				 WHERE kb_chunks_fts MATCH ?
+				 WHERE kb_chunks_fts MATCH ?${kindClause("c.tags", kindFilter)}
 				 ORDER BY rank LIMIT ?`,
 			)
 			.all(ftsQuery, limit) as ChunkRow[];
 	}
 
-	private likeSearch(query: string, limit: number): ChunkRow[] {
+	private likeSearch(query: string, limit: number, kindFilter?: "memory" | "knowledge"): ChunkRow[] {
 		const pattern = `%${query.replace(/[%_]/g, (m) => "\\" + m)}%`;
 		return this.opts.db
 			.prepare(
 				`SELECT id, source, source_id, title, tags, content, chunk_index, metadata,
 				        embed_status, embedding_model
 				 FROM kb_chunks
-				 WHERE content LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\'
+				 WHERE (content LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\')${kindClause("tags", kindFilter)}
 				 ORDER BY updated_at DESC LIMIT ?`,
 			)
 			.all(pattern, pattern, limit) as ChunkRow[];
 	}
+}
+
+
+/**
+ * SQL fragment restricting a chunk row to one source kind. Chunks copy the
+ * entry's comma-wrapped tags at index time, so "memory" is detectable here.
+ * undefined = no restriction (single-pass search).
+ */
+function kindClause(tagsColumn: string, kindFilter?: "memory" | "knowledge"): string {
+	if (!kindFilter) return "";
+	return kindFilter === "memory"
+		? ` AND (',' || COALESCE(${tagsColumn}, '') || ',') LIKE '%,memory,%'`
+		: ` AND (',' || COALESCE(${tagsColumn}, '') || ',') NOT LIKE '%,memory,%'`;
+}
+
+function kindMatches(tags: string | null | undefined, kindFilter?: "memory" | "knowledge"): boolean {
+	if (!kindFilter) return true;
+	const isMemory = ("," + (tags ?? "") + ",").includes(",memory,");
+	return kindFilter === "memory" ? isMemory : !isMemory;
 }
 
 function toHit(row: ChunkRow): RetrievalHit {
