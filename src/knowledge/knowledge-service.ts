@@ -55,6 +55,9 @@ export interface VectorStatus {
 	failed: number;
 }
 
+/** Max retrieval slots a single query may spend on memory hits (see applySourceQuota). */
+const MEMORY_SEARCH_CAP = 3;
+
 export class KnowledgeService {
 	private readonly store: KnowledgeContentStore;
 	private readonly vec: VecStore;
@@ -139,9 +142,20 @@ export class KnowledgeService {
 		return result;
 	}
 
-	/** Compact memory index for prompt injection (one line per entry), scope-filtered. */
-	listMemoryIndex(ctx: { personOwner?: string; conversationOwner?: string } = {}, limit = 30): { id: string; title: string; snippet: string; updatedAt: number; scope: string | null }[] {
-		return this.store.listMemoryForContext(ctx, limit).map((e) => ({
+	/**
+	 * Compact memory index for prompt injection (one line per entry), scope-filtered.
+	 *
+	 * `query`: the current user message. When present, recall is RELEVANCE
+	 * ranked and only what the turn can plausibly need is injected — the old
+	 * flat "newest 30" index paid a fixed token cost every turn and silently
+	 * truncated older durable facts once the cap was reached.
+	 */
+	listMemoryIndex(
+		ctx: { personOwner?: string; conversationOwner?: string } = {},
+		limit = 30,
+		query?: string,
+	): { id: string; title: string; snippet: string; updatedAt: number; scope: string | null }[] {
+		return this.store.recallMemory({ ctx, limit, query }).map((e) => ({
 			id: e.id,
 			title: e.title,
 			// Independent summary hook when present; otherwise fall back to title
@@ -228,16 +242,51 @@ export class KnowledgeService {
 		return chunks;
 	}
 
+	/**
+	 * Reserve retrieval slots per source kind: memory is capped so it cannot own
+	 * the whole topK, and knowledge keeps at least the remainder. Order is
+	 * preserved (the fusion already ranked them); this only drops overflow.
+	 */
+	private applySourceQuota(hits: RetrievalHit[], topK: number): RetrievalHit[] {
+		const memory = hits.filter((h) => this.isMemoryHit(h));
+		const others = hits.filter((h) => !this.isMemoryHit(h));
+		const allowedMemory = Math.min(memory.length, MEMORY_SEARCH_CAP);
+		// Knowledge fills the rest; when knowledge is scarce, unused memory slots
+		// are handed back rather than returned empty.
+		const allowedOther = Math.max(0, Math.min(others.length, topK - Math.min(allowedMemory, topK)));
+		const memoryBudget = Math.min(memory.length, Math.max(allowedMemory, topK - allowedOther));
+		const keep = new Set([...memory.slice(0, memoryBudget), ...others.slice(0, allowedOther)].map((h) => h.id));
+		return hits.filter((h) => keep.has(h.id)).slice(0, topK);
+	}
+
+	/** Whether a hit came from a memory entry (memory-tagged rows only). */
+	private isMemoryHit(hit: RetrievalHit): boolean {
+		return (hit.tags ?? "").split(",").some((t) => t.trim() === "memory");
+	}
+
 	// --- retrieval ---
+	/**
+	 * Hybrid retrieval over knowledge + memory.
+	 *
+	 * Memory used to compete with knowledge for the SAME topK slots, so a pile
+	 * of personal facts could crowd out the technical document that answered the
+	 * question (and vice versa). Slots are now reserved per kind: memory is
+	 * capped at `MEMORY_SEARCH_CAP` per query with the remainder going to
+	 * knowledge. Over-quota memory hits are dropped rather than displacing
+	 * knowledge, because memory is also injected as a turn prefix — losing a
+	 * memory hit here costs recall, losing a knowledge hit costs the answer.
+	 */
 	async search(query: string, memoryCtx?: { personOwner?: string; conversationOwner?: string }): Promise<RetrievalHit[]> {
 		const kb = this.kb();
 		const topK = kb.local.topK;
-		const localHits = await this.local.search({ query, topK, memoryCtx });
-		if (kb.mode !== "external") return localHits;
+		const localHits = await this.local.search({ query, topK: topK + MEMORY_SEARCH_CAP, memoryCtx });
+		const tiered = this.applySourceQuota(localHits, topK);
+		if (kb.mode !== "external") return tiered;
+		const localHitsRaw = tiered;
 
 		// mode is additive: local is primary, external source(s) extend coverage.
 		const externals = this.activeExternalProviders(kb);
-		if (externals.length === 0) return localHits;
+		if (externals.length === 0) return tiered;
 
 		const externalLists = await Promise.all(
 			externals.map(async (cfg) => {
@@ -254,7 +303,7 @@ export class KnowledgeService {
 		// 可能被截断，完整的本地内容应优先；本地命中不足 topK 时外接才补位。
 		const fused = reciprocalRankFuse<RetrievalHit>(
 			[
-				{ list: localHits, weight: 1 },
+				{ list: localHitsRaw, weight: 1 },
 				...externalLists.map((list) => ({ list, weight: 0.5 })),
 			],
 			(h) => h.chunkId,

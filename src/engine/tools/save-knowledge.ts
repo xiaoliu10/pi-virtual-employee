@@ -2,6 +2,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { KnowledgeService } from "../../knowledge/knowledge-service.js";
 import { deriveMemoryContext, ownerForScope, type MemoryScope } from "../../knowledge/memory-scope.js";
+import { CONFLICT_HINT_TEMPLATE, findTitleConflict, looksShortLived, memoryPhrasingHint } from "../../knowledge/memory-write.js";
 import { isLocalConversation, resolveRole, type Role } from "../../security/permissions.js";
 import type { ConfigStore } from "../../db/config-store.js";
 import type { InboundActor } from "../../im/types.js";
@@ -133,7 +134,9 @@ export function createRememberTool(deps: {
 		description:
 			"把长期事实写入记忆：对方的偏好、对做法的纠正、稳定环境情况（「我是…」「以后…」「记住…」「别再…」）。" +
 			"记忆默认按本人隔离（这个人在任何会话都生效）；明确说「本群/这个群记住」时按当前群隔离；明确要求「所有人/全局记住」时写入全配置共享记忆（仅管理员）。" +
-			"不要用于客观知识（规则/流程/地址 → save_to_knowledge）或操作步骤（→ save_to_skill）。同范围同标题重存会纠正覆盖旧记忆。",
+			"不要用于客观知识（规则/流程/地址 → save_to_knowledge）或操作步骤（→ save_to_skill）。同范围同标题重存会纠正覆盖旧记忆。" +
+			"**正文写成陈述事实，不要写祈使句**（「对方偏好可复制文本框」✓，「始终用可复制文本框」✗——记忆会被后续会话当作命令执行，可能压过对方当时的真实诉求）。" +
+			"**一周内就会过时的事不要写进记忆**（「今天/明天下单」这类），只记长期稳定的部分。",
 		parameters: Type.Object({
 			title: Type.String({ description: "记忆标题，简明点名主题（如「张工偏好：prompt 用可复制文本框交付」）" }),
 			content: Type.String({ description: "记忆正文：一到三句话写清事实与适用语境；纠正时直接写新事实，不要包含已作废的旧说法" }),
@@ -189,6 +192,33 @@ export function createRememberTool(deps: {
 				}
 
 				const summary = p.summary?.trim().slice(0, 120) || p.title.trim().slice(0, 120);
+
+				// Write-time advisories. All are non-blocking hints: the fact is still
+				// persisted (a rejected memory is a lost fact), but the model is told
+				// what will rot or collide so it can correct itself in the same turn.
+				const advisories: string[] = [];
+				// Conflict detection is an advisory, never a precondition: a read
+				// failure must not block persisting a fact the user asked to remember.
+				const siblings = (() => {
+					try {
+						return deps.knowledge
+							.listMemoryIndex({ personOwner: ctx.personOwner, conversationOwner: ctx.conversationOwner }, 50)
+							.map((m) => ({ id: m.id, title: m.title, summary: m.snippet }));
+					} catch {
+						return [];
+					}
+				})();
+				const nearDup = findTitleConflict(p.title, siblings);
+				if (nearDup) {
+					advisories.push(
+						CONFLICT_HINT_TEMPLATE.replace("{title}", nearDup.title).replace("{summary}", nearDup.summary || "无摘要"),
+					);
+				}
+				const shortLived = looksShortLived(p.content);
+				if (shortLived) advisories.push(shortLived);
+				const phrasing = memoryPhrasingHint(p.content);
+				if (phrasing) advisories.push(phrasing);
+
 				const r = deps.knowledge.saveMemory({
 					title: p.title,
 					content: p.content,
@@ -204,7 +234,10 @@ export function createRememberTool(deps: {
 						: "（当前会话不满足群级记忆条件，已按你本人记忆保存。）"
 					: "";
 				return {
-					content: [{ type: "text", text: (r.merged ? `已更新${scopeLabel}记忆「${p.title}」（旧内容已纠正覆盖）。` : `已记住${scopeLabel}记忆「${p.title}」，之后相关会话自动携带。`) + downgradeNote }],
+					content: [{ type: "text", text:
+						(r.merged ? `已更新${scopeLabel}记忆「${p.title}」（旧内容已纠正覆盖）。` : `已记住${scopeLabel}记忆「${p.title}」，之后相关会话自动携带。`) +
+						downgradeNote +
+						(advisories.length ? `\n\n${advisories.join("\n")}` : "") }],
 					details: { ok: true, id: r.id, merged: r.merged, scope, owner, downgradedFrom },
 				};
 			} catch (err) {

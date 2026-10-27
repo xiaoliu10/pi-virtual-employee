@@ -166,6 +166,131 @@ export class KnowledgeContentStore {
 	}
 
 	/**
+	 * Relevance-ranked recall for prompt injection — the replacement for
+	 * "dump the newest 30 rows every turn".
+	 *
+	 * Why this exists: the flat index paid a fixed token cost per turn AND
+	 * silently truncated the oldest rows once a person exceeded `limit`, so a
+	 * durable fact ("交付报告时用可复制文本框") could be crowded out by a week of
+	 * trivial ones. Recall now scores each candidate against the CURRENT user
+	 * message and injects only what the turn can plausibly need.
+	 *
+	 * Scoring (a small additive prior + text relevance):
+	 *   - text relevance: distinct query tokens present in title+summary+content,
+	 *     weighted higher for title hits. Deliberately not BM25/FTS: memory rows
+	 *     are few (tens), the query is a chat message, and a plain token tally
+	 *     keeps the behavior explainable in tests.
+	 *   - update-overwrite memories carry "the current truth", so a recent row
+	 *     keeps a small recency prior; heavily-recalled rows keep a usage prior.
+	 *   - decay: rows untouched for `staleDays` lose their priors, so a forgotten
+	 *     fact stops competing for the fixed budget. Nothing is deleted — it stays
+	 *     reachable by an explicit search and comes back if edited.
+	 *
+	 * scope-first ordering survives as a tiebreak: conversation > person >
+	 * profile, because the more specific scope is the likelier intent.
+	 */
+	recallMemory(input: {
+		ctx: { personOwner?: string; conversationOwner?: string };
+		/** Current user message; empty means "no query" → recency-only index. */
+		query?: string;
+		limit?: number;
+		/** Rows older than this many days lose their priors (default 90). */
+		staleDays?: number;
+		now?: number;
+	}): Array<KnowledgeEntry & { recallScore: number }> {
+		const limit = Math.max(1, input.limit ?? 30);
+		const now = input.now ?? Date.now();
+		const staleMs = Math.max(1, input.staleDays ?? 90) * 24 * 60 * 60 * 1000;
+		const rows = this.listMemoryCandidates(input.ctx);
+		if (rows.length === 0) return [];
+
+		const tokens = recallTokens(input.query ?? "");
+		const scored = rows.map((row) => {
+			const age = Math.max(0, now - (row.updated_at || 0));
+			const fresh = age <= staleMs;
+			// Priors are small on purpose: relevance must dominate. Without a query
+			// the priors ARE the whole signal, which reproduces the old
+			// "most recent first" behavior (backwards compatible).
+			let score = 0;
+			if (fresh) {
+				score += 1 / (1 + age / (24 * 60 * 60 * 1000)); // ≤1, halves per day
+				if ((row.hit_count ?? 0) > 0) score += Math.min(0.5, Math.log1p(row.hit_count ?? 0) / 4);
+			}
+			if (tokens.length) {
+				const hay = `${row.title} ${row.memory_summary ?? ""} ${row.content}`.toLowerCase();
+				const titleHay = row.title.toLowerCase();
+				let hits = 0;
+				let covered = 0;
+				for (const token of tokens) {
+					const inTitle = titleHay.includes(token);
+					const anywhere = inTitle || hay.includes(token);
+					if (anywhere) covered += 1;
+					if (inTitle) hits += 2; // a title hit is a stronger signal
+					else if (anywhere) hits += 1;
+				}
+				// COVERAGE, not raw hit volume, is what separates a real match from an
+				// incidental one: a single shared bigram ("事" in 「杂事7」) used to
+				// score the same per-token as a genuine topical match, so trivia could
+				// outrank the fact the message was actually about. Score on the
+				// fraction of the query's tokens this memory covers, then let title
+				// hits add a bounded bonus.
+				const coverage = covered / Math.max(1, tokens.length);
+				score += Math.min(6, coverage * 6) + Math.min(1.5, (hits / Math.max(1, tokens.length)) * 1.5);
+			}
+			return { ...row, recallScore: score };
+		});
+
+		const scopeRank = (scope: string | null | undefined): number =>
+			scope === "conversation" ? 0 : scope === "person" ? 1 : 2;
+		scored.sort((a, b) => {
+			// With a query, relevance first; without one, scope+recency (old order).
+			if (tokens.length && b.recallScore !== a.recallScore) return b.recallScore - a.recallScore;
+			const byScope = scopeRank(a.memory_scope) - scopeRank(b.memory_scope);
+			if (byScope !== 0) return byScope;
+			return (b.updated_at || 0) - (a.updated_at || 0);
+		});
+		const picked = scored.slice(0, limit);
+		// Telemetry: only rows actually injected count as recalled.
+		if (picked.length) this.markRecalled(picked.map((r) => r.id), now);
+		return picked;
+	}
+
+	/** Visible-memory candidates for a context (no ordering, no limit cap). */
+	private listMemoryCandidates(ctx: { personOwner?: string; conversationOwner?: string }): KnowledgeEntry[] {
+		const parts = ["(memory_scope IS NULL OR memory_scope = 'profile')"];
+		const params: (string | number)[] = [];
+		if (ctx.personOwner) {
+			parts.push("(memory_scope = 'person' AND memory_owner = ?)");
+			params.push(ctx.personOwner);
+		}
+		if (ctx.conversationOwner) {
+			parts.push("(memory_scope = 'conversation' AND memory_owner = ?)");
+			params.push(ctx.conversationOwner);
+		}
+		return this.db
+			.prepare(
+				`SELECT * FROM kb_entries
+				 WHERE archived = 0
+				   AND (',' || COALESCE(tags, '') || ',') LIKE '%,memory,%'
+				   AND (${parts.join(" OR ")})`,
+			)
+			.all(...params) as KnowledgeEntry[];
+	}
+
+	/**
+	 * Record a recall (feeds decay + usage prior). Reuses the existing
+	 * hit_count/last_used_at feedback columns — no parallel telemetry columns.
+	 * Best effort: never blocks injection.
+	 */
+	markRecalled(ids: string[], now = Date.now()): void {
+		if (!ids.length) return;
+		const stmt = this.db.prepare("UPDATE kb_entries SET last_used_at = ?, hit_count = hit_count + 1 WHERE id = ?");
+		this.db.transaction(() => {
+			for (const id of ids) stmt.run(now, id);
+		})();
+	}
+
+	/**
 	 * Corrective memory write: one durable fact keyed by (scope, owner, title).
 	 * Same key REPLACES content/summary in place (update-overwrite), rebuilds
 	 * chunks, and bumps version — a correction must never append the old fact.
@@ -800,4 +925,17 @@ function unionTags(...parts: string[]): string {
 		.map((s) => s.trim())
 		.filter(Boolean);
 	return [...new Set(all)].join(",");
+}
+
+/** Latin word / CJK bigram tokens for memory recall scoring. */
+export function recallTokens(query: string): string[] {
+	if (!query) return [];
+	const lower = query.toLowerCase();
+	const tokens = new Set<string>();
+	for (const word of lower.match(/[a-z0-9_]{2,}/g) ?? []) tokens.add(word);
+	// CJK has no spaces: bigrams are the standard cheap proxy.
+	for (const run of lower.match(/[\u4e00-\u9fff]{2,}/g) ?? []) {
+		for (let i = 0; i + 2 <= run.length; i += 1) tokens.add(run.slice(i, i + 2));
+	}
+	return [...tokens].slice(0, 40);
 }
