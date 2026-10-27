@@ -100,8 +100,25 @@ const URL_TOKEN_PARAM_SOURCE_BODY =
  * dead report links (private chats were exempt, hence "works for me" reports).
  * A Gitee raw_with_token URL is the OPPOSITE case and stays redacted: its
  * access_token is a long-lived personal token with API-wide scope.
+ *
+ * The exemption is TWO-FACTOR (review P1/P2): only the grant-carrying param
+ * ASSIGNMENTS (name+value) inside the URL are exempt — any other credential param in the same
+ * URL (access_token, password, ...) is redacted as usual, so a fake
+ * "&OSSAccessKeyId=x&Signature=y" marker cannot smuggle a credential URL
+ * through; and only aliyuncs.com/amazonaws.com hosts qualify, so "Signature="
+ * on an arbitrary host is never mistaken for a grant.
  */
 function isPresignedObjectUrl(url: string): boolean {
+	// Host allowlist first (review P2): without it, ANY host's "Signature=<real
+	// secret>" param would be treated as an access grant and left in place.
+	// Only object-storage hosts we actually generate report links on qualify.
+	let host = "";
+	try {
+		host = new URL(url).hostname.toLowerCase();
+	} catch {
+		return false;
+	}
+	if (!host.endsWith(".aliyuncs.com") && !host.endsWith(".amazonaws.com")) return false;
 	return (
 		(/[?&]OSSAccessKeyId=/.test(url) && /[?&]Signature=/.test(url)) ||
 		(/[?&]X-Amz-Signature=/.test(url) && /[?&]X-Amz-Credential=/.test(url))
@@ -113,13 +130,33 @@ const OBJECT_URL_SPAN_PATTERN = /https?:\/\/[^\s<>"']+/g;
 /** CJK/bracket punctuation that glues onto a URL in prose but is not part of it. */
 const URL_TRAILING_NOISE = /[)\]}>，。；！？、）】」』”’…]+$/;
 
-function presignedUrlSpans(text: string): Array<[number, number]> {
+/**
+ * The param names whose values are the presigned grant itself — exactly the
+ * OSS/AWS entries of URL_TOKEN_PARAM_SOURCE_BODY. Everything else in the same
+ * URL (access_token, password, token, ...) stays subject to redaction: a fake
+ * "&OSSAccessKeyId=x&Signature=y" marker must never rescue a credential URL
+ * (review P1 — the exemption is per-param, never per-URL).
+ */
+const PRESIGNED_PARAM_PATTERN = /([?&](?:OSSAccessKeyId|Signature|X-Amz-Signature|X-Amz-Credential)=)([^\s&"']*)/gi;
+
+/**
+ * Char spans of the grant-carrying param ASSIGNMENTS (name + = + value) inside
+ * presigned URLs. The name must be masked along with the value: param names
+ * like X-Amz-Credential contain detector label words ("credential"), and a
+ * value-only mask would leave "credential=<next params>" — a label+value shape
+ * assembled from the leftovers — for the detector to trip on.
+ */
+function presignedParamSpans(text: string): Array<[number, number]> {
 	const spans: Array<[number, number]> = [];
 	if (!text) return spans;
 	for (const match of text.matchAll(OBJECT_URL_SPAN_PATTERN)) {
 		const url = match[0].replace(URL_TRAILING_NOISE, "");
-		const end = match.index + url.length;
-		if (url && isPresignedObjectUrl(url)) spans.push([match.index, end]);
+		const start = match.index;
+		const end = start + url.length;
+		if (!url || !isPresignedObjectUrl(url)) continue;
+		for (const param of text.slice(start, end).matchAll(PRESIGNED_PARAM_PATTERN)) {
+			spans.push([start + param.index, start + param.index + param[0].length]);
+		}
 	}
 	return spans;
 }
@@ -156,7 +193,7 @@ export function containsConcreteCredential(text: string): boolean {
 }
 
 /**
- * Detection over text with certain spans pre-cleared (the presigned-URL spans):
+ * Detection over text with certain spans pre-cleared (the presigned grant-param VALUE spans):
  * the query params inside a protected URL are an access grant, not a credential
  * leak, so they must not trip the detector either — otherwise gateOutboundText
  * would withhold the whole message for the link it just chose to deliver.
@@ -170,7 +207,7 @@ function containsConcreteCredentialIn(text: string, protectedSpans: Array<[numbe
 		const parts: string[] = [];
 		let cursor = 0;
 		for (const [start, end] of protectedSpans) {
-			parts.push(text.slice(cursor, start), "\u0002".repeat(end - start));
+			parts.push(text.slice(cursor, start));
 			cursor = end;
 		}
 		parts.push(text.slice(cursor));
@@ -215,20 +252,23 @@ const URL_TOKEN_PARAM_GLOBAL = new RegExp(
  * to the full withhold.
  */
 function redactUrlCredentialParams(text: string): string {
-	const spans = presignedUrlSpans(text);
+	const spans = presignedParamSpans(text);
 	if (!spans.length) return text.replace(URL_TOKEN_PARAM_GLOBAL, (_m, prefix: string) => `${prefix}***`);
-	const inPresigned = (offset: number) => spans.some(([start, end]) => offset >= start && offset < end);
+	// spans cover the whole assignment while the callback match is the same
+	// assignment — the overlap test below is an exact containment in practice.
+	const inPresigned = (offset: number, length: number) =>
+		spans.some(([valueStart, valueEnd]) => offset < valueEnd && offset + length > valueStart);
 	return text.replace(URL_TOKEN_PARAM_GLOBAL, (match, prefix: string, _value: string, offset: number) =>
-		inPresigned(offset) ? match : `${prefix}***`);
+		inPresigned(offset, match.length) ? match : `${prefix}***`);
 }
 
 export function gateOutboundText(text: string, audience: CredentialAudience): string {
 	if (audience === "admin-single") return text;
 	const redacted = redactUrlCredentialParams(text);
-	// Presigned spans are recomputed on the REDACTED text: redaction may have
-	// shifted offsets (spans were computed against the original), and the
-	// presigned URLs themselves are untouched by the redaction.
-	if (containsConcreteCredentialIn(redacted, presignedUrlSpans(redacted))) {
+	// Exempt param spans are recomputed on the REDACTED text: redaction may have
+	// shifted offsets (spans were computed against the original), and the exempt
+	// param values themselves are untouched by the redaction.
+	if (containsConcreteCredentialIn(redacted, presignedParamSpans(redacted))) {
 		return CREDENTIAL_WITHHELD_NOTICE;
 	}
 	return redacted !== text ? redacted : text;
