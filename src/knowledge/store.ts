@@ -124,14 +124,37 @@ const DEFAULT_MIN_RELEVANCE = 0.12;
 const IDF_FLOOR = 0.08;
 
 /**
- * When exactly one ask token matches, that token alone must carry the match.
- * A rare token (high IDF) clears this easily; a common one ("分析", "报告")
- * does not — which is the whole point: one generic word is not a topic.
+ * A matching token only identifies a fact when it is SPECIFIC: it must not
+ * appear in too large a share of the whole memory corpus. Specificity is the
+ * linear form  (N - df) / (N - 1):
+ *   a token in 1 of N facts        → 1.0 (the discriminator, e.g. "Zeiss")
+ *   a token in every fact          → 0   (filler that cannot pick one fact)
+ *   a token in 4 of 6 facts        → 0.4 (generic, e.g. "报告")
+ *
+ * This replaces an earlier single-token rule keyed on relevance, which was
+ * dead: with one token, relevance = weight/weight is always 1.0 regardless of
+ * how common that token is, so IDF was normalized away and a single common
+ * word admitted a whole wall of facts.
+ *
+ * 0.5 ⇒ the rarest matching token may appear in at most ~half the corpus.
  */
-const MIN_SINGLE_TOKEN_RELEVANCE = 0.45;
+const TOKEN_SPECIFICITY_FLOOR = 0.5;
 
-/** Relevance floor for a row matching several ask tokens. */
-const MIN_MATCHED_TOKENS = 2;
+/**
+ * For a fact matching exactly ONE ask token, that token must cover at least
+ * this share of the ask. A one-word question ("Zeiss") covers 1.0 and passes;
+ * a single incidental hit inside a long question (1/26 = 0.038) does not.
+ */
+const SINGLE_HIT_MIN_COVERAGE = 0.3;
+
+/** Document specificity of a token given corpus size N and document frequency df. */
+function tokenSpecificity(df: number, n: number): number {
+	if (n <= 1) return 1; // a single-fact corpus: any hit is the whole topic
+	if (df <= 1) return 1;
+	return Math.max(0, (n - df) / (n - 1));
+}
+
+
 
 export class KnowledgeContentStore {
 	private readonly ftsSupported: boolean;
@@ -297,6 +320,8 @@ export class KnowledgeContentStore {
 			let titleBonus = 0;
 			let matchedTokens = 0;
 			let titleHitsCount = 0;
+			let bestSpecificity = 0;
+			let rawCoverage = 0;
 			if (hasQuery && searchable) {
 				const hay = `${row.title} ${row.memory_summary ?? ""} ${row.content}`.toLowerCase();
 				const titleHay = row.title.toLowerCase();
@@ -305,25 +330,37 @@ export class KnowledgeContentStore {
 				let totalWeight = 0;
 				let coveredWeight = 0;
 				let titleWeight = 0;
+				let hasAnchor = false;
 				for (const token of scoringTokens) {
-					const weight = Math.max(idf(token), IDF_FLOOR);
+					const df = docFreq.get(token) ?? 0;
+					// A token no fact contains is unrelated to the whole corpus;
+					// it carries no weight (a floor here inflates a single incidental
+					// hit: one IDF-1.0 word against 25 zero-df words still scored 0.33).
+					const idfVal = idf(token);
+					const weight = df > 0 ? Math.max(idfVal, IDF_FLOOR) : 0;
 					totalWeight += weight;
 					if (titleHay.includes(token)) {
 						coveredWeight += weight;
 						titleWeight += weight;
 						matchedTokens += 1;
 						titleHitsCount += 1;
+						if (tokenSpecificity(df, rows.length) >= TOKEN_SPECIFICITY_FLOOR) hasAnchor = true;
 					} else if (hay.includes(token)) {
 						coveredWeight += weight;
 						matchedTokens += 1;
+						if (tokenSpecificity(df, rows.length) >= TOKEN_SPECIFICITY_FLOOR) hasAnchor = true;
 					}
 				}
+				bestSpecificity = hasAnchor ? 1 : 0;
+				// IDF-weighted relevance (how specific the matched words are) and
+				// raw coverage (how much of the ask matched) are orthogonal signals.
 				relevance = totalWeight > 0 ? coveredWeight / totalWeight : 0;
+				rawCoverage = scoringTokens.length > 0 ? matchedTokens / scoringTokens.length : 0;
 				// Ranking-only: a title match orders equally relevant rows higher,
 				// it never lifts a row over the admission floor by itself.
 				titleBonus = totalWeight > 0 ? Math.min(0.2, (titleWeight / totalWeight) * 0.3) : 0;
 			}
-			return { ...row, prior, relevance, titleBonus, matchedTokens, titleHits: titleHitsCount, recallScore: 0 };
+			return { ...row, prior, relevance, titleBonus, matchedTokens, titleHits: titleHitsCount, bestSpecificity, rawCoverage, recallScore: 0 };
 		});
 
 		// Admission.
@@ -344,8 +381,22 @@ export class KnowledgeContentStore {
 			? searchable
 				? scored.filter((row) => {
 						if (row.matchedTokens === 0) return false;
-						// A single rare token is decisive; a single common token is not.
-						if (row.matchedTokens === 1) return row.relevance >= MIN_SINGLE_TOKEN_RELEVANCE;
+						// Every admitted fact needs a specificity anchor: at least one
+						// matched word rare enough in the corpus to identify it. This
+						// rejects a common word ("报告" in 4/6 facts) even when it is
+						// the only/every match, because such a word picks out no fact.
+						if (row.bestSpecificity < TOKEN_SPECIFICITY_FLOOR) return false;
+						if (row.matchedTokens === 1) {
+							// One matched word. In a SHORT ask that is decisive ("Zeiss",
+							// a one-word question). In a LONG ask it is usually an
+							// incidental bigram collision (「分析」 in a 26-token sports
+							// question matching 「分析仪采购」). Raw coverage separates
+							// the two; IDF cannot, since the word looks specific when the
+							// corpus happens to contain it only once.
+							return row.rawCoverage >= SINGLE_HIT_MIN_COVERAGE;
+						}
+						// Two or more matched words: dilution in a long pasted message is
+							// expected, so the specificity anchor (not raw coverage) decides.
 						return row.relevance >= minRelevance;
 					})
 				: []
@@ -1070,6 +1121,21 @@ const CJK_STOP_CHARS = new Set(
 
 /** Latin word / CJK content-bigram tokens for memory recall scoring. */
 /** Token budget per recall query, and the share the trailing ask may reserve. */
+/**
+ * Whether a line is machine output (stack frame, timestamped log line, error
+ * header) rather than something the user typed. Used to locate the trailing
+ * QUESTION inside a pasted log/stack.
+ */
+function isNonProseLine(line: string): boolean {
+	return (
+		// "at fn (file:line:col)" — but a frame line the user appended a question
+		// to is prose, so require the line to END like a frame (no trailing sentence).
+		(/^at\s/.test(line) && /\(?[^()\s]+:\d+(?::\d+)?\)?$/.test(line)) ||
+		/^\d{4}-\d{2}-\d{2}[ T]/.test(line) || // timestamped log line
+		/^(?:caused by|traceback|\w*error|exception)[: ]/i.test(line)
+	);
+}
+
 const RECALL_TOKEN_BUDGET = 40;
 const RECALL_TAIL_RESERVE = 24;
 /**
@@ -1113,13 +1179,22 @@ export function recallTokenDetail(query: string): { all: string[]; tail: string[
 		// entire 400-char tail inside  at fn13…fn16 , losing 「这个报告怎么交付」).
 		// So snap forward to the last paragraph break that still leaves a real
 		// sentence: the question is its own paragraph.
-		const rest = text.slice(cut);
-		const lastBreak = rest.search(/\n\s*\n[^\n]*$/);
-		if (lastBreak > 0) {
-			const candidate = rest.slice(lastBreak).trim();
-			// Only trust a paragraph break when what follows looks like prose
-			// rather than more log/stack noise.
-			if (candidate.length >= 4 && !/^(?:at\s|\s*\d{4}-)/.test(candidate)) cut += lastBreak;
+		// Walk BACK from the end over trailing non-prose lines (stack frames,
+		// timestamped log lines) and snap the cut to the start of the last prose
+		// run. Requiring a blank-line paragraph break was too weak: a stack
+		// returned by err.stack has NO blank line between the frames and the
+		// user's question, so the whole tail stayed frames. Per-line
+		// classification handles both shapes.
+		const lines = text.slice(cut).split("\n");
+		let firstProse = lines.length;
+		for (let i = lines.length - 1; i >= 0; i -= 1) {
+			const line = lines[i].trim();
+			if (!line) continue; // blank lines are neutral separators
+			if (isNonProseLine(line)) break;
+			firstProse = i;
+		}
+		if (firstProse < lines.length && firstProse > 0) {
+			cut += lines.slice(0, firstProse).join("\n").length + 1;
 		}
 	}
 	const tail = text.slice(cut);

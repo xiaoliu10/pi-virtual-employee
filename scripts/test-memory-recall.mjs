@@ -99,8 +99,11 @@ test("recall ranks by relevance to the current message, not by recency", (t) => 
 	write(store, "打印机位置", "三楼东侧打印室", { summary: "三楼东侧", ageDays: 1 });
 
 	const ctx = { personOwner: PERSON };
-	const withQuery = store.recallMemory({ ctx, query: "帮我把这次的分析整理成报告发我", limit: 2 });
-	// Admission, not just ordering: only the report-related row is relevant here.
+	// A query that shares a real PHRASE with one fact recalls only that fact.
+	// (A query sharing a single generic word — 「…整理成报告」 vs 「报告交付方式」 —
+	// is indistinguishable from an incidental collision, so it is rejected; the
+	// deliberate trade is "miss rather than pollute".)
+	const withQuery = store.recallMemory({ ctx, query: "报告交付的时候用什么方式", limit: 2 });
 	assert.equal(withQuery.length, 1, `off-topic rows are not admitted, got ${withQuery.map((r) => r.title).join(" / ")}`);
 	assert.equal(withQuery[0].title, "报告交付方式", `relevance must win, got ${withQuery.map((r) => r.title).join(" / ")}`);
 
@@ -341,4 +344,32 @@ test("R3: the trailing ask keeps its token share even behind a huge paste", () =
 	assert.ok(tokens.includes("报告"), "the ask's tokens survive a repetitive body");
 	assert.ok(tokens.includes("交付"), "adjacent ask token survives");
 	assert.ok(tokens.length <= 40, "budget still bounded");
+});
+
+test("R4-P1: a single GENERIC word never pulls the whole memory base in", (t) => {
+	// Reviewer: relevance = weight/weight made the single-token floor dead, so
+	// one common word returned every fact containing it (30/30 in their probe).
+	const store = freshStore(t);
+	for (let i = 0; i < 30; i += 1) write(store, `报告事项${i}`, `第${i}条报告相关记录内容`, { summary: `报告${i}` });
+	// "报告" is now in 30/30 facts → zero specificity → not an anchor.
+	const hits = store.recallMemory({ ctx: { personOwner: PERSON }, query: "报告", limit: 30 });
+	assert.ok(hits.length <= 3, `one generic word must not inject the whole base, got ${hits.length}`);
+});
+
+test("R4-P1: a single DISCRIMINATING word still recalls its one fact", (t) => {
+	const store = freshStore(t);
+	for (let i = 0; i < 30; i += 1) write(store, `报告事项${i}`, `第${i}条通用记录`, { summary: `记录${i}` });
+	write(store, "Zeiss 镜头", "调研用的镜头是 Zeiss 50mm", { summary: "Zeiss" });
+	const hits = store.recallMemory({ ctx: { personOwner: PERSON }, query: "Zeiss", limit: 30 });
+	assert.equal(hits.length, 1, `a rare word must recall exactly its fact, got ${hits.length}`);
+	assert.equal(hits[0].title, "Zeiss 镜头");
+});
+
+test("R4-P1-2: a stack with NO blank line before the question still recalls", (t) => {
+	const store = freshStore(t);
+	write(store, "报告交付方式", "正式报告用可复制文本框交付", { summary: "文本框" });
+	const frames = Array.from({ length: 25 }, (_, i) => `    at fn${i} (/app/x.js:${i}:1)`).join("\n");
+	// err.stack shape: frames then the question on the very next line.
+	const hits = store.recallMemory({ ctx: { personOwner: PERSON }, query: `${frames}\n这个报告怎么交付？`, limit: 5 });
+	assert.equal(hits.length, 1, `a no-blank-line stack must still yield the question, got ${hits.length}`);
 });
