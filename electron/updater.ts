@@ -545,7 +545,13 @@ function wireEvents(): void {
 		// overwrite a live download's state — that would wedge the download state
 		// machine while electron-updater's own downloadPromise keeps running
 		// (review 2026-10-26).
-		const isZombieCheckError = !checkWindowOpen && !downloadInFlight && lastState.phase !== "downloading";
+		// downloadInFlight is the reliable discriminator: downloadNow() sets it
+		// synchronously BEFORE downloadUpdate() and only a terminal download event
+		// clears it. So an in-flight download always has it set, and an error while
+		// it is set belongs to that download (or is a late check error that must
+		// not kill it). With no download in flight and the check window closed,
+		// this is a late CHECK error whose deadline already reported it — ignore.
+		const isZombieCheckError = !checkWindowOpen && !downloadInFlight;
 		if (isZombieCheckError) {
 			log("WARN", `late check error arrived after its window closed (${message}) — leaving download state untouched`);
 			return;

@@ -166,20 +166,52 @@ test("a zombie update-available (window closed) records but does NOT auto-downlo
 	assert.notEqual(state.phase, "checking");
 });
 
-test("a zombie check error (window closed) leaves a live download's state intact", async () => {
-	const { updater, harness, autoUpdater, settle } = await makeUpdater();
-	// Simulate: check times out → a real download is running → the abandoned
-	// check finally errors. That late error must not clear download state.
-	harness.check = () => new Promise((resolve, reject) => {
-		setTimeout(() => reject(new Error("HTTP 500: zombie")), 450);
-	});
-	await updater.checkNow(); // times out at 300ms → error state
-	// Pretend a download is in flight (the state machine's view).
-	autoUpdater.emit("download-progress", { percent: 40 });
-	const before = updater.getUpdateState();
-	assert.equal(before.phase, "downloading", "fixture: a download is in progress");
-	await settle(400); // zombie error lands at ~450ms
-	assert.equal(updater.getUpdateState().phase, "downloading", "a zombie check error must not clobber the download state");
+test("a late zombie check error cannot overwrite a later successful check's available state", async () => {
+	// Real electron-updater timing: dispatchError EMITS "error" BEFORE rejecting
+	// checkForUpdates()'s promise. The old stub only rejected, so the zombie
+	// guard branch never executed and this assertion passed vacuously.
+	//
+	// Reachable race this guard actually protects: check #1 hangs past the
+	// deadline; check #2 then succeeds and finds an update (phase = available);
+	// check #1's "error" finally arrives. It must NOT knock phase back to
+	// "error", or the user's downloadNow() would be blocked by its phase gate
+	// (`if (lastState.phase !== "available") return`) — the manual download
+	// would look permanently unavailable while nothing is wrong.
+	// Retry delay far outside the test window so the timeout's bounded auto-retry
+	// cannot race the manually-driven check #2 and the zombie event.
+	const { updater, harness, autoUpdater, settle } = await makeUpdater({ retryDelayMs: 100_000 });
+	let call = 0;
+	harness.check = () => {
+		call += 1;
+		if (call === 1) {
+			// Hung check: emit a REAL error event (then reject) only after the
+			// deadline has closed check #1's window.
+			return new Promise((_resolve, reject) => {
+				setTimeout(() => {
+					autoUpdater.emit("error", new Error("HTTP 500: zombie check"));
+					reject(new Error("HTTP 500: zombie check"));
+				}, 450);
+			});
+		}
+		// Check #2 (after the timeout): a healthy check that finds an update.
+		queueMicrotask(() => {
+			autoUpdater.emit("checking-for-update");
+			autoUpdater.emit("update-available", { version: "9.9.9" });
+		});
+		return Promise.resolve();
+	};
+	const first = await updater.checkNow(); // times out at 300ms
+	assert.equal(first.phase, "error", "fixture: check #1 timed out");
+	await updater.checkNow(); // check #2 succeeds → available
+	assert.equal(updater.getUpdateState().phase, "available", "fixture: check #2 found the update");
+	await settle(500); // check #1's zombie error lands at ~450ms
+	assert.equal(
+		updater.getUpdateState().phase,
+		"available",
+		"a zombie check error must not clobber the later successful check (would block manual download)",
+	);
+	// The 100s retry timer from check #1's timeout must not keep the process alive.
+	updater.stopUpdater();
 });
 
 test("a late zombie event cannot resurrect the checking phase", async () => {
