@@ -18,7 +18,8 @@ const electronAbi = getAbi(electronVersion, "electron");
 
 const betterSqliteArchive = `better-sqlite3-v${betterSqliteVersion}-electron-v${electronAbi}-win32-x64.tar.gz`;
 const betterSqliteUrl = `https://registry.npmmirror.com/-/binary/better-sqlite3/v${betterSqliteVersion}/${betterSqliteArchive}`;
-const sqliteVecUrl = `https://registry.npmjs.org/sqlite-vec-windows-x64/-/sqlite-vec-windows-x64-${sqliteVecVersion}.tgz`;
+// npmmirror mirror: registry.npmjs.org (Cloudflare) times out on direct connections from CN networks; the mirror serves the identical tgz.
+const sqliteVecUrl = `https://registry.npmmirror.com/sqlite-vec-windows-x64/-/sqlite-vec-windows-x64-${sqliteVecVersion}.tgz`;
 
 async function download(url, dest) {
 	console.log(`[prepare-win-native] download ${url}`);
