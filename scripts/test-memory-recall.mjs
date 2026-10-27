@@ -325,3 +325,20 @@ test("R2-P2: body-only relevance is admitted — content matches count", (t) => 
 	});
 	assert.ok(hits.length > 0, "a memory whose BODY matches the request must be admitted");
 });
+
+test("R3: a pasted log does not swallow the question at the end", (t) => {
+	const store = freshStore(t);
+	write(store, "报告交付方式", "对方偏好把正式报告用可复制文本框交付", { summary: "报告用文本框" });
+	// The real shape of a long input: a pasted log, then the actual question.
+	const log = Array.from({ length: 60 }, (_, i) => `2026-10-27 chrono:${String(i).padStart(2, "0")} INFO worker ${i} heartbeat ok latency=${i}ms`).join("\n");
+	const hits = store.recallMemory({ ctx: { personOwner: PERSON }, query: `${log}\n\n这个报告交付时应该用可复制文本框吗？`, limit: 5 });
+	assert.ok(hits.some((h) => h.title === "报告交付方式"), `the trailing question must still recall, got ${hits.map((h) => h.title).join(",")}`);
+});
+
+test("R3: the trailing ask keeps its token share even behind a huge paste", () => {
+	const log = "deploy ".repeat(400) + "worker heartbeat ok ";
+	const tokens = recallTokens(`${log} 这个报告交付用什么文本框`);
+	assert.ok(tokens.includes("报告"), "the ask's tokens survive a repetitive body");
+	assert.ok(tokens.includes("交付"), "adjacent ask token survives");
+	assert.ok(tokens.length <= 40, "budget still bounded");
+});

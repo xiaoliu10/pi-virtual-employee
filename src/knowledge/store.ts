@@ -1023,19 +1023,51 @@ const CJK_STOP_CHARS = new Set(
 );
 
 /** Latin word / CJK content-bigram tokens for memory recall scoring. */
+/** Token budget per recall query, and the share the trailing ask may reserve. */
+const RECALL_TOKEN_BUDGET = 40;
+const RECALL_TAIL_RESERVE = 24;
+/** Characters of trailing text treated as "the ask" (a paragraph, not a document). */
+const RECALL_TAIL_CHARS = 200;
+
 export function recallTokens(query: string): string[] {
 	if (!query) return [];
-	const lower = query.toLowerCase();
-	const tokens = new Set<string>();
-	for (const word of lower.match(/[a-z0-9_]{2,}/g) ?? []) tokens.add(word);
-	// CJK has no spaces: bigrams are the standard cheap proxy, minus the ones made
-	// entirely of function characters (see CJK_STOP_CHARS).
-	for (const run of lower.match(/[\u4e00-\u9fff]{2,}/g) ?? []) {
-		for (let i = 0; i + 2 <= run.length; i += 1) {
-			const gram = run.slice(i, i + 2);
-			if (CJK_STOP_CHARS.has(gram[0]) && CJK_STOP_CHARS.has(gram[1])) continue;
-			tokens.add(gram);
+	const text = query.toLowerCase();
+	// Long inputs are normal here: users paste an error log or a whole document
+	// and then ask a question at the END. Taking the first N tokens (or ranking
+	// every token by rarity) let that pasted body consume the budget and the
+	// actual ask never reached the scorer — verified: with a 60-line log plus
+	// 「这个报告交付时应该用可复制文本框吗」, 报告/交付/文本 were all absent from
+	// the 40-token list. So the trailing ask is tokenized FIRST and reserves a
+	// share of the budget; the body fills the remainder by frequency (its
+	// dominant vocabulary is its topic).
+	const tail = text.slice(-RECALL_TAIL_CHARS);
+	const body = text.slice(0, Math.max(0, text.length - RECALL_TAIL_CHARS));
+	const tokenize = (chunk: string): string[] => {
+		const out: string[] = [];
+		for (const word of chunk.match(/[a-z0-9_]{2,}/g) ?? []) out.push(word);
+		for (const run of chunk.match(/[\u4e00-\u9fff]{2,}/g) ?? []) {
+			for (let i = 0; i + 2 <= run.length; i += 1) {
+				const gram = run.slice(i, i + 2);
+				if (CJK_STOP_CHARS.has(gram[0]) && CJK_STOP_CHARS.has(gram[1])) continue;
+				out.push(gram);
+			}
 		}
+		return out;
+	};
+	const wanted = new Set<string>();
+	const fill = (list: string[], cap: number) => {
+		for (const token of list) {
+			if (wanted.size >= cap) return;
+			wanted.add(token);
+		}
+	};
+	fill(tokenize(tail), RECALL_TAIL_RESERVE);
+	const bodyTokens = tokenize(body);
+	if (bodyTokens.length) {
+		const freq = new Map<string, number>();
+		for (const token of bodyTokens) freq.set(token, (freq.get(token) ?? 0) + 1);
+		fill([...new Set(bodyTokens)].sort((a, b) => (freq.get(b) ?? 0) - (freq.get(a) ?? 0) || a.localeCompare(b)), RECALL_TOKEN_BUDGET);
 	}
-	return [...tokens].slice(0, 40);
+	fill(tokenize(tail), RECALL_TOKEN_BUDGET);
+	return [...wanted].slice(0, RECALL_TOKEN_BUDGET);
 }
