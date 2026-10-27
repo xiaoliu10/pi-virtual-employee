@@ -21,6 +21,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
+// Each makeUpdater() registers two exit handlers; 10+ instances trip node's
+// default listener cap. The handlers are intentional per-instance cleanup.
+process.setMaxListeners(0);
 
 /** Build a fresh updater instance with its own stub autoUpdater + harness. */
 async function makeUpdater({ checkTimeoutMs = 300, retryDelayMs = 150 } = {}) {
@@ -229,4 +232,79 @@ test("a late zombie event cannot resurrect the checking phase", async () => {
 	await updater.checkNow(); // times out at 300ms → error
 	await settle(700); // let the zombie settle at ~450ms (2.3x margin, not 1.5x)
 	assert.notEqual(updater.getUpdateState().phase, "checking", "no path may leave the renderer stuck on 「检查中」");
+});
+
+test("a late checking-for-update cannot re-wedge the button on 「检查中」 (review P2-1)", async () => {
+	const { updater, harness, autoUpdater, settle, callsOf } = await makeUpdater({ retryDelayMs: 100_000 });
+	// Check A hangs forever (its feed never answers); the deadline abandons it.
+	harness.check = () => new Promise(() => {});
+	const first = await updater.checkNow();
+	assert.equal(first.phase, "error", "fixture: the deadline fired");
+	// A's feed finally answers, but only with the opening event — no terminal
+	// event ever follows. Before the window gate this set `checking = true`
+	// with NO owner left to reset it, freezing the button exactly like the
+	// original field failure.
+	autoUpdater.emit("checking-for-update");
+	await updater.checkNow(); // a manual re-click must still reach electron-updater
+	assert.ok(callsOf("check") >= 2, `the button must not be wedged (check calls=${callsOf("check")})`);
+	updater.stopUpdater();
+});
+
+test("check A's zombie update-available inside check B's window never auto-downloads (review P2-2)", async () => {
+	const { updater, harness, autoUpdater, settle, callsOf } = await makeUpdater({ retryDelayMs: 100_000 });
+	updater.setupUnattended({ enabled: () => true, isIdle: () => true });
+	let call = 0;
+	harness.check = () => {
+		call += 1;
+		if (call === 1) {
+			// A hangs past the deadline; its update-available arrives LATE, after
+			// B has already opened its own window — the boolean window cannot
+			// tell this event apart from B's, so attribution must come from the
+			// per-call promise path (A's windowAlive is already false).
+			return new Promise((resolve) => {
+				setTimeout(() => {
+					autoUpdater.emit("update-available", { version: "9.9.9-zombie" });
+					resolve();
+				}, 450);
+			});
+		}
+		// B HANGS, so its window stays OPEN when A's zombie arrives. This is the
+		// exact mis-attribution shape: checkWindowOpen is true (it is B's), so an
+		// event-driven auto-download would fire for A's zombie. Only per-call
+		// attribution (A's windowAlive=false) prevents it.
+		return new Promise(() => {});
+	};
+	await updater.checkNow(); // A times out at 300ms
+	const pendingB = updater.checkNow(); // B opens its window and hangs
+	await settle(500); // A's zombie update-available lands at ~450ms, INSIDE B's open window
+	assert.equal(callsOf("download"), 0, "a zombie update-available must never start a download, even inside a later check's open window");
+	updater.stopUpdater();
+	await pendingB; // B's own deadline closes it (updaterStopped suppresses the retry)
+});
+
+test("a healthy check still auto-downloads in unattended mode (the per-call path works)", async () => {
+	const { updater, harness, autoUpdater, callsOf } = await makeUpdater({ retryDelayMs: 100_000 });
+	updater.setupUnattended({ enabled: () => true, isIdle: () => true });
+	harness.check = () => {
+		queueMicrotask(() => {
+			autoUpdater.emit("checking-for-update");
+			autoUpdater.emit("update-available", { version: "9.9.9" });
+		});
+		return Promise.resolve();
+	};
+	await updater.checkNow();
+	// downloadNow is invoked from the promise continuation, which has already
+	// run by the time checkNow resolves.
+	assert.equal(callsOf("download"), 1, "unattended + available must download exactly once");
+	updater.stopUpdater();
+});
+
+test("stopUpdater disarms the in-flight check's retry ladder (review P3)", async () => {
+	const { updater, harness, settle, callsOf } = await makeUpdater({ checkTimeoutMs: 200, retryDelayMs: 150 });
+	harness.check = () => Promise.reject(new Error("HTTP 404: feed not found"));
+	await updater.checkNow(); // arms a retry at +150ms
+	updater.stopUpdater(); // will-quit happens before the retry fires
+	const before = callsOf("check");
+	await settle(400);
+	assert.equal(callsOf("check"), before, "no further check may fire after stopUpdater");
 });
