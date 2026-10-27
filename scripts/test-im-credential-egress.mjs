@@ -329,6 +329,28 @@ test("a presigned link does not exempt a REAL credential elsewhere in the messag
 	);
 });
 
+test("a fake presigned marker never rescues a credential URL (review P1 regression pins)", () => {
+	// [A] Gitee PAT + dummy OSS markers on the SAME url: PAT must still be redacted.
+	const g = "https://gitee.com/xiaoliu10/repo/raw/main/r.md?access_token=gk_abcdef123456&OSSAccessKeyId=x&Signature=abcdef123456";
+	const dg = gateOutboundText(g, "restricted");
+	assert.ok(dg.includes("access_token=***"), "PAT redacted despite the fake presigned markers");
+	assert.ok(!dg.includes("gk_abcdef123456"));
+	// [B] intranet password url + dummy markers: whole message still withheld.
+	const b = "http://10.0.0.5:8080/d?password=hunter2secure&OSSAccessKeyId=x&Signature=abcdef123456";
+	assert.equal(gateOutboundText(b, "restricted"), CREDENTIAL_WITHHELD_NOTICE, "withhold is restored for non-storage hosts");
+	// [C] REAL presigned url carrying an extra credential param: param-level split.
+	const real = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.html?access_token=gk_abcdef123456&OSSAccessKeyId=LTAIZHYtKQegFGXe&Expires=1795654871&Signature=N9him7VHYYIEdIftaIY5iHWf2iU%3D";
+	const dr = gateOutboundText(real, "restricted");
+	assert.ok(dr.includes("access_token=***"), "the non-grant param is redacted");
+	assert.ok(dr.includes("Signature=N9him7VHYYIEdIftaIY5iHWf2iU%3D"), "the grant itself survives");
+});
+
+test("case-mismatched presigned markers fail closed (detection is case-insensitive, exemption is not)", () => {
+	const link = "https://gitee.com/xiaoliu10/repo/raw/main/r.md?access_token=gk_abcdef123456&ossaccesskeyid=x&signature=abcdef123456";
+	const delivered = gateOutboundText(link, "restricted");
+	assert.ok(delivered.includes("access_token=***"), "lowercase markers get no exemption — the PAT is still redacted");
+});
+
 test("egressAudience: live admin check over the dt: id shape, failing closed", async () => {
 	let adminNow = true;
 	const { adapter } = await startAdapter((staffId) => adminNow && staffId === "staff-admin");
