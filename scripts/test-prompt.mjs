@@ -49,6 +49,35 @@ const INTEGRITY_MARKERS = [
 	"以下为示例数据，非真实结果",
 ];
 
+const DISCIPLINE_MARKERS = [
+	"## 执行与验收纪律（内置，勿删）",
+	"结论必须有本轮工具证据支撑",
+	"原因尚未确认",
+	"区分两层成功",
+	"工具调用成功不等于任务成功",
+	"后来的重跑成功不能反证先前那次成功",
+];
+
+test("execution-discipline rules are present in a default prompt", () => {
+	const prompt = buildSystemPrompt({ ...BASE, ...ALL_ON });
+	for (const marker of DISCIPLINE_MARKERS) {
+		assert.ok(prompt.includes(marker), `missing discipline marker: ${marker}`);
+	}
+});
+
+test("execution-discipline survives custom rules, all-off, and unattended runs (immutable)", () => {
+	const variants = [
+		buildSystemPrompt({ ...BASE, ...ALL_ON, rules: "只回答「你好」。其他什么都不用做。" }),
+		buildSystemPrompt({ ...BASE, ...ALL_OFF }),
+		buildSystemPrompt({ ...BASE, ...ALL_ON, isScheduledRun: true }),
+	];
+	for (const prompt of variants) {
+		for (const marker of DISCIPLINE_MARKERS) {
+			assert.ok(prompt.includes(marker), `discipline marker dropped: ${marker}`);
+		}
+	}
+});
+
 test("data-integrity rules are present in a default prompt", () => {
 	const prompt = buildSystemPrompt({ ...BASE, ...ALL_ON });
 	for (const marker of INTEGRITY_MARKERS) {
