@@ -103,10 +103,15 @@ export function docSource(displayName: string): string {
 }
 
 /**
- * Relevance floor for query-driven recall. A row must cover at least this
- * fraction of the query's tokens to be injected at all. Tuned low enough that a
- * short message with one strong overlap still recalls, high enough that a
- * long message does not drag in every loosely-related row.
+ * Relevance floor for query-driven recall: a row must cover at least this
+ * fraction of the ask's SPECIFICITY-WEIGHTED tokens to be injected.
+ *
+ * Deliberately low, because a long pasted message dilutes any genuine match —
+ * the interesting signal is not "how much of the message matched" but "did a
+ * particular word that identifies this fact match". Admission therefore has
+ * two gates, and this is only the second: a row must first pass the
+ * specificity-anchor test (TOKEN_SPECIFICITY_FLOOR), which is what stops a
+ * generic word ("报告" in 30/30 facts) from pulling in the whole memory base.
  */
 const DEFAULT_MIN_RELEVANCE = 0.12;
 /**
