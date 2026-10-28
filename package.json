@@ -20,6 +20,7 @@
     "test:scheduler": "node --test scripts/test-scheduler.mjs",
     "test:scheduler-service": "node --test scripts/test-scheduler-service.mjs",
     "test:im-health": "node --test scripts/test-im-adapter-health.mjs",
+    "test:im-outbox": "node --test scripts/test-im-outbox.mjs",
     "test:model-info": "node --test scripts/test-model-info.mjs",
     "test:telemetry": "node --test scripts/test-telemetry.mjs",
     "test:immutable": "node --test scripts/test-immutable.mjs",

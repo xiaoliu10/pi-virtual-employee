@@ -61,14 +61,24 @@ export interface InboundMessage {
 	conversationName?: string;
 	/** Images the user sent with this message (vision models can see them). */
 	images?: InboundImage[];
+	/**
+	 * Platform id of THIS inbound message (DingTalk `msgId`, …). It is the
+	 * occurrence identity for reply-path delivery bookkeeping: a redelivered
+	 * stream message must not push its notes twice. Absent → no bookkeeping.
+	 */
+	messageId?: string;
+	/** Source channel name ('dingtalk' | 'echo' | …), namespacing messageId. */
+	channel?: string;
 }
 
 /** Per-message channel context: hooks the adapter exposes for a single inbound
  *  message, so the engine/manager can push mid-turn updates (e.g. a long-task
  *  progress heartbeat) back to that same chat. */
 export interface InboundCtx {
-	/** Push an arbitrary text update to the originating chat mid-turn. */
-	onProgress?: (text: string) => Promise<void>;
+	/** Push an arbitrary text update to the originating chat mid-turn. `opts`
+	 *  carries the delivery identity (the inbound message) so the manager can
+	 *  ledger the push — adapters that do not thread it keep today's behaviour. */
+	onProgress?: (text: string, opts?: { occurrenceId?: string; kind?: string }) => Promise<void>;
 	/**
 	 * Deliver a file into the originating chat (when the channel supports it,
 	 * e.g. DingTalk robot file message). Threads through to the provide_document
@@ -151,4 +161,11 @@ export interface IMAdapter {
 	/** Live connection/delivery health. Optional — channels without meaningful
 	 * connection state may omit it; the UI then shows the channel as idle. */
 	status?(): AdapterHealth;
+	/**
+	 * Injected by the manager before start(): lets a channel route a mid-turn
+	 * push (e.g. a progress note) through the manager's single delivery path so
+	 * the credential gate and the push ledger apply to it too. Absent ⇒ the
+	 * channel falls back to delivering through its own socket/webhook reply.
+	 */
+	onPush?(conversationId: string, text: string, occurrenceId: string, kind?: string): Promise<{ ok: boolean; error?: string }>;
 }
