@@ -73,3 +73,56 @@ test("text too big for maxParts truncates at a clean boundary with an explicit n
 	assert.ok(parts[0].length <= 3800 * 3 + 40, `truncated head must fit the budget: ${parts[0].length}`);
 	assert.ok(parts[0].includes("已截断"), "the cut must be announced, never silent");
 });
+
+// ─── Table-preserving splits (field 2026-10-28: "表格格式不对") ───────────────
+// A long report containing a table must never arrive as a headerless wall of
+// pipes: tables are packed as whole blocks, and an oversized table is split by
+// rows with the header repeated in every part.
+const makeTable = (rows, cols = 5) =>
+	[
+		"| 日期 | 任务 | 状态 | 次数 | 耗时 |",
+		"|---|---|---|---|---|",
+		...Array.from({ length: rows }, (_, i) => `| 10-${String((i % 28) + 1).padStart(2, "0")} | 生产部署 | 成功 | ${1000 + i} | 12.3s |`),
+	].join("\n");
+
+const tableInfo = (part) => {
+	const rows = part.split("\n").filter((l) => /^\s*\|/.test(l));
+	const hasHeader = /^\s*\|.*\|\s*$/.test(rows[0] ?? "");
+	const hasDelimiter = rows.some((l) => /^\s*\|\s*:?-{2,}/.test(l));
+	return { count: rows.length, header: hasHeader && hasDelimiter };
+};
+
+test("a table larger than one message is split BY ROWS with the header repeated", () => {
+	const report = `## 总览\n\n本周执行 120 次。\n\n## 分日明细\n\n${makeTable(120)}\n\n## 人工跟进\n\n- 3 条失败待查\n`;
+	const parts = splitForPush(report);
+	assert.ok(parts.length >= 2, `a 4.5k report must split, got ${parts.length}`);
+	const tableParts = parts.filter((p) => tableInfo(p).count > 0);
+	assert.ok(tableParts.length >= 2, "the table spans multiple parts");
+	for (const part of tableParts) {
+		const info = tableInfo(part);
+		assert.ok(info.header, `every part holding table rows needs header+delimiter, got ${info.count} rows without one: ${part.slice(0, 60)}`);
+	}
+	// No row is lost or duplicated across parts.
+	const total = tableParts.reduce((n, p) => n + tableInfo(p).count - 2, 0); // minus header+delimiter per part
+	assert.equal(total, 120, `all 120 data rows preserved, got ${total}`);
+	for (const part of parts) assert.ok(part.length <= 3800, `part within cap, got ${part.length}`);
+});
+
+test("a cut never lands inside a table (no half-tables)", () => {
+	// Text before the table fills most of a message: the naive line-boundary cut
+	// used to slice the first table rows off into the prose part.
+	const prose = Array.from({ length: 60 }, (_, i) => `第 ${i} 行说明文字，用于填充长度。`).join("\n");
+	const report = `${prose}\n\n${makeTable(10)}\n`;
+	for (const part of splitForPush(report)) {
+		const rows = part.split("\n").filter((l) => /^\s*\|/.test(l));
+		if (rows.length === 0) continue;
+		assert.ok(tableInfo(part).header, "a part with table rows must include the header, never a headerless fragment");
+	}
+});
+
+test("a small table stays whole in one part", () => {
+	const report = `## 明细\n\n${makeTable(3)}\n\n结束。\n`;
+	const parts = splitForPush(report);
+	assert.equal(parts.length, 1, "a short report is not split");
+	assert.equal(tableInfo(parts[0]).count, 5, "header + delimiter + 3 rows");
+});
