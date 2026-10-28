@@ -66,6 +66,13 @@ export function ChatPage({
 	const [conversationId, setConversationId] = useState<string | null>(activeId);
 	const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
 	const scrollRef = useRef<HTMLDivElement>(null);
+	/**
+	 * Newest `created_at` this pane has rendered. Drives the incremental reload
+	 * after a reconnect: only messages past this cursor are fetched instead of the
+	 * whole conversation (a long IM chat re-read in full on every activity ping was
+	 * both slow and a full re-render).
+	 */
+	const cursorRef = useRef<number>(0);
 
 	useEffect(() => {
 		api.listModels().then(setModelOptions).catch(() => setModelOptions([]));
@@ -81,8 +88,10 @@ export function ChatPage({
 			return;
 		}
 		let cancelled = false;
+		cursorRef.current = 0;
 		api.getMessages(activeId).then((rows) => {
 			if (cancelled) return;
+			cursorRef.current = rows.reduce((max, r) => (r.created_at > max ? r.created_at : max), 0);
 			setMessages(
 				rows.map((r) => ({ id: r.id, role: r.role, content: r.content })),
 			);
@@ -100,10 +109,27 @@ export function ChatPage({
 		if (!convId || imTick === 0 || imChangedId !== convId) return;
 		if (streaming) return;
 		let cancelled = false;
-		api.getMessages(convId).then((rows) => {
-			if (cancelled) return;
-			setMessages(rows.map((r) => ({ id: r.id, role: r.role, content: r.content })));
-		});
+		// Incremental: ask only for what this pane has not seen. Merging by id keeps
+		// it idempotent, so a duplicate delivery (or a same-millisecond tie) cannot
+		// add the same message twice — that is what makes this safe to use as the
+		// reconnect path too.
+		api.getMessagesSince(convId, cursorRef.current)
+			.then(({ rows, cursor }) => {
+				if (cancelled) return;
+				if (rows.length === 0) {
+					cursorRef.current = Math.max(cursorRef.current, cursor);
+					return;
+				}
+				cursorRef.current = Math.max(cursorRef.current, cursor);
+				setMessages((prev) => {
+					const seen = new Set(prev.map((m) => m.id));
+					const added = rows.filter((r) => !seen.has(r.id)).map((r) => ({ id: r.id, role: r.role, content: r.content }));
+					return added.length ? [...prev, ...added] : prev;
+				});
+			})
+			.catch(() => {
+				// A failed sync must not clear the pane: the next activity ping retries.
+			});
 		return () => {
 			cancelled = true;
 		};

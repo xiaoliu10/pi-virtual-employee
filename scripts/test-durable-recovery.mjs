@@ -32,15 +32,23 @@ const veActorBundle = join(probeDir, "ve-actor.mjs");
 const veGateBundle = join(probeDir, "ve-settle-gate.mjs");
 const hostBundle = join(probeDir, "harness-host.mjs");
 const phase1Bundle = join(probeDir, "phase1-tools.mjs");
-for (const [outfile, entry] of [
+const noticeBundle = join(probeDir, "interrupted-notice.mjs");
+for (const [outfile, entry, isRaw] of [
 	[veToolsBundle, "./src/engine/durable/ve-tools.ts"],
 	[veActorBundle, "./src/engine/durable/ve-actor.ts"],
 	[veGateBundle, "./src/engine/durable/ve-settle-gate.ts"],
 	[hostBundle, "./src/engine/durable/harness-host.ts"],
 	[phase1Bundle, "./src/engine/durable/phase1-tools.ts"],
+	[
+		noticeBundle,
+		// One bundle for the phase-3 surface: the notice extension re-exports nothing,
+		// so both modules are pulled in explicitly.
+		'export * from "./src/engine/durable/interrupted-notice.ts"; export * from "./src/engine/durable/recovery-policy.ts";',
+		true,
+	],
 ]) {
 	await build({
-		stdin: { contents: `export * from "${entry}";`, resolveDir: root, loader: "ts" },
+		stdin: { contents: isRaw ? entry : `export * from "${entry}";`, resolveDir: root, loader: "ts" },
 		outfile,
 		bundle: true,
 		platform: "node",
@@ -364,4 +372,84 @@ test("a real VE tool runs under durable and is not re-run after a restart", asyn
 	await new Promise((resolve) => setTimeout(resolve, 200));
 	assert.deepEqual(calls, { get_current_time: 1, read_file: 1 }, "a restart must not re-run completed tools");
 	await second.harness.close(BACKGROUND_CONTEXT);
+});
+
+// ── phase 3: recovery policy for tools with external effects ───────────────
+
+test("mutating tools never default to automatic retry", async () => {
+	const { recoveryRuleFor } = await import(pathToFileURL(noticeBundle).href);
+	// Unknown effect → the only safe answer is to ask a human.
+	assert.equal(recoveryRuleFor("run_command").policy, "manual");
+	assert.equal(recoveryRuleFor("computer_use").policy, "manual");
+	assert.equal(recoveryRuleFor("browser_click").policy, "manual");
+	assert.equal(recoveryRuleFor("some_future_mutating_tool").policy, "manual");
+	// Verifiable effects name what to re-read.
+	for (const tool of ["save_report", "provide_document", "create_scheduled_task", "delete_files"]) {
+		const rule = recoveryRuleFor(tool);
+		assert.equal(rule.policy, "verify", `${tool} should be verifiable`);
+		assert.ok(rule.verifyHint && rule.verifyHint.length > 10, `${tool} must say what to check`);
+	}
+	// Idempotent-by-construction only.
+	assert.equal(recoveryRuleFor("save_document").policy, "retry");
+});
+
+test("an interrupted mutating tool is told to verify, not to retry", async () => {
+	const { isInterruptedResult, interruptedToolNotice, recoveryRuleFor } = await import(
+		pathToFileURL(noticeBundle).href
+	);
+	// durable's own wording for an interrupted call.
+	const durableText = "Tool save_report was interrupted and may have partially run";
+	assert.equal(isInterruptedResult("save_report", durableText), true);
+	// A different tool's result that merely contains the words must not match.
+	assert.equal(isInterruptedResult("read_file", durableText), false);
+	assert.equal(isInterruptedResult("save_report", "报告已保存"), false);
+
+	const notice = interruptedToolNotice("save_report", recoveryRuleFor("save_report"));
+	assert.ok(notice.includes("不要直接重试"), "the notice must forbid blind retry");
+	assert.ok(notice.includes("人工核实"), "and tell the model what to do when it cannot verify");
+});
+
+test("the settle gate can write its streak from inside onYield", async () => {
+	// Guards the claim this whole anti-deadloop design rests on: a hook CAN
+	// persist (HookApi's published type omits commit, the runtime has it). Without
+	// this, a crash resets the counter and a task loops forever.
+	const dir = await tempDir();
+	const dbPath = join(dir, "gate-write.sqlite");
+	const { SettleStreakDocDef } = await import(pathToFileURL(veGateBundle).href);
+
+	const seen = [];
+	const registry = createRegistry();
+	registry.install(
+		defineExtension({
+			name: "probe-streak",
+			hooks: [
+				hook(GenerationTask, {
+					onYield: async (_answer, api, context) => {
+						const w = api;
+						const before = (await w.snapshot(SettleStreakDocDef, api.conversationId, context))?.rounds ?? 0;
+						seen.push(before);
+						await w.commit(async (tx) => {
+							(await tx.doc(SettleStreakDocDef, api.conversationId)).rounds = before + 1;
+						}, context);
+						return undefined;
+					},
+				}),
+			],
+		}),
+	);
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const harness = await Harness.open(await openNodeSqliteStorage(dbPath), { models, registry }, BACKGROUND_CONTEXT);
+	const root = await harness.root(BACKGROUND_CONTEXT, {
+		agent: { model: { provider: "faux", modelId: "faux-1" } },
+	});
+	faux.setResponses([fauxAssistantMessage("a"), fauxAssistantMessage("b")]);
+	await (await root.submit({ type: "input", content: "1" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+	await (await root.submit({ type: "input", content: "2" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+
+	assert.deepEqual(seen, [0, 1], "each run must SEE the previous run's write");
+	const stored = await harness.snapshot(SettleStreakDocDef, root.id, BACKGROUND_CONTEXT);
+	assert.equal(stored?.rounds, 2, "the write from inside the hook reached storage");
+	await harness.close(BACKGROUND_CONTEXT);
 });

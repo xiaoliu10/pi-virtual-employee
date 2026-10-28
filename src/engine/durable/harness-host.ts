@@ -35,6 +35,7 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 
 import { toDurableTools } from "./ve-tools.js";
 import { createDurableSettleGate } from "./ve-settle-gate.js";
+import { createInterruptedToolNotice } from "./interrupted-notice.js";
 
 export interface DurableHostOptions {
 	/** Profile-scoped data directory (app.getPath("userData")). */
@@ -90,6 +91,9 @@ export async function openDurableHost(opts: DurableHostOptions): Promise<Durable
 	const tools: ToolRegistration<any, any>[] = toDurableTools(opts.tools);
 	const extensions: Extension[] = [
 		defineExtension({ name: "ve-tools", tools }),
+		// Rewrite durable's one-line "interrupted" results into an instruction that
+		// tells the model to VERIFY instead of retry (phase 3).
+		createInterruptedToolNotice(),
 		...(opts.settleGate === false ? [] : [createDurableSettleGate()]),
 		...(opts.extensions ?? []),
 	];

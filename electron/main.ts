@@ -1258,6 +1258,24 @@ ${tailForProgress(decision.text)}`;
 
 	ipcMain.handle("tasks:list", () => history.listConversations());
 	ipcMain.handle("tasks:messages", (_e, id: string) => history.listMessages(id));
+	/**
+	 * Incremental reload used after a reconnect / activity ping: only what the
+	 * renderer has not seen yet.
+	 *
+	 * Why this exists: the renderer used to re-fetch the WHOLE conversation on
+	 * every activity signal, which turns a reconnect on a long chat into a full
+	 * re-transfer and re-render. `sinceTs` is the renderer's cursor (the newest
+	 * `created_at` it holds); the reply carries the new cursor so a dropped
+	 * connection can resume exactly where it stopped.
+	 *
+	 * `sinceTs` is exclusive. A tie at the same millisecond is possible, so the
+	 * renderer merges by id — the caller must be idempotent (it is: ids are keys).
+	 */
+	ipcMain.handle("tasks:messagesSince", (_e, id: string, sinceTs: number) => {
+		const rows = Number.isFinite(sinceTs) && sinceTs > 0 ? history.listMessagesSince(id, sinceTs, 500) : history.listMessages(id);
+		const cursor = rows.reduce((max, row) => (row.created_at > max ? row.created_at : max), sinceTs);
+		return { rows, cursor };
+	});
 	ipcMain.handle("tasks:delete", (_e, id: string) => {
 		engine.dropSession(id);
 		history.deleteConversation(id);

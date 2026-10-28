@@ -17,6 +17,8 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { ToolRegistration } from "@earendil-works/pi-durable";
 
+import { interruptedToolNotice, recoveryRuleFor } from "./recovery-policy.js";
+
 /**
  * Tools whose rerun cannot change the outside world.
  *
@@ -96,12 +98,29 @@ export function toDurableTool(tool: AgentTool<any>, opts: AdaptOptions = {}): To
 		parameters: tool.parameters,
 		replay,
 		execute: async (args: any) => {
-			const result = await tool.execute(`${tool.name}-durable`, args, undefined, undefined);
-			return {
-				output: result.content as never,
-				...(result.details !== undefined ? { details: result.details as never } : {}),
-				...(result.isError ? { isError: true } : {}),
-			};
+			try {
+				const result = await tool.execute(`${tool.name}-durable`, args, undefined, undefined);
+				return {
+					output: result.content as never,
+					...(result.details !== undefined ? { details: result.details as never } : {}),
+					...(result.isError ? { isError: true } : {}),
+				};
+			} catch (err) {
+				// A thrown error on an UNSAFE tool may mean "the effect landed and then
+				// something failed after it". durable already refuses to replay unsafe
+				// tools, but the model must not read a bare stack trace and retry by
+				// itself: hand it the recovery rule instead (verify against business
+				// state, or stop and ask a human).
+				if (replay === "unsafe") {
+					const rule = recoveryRuleFor(tool.name);
+					const cause = err instanceof Error ? err.message : String(err);
+					return {
+						output: [{ type: "text", text: `${interruptedToolNotice(tool.name, rule)}\n\n原始错误：${cause}` }] as never,
+						isError: true,
+					};
+				}
+				throw err;
+			}
 		},
 	} as ToolRegistration<any, any>;
 }

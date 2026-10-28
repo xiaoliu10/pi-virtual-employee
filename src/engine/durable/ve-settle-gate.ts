@@ -50,9 +50,23 @@ export const SETTLE_VERIFY_PROMPT =
  * and outlives one task — and `api.commit()` IS available inside a hook (measured:
  * 0→1→2 across two runs, written to storage).
  */
+/**
+ * Anti-deadloop streak, keyed by GENERATION TASK id.
+ *
+ * Keying it per conversation was wrong (review finding, reproduced on a real
+ * Harness): task A ends with `rounds: 1`, then an independent task B in the same
+ * conversation replies `[[VERIFY_FAIL]]` once and is immediately released as
+ * "2 consecutive failures". The counter belongs to the run that is being
+ * verified, and `api.taskId` names exactly that.
+ *
+ * The document stays per conversation (so a crash keeps it), while the map
+ * inside separates runs. A finished run's entry is cleared on pass/release so
+ * the document does not grow without bound.
+ */
 export interface SettleStreakDoc {
-	[key: string]: number;
-	rounds: number;
+	[key: string]: number | Record<string, number>;
+	/** taskId → consecutive failed verification rounds for that run. */
+	runs: Record<string, number>;
 }
 
 export const SettleStreakDocDef = defineDoc<SettleStreakDoc>({
@@ -61,7 +75,7 @@ export const SettleStreakDocDef = defineDoc<SettleStreakDoc>({
 	scope: "conversation",
 	history: "latest",
 	fork: "initial",
-	initial: () => ({ rounds: 0 }),
+	initial: () => ({ runs: {} as Record<string, number> }),
 	checkpointWhen: () => false,
 });
 
@@ -121,6 +135,38 @@ export function settleRepairInstruction(note: string): string {
 	return `${REPAIR_TURN_MARKER}：${note}。请针对未达成项继续修复，完成后重新声明完成。`;
 }
 
+/**
+ * Tool-evidence tracking per conversation.
+ *
+ * WHY THIS EXISTS (review blocker): `onYield` receives only the FINAL assistant
+ * message, but a model that verifies with tools emits the tool call in a
+ * PREVIOUS assistant message and then answers `[[VERIFY_PASS]]` in a later one.
+ * Judging evidence from the final message therefore marks a genuinely
+ * tool-verified round as "no evidence" — reproduced on a real Harness
+ * (`answer 内 toolCall = false` while `read` had actually run).
+ *
+ * `afterTools` fires once per tool round, so it is the only correct source for
+ * "did this run call a tool". The flag is per conversation and cleared when a
+ * run settles (see onYield's pass/release paths), because the next task in the
+ * same conversation must not inherit it.
+ */
+type ConversationKey = string | number;
+const toolEvidence = new Map<ConversationKey, { anyTool: boolean }>();
+
+function evidenceFor(conversationId: ConversationKey): { anyTool: boolean } {
+	let entry = toolEvidence.get(conversationId);
+	if (!entry) {
+		entry = { anyTool: false };
+		toolEvidence.set(conversationId, entry);
+	}
+	return entry;
+}
+
+/** Reset a conversation's evidence tracker (called when a run settles). */
+export function resetToolEvidence(conversationId: ConversationKey): void {
+	toolEvidence.delete(conversationId);
+}
+
 // ── Message helpers ──
 
 type ContentPart = { type?: string; text?: string };
@@ -153,13 +199,40 @@ interface WritableHookApi {
 	snapshot(token: unknown, id: unknown, context: unknown): Promise<SettleStreakDoc | undefined>;
 }
 
-const writable = (api: unknown): WritableHookApi => api as WritableHookApi;
+/**
+ * Narrow an unknown hook api to the writable surface, VERIFYING at runtime.
+ *
+ * TypeScript assertions are erase-only: if a future durable release renames or
+ * removes `commit`, a bare `as` would make every write a no-op and the gate would
+ * silently settle without recording a streak (review finding). Reporting the
+ * capability once per process turns that silent degradation into a diagnosable
+ * line in the log while keeping the gate fail-open (a broken gate must never
+ * wedge a conversation).
+ */
+let capabilityWarned = false;
+
+function writable(api: unknown): WritableHookApi | undefined {
+	const candidate = api as Partial<WritableHookApi> | undefined;
+	if (typeof candidate?.commit !== "function" || typeof candidate?.snapshot !== "function") {
+		if (!capabilityWarned) {
+			capabilityWarned = true;
+			console.warn("[durable-settle-gate] hook api lacks commit()/snapshot() — streak will NOT be persisted");
+		}
+		return undefined;
+	}
+	return api as WritableHookApi;
+}
 
 export function createDurableSettleGate() {
 	return defineExtension({
 		name: "ve-settle-gate",
 		hooks: [
 			hook(GenerationTask, {
+				// Record that this run performed a real tool round. onYield cannot see
+				// these calls — they live in earlier assistant messages.
+				afterTools: (_assistant, results, api) => {
+					if (results.length > 0) evidenceFor(api.conversationId).anyTool = true;
+				},
 				onYield: async (answer, api, context) => {
 					try {
 						const text = messageText(answer);
@@ -175,20 +248,30 @@ export function createDurableSettleGate() {
 							text.includes(AUTONOMOUS_VERIFY_FAIL_MARK)
 						) {
 							const w = writable(api);
-							const prevStreak =
-								(await w.snapshot(SettleStreakDocDef, api.conversationId, context))?.rounds ?? 0;
-							const verdict = judgeVerifyRound(text, turnHadToolCalls(answer), prevStreak);
+							const runKey = String(api.taskId);
+							const streakDoc = w ? await w.snapshot(SettleStreakDocDef, api.conversationId, context) : undefined;
+							const prevStreak = streakDoc?.runs?.[runKey] ?? 0;
+							// Evidence = this run called a tool at any point (afterTools), not
+							// "the final message contains a toolCall" (it never does).
+							const hadEvidence = evidenceFor(api.conversationId).anyTool;
+							const verdict = judgeVerifyRound(text, hadEvidence, prevStreak);
 							const writeStreak = async (value: number): Promise<void> => {
+								if (!w) return; // capability already warned once at the call site
 								await w.commit(async (tx) => {
-									(await tx.doc(SettleStreakDocDef, w.conversationId)).rounds = value;
+									const target = await tx.doc(SettleStreakDocDef, w.conversationId);
+									if (!target.runs) target.runs = {};
+									if (value === 0) delete target.runs[runKey];
+									else target.runs[runKey] = value;
 								}, context);
 							};
 							if (verdict.action === "pass") {
 								if (prevStreak > 0) await writeStreak(0); // next task starts clean
+								resetToolEvidence(api.conversationId); // next task must re-earn evidence
 								return undefined; // settle: verified done
 							}
 							if (verdict.action === "release") {
-								await writeStreak(0);
+								await writeStreak(0); // drop THIS run's entry only
+								resetToolEvidence(api.conversationId);
 								// Release WITH the explicit warning, then settle (no more rounds).
 								return { continue: settleReleaseReport(verdict.note) };
 							}
