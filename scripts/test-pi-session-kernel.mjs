@@ -9,7 +9,8 @@
  *    the host is created and tracked, VE tool closures (telemetry hooks)
  *    still fire THROUGH the session-wrapped registry, and pi's built-in
  *    coding tools do not leak into the agent's toolset;
- *  - default kernel "legacy": zero hosts — the gray switch is off by default;
+ *  - kernel "legacy" (explicit): zero hosts — no session shells; note the
+ *    DEFAULT kernel is "durable" since v0.2.167 (see test-kernel-fallback.mjs).
  *  - dropSession disposes the host (no leaked session shells).
  */
 import assert from "node:assert/strict";
@@ -100,7 +101,7 @@ function scriptedStreamFn(toolName) {
 	};
 }
 
-test("legacy kernel (default): a send works with ZERO session hosts — gray switch off", async (t) => {
+test("kernel legacy (explicit): a send works with ZERO session hosts — no shells", async (t) => {
 	await initPiRuntime();
 	const { engine } = makeEngine(t, { streamFn: scriptedStreamFn("get_current_time") });
 	supplierConfig(engine.config);
