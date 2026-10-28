@@ -56,7 +56,7 @@
     "@types/adm-zip": "^0.5.8",
     "adm-zip": "^0.6.0",
     "ali-oss": "^6.23.0",
-    "better-sqlite3": "^11.7.0",
+    "better-sqlite3": "^12.11.1",
     "cron-parser": "^5.7.0",
     "dingtalk-stream": "^2.1.6-beta.1",
     "electron-updater": "^6.8.9",
@@ -118,7 +118,17 @@
       "!node_modules/better-sqlite3/src/**",
       "!node_modules/@anthropic-ai/**",
       "!node_modules/@google/**",
-      "package.json"
+      "package.json",
+      "!node_modules/better-sqlite3/build/**",
+      "!node_modules/better-sqlite3/bin/**",
+      "!**/*.map",
+      "!**/*.d.ts",
+      "!**/*.d.ts.map",
+      "!node_modules/@aws-sdk/**",
+      "!node_modules/@smithy/**",
+      "!node_modules/@earendil-works/pi-coding-agent/docs/**",
+      "!node_modules/@earendil-works/pi-coding-agent/examples/**",
+      "!node_modules/@earendil-works/pi-coding-agent/**"
     ],
     "asarUnpack": [
       "node_modules/better-sqlite3/**/*"
@@ -208,6 +218,11 @@
       "category": "Office",
       "artifactName": "Pi-Virtual-Employee-${version}-${arch}.${ext}",
       "maintainer": "Pi Virtual Employee"
-    }
+    },
+    "compression": "maximum",
+    "electronLanguages": [
+      "en-US",
+      "zh-CN"
+    ]
   }
 }
