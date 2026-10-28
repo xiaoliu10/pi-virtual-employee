@@ -178,7 +178,12 @@ export class IMAdapterManager {
 		// full text in order (field 2026-09-20: daily reports hard-cut at 1200).
 		const parts = splitForPush(text);
 		for (let i = 0; i < parts.length; i += 1) {
-			const piece = parts.length > 1 ? `【${i + 1}/${parts.length}】\n${parts[i]}` : parts[i];
+			// A bare marker line directly above a table row breaks the table's
+			// first block (the renderer needs a blank line before every table).
+			// Insert the separating blank line only when the part starts with one.
+			const piece = parts.length > 1
+				? `【${i + 1}/${parts.length}】\n${/^\s*\|/.test(parts[i]) ? "\n" : ""}${parts[i]}`
+				: parts[i];
 			const pushed = await adapter.push(conversationId, piece);
 			if (!pushed.ok) return pushed;
 		}

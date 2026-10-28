@@ -24,7 +24,7 @@ import { app, type BrowserWindow } from "electron";
 import { DownloadRetryController } from "./update-download-retry.js";
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
-import { basename, join } from "node:path";
+import { basename, join, sep } from "node:path";
 import electronUpdater from "electron-updater";
 
 const { autoUpdater } = electronUpdater;
@@ -1293,6 +1293,9 @@ export async function checkNow(): Promise<UpdateState> {
 export async function downloadNow(): Promise<UpdateState> {
 	if (!enabled()) return lastState;
 	if (downloading) return lastState;
+	// A bounded retry re-enters here right after an error, and the caller resets
+	// the phase to "available" for exactly this reason. Accept that, but never
+	// start a download from an unrelated terminal state (idle/none/downloaded).
 	if (lastState.phase !== "available") return lastState;
 	downloading = true;
 	downloadInFlight = true;
@@ -1373,8 +1376,48 @@ export function stopUpdater(): void {
  * Initialize the updater after the main window exists. No-op in dev/macOS.
  * The startup check is fire-and-forget — it must never block app startup.
  */
+/**
+ * Keep each profile's update cache in its own directory.
+ *
+ * electron-updater names the cache dir from `updaterCacheDirName` in
+ * app-update.yml — a STATIC build-time value, identical for every profile on
+ * the machine. Two profiles downloading the same version therefore write to
+ * the SAME `<localAppData>/pi-virtual-employee-updater/pending/temp-*.exe`;
+ * the first one to finish renames it away and the other fails
+ * `ENOENT: rename temp-… -> …exe` (field 2026-10-28, exactly this message).
+ * electron-updater only retries EBUSY there, so the loser just errors out.
+ *
+ * Namespacing the cache by profile name removes the collision at the source;
+ * the default profile keeps the original path so an existing download is not
+ * orphaned by the upgrade.
+ */
+/** Active profile name, derived from the userData path main.ts redirects. */
+function currentProfileName(): string {
+	const userData = app.getPath("userData");
+	const marker = join("pi-virtual-employee", "profiles") + sep;
+	const at = userData.indexOf(marker);
+	return at >= 0 ? userData.slice(at + marker.length) : "default";
+}
+
+function isolateUpdaterCache(profileName: string): void {
+	if (!profileName || profileName === "default") return;
+	try {
+		const base = join(process.env.LOCALAPPDATA ?? app.getPath("appData"), "pi-virtual-employee-updater");
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const target = autoUpdater as any;
+		if (typeof target.setUpdaterCacheDir !== "function") return;
+		target.setUpdaterCacheDir(`${base}-${profileName}`);
+		log("INFO", `updater cache isolated for profile "${profileName}"`);
+	} catch (err) {
+		// A cache-dir override must never prevent the updater from working.
+		log("WARN", `could not isolate updater cache: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
 export function setupAutoUpdater(win: BrowserWindow): void {
 	window = win;
+	// Namespace the update cache per profile BEFORE any download starts.
+	isolateUpdaterCache(currentProfileName());
 	if (!enabled()) {
 		// Non-Windows/dev: renderer still gets a stable "idle" state so the UI
 		// shows the current version without offering update buttons.
