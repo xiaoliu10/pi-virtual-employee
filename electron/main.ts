@@ -947,14 +947,20 @@ ${tailForProgress(decision.text)}`;
 				const at = userData.indexOf(marker);
 				return at >= 0 ? userData.slice(at + marker.length) : "default";
 			})();
+			// Phase 1 wires ONLY the read-only subset (phase1-tools.ts). A tool under
+			// durable may re-run after a crash when declared safe, so mutating tools
+			// wait for phase 3 where each gets an idempotency key or a business-state
+			// check. Take the tools from the engine's own builder: the RBAC
+			// `guarded()` wrappers come along, so permissions cannot diverge between
+			// kernels.
+			const { selectPhase1Tools } = await import("../src/engine/durable/phase1-tools.js");
+			const phase1 = selectPhase1Tools(engine.buildToolSetFor("durable:console"));
 			const host = await openDurableHost({
 				userDataDir: userData,
 				profileName,
-				// Phase 1 keeps the tool surface empty: the recovery contract (resume,
-				// replay policy, identity, gate) is proven before any real tool runs
-				// under it. Wiring the 30+ VE tools is the next slice.
-				tools: [],
+				tools: phase1,
 			});
+			console.log(`[durable] tool surface: ${phase1.length} read-only tools (${phase1.map((t) => t.name).join(", ")})`);
 			durableHost = host;
 			host.resume(); // pick up whatever the last process left unfinished
 			console.log(`[durable] host ready (profile ${profileName}, db ${host.databasePath})`);

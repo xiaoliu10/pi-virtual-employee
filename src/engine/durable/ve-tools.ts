@@ -18,29 +18,47 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { ToolRegistration } from "@earendil-works/pi-durable";
 
 /**
- * Tools whose rerun cannot change the outside world. Anything absent is unsafe.
+ * Tools whose rerun cannot change the outside world.
  *
- * `manage_work` and `manage_settings` are deliberately ABSENT even though both
- * have read-only actions: the policy is keyed on the tool NAME, and both also
- * create/confirm/pause work items or write config. Marking a mixed tool "safe"
- * would let a crash mid-write replay the mutation — the exact failure this
- * policy exists to prevent. Read-only callers lose nothing: an unsafe tool is
- * still usable, it just is not re-run automatically after a crash.
+ * Classification rule (phase 1, read-only set): a tool is `safe` only when
+ * re-running it produces the SAME observable state — a read, a query, or a write
+ * to a file this app owns (audit log, screenshot artifact, download). Anything
+ * that mutates business state, sends something to a human, or changes config is
+ * NOT here, even if it also has read-only actions.
+ *
+ * Deliberately excluded despite sounding harmless:
+ *  - `manage_*` family: every one of them has a write action (create/confirm/
+ *    pause/cancel/set), and the policy is keyed on the tool NAME, so a crash
+ *    mid-write would replay the mutation.
+ *  - `browser_navigate` / `browser_click` / `browser_type*` / `browser_evaluate`
+ *    / `browser_download`: they drive an external site; a replay submits the form
+ *    or the order twice.
+ *  - `send_image` / `provide_document` / `save_report`: visible to a human —
+ *    replay = the user receives it twice.
+ *  - `remember` / `save_to_knowledge` / `save_to_skill` / `save_document`:
+ *    append records; a duplicate pollutes the knowledge base.
+ *  - `run_command` / `computer_use`: arbitrary external effects.
  */
-const SAFE_TOOLS = new Set([
+export const SAFE_TOOLS: ReadonlySet<string> = new Set([
+	// Pure reads.
 	"get_current_time",
-	"search_knowledge",
 	"read_file",
-	"list_files",
+	"list_directory",
+	"list_documents",
 	"list_downloads",
-	"list_conversations",
-	"list_members",
-	"check_my_access",
-	"capabilities",
-	"list_skills",
+	"list_scheduled_tasks",
 	"get_scheduled_task",
+	"read_skill_asset",
+	"search_knowledge_base",
+	"lookup_order",
 	"inspect_spreadsheet",
-	"search_files",
+	"my_stats",
+	"check_my_access",
+	// Reads that also write a file this app owns (idempotent: same input → same
+	// artifact path/content; a replay cannot change business state).
+	"view_image",
+	"browser_read",
+	"browser_screenshot",
 ]);
 
 /**

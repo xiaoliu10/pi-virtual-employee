@@ -31,11 +31,13 @@ const veToolsBundle = join(probeDir, "ve-tools.mjs");
 const veActorBundle = join(probeDir, "ve-actor.mjs");
 const veGateBundle = join(probeDir, "ve-settle-gate.mjs");
 const hostBundle = join(probeDir, "harness-host.mjs");
+const phase1Bundle = join(probeDir, "phase1-tools.mjs");
 for (const [outfile, entry] of [
 	[veToolsBundle, "./src/engine/durable/ve-tools.ts"],
 	[veActorBundle, "./src/engine/durable/ve-actor.ts"],
 	[veGateBundle, "./src/engine/durable/ve-settle-gate.ts"],
 	[hostBundle, "./src/engine/durable/harness-host.ts"],
+	[phase1Bundle, "./src/engine/durable/phase1-tools.ts"],
 ]) {
 	await build({
 		stdin: { contents: `export * from "${entry}";`, resolveDir: root, loader: "ts" },
@@ -57,7 +59,7 @@ const { Harness, createRegistry, defineExtension, defineTool, GenerationTask, ho
 );
 const { openNodeSqliteStorage } = await import("@earendil-works/pi-durable/storage/sqlite/node");
 const { Type } = await import("typebox");
-const { replayPolicyFor, toDurableTools } = await import(pathToFileURL(veToolsBundle).href);
+const { replayPolicyFor, toDurableTools, SAFE_TOOLS: SAFE_TOOL_NAMES_FOR_TEST } = await import(pathToFileURL(veToolsBundle).href);
 
 const dirs = [];
 async function tempDir() {
@@ -221,9 +223,19 @@ test("the anti-deadloop streak is persisted, so a crash cannot reset the gate", 
 
 test("replay policy defaults to unsafe so a new tool can never silently repeat an effect", () => {
 	assert.equal(replayPolicyFor("read_file"), "safe");
-	assert.equal(replayPolicyFor("search_knowledge"), "safe");
+	assert.equal(replayPolicyFor("search_knowledge_base"), "safe");
+	assert.equal(replayPolicyFor("get_current_time"), "safe");
+	assert.equal(replayPolicyFor("my_stats"), "safe");
 	// Anything not reviewed is unsafe by construction.
-	assert.equal(replayPolicyFor("send_file"), "unsafe");
+	// Visible to a human: a replay means the user receives it twice.
+	assert.equal(replayPolicyFor("send_image"), "unsafe");
+	assert.equal(replayPolicyFor("provide_document"), "unsafe");
+	assert.equal(replayPolicyFor("save_report"), "unsafe");
+	// Drives an external site: a replay submits the form again.
+	assert.equal(replayPolicyFor("browser_navigate"), "unsafe");
+	assert.equal(replayPolicyFor("browser_click"), "unsafe");
+	assert.equal(replayPolicyFor("browser_evaluate"), "unsafe");
+	assert.equal(replayPolicyFor("run_command"), "unsafe");
 	assert.equal(replayPolicyFor("some_future_tool"), "unsafe");
 	assert.equal(replayPolicyFor("refund"), "unsafe");
 	// Mixed read/write tools must never be marked replayable: the policy is keyed
@@ -288,4 +300,68 @@ test("opening the host creates a resumable store and closes cleanly", async () =
 	const again = await openDurableHost({ userDataDir: dir, profileName: "probe", tools: [] });
 	again.resume(); // reopening the SAME store must work
 	await again.close();
+});
+
+// ── phase-1 tool surface ───────────────────────────────────────────────────
+
+test("phase 1 wires only read-only tools and derives its list from SAFE_TOOLS", async () => {
+	const { PHASE1_TOOL_NAMES, selectPhase1Tools } = await import(pathToFileURL(phase1Bundle).href);
+	const make = (name) => ({
+		name,
+		label: name,
+		description: name,
+		parameters: Type.Object({}),
+		execute: async () => ({ content: [{ type: "text", text: name }], details: undefined }),
+	});
+	const all = [
+		"get_current_time",
+		"read_file",
+		"my_stats",
+		"run_command",
+		"manage_work",
+		"browser_navigate",
+		"send_image",
+	].map(make);
+	const picked = selectPhase1Tools(all).map((t) => t.name);
+
+	assert.deepEqual(picked.sort(), ["get_current_time", "my_stats", "read_file"]);
+	for (const mutating of ["run_command", "manage_work", "browser_navigate", "send_image"]) {
+		assert.ok(!picked.includes(mutating), `${mutating} must never be wired in phase 1`);
+	}
+	// Single source of truth: the wired set IS the safe set.
+	assert.deepEqual([...PHASE1_TOOL_NAMES].sort(), [...SAFE_TOOL_NAMES_FOR_TEST].sort());
+});
+
+test("a real VE tool runs under durable and is not re-run after a restart", async () => {
+	const dir = await tempDir();
+	const dbPath = join(dir, "tools.sqlite");
+	const calls = { get_current_time: 0, read_file: 0 };
+	const veTool = (name) => ({
+		name,
+		label: name,
+		description: name,
+		parameters: Type.Object({}),
+		execute: async () => {
+			calls[name] += 1;
+			return { content: [{ type: "text", text: `${name}-result` }], details: { ok: true } };
+		},
+	});
+	const host = makeHost(dbPath, toDurableTools([veTool("get_current_time"), veTool("read_file")]));
+	host.faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("get_current_time", {}), { stopReason: "toolUse" }),
+		fauxAssistantMessage(fauxToolCall("read_file", {}), { stopReason: "toolUse" }),
+		fauxAssistantMessage("done"),
+	]);
+	const first = await host.open();
+	const submission = await first.root.submit({ type: "input", content: "read both" }, BACKGROUND_CONTEXT);
+	assert.equal((await submission.wait(BACKGROUND_CONTEXT)).status, "done");
+	assert.deepEqual(calls, { get_current_time: 1, read_file: 1 }, "each tool ran once");
+	await first.harness.close(BACKGROUND_CONTEXT);
+
+	// Restart on the same storage: nothing to do, so nothing may run again.
+	const second = await host.open();
+	second.harness.resume();
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	assert.deepEqual(calls, { get_current_time: 1, read_file: 1 }, "a restart must not re-run completed tools");
+	await second.harness.close(BACKGROUND_CONTEXT);
 });
