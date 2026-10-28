@@ -1114,18 +1114,55 @@ ${tailForProgress(decision.text)}`;
 	// in via capabilities.autonomousMining. Checked hourly; fires per its
 	// interval. On-demand mining (manage_work_items action=mine) is unaffected.
 	let lastMiningRun = 0;
+	const setMiningMeta = (key: string, value: string | number): void => {
+		try {
+			db.prepare("INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(`mining.${key}`, String(value));
+		} catch { /* health recording must never break mining */ }
+	};
 	workMiningTimer = setInterval(() => {
 		const mining = config.all().capabilities.autonomousMining;
+		// A disabled switch is itself health state: the settings page shows WHY
+		// there are no proposals instead of the feature silently not existing.
+		setMiningMeta("lastTickAt", Date.now());
+		setMiningMeta("enabled", mining?.enabled ? 1 : 0);
 		if (!mining?.enabled) return;
 		if (Date.now() - lastMiningRun < mining.intervalHours * 3_600_000) return;
 		lastMiningRun = Date.now();
+		setMiningMeta("lastRunAt", Date.now());
 		void engine
 			.mineRecentWork({ maxProposals: 2 })
 			.then((r) => {
-				if (r.error) console.warn("[work] background mining failed:", r.error);
+				setMiningMeta("lastMiningScanned", r.scanned);
+				setMiningMeta("lastMiningProposals", r.proposals.length);
+				if (r.error) {
+					setMiningMeta("lastMiningError", r.error);
+					console.warn("[work] background mining failed:", r.error);
+				} else {
+					setMiningMeta("lastMiningError", "");
+				}
 			})
-			.catch((err) => console.warn("[work] background mining failed:", (err as Error).message));
+			.catch((err) => {
+				setMiningMeta("lastMiningError", (err as Error).message || String(err));
+				console.warn("[work] background mining failed:", (err as Error).message);
+			});
 	}, 60 * 60_000);
+
+	ipcMain.handle("work:miningStatus", () => {
+		const read = (key: string): string | null => {
+			const row = db.prepare("SELECT value FROM app_meta WHERE key = ?").get(`mining.${key}`) as { value: string } | undefined;
+			return row?.value ?? null;
+		};
+		return {
+			enabled: config.all().capabilities.autonomousMining?.enabled === true,
+			intervalHours: config.all().capabilities.autonomousMining?.intervalHours ?? 4,
+			lastTickAt: read("lastTickAt"),
+			lastRunAt: read("lastRunAt"),
+			lastMiningScanned: read("lastMiningScanned"),
+			lastMiningProposals: read("lastMiningProposals"),
+			lastMiningError: read("lastMiningError"),
+			pendingProposals: engine.workItems?.list().filter((i) => i.status === "proposed").length ?? null,
+		};
+	});
 
 	ipcMain.handle("server:port", () => port);
 	const computerAction = async (event: Electron.IpcMainInvokeEvent, action: string) => {

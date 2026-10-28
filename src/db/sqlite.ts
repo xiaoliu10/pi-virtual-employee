@@ -99,6 +99,14 @@ function migrate(db: DB): void {
 		);
 		CREATE INDEX IF NOT EXISTS idx_kb_chunks_source ON kb_chunks(source, source_id);
 
+		-- Process-level runtime status (last background-mining pass, …). Deliberately
+		-- separate from config: this is OBSERVED state an operator reads, not
+		-- settings they write. Exists so an autonomous feature that silently stops
+		-- working is visible on first glance, not discoverable months later.
+		CREATE TABLE IF NOT EXISTS app_meta (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
 		-- Runtime state for the knowledge base (vec availability / dims / model, …).
 		CREATE TABLE IF NOT EXISTS kb_state (
 			key   TEXT PRIMARY KEY,
