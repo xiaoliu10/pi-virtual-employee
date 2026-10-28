@@ -52,6 +52,9 @@ export interface LedgerClaim {
 	/** true when this claim adopted a row a previous process left in
 	 *  pending/attempting (crash evidence — the delivery MAY have landed). */
 	recovered: boolean;
+	/** true when a previous process died MID-SEND: the delivery may already have
+	 *  landed, so the caller must NOT push. */
+	uncertain: boolean;
 	attempts: number;
 }
 
@@ -99,8 +102,13 @@ export class DeliveryLedger {
 	 * - unknown occurrence → row created in `attempting`, allowed to push
 	 * - `delivered`        → `skipped:true`, caller must not push (permanent)
 	 * - `failed`           → re-claimed (attempts++), allowed to retry
-	 * - `attempting`/`pending` → re-claimed (attempts++), allowed, flagged
-	 *   `recovered` (crash left it behind; user may see a duplicate)
+	 * - `attempting` → BLOCKED. A row in this state means a push started and the
+	 *   process died before recording the outcome: it may well have reached the
+	 *   user. Re-sending would be exactly the duplicate this ledger exists to
+	 *   prevent, so the claim returns `uncertain:true` and the caller must not
+	 *   send. (Previously this re-claimed and re-sent — review finding.)
+	 * - `pending` → re-claimed: a row reserved but never started cannot have
+	 *   delivered anything, so sending is safe.
 	 */
 	claim(occurrenceId: string, conversationId: string, opts: ClaimOptions = {}): LedgerClaim {
 		const id = normalizeId(occurrenceId);
@@ -113,16 +121,20 @@ export class DeliveryLedger {
 						"INSERT INTO push_ledger (occurrence_id, conversation_id, status, attempts, kind, last_error, created_at, updated_at) VALUES (?, ?, 'attempting', 1, ?, NULL, ?, ?)",
 					)
 					.run(id, conversationId, opts.kind ?? null, now, now);
-				return { skipped: false, recovered: false, attempts: 1 };
+				return { skipped: false, recovered: false, uncertain: false, attempts: 1 };
 			}
 			if (row.status === "delivered") {
-				return { skipped: true, recovered: false, attempts: row.attempts };
+				return { skipped: true, recovered: false, uncertain: false, attempts: row.attempts };
 			}
-			const recovered = row.status === "attempting" || row.status === "pending";
+			if (row.status === "attempting") {
+				// Mid-send crash: outcome unknown. Block instead of risking a duplicate.
+				return { skipped: false, recovered: true, uncertain: true, attempts: row.attempts };
+			}
+			const recovered = row.status === "pending";
 			this.db
 				.prepare("UPDATE push_ledger SET status = 'attempting', attempts = attempts + 1, conversation_id = ?, updated_at = ? WHERE occurrence_id = ?")
 				.run(conversationId, now, id);
-			return { skipped: false, recovered, attempts: row.attempts + 1 };
+			return { skipped: false, recovered, uncertain: false, attempts: row.attempts + 1 };
 		});
 	}
 
@@ -238,4 +250,22 @@ export function scheduledOccurrenceId(taskId: string, fireInstant: number | stri
  */
 export function chatOccurrenceId(channel: string, platformMessageId: string): string {
 	return `chat:${channel}:${platformMessageId}`;
+}
+
+/**
+ * Build the occurrence id for ONE chat progress heartbeat (the periodic
+ * `longTaskProgressMin` cadence, v0.2.162 ProgressNotifier behaviour): the
+ * identity is (message, time bucket) — `chat:<channel>:<msgId>#hb-<bucket>` —
+ * so a duplicate push INSIDE one bucket (retried claim, crash-restart
+ * redelivery of the same inbound message) collapses to one delivery while the
+ * NEXT bucket's scheduled beat is a new occurrence and pushes normally. The
+ * bucket size is the caller's live heartbeat interval — the same configured
+ * value that drives its timer — so consecutive timer fires always land in
+ * consecutive buckets and the ledger never eats a legitimate cadence beat.
+ * Returns "" for unusable input → the caller pushes unledgered: a broken
+ * bucket derivation must never be the reason a heartbeat is lost.
+ */
+export function chatHeartbeatOccurrenceId(channel: string, platformMessageId: string, pushTs: number, intervalMs: number): string {
+	if (!platformMessageId || !Number.isFinite(pushTs) || !(intervalMs > 0)) return "";
+	return `${chatOccurrenceId(channel, platformMessageId)}#hb-${Math.floor(pushTs / intervalMs)}`;
 }

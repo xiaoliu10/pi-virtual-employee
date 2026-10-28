@@ -18,6 +18,7 @@ import { after, test } from "node:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { mkdtempSync, rmSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { build } from "esbuild";
 
@@ -29,7 +30,7 @@ const bundle = join(dir, "outbox.mjs");
 await build({
 	stdin: {
 		contents: `
-			export { DeliveryLedger, scheduledOccurrenceId, chatOccurrenceId } from "./src/im/delivery-ledger.ts";
+			export { DeliveryLedger, scheduledOccurrenceId, chatOccurrenceId, chatHeartbeatOccurrenceId } from "./src/im/delivery-ledger.ts";
 			export { IMAdapterManager } from "./src/im/manager.ts";
 		`,
 		resolveDir: root,
@@ -41,7 +42,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { DeliveryLedger, IMAdapterManager, scheduledOccurrenceId, chatOccurrenceId } = await import(pathToFileURL(bundle).href);
+const { DeliveryLedger, IMAdapterManager, scheduledOccurrenceId, chatOccurrenceId, chatHeartbeatOccurrenceId } = await import(pathToFileURL(bundle).href);
 
 /** A real sqlite file per test — the ledger must survive closing/reopening it. */
 async function dbFile(t) {
@@ -165,12 +166,13 @@ test("restart with a row left mid-flight (attempting) does not re-push on its ow
 	const { ledger } = useLedger(t, manager, file);
 	assert.equal(calls(), 0, "boot alone pushes nothing (no auto re-push of unknown outcomes)");
 
+	// Review finding: re-sending a mid-crash occurrence risks a duplicate the user
+	// can see. The ledger must report uncertainty and the push path must NOT send.
 	const retried = await manager.pushToConversation("dt:group:crashed", "报告", { occurrenceId: occ });
-	assert.equal(retried.ok, true);
-	assert.equal(retried.recovered, true, "the caller is told this delivery may be a duplicate");
-	assert.equal(sent.length, 1);
-	assert.equal(ledger.get(occ).status, "delivered");
-	assert.equal(ledger.get(occ).attempts, 2, "the crashed claim counted as attempt 1");
+	assert.equal(retried.ok, false, "an uncertain delivery must not be reported as success");
+	assert.equal(retried.uncertain, true, "the caller is told the outcome is UNKNOWN");
+	assert.equal(sent.length, 0, "CRITICAL: never re-send what may already have been delivered");
+	assert.equal(ledger.get(occ).status, "attempting", "the row stays mid-flight for a human to resolve");
 });
 
 test("no occurrence id: pushes are not recorded in the ledger (backward compatible)", async (t) => {
@@ -220,6 +222,43 @@ test("occurrence id helpers: same identity ⇒ same string, chat ids carry the m
 	assert.notEqual(chatOccurrenceId("dingtalk", "msg-7"), chatOccurrenceId("dingtalk", "msg-8"));
 });
 
+test("heartbeat occurrence ids: (message, 15-min bucket) identity in the documented shape", () => {
+	const interval = 15 * 60_000; // general.longTaskProgressMin 默认 15（ProgressNotifier 同一配置源）
+	const t14x59 = Date.parse("2026-01-01T14:59:00Z");
+	const t15x01 = t14x59 + 2 * 60_000; // crosses the :00 bucket boundary
+	const a = chatHeartbeatOccurrenceId("dingtalk", "msg-7", t14x59, interval);
+	assert.equal(a, `chat:dingtalk:msg-7#hb-${Math.floor(t14x59 / interval)}`, "shape: chat:<channel>:<msgId>#hb-<floor(ts/interval)>");
+	assert.equal(chatHeartbeatOccurrenceId("dingtalk", "msg-7", t14x59, interval), a, "same message + same bucket ⇒ same id (redelivery-safe)");
+	assert.notEqual(chatHeartbeatOccurrenceId("dingtalk", "msg-7", t15x01, interval), a, "next bucket ⇒ new occurrence (the periodic beat still fires)");
+	assert.equal(chatHeartbeatOccurrenceId("dingtalk", "msg-7", t14x59, 0), "", "unusable interval ⇒ no identity, the push stays unledgered");
+});
+
+test("chat heartbeat ledger: same-bucket redelivery suppressed, 14:59 and 15:01 beats both deliver", async (t) => {
+	const file = await dbFile(t);
+	const { manager, sent, calls } = fakeManager();
+	const { ledger } = useLedger(t, manager, file);
+	const intervalMs = 15 * 60_000; // the configured longTaskProgressMin cadence
+	const t14x59 = Date.parse("2026-01-01T14:59:00Z");
+	const t14x5930 = t14x59 + 30_000; // SAME bucket — e.g. crash-restart redelivery
+	const t15x01 = t14x59 + 2 * 60_000; // next bucket — the normal periodic beat
+	const push = (ts) => manager.pushToConversation("dt:staff-5", "⏳ 仍在进行中", {
+		occurrenceId: chatHeartbeatOccurrenceId("dingtalk", "msg-hb", ts, intervalMs),
+		kind: "chat-progress",
+	});
+
+	const first = await push(t14x59);
+	const redelivery = await push(t14x5930);
+	const nextBeat = await push(t15x01);
+
+	assert.deepEqual(first, { ok: true }, "first heartbeat of the bucket delivers");
+	assert.equal(redelivery.skipped, true, "same-bucket duplicate is suppressed (crash-restart safe)");
+	assert.equal(nextBeat.ok, true);
+	assert.equal(nextBeat.skipped, undefined, "the NEXT bucket's beat is NOT suppressed — v0.2.162 cadence preserved");
+	assert.equal(calls(), 2, "one delivery per bucket: two buckets, two sends");
+	assert.equal(sent.length, 2);
+	assert.equal(ledger.counts().delivered, 2);
+});
+
 test("ledger bookkeeping never turns a succeeded delivery into a failure (closed ledger)", async (t) => {
 	const file = await dbFile(t);
 	const { manager, sent } = fakeManager();
@@ -229,4 +268,25 @@ test("ledger bookkeeping never turns a succeeded delivery into a failure (closed
 	const r = await manager.pushToConversation("dt:staff-3", "hello", { occurrenceId: occ });
 	assert.equal(r.ok, true, "delivery still happens");
 	assert.equal(sent.length, 1);
+});
+
+test("a row left MID-SEND is never re-sent (outcome unknown, not 'delivered')", () => {
+	// Field risk: process dies between "push started" and "record outcome". The
+	// message may already be in the user's chat, so re-sending duplicates it.
+	// Re-claiming here was the review finding; the claim must now report
+	// uncertainty and the push path must not send.
+	const dir = mkdtempSync(join(tmpdir(), "ledger-unsure-"));
+	const db = new DatabaseSync(join(dir, "l.sqlite"));
+	const ledger = new DeliveryLedger(db);
+	ledger.claim("chat:dt:m1", "dt:single:1");
+	// Simulate the crash: no markDelivered / markFailed. Re-open (new process).
+	db.close();
+	const db2 = new DatabaseSync(join(dir, "l.sqlite"));
+	const ledger2 = new DeliveryLedger(db2);
+	const again = ledger2.claim("chat:dt:m1", "dt:single:1");
+	assert.equal(again.skipped, false, "it is not known-delivered");
+	assert.equal(again.uncertain, true, "a mid-send row must be reported UNCERTAIN, never silently retried");
+	assert.equal(ledger2.get("chat:dt:m1").status, "attempting", "the row must stay attempting (not rewritten as a fresh attempt)");
+	db2.close();
+	rmSync(dir, { recursive: true, force: true });
 });

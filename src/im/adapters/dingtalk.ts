@@ -389,8 +389,9 @@ export class DingtalkAdapter implements IMAdapter {
 							// The group's own name — the only handle a human has for it (the
 							// client never shows openConversationId). Absent in 1:1 chats.
 							conversationName: (msg as { conversationTitle?: string }).conversationTitle?.trim() || undefined,
-							// Delivery identity for reply-path bookkeeping (a redelivered
-							// stream message must not re-push its progress notes).
+							// Delivery identity for reply-path bookkeeping: the manager derives
+							// (message, time-bucket) heartbeat occurrences from it, so a
+							// redelivered stream message cannot re-push a same-bucket note.
 							messageId: msg.msgId || undefined,
 							channel: "dingtalk",
 							actor: {

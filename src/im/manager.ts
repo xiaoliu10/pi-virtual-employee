@@ -22,7 +22,7 @@ import { isAuthorizationPhrase } from "../engine/authorization.js";
 import { startStallWatchdog } from "./watchdog.js";
 import { splitForPush } from "./chunks.js";
 import { gateOutboundText } from "./credential-egress.js";
-import { chatOccurrenceId, DeliveryLedger } from "./delivery-ledger.js";
+import { chatHeartbeatOccurrenceId, DeliveryLedger } from "./delivery-ledger.js";
 import type { AdapterCapabilities, AdapterHealth } from "./types.js";
 
 /** Shared deps handed to adapter factories that need them (e.g. image hosting). */
@@ -68,6 +68,9 @@ export interface PushResult {
 	/** Set when the ledger adopted a row a previous run left mid-flight: the
 	 *  delivery may have already reached the user (honest at-least-once). */
 	recovered?: boolean;
+	/** The delivery may or may not have reached the user (a previous attempt crashed
+	 *  mid-send). Callers must NOT retry automatically; surface it for a human. */
+	uncertain?: boolean;
 }
 
 /** channel type → factory. Add more real channels (feishu/wecom/…) here. */
@@ -212,6 +215,14 @@ export class IMAdapterManager {
 					// Same occurrence already delivered — the whole point of the ledger.
 					console.log(`[im] delivery skipped (occurrence already delivered): ${occurrenceId} → ${conversationId}`);
 					return { ok: true, skipped: true };
+				}
+				if (claim.uncertain) {
+					// A previous process died mid-send. The user may already have the
+					// message, so re-sending would be the duplicate this ledger exists to
+					// prevent; report uncertainty and let the caller decide (never claim
+					// success — that would hide a possible non-delivery).
+					console.warn(`[im] delivery uncertain (crashed mid-send, not re-sending): ${occurrenceId} → ${conversationId}`);
+					return { ok: false, error: `投递状态未知（上次发送中进程中断，可能已送达）：${occurrenceId}`, uncertain: true };
 				}
 				const result = await this.deliver(conversationId, text);
 				// Below ok:false the SAME occurrence may retry (failed is not terminal).
@@ -432,12 +443,14 @@ export class IMAdapterManager {
 					// concrete ≤100-char progress report; if the turn settles while the
 					// summary is in flight, the stale "仍在进行中" is dropped.
 					//
-					// Delivery ledger (2026-10-27): a heartbeat is ONE occurrence per
-					// inbound message — the last note before the turn settles is the one
-					// that matters. Once a note for this message has been delivered, later
-					// heartbeats for the SAME message are skipped instead of repeated, and
-					// a redelivered inbound message cannot re-emit them after a restart.
-					const inboundOccurrenceId = msg.messageId ? chatOccurrenceId(msg.channel ?? "im", msg.messageId) : undefined;
+					// Delivery ledger (2026-10-27): each heartbeat occurrence is (inbound
+					// message, time bucket) — bucket size = THIS config value that also
+					// drives the timer below, so consecutive timer fires land in consecutive
+					// buckets. A duplicate claim inside one bucket (retried push, a
+					// redelivered stream message after a restart) is suppressed; the NEXT
+					// bucket's beat is a new occurrence — the deliberate v0.2.162 cadence
+					// (one note every `longTaskProgressMin` for as long as the turn runs)
+					// is preserved, only true duplicates are deduped.
 					const onProgress = ctx?.onProgress;
 					const progressMin = this.config.all().general.longTaskProgressMin;
 					let progressInFlight = false;
@@ -447,7 +460,13 @@ export class IMAdapterManager {
 							progressInFlight = true;
 							void this.engine.progressBrief(agent, msg.conversationId)
 								.then((note) => {
-									if (agent.state.isStreaming) return onProgress(note, { occurrenceId: inboundOccurrenceId, kind: "chat-progress" });
+									if (!agent.state.isStreaming) return;
+									// Bucket derived at PUSH time, from the same interval the timer
+									// above was sized with — never a second hardcoded cadence.
+									const occurrenceId = msg.messageId
+										? chatHeartbeatOccurrenceId(msg.channel ?? "im", msg.messageId, Date.now(), progressMin * 60_000)
+										: undefined;
+									return onProgress(note, { occurrenceId: occurrenceId || undefined, kind: "chat-progress" });
 								})
 								.catch((err) => console.warn("[im] progress push failed:", (err as Error).message))
 								.finally(() => {
