@@ -963,8 +963,14 @@ ${tailForProgress(decision.text)}`;
 			kernel = "legacy";
 		}
 	}
+	// Orderly close: `close()` waits for running task code to return, so a clean
+	// quit writes the final checkpoint instead of leaving the run to be counted as
+	// a crash. Electron's will-quit cannot await, so the update path (which DOES
+	// have an await point) closes it explicitly in prepareToInstall below; this
+	// handler is the ordinary-quit fallback and must stay best-effort like the
+	// other resource teardowns on this event.
 	app.on("will-quit", () => {
-		if (durableHost) void durableHost.close();
+		if (durableHost) void durableHost.close().catch(() => {});
 	});
 
 	scheduler.setRunner({
@@ -1969,6 +1975,16 @@ ${tailForProgress(decision.text)}`;
 			// electron-updater spawns NSIS before app.quit(). Release every process /
 			// listener that can keep the old app tree alive before calling it.
 			await stopWork();
+			// Durable host BEFORE the DB closes: close() waits for running task code
+			// to return and writes the final checkpoint, so an upgrade is a graceful
+			// stop (resumable, not counted as a crash). Bounded so a wedged task
+			// cannot hold the installer open — partial progress is already committed.
+			if (durableHost) {
+				await Promise.race([
+					durableHost.close().catch(() => {}),
+					new Promise<void>((resolve) => setTimeout(resolve, 8_000)),
+				]);
+			}
 			scheduler.stop();
 			disposeShellCommands(config);
 			await im.stopAll();

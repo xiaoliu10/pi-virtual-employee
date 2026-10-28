@@ -177,7 +177,7 @@ test("actor identity is persisted, so a recovered turn re-checkes the same perso
 	await first.root.commit(async (tx) => {
 		const doc = await tx.doc(VeActorDocDef, first.root.id);
 		doc.staffId = "staff-42";
-		doc.role = "admin";
+		doc.channel = "dingtalk";
 		doc.stampedAt = Date.now();
 	}, BACKGROUND_CONTEXT);
 	await first.harness.close(BACKGROUND_CONTEXT);
@@ -186,7 +186,14 @@ test("actor identity is persisted, so a recovered turn re-checkes the same perso
 	const second = await host.open();
 	const recovered = await second.harness.snapshot(VeActorDocDef, second.root.id, BACKGROUND_CONTEXT);
 	assert.equal(recovered?.staffId, "staff-42", "verified sender survives the restart");
-	assert.equal(recovered?.role, "admin", "role is re-derived from the stored reference");
+	// The document stores a REFERENCE, never an authorization decision: a role
+	// cached here would let a recovered turn keep permissions that were revoked
+	// between the crash and the restart. The role must be re-resolved from config.
+	assert.equal(
+		Object.prototype.hasOwnProperty.call(recovered ?? {}, "role"),
+		false,
+		"the actor doc must NOT cache a role — it is re-derived from current config",
+	);
 	await second.harness.close(BACKGROUND_CONTEXT);
 });
 
