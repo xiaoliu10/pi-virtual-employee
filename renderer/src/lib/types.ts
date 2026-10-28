@@ -158,7 +158,10 @@ export interface AppConfig {
 	documents: { enabled: boolean; dir: string };
 	filesystem: { enabled: boolean; allowedDirs: string[] };
 	/** Restricted shell command execution (run_command tool) for headless-server ops. */
-	capabilities: { shell: { enabled: boolean; allowedCommands: string[]; timeoutSec: number; backgroundTimeoutSec: number; pollTimeoutSec: number } };
+	capabilities: {
+		shell: { enabled: boolean; allowedCommands: string[]; timeoutSec: number; backgroundTimeoutSec: number; pollTimeoutSec: number };
+		autonomousMining: { enabled: boolean; intervalHours: number };
+	};
 	reports: {
 		enabled: boolean;
 		target: "gitee" | "oss";

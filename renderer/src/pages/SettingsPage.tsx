@@ -385,6 +385,18 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 	// would strip the trailing empty line and "eat" the Enter key).
 	const [domainsText, setDomainsText] = useState((config?.browser.allowedDomains ?? []).join("\n"));
 	const [shellCommandsText, setShellCommandsText] = useState((config?.capabilities.shell.allowedCommands ?? []).join("\n"));
+	// Mining health: the feature runs in the background with NO user-visible
+	// artifact until a proposal lands. Twice now (prompt_lab, mining) a wired
+	// feature sat silently "off" and nobody noticed for months — so the settings
+	// page always shows WHEN it last ran and WHAT it produced.
+	const [miningStatus, setMiningStatus] = useState<Awaited<ReturnType<typeof api.getMiningStatus>> | null>(null);
+	useEffect(() => {
+		void api.getMiningStatus().then(setMiningStatus).catch(() => {});
+	}, []);
+	useEffect(() => {
+		const t = setInterval(() => { void api.getMiningStatus().then(setMiningStatus).catch(() => {}); }, 60_000);
+		return () => clearInterval(t);
+	}, []);
 	useEffect(() => {
 		setDomainsText((config?.browser.allowedDomains ?? []).join("\n"));
 		setShellCommandsText((config?.capabilities.shell.allowedCommands ?? []).join("\n"));
@@ -1054,6 +1066,45 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 															className={inputCls + " h-auto py-2 font-mono"}
 														/>
 													</Field>
+												</div>
+											</div>
+
+											<div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+												<div className="mb-3">
+													<div className="text-sm font-medium text-slate-800">自主任务挖掘</div>
+													<div className="mt-1 text-xs leading-relaxed text-slate-400">定期阅读各会话的新消息（严格单会话来源、只读），把值得主动跟进的工作整理成提案，推回原会话等你确认——不会自动创建或执行任何任务。默认关闭。</div>
+												</div>
+												<div className="space-y-3">
+													<label className="flex cursor-pointer items-center justify-between rounded-xl border border-amber-200 bg-amber-50/50 px-4 py-3">
+														<div><div className="text-sm font-medium text-slate-800">启用自主任务挖掘</div><div className="mt-0.5 text-xs text-amber-700/70">开启后按下方间隔在后台提炼提案；驳回过的提案进入冷却，之后对话中再次多次提到才会重新提出。</div></div>
+														<input type="checkbox" checked={draft.capabilities.autonomousMining.enabled} onChange={(e) => setDraft((v) => v ? { ...v, capabilities: { ...v.capabilities, autonomousMining: { ...v.capabilities.autonomousMining, enabled: e.target.checked } } } : v)} className="h-5 w-5 accent-amber-500" />
+													</label>
+													<Field label="挖掘间隔（小时）" hint="两次后台提炼的最小间隔（1–24）。提案会推回各自来源会话，由该会话的管理员确认。">
+														<input
+															type="number"
+															min={1}
+															max={24}
+															value={draft.capabilities.autonomousMining.intervalHours}
+															onChange={(e) => setDraft((v) => v ? { ...v, capabilities: { ...v.capabilities, autonomousMining: { ...v.capabilities.autonomousMining, intervalHours: Math.min(24, Math.max(1, Math.floor(Number(e.target.valueAsNumber) || 1))) } } } : v)}
+															className={inputCls}
+														/>
+													</Field>
+													<div className="rounded-xl bg-slate-50 px-4 py-3 text-xs leading-relaxed text-slate-500">
+														{!miningStatus ? "正在读取挖掘状态…" : (
+															<>
+																<div>上次轮询：{miningStatus.lastTickAt ? new Date(Number(miningStatus.lastTickAt)).toLocaleString() : "尚未轮询（每小时检查一次，与开关无关）"}</div>
+																<div>上次实际挖掘：{miningStatus.lastRunAt ? new Date(Number(miningStatus.lastRunAt)).toLocaleString() : "还没有运行过"}</div>
+																{miningStatus.pendingProposals != null && miningStatus.pendingProposals > 0 && (
+																	<div>待你确认的提案：{miningStatus.pendingProposals} 条</div>
+																)}
+																{miningStatus.lastRunAt && (
+																	<div>上次挖掘：扫描会话 {miningStatus.lastMiningScanned ?? "?"} 个 · 产出提案 {miningStatus.lastMiningProposals ?? "?"} 条</div>
+																)}
+																{miningStatus.lastMiningError && <div className="text-red-600">上次出错：{miningStatus.lastMiningError}</div>}
+																{miningStatus.enabled === false && <div className="text-amber-700/80">当前处于关闭状态——关闭期间不会产出任何提案。</div>}
+															</>
+														)}
+													</div>
 												</div>
 											</div>
 

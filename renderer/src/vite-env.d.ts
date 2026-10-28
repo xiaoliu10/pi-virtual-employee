@@ -6,6 +6,16 @@ import type { ConversationRow, MessageRow } from "./lib/types";
 /** Whitelisted API bridged by electron/preload.ts. Kept in sync manually. */
 export interface RendererApi {
 	getServerPort(): Promise<number>;
+	getMiningStatus(): Promise<{
+		enabled: boolean;
+		intervalHours: number;
+		lastTickAt: string | null;
+		lastRunAt: string | null;
+		lastMiningScanned: string | null;
+		lastMiningProposals: string | null;
+		lastMiningError: string | null;
+		pendingProposals: number | null;
+	}>;
 	getConfig(): Promise<AppConfig>;
 	setConfig(patch: unknown): Promise<AppConfig>;
 	manageComputer(action: "status" | "install" | "connect" | "disconnect"): Promise<import("../../src/shared/computer").ComputerStatus>;
