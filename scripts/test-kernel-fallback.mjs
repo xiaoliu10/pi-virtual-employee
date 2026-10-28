@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
+import { rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { build } from "esbuild";
@@ -96,8 +97,8 @@ test("default config resolves engineKernel to durable (flip verified)", () => {
 	db.close();
 });
 
-test("kernel durable without an opened runtime → send throws (fail-loud)", async () => {
-	const engine = makeEngine({ after() {} }, { streamFn: okStreamFn, kernel: "durable" });
+test("kernel durable without an opened runtime → send throws (fail-loud)", async (t) => {
+	const engine = makeEngine(t, { streamFn: okStreamFn, kernel: "durable" });
 	supplierConfig(engine);
 	const agent = engine.getOrCreateSession("conv-durable");
 	await assert.rejects(
@@ -106,8 +107,8 @@ test("kernel durable without an opened runtime → send throws (fail-loud)", asy
 	);
 });
 
-test("after degradeToLegacyKernel → send runs the legacy pipeline and replies", async () => {
-	const engine = makeEngine({ after() {} }, { streamFn: okStreamFn, kernel: "durable" });
+test("after degradeToLegacyKernel → send runs the legacy pipeline and replies", async (t) => {
+	const engine = makeEngine(t, { streamFn: okStreamFn, kernel: "durable" });
 	supplierConfig(engine);
 	engine.degradeToLegacyKernel("test: durable host failed to open");
 	const agent = engine.getOrCreateSession("conv-degraded");
@@ -119,11 +120,49 @@ test("after degradeToLegacyKernel → send runs the legacy pipeline and replies"
 	assert.ok(again.reply.length > 0);
 });
 
-test("degrading a legacy engine is a no-op", async () => {
-	const engine = makeEngine({ after() {} }, { streamFn: okStreamFn, kernel: "legacy" });
+test("degrading a legacy engine is a no-op", async (t) => {
+	const engine = makeEngine(t, { streamFn: okStreamFn, kernel: "legacy" });
 	supplierConfig(engine);
 	engine.degradeToLegacyKernel("test: should not change anything");
 	const agent = engine.getOrCreateSession("conv-legacy");
 	const result = await engine.send(agent, "hello");
 	assert.equal(result.reply, "legacy 管线答复");
+});
+
+test("carry-forward: persisted old-default legacy bumps to durable once", (t) => {
+	const db = new DatabaseSync(":memory:");
+	db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
+	t.after(() => db.close());
+	// Every install that ever ran ≤0.2.166 has the OLD default materialized:
+	const legacyBlob = JSON.stringify({ general: { engineKernel: "legacy" }, model: {}, im: {}, kb: {}, security: {}, capabilities: {}, computer: {} });
+	db.prepare("INSERT INTO config (key, value) VALUES ('appconfig', ?)").run(legacyBlob);
+	const config = new ConfigStore(db);
+	assert.equal(config.all().general.engineKernel, "durable");
+	assert.equal(config.all().general.engineKernelCarried, true);
+	// and the migration is persisted, not just in-memory:
+	const stored = JSON.parse(db.prepare("SELECT value FROM config WHERE key = 'appconfig'").get().value);
+	assert.equal(stored.general.engineKernel, "durable");
+	assert.equal(stored.general.engineKernelCarried, true);
+});
+
+test("carry-forward respects an explicit legacy (marker present)", (t) => {
+	const db = new DatabaseSync(":memory:");
+	db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
+	t.after(() => db.close());
+	const explicitBlob = JSON.stringify({ general: { engineKernel: "legacy", engineKernelCarried: true }, model: {}, im: {}, kb: {}, security: {}, capabilities: {}, computer: {} });
+	db.prepare("INSERT INTO config (key, value) VALUES ('appconfig', ?)").run(explicitBlob);
+	const config = new ConfigStore(db);
+	assert.equal(config.all().general.engineKernel, "legacy");
+});
+
+test("carry-forward: an explicit update(engineKernel) after migration is respected", (t) => {
+	const db = new DatabaseSync(":memory:");
+	db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
+	t.after(() => db.close());
+	const legacyBlob = JSON.stringify({ general: { engineKernel: "legacy" }, model: {}, im: {}, kb: {}, security: {}, capabilities: {}, computer: {} });
+	db.prepare("INSERT INTO config (key, value) VALUES ('appconfig', ?)").run(legacyBlob);
+	const config = new ConfigStore(db);
+	assert.equal(config.all().general.engineKernel, "durable"); // migrated
+	config.update({ general: { engineKernel: "legacy" } }); // deliberate opt-out
+	assert.equal(config.all().general.engineKernel, "legacy"); // sticks
 });

@@ -965,6 +965,7 @@ ${tailForProgress(decision.text)}`;
 	// the legacy kernel instead of blocking startup: a broken recovery path must
 	// never take the app down with it.
 	let durableHost: { resume(): void; close(): Promise<void> } | undefined;
+	let durableStartupFailed = false;
 	if (kernel === "durable") {
 		try {
 			const host = await engine.openDurableRuntime(userData, async (conversationId, result, occurrenceId) => {
@@ -997,7 +998,8 @@ ${tailForProgress(decision.text)}`;
 			// "durable" is the default kernel since v0.2.167 — an environment that
 			// cannot open the durable storage must fall back to a WORKING legacy
 			// pipeline, not a bot that throws on every send.
-			engine.degradeToLegacyKernel(`durable host failed to open: ${err instanceof Error ? err.message : err}`);
+			durableStartupFailed = true;
+			engine.degradeToLegacyKernel(`durable initialization failed: ${err instanceof Error ? err.message : err}`);
 		}
 	}
 	// Orderly close: `close()` waits for running task code to return, so a clean
@@ -2014,6 +2016,14 @@ ${tailForProgress(decision.text)}`;
 	});
 
 	createWindow();
+	if (durableStartupFailed && mainWindow) {
+		void dialog.showMessageBox(mainWindow, {
+			type: "warning", title: "任务恢复内核未启动",
+			message: "本次启动已回退旧执行内核，当前不具备崩溃或升级后的任务恢复能力。",
+			detail: "普通消息仍可处理。请查看 logs/main.log 中的 [durable] 初始化错误，排除故障后重启应用以重新启用任务恢复。",
+			buttons: ["知道了"],
+		}).catch((err) => console.warn("[durable] startup warning failed", err));
+	}
 	// Auto-updater hooks the main window so state changes can be pushed to the
 	// renderer. No-op in dev / macOS (packaged Windows-only); setState still
 	// pushes an "idle" so the UI shows the current version without update buttons.

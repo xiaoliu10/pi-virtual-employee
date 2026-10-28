@@ -90,6 +90,7 @@ export class DurableRuntime {
 			},
 		}));
 		runtime.host = await openDurableHost({ userDataDir: opts.userDataDir, profileName: "default", tools: [], models, registrations });
+		try {
 		// Read-only scans must finish before scheduling starts: tool/model closures
 		// need the restored route, never a fabricated console identity.
 		let cursor: Cursor | undefined;
@@ -121,17 +122,27 @@ export class DurableRuntime {
 				subCursor = page.next;
 			} while (subCursor);
 		}
+		// Validate every route before starting ANY recovery, so a later invalid
+		// conversation cannot leave earlier recoveries running after open rejects.
+		const recoveries: { conv: Conversation; conversationId: string }[] = [];
 		for (const cid of unfinished) {
 			const conv = await runtime.host.harness.conversation(cid, context);
 			const route = runtime.routes.get(cid);
 			if (!conv || !route) throw new Error("Unfinished durable work has no route; refusing recovery");
-			runtime.track(conv, route.conversationId);
-			const work = runtime.finishRecovered(conv, route.conversationId).finally(() => runtime.untrack(conv, route.conversationId));
+			recoveries.push({ conv, conversationId: route.conversationId });
+		}
+		runtime.host.resume();
+		for (const { conv, conversationId } of recoveries) {
+			runtime.track(conv, conversationId);
+			const work = runtime.finishRecovered(conv, conversationId).finally(() => runtime.untrack(conv, conversationId));
 			runtime.tasks.add(work);
 			void work.catch((err) => console.error("[durable] recovery failed", err)).finally(() => runtime.tasks.delete(work));
 		}
-		runtime.host.resume();
 		return runtime;
+		} catch (error) {
+			await runtime.close().catch((closeError) => console.error("[durable] failed-open cleanup failed", closeError));
+			throw error;
+		}
 	}
 
 	private actorContext(cid: ConversationId, route: Readonly<RouteDoc>): SendCtx {
