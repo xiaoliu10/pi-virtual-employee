@@ -193,9 +193,11 @@ export interface AppConfig {
 		/** 管理员完全访问模式：管理操作免「确认」口令（身份/白名单校验不变）。 */
 		adminFullAccess?: boolean;
 		/** Per-person roles, resolved from the platform-verified sender id. */
-		people?: { staffId: string; name?: string; role: "viewer" | "operator" | "admin" }[];
+		people?: { staffId: string; name?: string; role: "viewer" | "operator" | "admin" | "owner" }[];
 		/** Role for senders with no explicit entry (default "viewer"). */
 		defaultRole?: "viewer" | "operator" | "admin";
+		/** Deployment owner(s): admin + cross-conversation task/知识 changes. */
+		ownerStaffIds?: string[];
 		/** Per-conversation capability floors — they only ever tighten access. */
 		conversations?: { id: string; name?: string; floors?: Record<string, string> }[];
 	};

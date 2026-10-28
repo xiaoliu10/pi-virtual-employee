@@ -27,7 +27,7 @@
 			"path": "src/security/permissions.ts",
 			"kind": "region",
 			"why": "角色解析与能力判定：所有权限结论的唯一出处",
-			"sha256": "68e9d0fabb63f5a37f7ab20b91cbf82c3b906091b3cae4a83c8f4c0445623c68"
+			"sha256": "721b2518e78278975cac413329fdfba9459f9f7046b734b054ab38732d6e83a0"
 		},
 		{
 			"id": "rbac-defaults",
@@ -76,7 +76,7 @@
 			"path": "scripts/test-permissions.mjs",
 			"kind": "file",
 			"why": "守护权限模型的断言本身",
-			"sha256": "2c5c7abfb2ad89b39fde4f2a6803023f6025bd9f13d0343ee545e83d6d993c79"
+			"sha256": "70a9e1326ea5c2104783cf1483b1dfc0f5fd165c4146207ceb8baea84f3a7a1a"
 		},
 		{
 			"id": "test-immutable",

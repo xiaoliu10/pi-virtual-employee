@@ -54,10 +54,11 @@ const ROLE_LABEL: Record<Role, string> = {
 	viewer: "viewer（只读：对话/知识库检索/记忆沉淀）",
 	operator: "operator（可操作：浏览器/桌面/文档/文件/定时任务/白名单命令）",
 	admin: "admin（全部：完整命令、系统设置、权限管理）",
+	owner: "owner（部署所有者：admin 全部权限 + 可跨会话变更自主任务/定时任务）",
 };
 
-const ROLE_ENUM = Type.Union([Type.Literal("viewer"), Type.Literal("operator"), Type.Literal("admin")], {
-	description: "角色：viewer=只读；operator=可操作；admin=管理员（全部权限）",
+const ROLE_ENUM = Type.Union([Type.Literal("viewer"), Type.Literal("operator"), Type.Literal("admin"), Type.Literal("owner")], {
+	description: "角色：viewer=只读；operator=可操作；admin=管理员（全部权限）；owner=部署所有者（admin 全部 + 跨会话变更任务）",
 });
 
 /** Capability legend rendered for `list` (name + default minimum role). */
@@ -668,6 +669,9 @@ export function createManageAccessTool(deps: AccessToolDeps): AgentTool {
 			if (action === "set_default_role") {
 				const parsed = parseRole(role);
 				if (!parsed) return refuse("role 必须是 viewer / operator / admin 之一。");
+				// defaultRole applies to EVERY unknown sender, so it must never be
+				// owner: that would make the whole world able to cross conversations.
+				if (parsed === "owner") return refuse("默认角色不能设为 owner（owner 可跨会话修改任务与知识，必须逐人授予）。");
 				const before = sec.defaultRole ?? "viewer";
 				deps.config.update({ security: { defaultRole: parsed } });
 				deps.onConfigChanged();

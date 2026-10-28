@@ -24,7 +24,7 @@ await build({
 		contents: `
 			export { ConfigStore } from "./src/db/config-store.ts";
 			export { HistoryStore } from "./src/db/history-store.ts";
-			export { checkPermission, resolveRole, hasAnyAdmin, isAdmin, describeAccess, CAPABILITY_LABEL } from "./src/security/permissions.ts";
+			export { checkPermission, resolveRole, hasAnyAdmin, isAdmin, isOwner, describeAccess, CAPABILITY_LABEL } from "./src/security/permissions.ts";
 			export { createManageAccessTool, createCheckMyAccessTool } from "./src/engine/tools/access.ts";
 			export { createManageSettingsTool, ROOT_CATALOG } from "./src/engine/tools/settings.ts";
 			export { createComputerTools } from "./src/engine/tools/computer.ts";
@@ -46,6 +46,7 @@ const {
 	resolveRole,
 	hasAnyAdmin,
 	isAdmin,
+	isOwner,
 	describeAccess,
 	createManageAccessTool,
 	createCheckMyAccessTool,
@@ -807,4 +808,36 @@ test("short secrets hide entirely in get and dump (review L1)", async (t) => {
 	assert.match(viaGet.content[0].text, /\*\*\*/);
 	const viaDump = await tool.execute("t2", { action: "dump", path: "model.suppliers" });
 	assert.doesNotMatch(viaDump.content[0].text, /"apiKey": "ab123"/);
+});
+
+// ─── owner role (field 2026-10-28) ───────────────────────────────────────────
+// The owner exists because tenant isolation (changes confined to the source
+// conversation) is right for tenants but wrong for the person who owns the box:
+// "I am the owner and I still have to go to another chat to fix a stuck task".
+test("owner is a strict superset of admin and is granted only explicitly", (t) => {
+	const db = new DatabaseSync(":memory:");
+	db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
+	t.after(() => db.close());
+	const cfg = new ConfigStore(db);
+	cfg.update({
+		security: {
+			adminStaffIds: ["admin1"],
+			ownerStaffIds: ["boss"],
+			people: [{ staffId: "alice", role: "owner" }, { staffId: "bob", role: "operator" }],
+		},
+	});
+	// Explicit grants only.
+	assert.equal(resolveRole(cfg, "boss"), "owner", "ownerStaffIds grants owner");
+	assert.equal(resolveRole(cfg, "alice"), "owner", "people[].role=owner grants owner");
+	assert.equal(resolveRole(cfg, "admin1"), "admin");
+	assert.equal(resolveRole(cfg, "bob"), "operator");
+	assert.equal(resolveRole(cfg, "stranger"), "viewer", "unknown senders never become owner");
+	// owner keeps every admin power (granting owner must not REMOVE abilities).
+	assert.equal(isAdmin(cfg, "boss"), true, "owner passes admin gates");
+	assert.equal(isAdmin(cfg, "alice"), true);
+	// ...but admin does not gain cross-conversation authority.
+	assert.equal(isOwner(cfg, "admin1"), false);
+	assert.equal(isAdmin(cfg, "bob"), false);
+	// ownerStaffIds must survive normalization (an unlisted field is dropped on save).
+	assert.deepEqual(cfg.all().security.ownerStaffIds, ["boss"]);
 });

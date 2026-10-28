@@ -23,9 +23,22 @@ import type { ConfigStore } from "../db/config-store.js";
 import { inferConversationOrigin } from "../db/history-store.js";
 import type { InboundActor } from "../im/types.js";
 
-export type Role = "viewer" | "operator" | "admin";
+/**
+ * viewer < operator < admin < owner.
+ *
+ * `owner` exists for one specific gap (field 2026-10-28): every change to a
+ * work item or scheduled task is confined to its SOURCE conversation, which is
+ * right for tenant isolation but wrong for the person who owns the whole
+ * deployment — "I am the owner and I still have to go to another chat to fix a
+ * stuck task" is a usability defect, not a security property. `owner` may
+ * change things across conversations; `admin` (who may be many) may not.
+ *
+ * The role is therefore deliberately narrow and deliberate to grant: it is set
+ * only via security.people[].role or security.ownerStaffIds, never inferred.
+ */
+export type Role = "viewer" | "operator" | "admin" | "owner";
 
-const ROLE_RANK: Record<Role, number> = { viewer: 0, operator: 1, admin: 2 };
+const ROLE_RANK: Record<Role, number> = { viewer: 0, operator: 1, admin: 2, owner: 3 };
 
 export const CAPABILITY_LABEL: Record<string, string> = {
 	chat: "对话服务",
@@ -87,7 +100,7 @@ export interface PermissionGrant {
 }
 
 function asRole(v: string | undefined): Role | undefined {
-	return v === "viewer" || v === "operator" || v === "admin" ? v : undefined;
+	return v === "viewer" || v === "operator" || v === "admin" || v === "owner" ? v : undefined;
 }
 
 // #region immutable:rbac-gate
@@ -100,6 +113,7 @@ export function resolveRole(config: ConfigStore, senderId: string | undefined | 
 		const role = asRole(person.role);
 		if (role) return role;
 	}
+	if (Array.isArray(sec.ownerStaffIds) && sec.ownerStaffIds.includes(senderId)) return "owner";
 	if (sec.adminStaffIds.includes(senderId)) return "admin";
 	return asRole(sec.defaultRole) ?? "viewer";
 }
@@ -111,7 +125,14 @@ export function resolveRole(config: ConfigStore, senderId: string | undefined | 
  * hits a "not in the whitelist" refusal.
  */
 export function isAdmin(config: ConfigStore, senderId: string | undefined | null): boolean {
-	return resolveRole(config, senderId) === "admin";
+	// owner is a strict superset of admin — every admin-gated action must accept
+	// it, otherwise granting owner would silently REMOVE ordinary admin powers.
+	return ROLE_RANK[resolveRole(config, senderId)] >= ROLE_RANK.admin;
+}
+
+/** True only for the deployment owner (cross-conversation authority). */
+export function isOwner(config: ConfigStore, senderId: string | undefined | null): boolean {
+	return resolveRole(config, senderId) === "owner";
 }
 
 /**
