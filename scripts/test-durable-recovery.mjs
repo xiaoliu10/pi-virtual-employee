@@ -409,15 +409,19 @@ test("an interrupted mutating tool is told to verify, not to retry", async () =>
 	assert.ok(notice.includes("人工核实"), "and tell the model what to do when it cannot verify");
 });
 
-test("the settle gate can write its streak from inside onYield", async () => {
-	// Guards the claim this whole anti-deadloop design rests on: a hook CAN
-	// persist (HookApi's published type omits commit, the runtime has it). Without
-	// this, a crash resets the counter and a task loops forever.
+test("the settle gate can write its streak from inside onYield — persisted, isolated per run", async () => {
+	// Guards TWO claims the anti-deadloop design rests on:
+	// 1. a hook CAN persist (HookApi's published type omits commit; the runtime has
+	//    it) and the write survives a close/reopen cycle — a crash cannot reset it;
+	// 2. the counter is keyed by GENERATION TASK id, so an independent submission
+	//    in the same conversation starts at 0 instead of inheriting the previous
+	//    run's failures (the cross-task leak found in review).
 	const dir = await tempDir();
 	const dbPath = join(dir, "gate-write.sqlite");
 	const { SettleStreakDocDef } = await import(pathToFileURL(veGateBundle).href);
 
 	const seen = [];
+	const runKeys = [];
 	const registry = createRegistry();
 	registry.install(
 		defineExtension({
@@ -426,10 +430,14 @@ test("the settle gate can write its streak from inside onYield", async () => {
 				hook(GenerationTask, {
 					onYield: async (_answer, api, context) => {
 						const w = api;
-						const before = (await w.snapshot(SettleStreakDocDef, api.conversationId, context))?.rounds ?? 0;
+						const runKey = String(api.taskId);
+						runKeys.push(runKey);
+						const before = (await w.snapshot(SettleStreakDocDef, api.conversationId, context))?.runs?.[runKey] ?? 0;
 						seen.push(before);
 						await w.commit(async (tx) => {
-							(await tx.doc(SettleStreakDocDef, api.conversationId)).rounds = before + 1;
+							const doc = await tx.doc(SettleStreakDocDef, api.conversationId);
+							if (!doc.runs) doc.runs = {};
+							doc.runs[runKey] = before + 1;
 						}, context);
 						return undefined;
 					},
@@ -440,7 +448,8 @@ test("the settle gate can write its streak from inside onYield", async () => {
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
-	const harness = await Harness.open(await openNodeSqliteStorage(dbPath), { models, registry }, BACKGROUND_CONTEXT);
+	const storage = await openNodeSqliteStorage(dbPath);
+	const harness = await Harness.open(storage, { models, registry }, BACKGROUND_CONTEXT);
 	const root = await harness.root(BACKGROUND_CONTEXT, {
 		agent: { model: { provider: "faux", modelId: "faux-1" } },
 	});
@@ -448,8 +457,84 @@ test("the settle gate can write its streak from inside onYield", async () => {
 	await (await root.submit({ type: "input", content: "1" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
 	await (await root.submit({ type: "input", content: "2" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
 
-	assert.deepEqual(seen, [0, 1], "each run must SEE the previous run's write");
-	const stored = await harness.snapshot(SettleStreakDocDef, root.id, BACKGROUND_CONTEXT);
-	assert.equal(stored?.rounds, 2, "the write from inside the hook reached storage");
+	// Per-run isolation: each submission is a NEW task id and starts at 0.
+	assert.deepEqual(seen, [0, 0], "a new submission must not inherit another run's streak");
+	assert.notEqual(runKeys[0], runKeys[1], "each submission must have its own task id");
+	// Persistence: the first run's write is in storage, under ITS key.
+	const afterRun1 = await harness.snapshot(SettleStreakDocDef, root.id, BACKGROUND_CONTEXT);
+	assert.equal(afterRun1?.runs?.[runKeys[0]], 1, "run 1's write reached storage under its own key");
+
+	// Crash semantics: close (process death surrogate) and reopen the SAME db —
+	// the entry must still be there for a resuming run to read.
+	await harness.close(BACKGROUND_CONTEXT);
+	const reopened = await Harness.open(await openNodeSqliteStorage(dbPath), { models, registry }, BACKGROUND_CONTEXT);
+	const survived = await reopened.snapshot(SettleStreakDocDef, root.id, BACKGROUND_CONTEXT);
+	assert.equal(survived?.runs?.[runKeys[0]], 1, "the streak entry must survive a close/reopen cycle");
+	await reopened.close(BACKGROUND_CONTEXT);
+});
+
+
+test("the real gate: tool evidence comes from afterTools, and the streak is per run", async () => {
+	// Reproduces both review findings against the REAL gate extension:
+	//  A. a verify round that verifies WITH a tool must settle (the tool call lives
+	//     in an EARLIER assistant message — the final answer never contains it);
+	//  B. an independent task in the same conversation must start its own streak,
+	//     not inherit task A's failed rounds.
+	const { createDurableSettleGate, SettleStreakDocDef } = await import(pathToFileURL(veGateBundle).href);
+
+	let toolRuns = 0;
+	const read = defineTool({
+		name: "read",
+		description: "read a file",
+		parameters: Type.Object({}),
+		replay: "safe",
+		execute: async () => {
+			toolRuns += 1;
+			return { output: [{ type: "text", text: "file-content" }] };
+		},
+	});
+
+	const registry = createRegistry();
+	registry.install(defineExtension({ name: "tools", tools: [read] }));
+	registry.install(createDurableSettleGate());
+
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const harness = await Harness.open(await openNodeSqliteStorage(join(await tempDir(), "gate.sqlite")), { models, registry }, BACKGROUND_CONTEXT);
+	const root = await harness.root(BACKGROUND_CONTEXT, {
+		agent: { model: { provider: "faux", modelId: "faux-1" } },
+	});
+
+	// Task A: two failed verify rounds → repair, then release (anti-deadloop),
+	// then a plain reply settles it. Leaves ONE release warning in the transcript.
+	faux.setResponses([
+		fauxAssistantMessage("还没好\n[[VERIFY_FAIL]]: 缺一步"),
+		fauxAssistantMessage("还是不行\n[[VERIFY_FAIL]]"),
+		fauxAssistantMessage("收到，先放行"),
+	]);
+	await (await root.submit({ type: "input", content: "任务A" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+
+	// Task B (same conversation): one failed round must be REPAIRED (streak 0→1),
+	// not released — the old conversation-level counter would have said 2.
+	// Then it verifies WITH the read tool and must settle on [[VERIFY_PASS]].
+	faux.setResponses([
+		fauxAssistantMessage("新任务\n[[VERIFY_FAIL]]: 还没查"),
+		fauxAssistantMessage(fauxToolCall("read", {}), { stopReason: "toolUse" }),
+		fauxAssistantMessage("查到了 file-content\n[[VERIFY_PASS]]"),
+	]);
+	await (await root.submit({ type: "input", content: "任务B" }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT);
+
+	// B: evidence was earned by a real tool call (afterTools), and the pass settled.
+	assert.equal(toolRuns, 1, "task B's verify round must have actually called the tool");
+	const entries = await root.entries({}, 30, undefined, BACKGROUND_CONTEXT);
+	const transcript = entries.items.map((e) => JSON.stringify(e)).join("\n");
+	const releases = transcript.split("防死循环策略放行").length - 1;
+	assert.equal(releases, 1, "only task A may be released by the anti-deadloop policy — task B's first failure must NOT count task A's streak");
+	const repairs = transcript.split("上一轮收尾验证未通过").length - 1;
+	assert.ok(repairs >= 2, `both tasks' first failures must be repaired (got ${repairs})`);
+	// Both runs finished clean: no stale streak entries left behind.
+	const doc = await harness.snapshot(SettleStreakDocDef, root.id, BACKGROUND_CONTEXT);
+	assert.equal(Object.keys(doc?.runs ?? {}).length, 0, "settled runs must not leave streak entries behind");
 	await harness.close(BACKGROUND_CONTEXT);
 });

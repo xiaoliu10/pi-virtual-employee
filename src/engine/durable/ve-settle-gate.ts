@@ -167,6 +167,24 @@ export function resetToolEvidence(conversationId: ConversationKey): void {
 	toolEvidence.delete(conversationId);
 }
 
+/**
+ * Run-identity across the gate's own injections.
+ *
+ * MEASURED, not assumed: `{ continue }` spawns a NEW generation with a NEW
+ * `api.taskId` (probed: one submit → one onYield; each injected round → fresh
+ * id). Keying the streak by taskId therefore resets it every verify round and
+ * the anti-deadloop release can never trigger. The stable run identity is the
+ * INJECTION CHAIN: after this gate returns `{ continue }`, the next onYield in
+ * the same conversation belongs to the same logical run, whatever its taskId.
+ *
+ * Crash trade-off (deliberate, fail-open): the map dies with the process, so a
+ * run resumed mid-verify after a crash starts a fresh streak — it errs toward
+ * MORE verification rounds, never toward a wrongful release, and the per-run
+ * cap still applies within the resumed chain. Stale persisted entries from
+ * crashed runs are pruned when a new run starts (see onYield).
+ */
+const expectingContinuation = new Map<ConversationKey, string>();
+
 // ── Message helpers ──
 
 type ContentPart = { type?: string; text?: string };
@@ -239,7 +257,14 @@ export function createDurableSettleGate() {
 
 						// settle #1: a done claim → ask for the evidence round.
 						if (text.includes(AUTONOMOUS_DONE_MARK)) {
+							expectingContinuation.set(api.conversationId, expectingContinuation.get(api.conversationId) ?? String(api.taskId));
 							return { continue: SETTLE_VERIFY_PROMPT };
+						}
+						// A plain reply (no markers) settles the run normally.
+						if (!text.includes(AUTONOMOUS_VERIFY_PASS_MARK) && !text.includes(AUTONOMOUS_VERIFY_FAIL_MARK)) {
+							expectingContinuation.delete(api.conversationId);
+							resetToolEvidence(api.conversationId);
+							return undefined;
 						}
 
 						// settle #2: a verify reply → judge, then pass / repair / release.
@@ -248,9 +273,21 @@ export function createDurableSettleGate() {
 							text.includes(AUTONOMOUS_VERIFY_FAIL_MARK)
 						) {
 							const w = writable(api);
-							const runKey = String(api.taskId);
+							// Identity: an onYield right after our own injection continues the
+							// SAME run; anything else is a new run (fresh key, prune stale).
+							const continuedRunKey = expectingContinuation.get(api.conversationId);
+							const runKey = continuedRunKey ?? String(api.taskId);
 							const streakDoc = w ? await w.snapshot(SettleStreakDocDef, api.conversationId, context) : undefined;
 							const prevStreak = streakDoc?.runs?.[runKey] ?? 0;
+							if (!continuedRunKey && w && streakDoc && Object.keys(streakDoc.runs ?? {}).some((k) => k !== runKey)) {
+								// A fresh run must not trip over entries left by crashed ones.
+								await w.commit(async (tx) => {
+									const doc = await tx.doc(SettleStreakDocDef, w.conversationId);
+									for (const k of Object.keys(doc.runs ?? {})) {
+										if (k !== runKey) delete doc.runs[k];
+									}
+								}, context);
+							}
 							// Evidence = this run called a tool at any point (afterTools), not
 							// "the final message contains a toolCall" (it never does).
 							const hadEvidence = evidenceFor(api.conversationId).anyTool;
@@ -267,15 +304,18 @@ export function createDurableSettleGate() {
 							if (verdict.action === "pass") {
 								if (prevStreak > 0) await writeStreak(0); // next task starts clean
 								resetToolEvidence(api.conversationId); // next task must re-earn evidence
+								expectingContinuation.delete(api.conversationId);
 								return undefined; // settle: verified done
 							}
 							if (verdict.action === "release") {
 								await writeStreak(0); // drop THIS run's entry only
 								resetToolEvidence(api.conversationId);
+								expectingContinuation.set(api.conversationId, runKey); // the warning round is still this run
 								// Release WITH the explicit warning, then settle (no more rounds).
 								return { continue: settleReleaseReport(verdict.note) };
 							}
 							await writeStreak(prevStreak + 1); // survive a crash mid-repair
+							expectingContinuation.set(api.conversationId, runKey);
 							return { continue: settleRepairInstruction(verdict.note) };
 						}
 
