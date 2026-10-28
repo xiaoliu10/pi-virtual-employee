@@ -57,6 +57,7 @@ import { setupAutoUpdater, getUpdateState, lastCheckTime, checkNow, downloadNow,
 import type { UpdateToolStatus } from "../src/engine/tools/update.js";
 import { IMAdapterManager, availableChannels } from "../src/im/manager.js";
 import { setDiagFile } from "../src/im/diag.js";
+import { DeliveryLedger, scheduledOccurrenceId } from "../src/im/delivery-ledger.js";
 import type { InboundActor } from "../src/im/types.js";
 import {
 	buildEmployeePackage,
@@ -563,9 +564,15 @@ async function main(): Promise<void> {
 	// dedicated conversation (results show in the sidebar), then refreshes the UI.
 	// If the task was created in an IM conversation, the result is proactively
 	// pushed back to that group/1:1 through the active IM adapter.
+	// Delivery ledger (docs/design/delivery-reliability.md S1): one row per push
+	// occurrence, so the same scheduled fire / inbound message cannot be delivered
+	// twice — including across a restart. Rows outlive the sessions they describe,
+	// hence the retention sweep next to the other housekeeping.
+	const deliveryLedger = new DeliveryLedger(db);
 	const im = new IMAdapterManager(engine, config, {
 		reportService,
 		inboundDir,
+		ledger: deliveryLedger,
 		// Credential egress gate (field 2026-10-20): only a 1:1 recipient who is an
 		// admin RIGHT NOW may receive credential-bearing text. Read live from
 		// config so a revoked admin stops being exempt on the next message.
@@ -613,6 +620,17 @@ async function main(): Promise<void> {
 			/* logging must never break the run */
 		}
 	};
+	/**
+	 * Occurrence id for autonomous-chain pushes (docs/design/delivery-reliability.md
+	 * §6 open question 1): the chain's own identity — the chain conversation it was
+	 * planned under plus the moment that chain started. Every turn/report of ONE
+	 * fire shares it (that is what makes a re-push of the same turn a duplicate),
+	 * while the NEXT fire starts a new chain and therefore a new occurrence. The
+	 * per-turn notes are disambiguated with a stage label so distinct stages of the
+	 * same fire still deliver.
+	 */
+	const chainOccurrence = (chain: AutonomousChainState, stage: string) => `chain:${chain.convId}:${chain.startedAt}:${stage}`;
+
 	const runAutonomousTask = async (task: ScheduledTaskRow): Promise<{ status: string }> => {
 		const budget = normalizeBudget(task.max_turns, task.max_minutes);
 		const prior = parseChainState(task.chain_state);
@@ -644,7 +662,7 @@ async function main(): Promise<void> {
 						const hb = note.startsWith("⏳") ? note : `⏳ ${note}`;
 						if (agent.state.isStreaming && shouldPushScheduledResult(task, undefined, hb)) {
 							const cid = task.conversation_id!;
-							void im.pushToConversation(cid, hb);
+							void im.pushToConversation(cid, hb, { occurrenceId: chainOccurrence(chain, "heartbeat"), kind: "scheduled-heartbeat" });
 						}
 					})
 					.catch(() => {})
@@ -719,7 +737,7 @@ async function main(): Promise<void> {
 							const conNote = `📌 已沉淀经验到知识库：${note.slice(0, 120)}`;
 							if (shouldPushScheduledResult(task, undefined, conNote)) {
 								const cid = task.conversation_id!;
-								void im.pushToConversation(cid, conNote);
+								void im.pushToConversation(cid, conNote, { occurrenceId: chainOccurrence(chain, `remember:${saved.id}`), kind: "scheduled-note" });
 							}
 						}
 					} catch (learnErr) {
@@ -784,7 +802,7 @@ async function main(): Promise<void> {
 ${tailForProgress(decision.text)}`;
 				if (shouldPushScheduledResult(task, undefined, tbNote)) {
 					const cid = task.conversation_id!;
-					await im.pushToConversation(cid, tbNote);
+					await im.pushToConversation(cid, tbNote, { occurrenceId: chainOccurrence(chain, `turn:${chain.turns}`), kind: "scheduled-progress" });
 				}
 			}
 		} finally {
@@ -838,7 +856,7 @@ ${tailForProgress(decision.text)}`;
 					: alNote;
 				if (shouldPushScheduledResult(task, undefined, alText)) {
 					const cid = task.conversation_id!;
-					await im.pushToConversation(cid, alText);
+					await im.pushToConversation(cid, alText, { occurrenceId: chainOccurrence(chain, "learn"), kind: "scheduled-note" });
 				}
 				}
 			} catch (err) {
@@ -867,7 +885,10 @@ ${tailForProgress(decision.text)}`;
 		const attention = outcome !== "done" ? outcome : undefined;
 		if (shouldPushScheduledResult(task, attention, pushText)) {
 			const cid = task.conversation_id!;
-			const pushed = await im.pushToConversation(cid, pushText);
+			// One occurrence for the WHOLE fire: a duplicate delivery of this outcome
+			// (retry, late losing run, restart between push and bookkeeping) is
+			// suppressed; the next fire has a new chain id and pushes normally.
+			const pushed = await im.pushToConversation(cid, pushText, { occurrenceId: chainOccurrence(chain, "outcome"), kind: "scheduled-result" });
 			if (!pushed.ok) console.warn(`[sched] autonomous push failed for ${cid}: ${pushed.error}`);
 		}
 		}
@@ -908,6 +929,11 @@ ${tailForProgress(decision.text)}`;
 			},
 		}),
 		release: (convId) => browser.releasePage(convId),
+		// Work-window pushes stay UN-ledgered on purpose: the WorkService push hook
+		// carries no occurrence identity (neither the window start nor the reminder
+		// attempt), and an id minted here (Date.now()) would be a fresh occurrence on
+		// every call — noise in the ledger that dedupes nothing. Giving work windows a
+		// real occurrence is a follow-up that must extend the service's push signature.
 		push: (cid, text) => im.pushToConversation(cid, text),
 		lastInboundAt: (cid, sinceTs) => history.lastInboundAt(cid, sinceTs),
 		canLearn: () => {
@@ -944,13 +970,24 @@ ${tailForProgress(decision.text)}`;
 			const host = await engine.openDurableRuntime(userData, async (conversationId, result, occurrenceId) => {
 				const wc = mainWindow?.webContents;
 				if (wc && !wc.isDestroyed()) wc.send("im:activity", conversationId);
-				// Recovered replies go back to the conversation they came from. The
-				// projection already used a stable key, so a crash between projection and
-				// push cannot duplicate the UI row; the outbox ledger (separate branch)
-				// extends the same guarantee to the channel delivery via `occurrenceId`.
+				// Recovered replies go back to the conversation they came from, under the
+				// SAME occurrence identity derived from the durable answer entry. Two
+				// independent duplicate guards therefore agree:
+				//   - the UI projection uses a stable message key,
+				//   - the push ledger skips an occurrence that already went out.
+				// A crash between "pushed" and "recorded" leaves the ledger in
+				// `attempting`, which reports `uncertain` and refuses to re-send — the
+				// user never receives the same recovered answer twice.
 				if (history.isReadOnly(conversationId)) {
-					const pushed = await im.pushToConversation(conversationId, result.reply);
-					if (!pushed.ok) console.warn(`[durable] recovered reply not delivered to ${conversationId} (${occurrenceId}): ${pushed.error ?? "unknown"}`);
+					const pushed = await im.pushToConversation(conversationId, result.reply, {
+						occurrenceId,
+						kind: "durable-recovered",
+					});
+					if (pushed.uncertain) {
+						console.warn(`[durable] recovered reply delivery UNKNOWN for ${conversationId} (${occurrenceId}) — not re-sent; needs manual check`);
+					} else if (!pushed.ok) {
+						console.warn(`[durable] recovered reply not delivered to ${conversationId} (${occurrenceId}): ${pushed.error ?? "unknown"}`);
+					}
 				}
 			});
 			durableHost = { resume() {}, close: () => host.close() };
@@ -982,6 +1019,13 @@ ${tailForProgress(decision.text)}`;
 			// the scheduler's runId and any future push idempotency key all
 			// correlate to the same occurrence.
 			const execConvId = `sched:${ctx?.runId ?? `${task.id}:${Date.now()}`}`;
+			// Delivery occurrence = this FIRE (task id + run instant), the same identity
+			// the scheduler's runId carries. Used below for the progress notes and the
+			// completion result, so this fire's pushes can each be delivered at most
+			// once while the next fire is a different occurrence (never deduped).
+			const runOccurrence = scheduledOccurrenceId(task.id, ctx?.runId ?? execConvId.slice("sched:".length));
+			const pushOnce = (cid: string, text: string, stage: string, kind: string) =>
+				im.pushToConversation(cid, text, { occurrenceId: `${runOccurrence}#${stage}`, kind });
 			// Give the sidebar entry the task title instead of a prompt-derived title
 			// (engine.send keeps an existing title when re-ensuring the conversation).
 			history.ensureConversation(execConvId, `⏰ ${task.title}`);
@@ -1015,7 +1059,9 @@ ${tailForProgress(decision.text)}`;
 				target: task.conversation_id,
 				intervalMin: progressIntervalMin,
 				summarize: () => engine.progressBriefDetailed(agent, execConvId),
-				push: (cid, text) => im.pushToConversation(cid, text),
+				// Progress notes share ONE occurrence: repeated intervals must not pile
+				// up duplicates for the same fire (the note itself is a snapshot).
+				push: (cid, text) => pushOnce(cid, text, "progress", "scheduled-progress"),
 				isRunning: () => agent.state.isStreaming,
 				suppress: () => ctx?.isTimedOut() === true,
 				// Static gate BEFORE the side LLM call: a silent task's notes can
@@ -1093,7 +1139,7 @@ ${tailForProgress(decision.text)}`;
 				// its stale result as fresh — annotateLatePush adds the notice
 				// (pure helper, pinned by test-scheduler-service).
 				const pushText = annotateLatePush(`⏰ **定时任务完成：${task.title}**\n\n${body}`, ctx?.isTimedOut() === true);
-				const pushed = await im.pushToConversation(pushTarget, pushText);
+				const pushed = await pushOnce(pushTarget, pushText, "result", "scheduled-result");
 				if (!pushed.ok) {
 					pushError = pushed.error || "未知推送错误";
 					console.warn(`[sched] push result failed for ${pushTarget}: ${pushError}`);
@@ -1133,6 +1179,14 @@ ${tailForProgress(decision.text)}`;
 	// the task list; age out the untouched ones before the UI lists them.
 	pruneOneOffConversations();
 	pruneOldMessages();
+	// Delivery ledger: keep terminal rows long past any retry horizon (dropping a
+	// `delivered` row re-opens that occurrence for a duplicate), then age them out.
+	try {
+		const dropped = deliveryLedger.prune(Date.now() - 90 * 86_400_000);
+		if (dropped > 0) console.log(`[main] delivery ledger pruned: ${dropped} row(s) past retention`);
+	} catch (err) {
+		console.warn("[main] delivery ledger prune failed:", (err as Error).message);
+	}
 
 	// Reconcile IM adapter + autostart with saved config.
 	applyAutostart(config.all().general.autostart);
