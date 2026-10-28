@@ -468,7 +468,11 @@ async function main(): Promise<void> {
 	// "pi-session" needs the pi runtime installed+verified before the engine
 	// exists — a failed bootstrap keeps the app on the legacy kernel (loud log,
 	// settings surface the state) instead of bricking the profile.
-	let kernel: "legacy" | "pi-session" = initialCfg.general.engineKernel ?? "legacy";
+	let kernel: "legacy" | "pi-session" | "durable" = initialCfg.general.engineKernel ?? "legacy";
+	// "durable" (crash recovery, docs/design/crash-recovery.md) needs NO runtime
+	// bootstrap: pi-durable is an ordinary dependency. It rolls back to legacy if
+	// its host cannot open (e.g. the storage file is owned by another instance) —
+	// a failed recovery path must never brick the profile.
 	if (kernel === "pi-session") {
 		const { ensurePiRuntime } = await import("../src/runtime/bootstrap.js");
 		const result = await ensurePiRuntime({
@@ -928,6 +932,52 @@ ${tailForProgress(decision.text)}`;
 		return workService.stop();
 	};
 	app.on("before-quit", () => { void stopWork(); });
+
+	// ── Durable host (crash recovery, docs/design/crash-recovery.md) ──────────
+	// Opens ONLY under the "durable" kernel. Opening owns the profile's SQLite
+	// file (durable has no cross-process lock), so a failure here must degrade to
+	// the legacy kernel instead of blocking startup: a broken recovery path must
+	// never take the app down with it.
+	let durableHost: { resume(): void; close(): Promise<void> } | undefined;
+	if (kernel === "durable") {
+		try {
+			const { openDurableHost } = await import("../src/engine/durable/harness-host.js");
+			const profileName = (() => {
+				const marker = path.join("pi-virtual-employee", "profiles") + path.sep;
+				const at = userData.indexOf(marker);
+				return at >= 0 ? userData.slice(at + marker.length) : "default";
+			})();
+			// Phase 1 wires ONLY the read-only subset (phase1-tools.ts). A tool under
+			// durable may re-run after a crash when declared safe, so mutating tools
+			// wait for phase 3 where each gets an idempotency key or a business-state
+			// check. Take the tools from the engine's own builder: the RBAC
+			// `guarded()` wrappers come along, so permissions cannot diverge between
+			// kernels.
+			const { selectPhase1Tools } = await import("../src/engine/durable/phase1-tools.js");
+			const phase1 = selectPhase1Tools(engine.buildToolSetFor("durable:console"));
+			const host = await openDurableHost({
+				userDataDir: userData,
+				profileName,
+				tools: phase1,
+			});
+			console.log(`[durable] tool surface: ${phase1.length} read-only tools (${phase1.map((t) => t.name).join(", ")})`);
+			durableHost = host;
+			host.resume(); // pick up whatever the last process left unfinished
+			console.log(`[durable] host ready (profile ${profileName}, db ${host.databasePath})`);
+		} catch (err) {
+			console.error(`[durable] host failed to open — keeping the legacy kernel: ${err instanceof Error ? err.message : err}`);
+			kernel = "legacy";
+		}
+	}
+	// Orderly close: `close()` waits for running task code to return, so a clean
+	// quit writes the final checkpoint instead of leaving the run to be counted as
+	// a crash. Electron's will-quit cannot await, so the update path (which DOES
+	// have an await point) closes it explicitly in prepareToInstall below; this
+	// handler is the ordinary-quit fallback and must stay best-effort like the
+	// other resource teardowns on this event.
+	app.on("will-quit", () => {
+		if (durableHost) void durableHost.close().catch(() => {});
+	});
 
 	scheduler.setRunner({
 		async runTask(task, ctx) {
@@ -1931,6 +1981,16 @@ ${tailForProgress(decision.text)}`;
 			// electron-updater spawns NSIS before app.quit(). Release every process /
 			// listener that can keep the old app tree alive before calling it.
 			await stopWork();
+			// Durable host BEFORE the DB closes: close() waits for running task code
+			// to return and writes the final checkpoint, so an upgrade is a graceful
+			// stop (resumable, not counted as a crash). Bounded so a wedged task
+			// cannot hold the installer open — partial progress is already committed.
+			if (durableHost) {
+				await Promise.race([
+					durableHost.close().catch(() => {}),
+					new Promise<void>((resolve) => setTimeout(resolve, 8_000)),
+				]);
+			}
 			scheduler.stop();
 			disposeShellCommands(config);
 			await im.stopAll();

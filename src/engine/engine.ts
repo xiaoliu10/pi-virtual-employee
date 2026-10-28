@@ -224,7 +224,7 @@ export interface EngineOptions {
 	 * field behavior); "pi-session" wraps each Agent in a pi AgentSession so
 	 * the extension runtime (plugins) and pi scaffolding attach. Default
 	 * "legacy" — the switch exists for the kernel migration gray rollout. */
-	kernel?: "legacy" | "pi-session";
+	kernel?: "legacy" | "pi-session" | "durable";
 	/** Per-LLM-call timeout (ms). 0 = no timeout. */
 	timeoutMs?: number;
 	/** Test seam: the backoff sleep between transient retries (defaults to a
@@ -275,7 +275,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * the pi agent dir's auth.json (shared with the pi CLI), so account logins
 	 * work everywhere; injectable for tests. */
 	private readonly credentialStore: CredentialStore;
-	private readonly opts: { timeoutMs: number; streamFn?: StreamFn; retrySleepFn?: (ms: number) => Promise<void>; kernel: "legacy" | "pi-session" };
+	private readonly opts: { timeoutMs: number; streamFn?: StreamFn; retrySleepFn?: (ms: number) => Promise<void>; kernel: "legacy" | "pi-session" | "durable" };
 	private readonly skillLoader: SkillLoader;
 	/** Authoring surface for declarative skills (save_to_skill). */
 	private readonly skillWriter: SkillWriter;
@@ -948,7 +948,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				initialState: {
 					systemPrompt: buildSystemPrompt(this.promptPartsFor(conversationId)),
 				model: this.resolveModel(supplier, modelId),
-				tools: buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), resolveMemoryContext: (cid) => this.turnMemoryContext.get(cid) ?? deriveMemoryContext(this.turnActor.get(cid), cid), onRoleRefusal: (cid, info) => this.noteAuthorizationNeeded(cid, info), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules), mcp: { enabled: cfg.capabilities.mcp?.enabled ?? false, tools: this.mcpManager.tools() }, work: this.workItems ? { items: this.workItems, fireItem: (id) => this.workBridge?.fireItem(id) ?? false, mine: (opts) => this.mineRecentWork({ ...opts, sinceTs: Date.now() - 24 * 60 * 60_000, sourceConversationId: inferConversationOrigin(conversationId) === "im" ? conversationId : undefined }) } : undefined }),
+				tools: this.buildToolSetFor(conversationId),
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
 				messages: rehydrateMessages(this.history.listMessages(conversationId)),
@@ -2778,6 +2778,19 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/** True when neither agent turns nor supervised commands are active. */
+	/**
+	 * Build this conversation's tool set.
+	 *
+	 * Extracted from the Agent construction so the durable host (crash recovery)
+	 * gets the EXACT same instances — including the RBAC `guarded()` wrappers —
+	 * instead of a second, drifting construction. A permission check must not
+	 * depend on which kernel drives the conversation.
+	 */
+	buildToolSetFor(conversationId: string): AgentTool<any>[] {
+		const cfg = this.config.all();
+		return buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), resolveMemoryContext: (cid) => this.turnMemoryContext.get(cid) ?? deriveMemoryContext(this.turnActor.get(cid), cid), onRoleRefusal: (cid, info) => this.noteAuthorizationNeeded(cid, info), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules), mcp: { enabled: cfg.capabilities.mcp?.enabled ?? false, tools: this.mcpManager.tools() }, work: this.workItems ? { items: this.workItems, fireItem: (id) => this.workBridge?.fireItem(id) ?? false, mine: (opts) => this.mineRecentWork({ ...opts, sinceTs: Date.now() - 24 * 60 * 60_000, sourceConversationId: inferConversationOrigin(conversationId) === "im" ? conversationId : undefined }) } : undefined });
+	}
+
 	isIdle(): boolean {
 		if (hasActiveShellCommands(this.config)) return false;
 		if (this.computer?.busy) return false;
