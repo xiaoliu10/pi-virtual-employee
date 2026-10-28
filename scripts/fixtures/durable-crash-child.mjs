@@ -83,11 +83,17 @@ if (phase === "start") {
 	const before = await harness.inspect(BACKGROUND_CONTEXT);
 	record(`pre-resume-pending:${before.submissions.length}`);
 	harness.resume();
-	const pending = await harness.inspect(BACKGROUND_CONTEXT);
-	record(`pending-submissions:${pending.submissions.length}`);
-	for (const item of pending.submissions) {
+	// Observe only: Submission.wait() also enables scheduling and would hide a
+	// missing host resume() call. Read status until the resumed scheduler settles.
+	for (const item of before.submissions) {
 		const submission = await harness.submission(item.id, BACKGROUND_CONTEXT);
-		const settled = await submission?.wait(BACKGROUND_CONTEXT).catch(() => ({ status: "failed" }));
+		let settled;
+		const deadline = Date.now() + 10_000;
+		while (Date.now() < deadline) {
+			settled = await submission?.status(BACKGROUND_CONTEXT);
+			if (settled?.status === "done" || settled?.status === "unanswered") break;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
 		record(`settled:${settled?.status ?? "unknown"}`);
 	}
 	// Prove the recovery carried the interrupted call's outcome into the model's

@@ -1,0 +1,197 @@
+/** Durable execution owned by VE; UI history is a projection of the transcript. */
+import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
+import { createModels, createProvider, createAssistantMessageEventStream, type Model, type Api, type Message, type AssistantMessage, type SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { defineDoc, ProviderDoc, type Conversation, type ConversationId, type Cursor, type ToolRegistration } from "@earendil-works/pi-durable";
+import type { Agent, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
+import type { SendCtx, SendResult } from "../engine.js";
+import type { HistoryStore } from "../../db/history-store.js";
+import { openDurableHost, type DurableHost } from "./harness-host.js";
+import { toDurableTool } from "./ve-tools.js";
+
+interface RouteDoc {
+	[key: string]: string | number;
+	conversationId: string;
+	requestId: string;
+	staffId: string;
+	name: string;
+	channel: string;
+	chatType: string;
+	text: string;
+	projected: number;
+}
+export const Route = defineDoc<RouteDoc>({
+	kind: "ve.execution", version: 1, scope: "conversation", history: "latest", fork: "initial",
+	checkpointWhen: () => false,
+	initial: () => ({ conversationId: "", requestId: "", staffId: "", name: "", channel: "", chatType: "", text: "", projected: 0 }),
+});
+interface RuntimeOptions {
+	userDataDir: string;
+	history: HistoryStore;
+	session(id: string): Agent;
+	tools(id: string): AgentTool<any>[];
+	stream(id: string, options: SimpleStreamOptions, messages: Message[]): ReturnType<StreamFn>;
+	withActor<T>(id: string, ctx: SendCtx, text: string, run: () => Promise<T>): Promise<T>;
+	onRecovered(id: string, result: SendResult, occurrenceId: string): Promise<void>;
+}
+
+/** One durable conversation per submission: queued senders can never overwrite identity. */
+export class DurableRuntime {
+	private host!: DurableHost;
+	private readonly routes = new Map<ConversationId, Readonly<RouteDoc>>();
+	private readonly providerRoutes = new Map<string, ConversationId>();
+	private readonly active = new Map<string, Set<Conversation>>();
+	private readonly liveContexts = new Map<ConversationId, SendCtx>();
+	private readonly tails = new Map<string, Promise<unknown>>();
+	private readonly tasks = new Set<Promise<unknown>>();
+	private closing = false;
+	private constructor(private readonly opts: RuntimeOptions) {}
+
+	static async open(opts: RuntimeOptions): Promise<DurableRuntime> {
+		const runtime = new DurableRuntime(opts);
+		const models = createModels();
+		// A stable provider identity in storage; actual model and credentials are
+		// resolved through VE on EVERY request, including a recovered request.
+		const model: Model<Api> = { ...opts.session("default").state.model, provider: "ve-runtime", id: "current" };
+		const stream = (_model: Model<Api>, transcript: any, options?: SimpleStreamOptions) => {
+			const events = createAssistantMessageEventStream();
+			void (async () => {
+				try {
+					const id = options?.sessionId;
+					if (!id) throw new Error("Missing durable execution identity");
+					const cid = runtime.providerRoutes.get(id);
+					if (cid === undefined) throw new Error("Unknown durable provider session");
+					const route = runtime.routes.get(cid);
+					if (!route) throw new Error("Durable execution has no trusted route");
+					const response = await opts.stream(route.conversationId, options ?? {}, transcript.messages ?? transcript);
+					for await (const event of response) {
+						events.push(event);
+					}
+					events.end(await response.result());
+				} catch (error) {
+					const failed: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "error", errorMessage: error instanceof Error ? error.message : String(error), timestamp: Date.now() };
+					events.push({ type: "error", reason: "error", error: failed });
+				}
+			})();
+			return events;
+		};
+		models.setProvider(createProvider({ id: model.provider, models: [model], auth: { apiKey: { name: "VE credentials", resolve: async () => ({ auth: {}, source: "VE" }) } }, api: { stream, streamSimple: stream } }));
+		const registrations: ToolRegistration<any, any>[] = opts.tools("default").map((template) => ({
+			...toDurableTool(template),
+			execute: async (args, api, ctx) => {
+				const route = runtime.routes.get(api.conversationId);
+				if (!route) throw new Error("Missing durable tool identity; execution refused");
+				const current = opts.tools(route.conversationId).find((tool) => tool.name === template.name);
+				if (!current) throw new Error(`Tool ${template.name} is currently disabled`);
+				return opts.withActor(route.conversationId, runtime.actorContext(api.conversationId, route), route.text,
+					() => toDurableTool(current).execute(args, api, ctx));
+			},
+		}));
+		runtime.host = await openDurableHost({ userDataDir: opts.userDataDir, profileName: "default", tools: [], models, registrations });
+		// Read-only scans must finish before scheduling starts: tool/model closures
+		// need the restored route, never a fabricated console identity.
+		let cursor: Cursor | undefined;
+		do {
+			const page = await runtime.host.harness.commit((tx) => tx.scanConversations({}, 100, cursor), context);
+			for (const item of page.items) {
+				const route = await runtime.host.harness.snapshot(Route, item.id, context);
+				if (route?.conversationId) {
+					runtime.routes.set(item.id, route);
+					const provider = await runtime.host.harness.snapshot(ProviderDoc, item.id, context);
+					if (provider) runtime.providerRoutes.set(provider.sessionId, item.id);
+				}
+			}
+			cursor = page.next;
+		} while (cursor);
+		const pending = await runtime.host.harness.inspect(context);
+		for (const cid of new Set(pending.submissions.map((s) => s.conversationId))) {
+			const conv = await runtime.host.harness.conversation(cid, context);
+			const route = runtime.routes.get(cid);
+			if (!conv || !route) throw new Error("Unfinished durable work has no route; refusing recovery");
+			runtime.track(conv, route.conversationId);
+			const work = runtime.finishRecovered(conv).finally(() => runtime.untrack(conv, route.conversationId));
+			runtime.tasks.add(work);
+			void work.catch((err) => console.error("[durable] recovery failed", err)).finally(() => runtime.tasks.delete(work));
+		}
+		runtime.host.resume();
+		return runtime;
+	}
+
+	private actorContext(cid: ConversationId, route: Readonly<RouteDoc>): SendCtx {
+		return { ...this.liveContexts.get(cid), actor: route.staffId ? { senderId: route.staffId, senderName: route.name, channel: route.channel, chatType: route.chatType === "group" ? "group" : "single" } : undefined };
+	}
+	private track(conv: Conversation, id: string): void {
+		const set = this.active.get(id) ?? new Set(); set.add(conv); this.active.set(id, set);
+	}
+	private untrack(conv: Conversation, id: string): void {
+		const set = this.active.get(id); set?.delete(conv); if (!set?.size) this.active.delete(id);
+	}
+	get busy(): boolean { return this.active.size > 0; }
+	abort(id: string): boolean {
+		const set = this.active.get(id);
+		for (const conv of set ?? []) void conv.abort(context).catch((err) => console.error("[durable] abort failed", err));
+		return !!set?.size;
+	}
+
+	async send(agent: Agent, text: string, ctx?: SendCtx): Promise<SendResult> {
+		if (this.closing) throw new Error("Durable runtime is closing");
+		const id = agent.sessionId ?? "default";
+		// Keep current callbacks scoped to the submission and serialize same-chat
+		// admission; other chats continue independently.
+		const previous = this.tails.get(id) ?? Promise.resolve();
+		const work = previous.catch(() => {}).then(() => this.execute(agent, text, ctx));
+		this.tails.set(id, work);
+		try { return await work; } finally { if (this.tails.get(id) === work) this.tails.delete(id); }
+	}
+	private async execute(agent: Agent, text: string, ctx?: SendCtx): Promise<SendResult> {
+		if (this.closing) throw new Error("Durable runtime is closing");
+		const id = agent.sessionId ?? "default";
+		const conv = await this.host.harness.createConversation({ ownership: { kind: "ownerless" }, agent: { model: { provider: "ve-runtime", modelId: "current" }, instructions: agent.state.systemPrompt }, init: async (tx, cid) => {
+			const route = await tx.doc(Route, cid);
+			Object.assign(route, { conversationId: id, requestId: `ve:${cid}`, staffId: ctx?.actor?.senderId ?? "", name: ctx?.actor?.senderName ?? "", channel: ctx?.actor?.channel ?? "", chatType: ctx?.actor?.chatType ?? "", text });
+			// Import only on a NEW execution; resumed executions use their complete
+			// stored tool transcript and never rehydrate lossy UI messages.
+			for (const row of this.opts.history.listMessages(id)) await tx.appendEntry(cid, { kind: "ve.history", model: [{ role: row.role, content: row.role === "user" ? row.content : [{ type: "text", text: row.content }], timestamp: row.created_at } as Message] });
+		} }, context);
+		this.routes.set(conv.id, (await this.host.harness.snapshot(Route, conv.id, context))!);
+		const provider = await this.host.harness.snapshot(ProviderDoc, conv.id, context);
+		if (!provider) throw new Error("Missing persisted provider session");
+		this.providerRoutes.set(provider.sessionId, conv.id);
+		this.liveContexts.set(conv.id, ctx ?? {});
+		this.track(conv, id);
+		this.opts.history.ensureConversation(id, text.slice(0, 40));
+		this.opts.history.appendMessage(id, "user", text);
+		ctx?.onPersist?.(id);
+		try {
+			const content = ctx?.images?.length ? [{ type: "text" as const, text }, ...ctx.images.map((image) => ({ type: "image" as const, ...image }))] : text;
+			const submission = await conv.submit({ type: "input", content, requestId: `ve:${conv.id}` }, context);
+			const outcome = await submission.wait(context);
+			const result = await this.result(conv, outcome.status === "done" ? outcome.answer : undefined);
+			await this.project(conv, result);
+			ctx?.onPersist?.(id);
+			return result;
+		} finally { this.liveContexts.delete(conv.id); this.untrack(conv, id); }
+	}
+	private async result(conv: Conversation, answer?: unknown): Promise<SendResult> {
+		const entries = await conv.entries({}, 20, undefined, context);
+		const entry = answer === undefined ? undefined : entries.items.find((item) => item.id === answer);
+		const message = entry?.model?.find((m) => m.role === "assistant");
+		const reply = message?.role === "assistant" ? message.content.filter((p) => p.type === "text").map((p) => p.text).join("") : "";
+		return reply ? { reply } : { reply: "执行已暂停，请检查恢复状态。", error: "durable submission unanswered" };
+	}
+	private async project(conv: Conversation, result: SendResult): Promise<void> {
+		const route = this.routes.get(conv.id)!;
+		if (route.projected) return;
+		// Stable message key closes the cross-database projection crash window.
+		this.opts.history.appendMessageOnce(route.conversationId, "assistant", result.reply, `durable:${conv.id}:answer`);
+		await conv.commit(async (tx) => { (await tx.doc(Route, conv.id)).projected = 1; }, context);
+	}
+	private async finishRecovered(conv: Conversation): Promise<void> {
+		const route = this.routes.get(conv.id)!;
+		await conv.waitForIdle(context);
+		const state = await this.host.harness.commit((tx) => tx.submissionByRequest(conv.id, `ve:${conv.id}`), context);
+		const result = await this.result(conv, state?.status === "done" ? state.answer : undefined);
+		await this.project(conv, result);
+		await this.opts.onRecovered(route.conversationId, result, `durable:${conv.id}:answer`);
+	}
+	async close(): Promise<void> { this.closing = true; await this.host.close(); }
+}

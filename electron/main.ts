@@ -941,32 +941,15 @@ ${tailForProgress(decision.text)}`;
 	let durableHost: { resume(): void; close(): Promise<void> } | undefined;
 	if (kernel === "durable") {
 		try {
-			const { openDurableHost } = await import("../src/engine/durable/harness-host.js");
-			const profileName = (() => {
-				const marker = path.join("pi-virtual-employee", "profiles") + path.sep;
-				const at = userData.indexOf(marker);
-				return at >= 0 ? userData.slice(at + marker.length) : "default";
-			})();
-			// Phase 1 wires ONLY the read-only subset (phase1-tools.ts). A tool under
-			// durable may re-run after a crash when declared safe, so mutating tools
-			// wait for phase 3 where each gets an idempotency key or a business-state
-			// check. Take the tools from the engine's own builder: the RBAC
-			// `guarded()` wrappers come along, so permissions cannot diverge between
-			// kernels.
-			const { selectPhase1Tools } = await import("../src/engine/durable/phase1-tools.js");
-			const phase1 = selectPhase1Tools(engine.buildToolSetFor("durable:console"));
-			const host = await openDurableHost({
-				userDataDir: userData,
-				profileName,
-				tools: phase1,
+			const host = await engine.openDurableRuntime(userData, async (conversationId, result, occurrenceId) => {
+				const wc = mainWindow?.webContents;
+				if (wc && !wc.isDestroyed()) wc.send("im:activity", conversationId);
+				if (history.isReadOnly(conversationId)) await im.pushToConversation(conversationId, result.reply);
 			});
-			console.log(`[durable] tool surface: ${phase1.length} read-only tools (${phase1.map((t) => t.name).join(", ")})`);
-			durableHost = host;
-			host.resume(); // pick up whatever the last process left unfinished
-			console.log(`[durable] host ready (profile ${profileName}, db ${host.databasePath})`);
+			durableHost = { resume() {}, close: () => host.close() };
+			console.log("[durable] execution runtime restored and ready");
 		} catch (err) {
-			console.error(`[durable] host failed to open — keeping the legacy kernel: ${err instanceof Error ? err.message : err}`);
-			kernel = "legacy";
+			console.error(`[durable] runtime unavailable; unfinished work will remain parked: ${err instanceof Error ? err.message : err}`);
 		}
 	}
 	// Orderly close: `close()` waits for running task code to return, so a clean

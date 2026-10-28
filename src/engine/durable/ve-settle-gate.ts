@@ -26,7 +26,7 @@
  * with zero extra writes, and it is automatically correct across a crash because
  * the transcript is the durable artifact.
  */
-import { defineDoc, defineExtension, GenerationTask, hook } from "@earendil-works/pi-durable";
+import { defineDoc, defineExtension, GenerationTask, LiveDoc, type HookApi, type Tx, hook } from "@earendil-works/pi-durable";
 
 export const VERIFY_GIVE_UP = 2;
 export const AUTONOMOUS_VERIFY_PASS_MARK = "[[VERIFY_PASS]]";
@@ -211,10 +211,8 @@ export function turnHadToolCalls(message: { content?: unknown }): boolean {
  * work (0→1→2 persisted across runs), so the gate narrows the type here —
  * ONE place, with the evidence recorded — instead of casting at each call site.
  */
-interface WritableHookApi {
-	conversationId: never;
-	commit<T>(change: (tx: { doc: (token: unknown, id: unknown) => Promise<SettleStreakDoc> }) => Promise<T>, context: unknown): Promise<T>;
-	snapshot(token: unknown, id: unknown, context: unknown): Promise<SettleStreakDoc | undefined>;
+interface WritableHookApi extends HookApi {
+	commit<T>(change: (tx: Tx) => Promise<T>, context: import("@earendil-works/chord/context").Context): Promise<T>;
 }
 
 /**
@@ -258,6 +256,11 @@ export function createDurableSettleGate() {
 						// settle #1: a done claim → ask for the evidence round.
 						if (text.includes(AUTONOMOUS_DONE_MARK)) {
 							expectingContinuation.set(api.conversationId, expectingContinuation.get(api.conversationId) ?? String(api.taskId));
+							// Evidence must be earned DURING the verify round: tools used while
+							// DOING the work are not proof the result was re-checked (review:
+							// work-phase tools otherwise let a memory-only VERIFY_PASS through).
+							// Also drops any residue from a run that died abnormally.
+							resetToolEvidence(api.conversationId);
 							return { continue: SETTLE_VERIFY_PROMPT };
 						}
 						// A plain reply (no markers) settles the run normally.
@@ -275,8 +278,11 @@ export function createDurableSettleGate() {
 							const w = writable(api);
 							// Identity: an onYield right after our own injection continues the
 							// SAME run; anything else is a new run (fresh key, prune stale).
-							const continuedRunKey = expectingContinuation.get(api.conversationId);
-							const runKey = continuedRunKey ?? String(api.taskId);
+							const live = await api.snapshot(LiveDoc, api.conversationId, context);
+							// Submission ids remain stable when onYield hands off to a new
+							// generation and when the process restarts.
+							const runKey = live?.run?.inputs.join(",") ?? String(api.taskId);
+							const continuedRunKey = runKey;
 							const streakDoc = w ? await w.snapshot(SettleStreakDocDef, api.conversationId, context) : undefined;
 							const prevStreak = streakDoc?.runs?.[runKey] ?? 0;
 							if (!continuedRunKey && w && streakDoc && Object.keys(streakDoc.runs ?? {}).some((k) => k !== runKey)) {

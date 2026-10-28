@@ -97,11 +97,17 @@ export function toDurableTool(tool: AgentTool<any>, opts: AdaptOptions = {}): To
 		description: tool.description,
 		parameters: tool.parameters,
 		replay,
-		execute: async (args: any) => {
+		prepareArguments: tool.prepareArguments,
+		structuredOutputSchema: tool.outputSchema,
+		executionMode: "sequential",
+		execute: async (args: any, api, context) => {
 			try {
-				const result = await tool.execute(`${tool.name}-durable`, args, undefined, undefined);
+				const result = await tool.execute(api.callId, args, context.abortSignal, (partial) => {
+					if (partial.details !== undefined) void api.details(partial.details, context).catch(() => {});
+				});
 				return {
 					output: result.content as never,
+					...(result.structuredContent !== undefined ? { structuredOutput: result.structuredContent } : {}),
 					...(result.details !== undefined ? { details: result.details as never } : {}),
 					...(result.isError ? { isError: true } : {}),
 				};

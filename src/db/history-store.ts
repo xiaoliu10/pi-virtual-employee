@@ -238,6 +238,12 @@ export class HistoryStore {
 			.run(conversationId);
 	}
 
+	/** Idempotent projection from a durable execution into the UI transcript. */
+	appendMessageOnce(conversationId: string, role: "user" | "assistant", content: string, id: string): void {
+		this.db.prepare("INSERT OR IGNORE INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)").run(id, conversationId, role, content, Date.now());
+		this.touch(conversationId);
+	}
+
 	appendMessage(
 		conversationId: string,
 		role: "user" | "assistant",

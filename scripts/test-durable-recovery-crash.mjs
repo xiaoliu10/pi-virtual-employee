@@ -87,8 +87,8 @@ test("a SIGKILL mid-tool resumes the run and never repeats the completed call", 
 	assert.ok(settled.length > 0, "the pending submission reached a terminal state after recovery");
 	for (const status of settled) {
 		assert.ok(
-			["done", "failed", "unanswered"].includes(status),
-			`recovery must produce a definite outcome, got "${status}"`,
+			status === "done",
+			`recovery must finish the original submission successfully, got "${status}"`,
 		);
 	}
 	// The interrupted call's outcome must be IN the recovered context — otherwise

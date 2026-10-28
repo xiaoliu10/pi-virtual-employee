@@ -11,12 +11,13 @@
  * base model of the matching api type and overriding id + baseUrl.
  */
 import { randomUUID } from "node:crypto";
+import { DurableRuntime } from "./durable/runtime.js";
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import type { AgentEvent, AgentMessage, FinishTurn, StreamFn } from "@earendil-works/pi-agent-core";
 import { createSessionHost, type SessionHost } from "./session-host.js";
 import type { Skill } from "./skills/types.js";
 import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "./pi-compaction.js";
-import { createModels, ModelsError } from "@earendil-works/pi-ai";
+import { createModels, normalizeContext, ModelsError } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { Api, AuthInteraction, AuthPrompt, AuthEvent, CredentialStore, ImageContent, Model, MutableModels, TextContent } from "@earendil-works/pi-ai";
 import type { ConfigStore, Supplier } from "../db/config-store.js";
@@ -418,6 +419,32 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** Inject the platform updater after construction; new sessions see manage_update. */
 	setUpdateOperations(updates: UpdateOperations | undefined): void {
 		this.updates = updates;
+	}
+
+	private durableRuntime?: DurableRuntime;
+
+	async openDurableRuntime(userDataDir: string, onRecovered: (id: string, result: SendResult, occurrenceId: string) => Promise<void>): Promise<DurableRuntime> {
+		this.durableRuntime = await DurableRuntime.open({
+			userDataDir, history: this.history,
+			session: (id) => this.getOrCreateSession(id),
+			tools: (id) => this.buildToolSetFor(id),
+			stream: (id, options, messages) => {
+				const { supplier, modelId } = this.resolveForConversation(id);
+				return this.makeStreamFn(id)(this.resolveModel(supplier, modelId), normalizeContext({ messages }), { ...options, sessionId: id, apiKey: this.apiKeyFor(supplier) });
+			},
+			withActor: async (id, ctx, text, run) => {
+				if (ctx.actor) this.turnActor.set(id, { ...ctx.actor, text });
+				else this.turnActor.delete(id);
+				this.turnMemoryContext.set(id, deriveMemoryContext(ctx.actor, id));
+				if (ctx.sendFile) this.turnSendFile.set(id, ctx.sendFile);
+				if (ctx.sendImage) this.turnSendImage.set(id, ctx.sendImage);
+				try { return await run(); } finally {
+					this.turnActor.delete(id); this.turnMemoryContext.delete(id);
+					this.turnSendFile.delete(id); this.turnSendImage.delete(id);
+				}
+			}, onRecovered,
+		});
+		return this.durableRuntime;
 	}
 
 	private computer?: ComputerService;
@@ -1096,6 +1123,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * fresh transcript.
 	 */
 	abortSession(conversationId: string): boolean {
+		if (this.durableRuntime?.abort(conversationId)) return true;
 		const cached = this.sessions.get(conversationId);
 		if (!cached) return false;
 		// /stop lands HERE (not markTurnAbort) — and during a retry-backoff wait
@@ -1949,6 +1977,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	async send(agent: Agent, message: string, ctx?: SendCtx): Promise<SendResult> {
+		if (this.opts.kernel === "durable" && !ctx?.ephemeral) {
+			if (!this.durableRuntime) throw new Error("Durable runtime is unavailable; refusing to replay through legacy");
+			return this.durableRuntime.send(agent, message, ctx);
+		}
 		const conversationId = agent.sessionId ?? "default";
 
 		const existing = this.history.getConversation(conversationId);
@@ -2792,6 +2824,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	isIdle(): boolean {
+		if (this.durableRuntime?.busy) return false;
 		if (hasActiveShellCommands(this.config)) return false;
 		if (this.computer?.busy) return false;
 		if (this.retryWaits.size > 0) return false; // mid-backoff: a turn is alive (review M2)

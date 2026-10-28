@@ -267,7 +267,7 @@ test("tool adapter maps VE results onto the durable result shape", async () => {
 	const [adapted] = toDurableTools([fakeVeTool]);
 	assert.equal(adapted.name, "demo");
 	assert.equal(adapted.replay, "unsafe", "unknown tool names are unsafe");
-	const result = await adapted.execute({});
+	const result = await adapted.execute({}, { callId: "test-call" }, BACKGROUND_CONTEXT);
 	assert.deepEqual(result.output, [{ type: "text", text: "hello" }]);
 	assert.deepEqual(result.details, { ok: true });
 });
