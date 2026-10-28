@@ -105,7 +105,7 @@ renderer/src/        React + Vite + Tailwind 控制台
 
 ### 内核与 pi runtime
 
-会话内核保留**自建 `Agent`**（pi-agent-core）管线——现场加固（压缩口径、退化门禁、重试梯子、会话亲和、scoped memory、RBAC）都在这一层。自 v0.2.149 起可经 `general.engineKernel` 灰度开关切到 `pi-session`：在 Agent 外包一层 pi-coding-agent 的 `AgentSession`，启用扩展运行时（pi 插件宿主）；pi 自带的 auto-retry / auto-compaction 显式关闭，上述行为零改变。**默认 `legacy`**，现场零影响。
+会话内核保留**自建 `Agent`**（pi-agent-core）管线——现场加固（压缩口径、退化门禁、重试梯子、会话亲和、scoped memory、RBAC）都在这一层。自 v0.2.149 起可经 `general.engineKernel` 灰度开关切到 `pi-session`：在 Agent 外包一层 pi-coding-agent 的 `AgentSession`，启用扩展运行时（pi 插件宿主）；pi 自带的 auto-retry / auto-compaction 显式关闭，上述行为零改变。**默认 `durable`**（持久执行内核：崩溃/升级中断后自动接续、恢复按当前权限重鉴权；durable 存储不可用时自动回退 legacy）。
 
 pi-coding-agent **不进安装包**：安装包只内置锁定版本的 `pi-runtime-lock`（钉住全依赖树），首启由引导器（`src/runtime/`）按 **npmmirror → Gitee → npmjs** 源链装到 `userData/pi-runtime`（`general.piRegistryUrl` 可指定私有源），装完做版本自检；安装失败留在 legacy，不带病启动。
 
