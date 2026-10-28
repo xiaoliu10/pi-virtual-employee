@@ -19,6 +19,9 @@ interface RouteDoc {
 	text: string;
 	projected: number;
 }
+/** How long a recovered run may take to reach a terminal state before we report it as unfinished. */
+const RECOVERY_WAIT_MS = 10 * 60_000;
+
 export const Route = defineDoc<RouteDoc>({
 	kind: "ve.execution", version: 1, scope: "conversation", history: "latest", fork: "initial",
 	checkpointWhen: () => false,
@@ -102,13 +105,28 @@ export class DurableRuntime {
 			}
 			cursor = page.next;
 		} while (cursor);
-		const pending = await runtime.host.harness.inspect(context);
-		for (const cid of new Set(pending.submissions.map((s) => s.conversationId))) {
+		// Find unfinished work by SCANNING SUBMISSIONS, not by inspect(): inspect()
+		// reports what the scheduler knows, and before resume() it reports nothing
+		// (measured — the field bug: only the conversation whose run happened to be
+		// re-admitted got continued, the other was silently dropped).
+		const unfinished: ConversationId[] = [];
+		// `status` takes ONE value, so both non-terminal states are scanned.
+		for (const status of ["queued", "placed"] as const) {
+			let subCursor: Cursor | undefined;
+			do {
+				const page = await runtime.host.storage.scanSubmissions({ status }, 200, subCursor, context);
+				for (const record of page.items) {
+					if (!unfinished.includes(record.conversationId)) unfinished.push(record.conversationId);
+				}
+				subCursor = page.next;
+			} while (subCursor);
+		}
+		for (const cid of unfinished) {
 			const conv = await runtime.host.harness.conversation(cid, context);
 			const route = runtime.routes.get(cid);
 			if (!conv || !route) throw new Error("Unfinished durable work has no route; refusing recovery");
 			runtime.track(conv, route.conversationId);
-			const work = runtime.finishRecovered(conv).finally(() => runtime.untrack(conv, route.conversationId));
+			const work = runtime.finishRecovered(conv, route.conversationId).finally(() => runtime.untrack(conv, route.conversationId));
 			runtime.tasks.add(work);
 			void work.catch((err) => console.error("[durable] recovery failed", err)).finally(() => runtime.tasks.delete(work));
 		}
@@ -185,13 +203,21 @@ export class DurableRuntime {
 		this.opts.history.appendMessageOnce(route.conversationId, "assistant", result.reply, `durable:${conv.id}:answer`);
 		await conv.commit(async (tx) => { (await tx.doc(Route, conv.id)).projected = 1; }, context);
 	}
-	private async finishRecovered(conv: Conversation): Promise<void> {
+	private async finishRecovered(conv: Conversation, conversationId: string): Promise<void> {
 		const route = this.routes.get(conv.id)!;
-		await conv.waitForIdle(context);
-		const state = await this.host.harness.commit((tx) => tx.submissionByRequest(conv.id, `ve:${conv.id}`), context);
+		// waitForIdle can resolve BEFORE the resumed run re-admits anything, so poll
+		// the submission until it is genuinely terminal. Taking the first readable
+		// state produced a bogus "执行已暂停" answer while the run was still going
+		// (measured in the two-conversation acceptance run).
+		let state = await this.host.harness.commit((tx) => tx.submissionByRequest(conv.id, `ve:${conv.id}`), context);
+		const deadline = Date.now() + RECOVERY_WAIT_MS;
+		while (state?.status !== "done" && state?.status !== "unanswered" && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			state = await this.host.harness.commit((tx) => tx.submissionByRequest(conv.id, `ve:${conv.id}`), context);
+		}
 		const result = await this.result(conv, state?.status === "done" ? state.answer : undefined);
 		await this.project(conv, result);
-		await this.opts.onRecovered(route.conversationId, result, `durable:${conv.id}:answer`);
+		await this.opts.onRecovered(conversationId, result, `durable:${conv.id}:answer`);
 	}
 	async close(): Promise<void> { this.closing = true; await this.host.close(); }
 }

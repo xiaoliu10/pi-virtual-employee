@@ -60,6 +60,8 @@ export interface DurableHost {
 	close(): Promise<void>;
 	/** Absolute path of this profile's durable database. */
 	databasePath: string;
+	/** Underlying storage — same single-owner handle the Harness runs on, for reads the Harness does not expose (e.g. scanning submissions on startup). */
+	storage: Awaited<ReturnType<typeof openNodeSqliteStorage>>;
 }
 
 /**
@@ -108,6 +110,7 @@ export async function openDurableHost(opts: DurableHostOptions): Promise<Durable
 
 	return {
 		harness,
+		storage,
 		databasePath,
 		resume: () => harness.resume(),
 		close: () => harness.close(BACKGROUND_CONTEXT),

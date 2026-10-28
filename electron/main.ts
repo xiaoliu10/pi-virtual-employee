@@ -944,7 +944,14 @@ ${tailForProgress(decision.text)}`;
 			const host = await engine.openDurableRuntime(userData, async (conversationId, result, occurrenceId) => {
 				const wc = mainWindow?.webContents;
 				if (wc && !wc.isDestroyed()) wc.send("im:activity", conversationId);
-				if (history.isReadOnly(conversationId)) await im.pushToConversation(conversationId, result.reply);
+				// Recovered replies go back to the conversation they came from. The
+				// projection already used a stable key, so a crash between projection and
+				// push cannot duplicate the UI row; the outbox ledger (separate branch)
+				// extends the same guarantee to the channel delivery via `occurrenceId`.
+				if (history.isReadOnly(conversationId)) {
+					const pushed = await im.pushToConversation(conversationId, result.reply);
+					if (!pushed.ok) console.warn(`[durable] recovered reply not delivered to ${conversationId} (${occurrenceId}): ${pushed.error ?? "unknown"}`);
+				}
 			});
 			durableHost = { resume() {}, close: () => host.close() };
 			console.log("[durable] execution runtime restored and ready");
