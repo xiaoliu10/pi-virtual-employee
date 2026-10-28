@@ -344,11 +344,15 @@ test("failed delivery keeps a real SQL proposal, conditions and provenance acces
 test("manage_settings discovers and switches mining without a new UI", async t => {
 	const config = new ConfigStore(database(t));
 	config.update({ security: { adminStaffIds: ["boss"] } });
-	assert.deepEqual(config.all().capabilities.autonomousMining, { enabled: false, intervalHours: 4 });
+	// Default is ON: proactivity is the product default (2026-10-28), not an
+	// opt-in easter egg — an admin who never opens settings still gets proposals.
+	assert.deepEqual(config.all().capabilities.autonomousMining, { enabled: true, intervalHours: 4 });
 	const tool = createManageSettingsTool({ config, conversationId: "dt:single:boss",
 		resolveActor: () => ({ senderId: "boss", channel: "dingtalk", chatType: "single", text: "确认修改自动挖掘配置" }) });
 	assert.match(tool.description, /capabilities.autonomousMining.enabled/);
 	assert.match((await tool.execute("list", { action: "list" })).content[0].text, /intervalHours/);
+	await tool.execute("disable-first", { action: "set", path: "capabilities.autonomousMining.enabled", value: false });
+	assert.equal(config.all().capabilities.autonomousMining.enabled, false);
 	await tool.execute("enable", { action: "set", path: "capabilities.autonomousMining.enabled", value: true });
 	assert.equal(config.all().capabilities.autonomousMining.enabled, true);
 	await tool.execute("interval", { action: "set", path: "capabilities.autonomousMining.intervalHours", value: 8 });

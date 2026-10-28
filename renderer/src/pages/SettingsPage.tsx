@@ -1072,7 +1072,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 											<div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
 												<div className="mb-3">
 													<div className="text-sm font-medium text-slate-800">自主任务挖掘</div>
-													<div className="mt-1 text-xs leading-relaxed text-slate-400">定期阅读各会话的新消息（严格单会话来源、只读），把值得主动跟进的工作整理成提案，推回原会话等你确认——不会自动创建或执行任何任务。默认关闭。</div>
+													<div className="mt-1 text-xs leading-relaxed text-slate-400">定期阅读各会话的新消息（严格单会话来源、只读），把值得主动跟进的工作整理成提案，推回原会话等你确认——不会自动创建或执行任何任务。默认开启。</div>
 												</div>
 												<div className="space-y-3">
 													<label className="flex cursor-pointer items-center justify-between rounded-xl border border-amber-200 bg-amber-50/50 px-4 py-3">
@@ -1101,7 +1101,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 																	<div>上次挖掘：扫描会话 {miningStatus.lastMiningScanned ?? "?"} 个 · 产出提案 {miningStatus.lastMiningProposals ?? "?"} 条</div>
 																)}
 																{miningStatus.lastMiningError && <div className="text-red-600">上次出错：{miningStatus.lastMiningError}</div>}
-																{miningStatus.enabled === false && <div className="text-amber-700/80">当前处于关闭状态——关闭期间不会产出任何提案。</div>}
+																{miningStatus.enabled === false && <div className="text-amber-700/80">当前处于关闭状态（出厂默认开启）——关闭期间不会产出任何提案。</div>}
 															</>
 														)}
 													</div>
