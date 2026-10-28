@@ -469,7 +469,7 @@ async function main(): Promise<void> {
 	// "pi-session" needs the pi runtime installed+verified before the engine
 	// exists — a failed bootstrap keeps the app on the legacy kernel (loud log,
 	// settings surface the state) instead of bricking the profile.
-	let kernel: "legacy" | "pi-session" | "durable" = initialCfg.general.engineKernel ?? "legacy";
+	let kernel: "legacy" | "pi-session" | "durable" = initialCfg.general.engineKernel ?? "durable";
 	// "durable" (crash recovery, docs/design/crash-recovery.md) needs NO runtime
 	// bootstrap: pi-durable is an ordinary dependency. It rolls back to legacy if
 	// its host cannot open (e.g. the storage file is owned by another instance) —
@@ -994,6 +994,10 @@ ${tailForProgress(decision.text)}`;
 			console.log("[durable] execution runtime restored and ready");
 		} catch (err) {
 			console.error(`[durable] runtime unavailable; unfinished work will remain parked: ${err instanceof Error ? err.message : err}`);
+			// "durable" is the default kernel since v0.2.167 — an environment that
+			// cannot open the durable storage must fall back to a WORKING legacy
+			// pipeline, not a bot that throws on every send.
+			engine.degradeToLegacyKernel(`durable host failed to open: ${err instanceof Error ? err.message : err}`);
 		}
 	}
 	// Orderly close: `close()` waits for running task code to return, so a clean

@@ -421,6 +421,21 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.updates = updates;
 	}
 
+	/**
+	 * Degrade the kernel to legacy after the durable host failed to open (main
+	 * calls this from the openDurableRuntime catch). The engine was CONSTRUCTED
+	 * with kernel:"durable"; without this, every send() throws "refusing to
+	 * replay through legacy" and the bot goes dark until the storage problem is
+	 * fixed. Since v0.2.167 "durable" is the DEFAULT kernel, so an environment
+	 * that cannot open the durable storage (permissions, another instance) must
+	 * fall back to a working legacy pipeline, not a dead bot.
+	 */
+	degradeToLegacyKernel(reason: string): void {
+		if (this.opts.kernel !== "durable") return;
+		this.opts.kernel = "legacy";
+		console.warn("[engine] kernel degraded to legacy: " + reason);
+	}
+
 	private durableRuntime?: DurableRuntime;
 
 	async openDurableRuntime(userDataDir: string, onRecovered: (id: string, result: SendResult, occurrenceId: string) => Promise<void>): Promise<DurableRuntime> {

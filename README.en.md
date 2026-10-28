@@ -107,7 +107,7 @@ renderer/src/        React + Vite + Tailwind console
 
 ### Kernel and pi runtime
 
-The conversation kernel keeps the **self-built `Agent`** (pi-agent-core) pipeline — the field hardening (compaction policy, degenerate-reply gating, the retry ladder, session affinity, scoped memory, RBAC) all lives there. Since v0.2.149, a kernel switch (`general.engineKernel`) can wrap the Agent in a pi-coding-agent `AgentSession` shell, enabling the extension runtime (the pi plugin host); pi's built-in auto-retry / auto-compaction are explicitly disabled, so the behavior above is unchanged. **The default is `legacy`**, with zero field impact.
+The conversation kernel keeps the **self-built `Agent`** (pi-agent-core) pipeline — the field hardening (compaction policy, degenerate-reply gating, the retry ladder, session affinity, scoped memory, RBAC) all lives there. Since v0.2.149, a kernel switch (`general.engineKernel`) can wrap the Agent in a pi-coding-agent `AgentSession` shell, enabling the extension runtime (the pi plugin host); pi's built-in auto-retry / auto-compaction are explicitly disabled, so the behavior above is unchanged. **The default is `durable`** (persistent execution: interrupted work resumes after crashes/upgrades, re-authorized under current permissions; falls back to `legacy` when the durable storage cannot open).
 
 pi-coding-agent is **not packaged**: the installer ships only a pinned `pi-runtime-lock` (the full dependency tree), and on first launch a bootstrap (`src/runtime/`) installs it into `userData/pi-runtime` from an **npmmirror → Gitee → npmjs** source chain (set `general.piRegistryUrl` for a private registry), followed by a version self-check. If installation fails the app stays on legacy — it never starts up broken.
 
