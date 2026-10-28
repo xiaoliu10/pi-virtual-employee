@@ -61,6 +61,12 @@ const DISCIPLINE_MARKERS = [
 	"后来的重跑成功不能反证先前那次成功",
 	"新证据与先前结论冲突时",
 	"显式标注哪些部分是假设",
+	// Goal-oriented path discipline (user ruling 2026-10-28, spay download: the
+	// agent burned 70+ turns retrying one broken write path, then asked the user
+	// to pick between three approaches instead of switching itself).
+	"目标导向：路径自己选，别把选择题抛给用户",
+	"主动切换到下一条可行路径继续执行",
+	"请示只留给三种情况",
 ];
 
 test("execution-discipline rules are present in a default prompt", () => {
