@@ -20,7 +20,7 @@
 			"path": "src/engine/prompt.ts",
 			"kind": "region",
 			"why": "执行与验收纪律（因果结论须有工具证据、两层成功、外部写读回验证）——用户红线，2026-10-27 现场事故，见 docs/design/ops-agent-quality-prompts.md",
-			"sha256": "7f57248cb55e38d53da4ca984087b80c9a159d2e14b71781858009f10c1bab2a"
+			"sha256": "9bce5b7805ff989a53441bdd11d1c0c83cf624db644bfbad088f42a604abe79f"
 		},
 		{
 			"id": "rbac-gate",
@@ -69,7 +69,7 @@
 			"path": "scripts/test-prompt.mjs",
 			"kind": "file",
 			"why": "守护提示词红线的断言本身（改测试而不是改行为是 RSI 最经典的失败模式）",
-			"sha256": "6b72d81d03b92a17b2c1ff550db81add29c9362e41f6f7694fd8b48691246d58"
+			"sha256": "a2b46deef9b2125fc7b1313b6f797bddf5ba567fc747efeb7dc37b2e1a8f4d53"
 		},
 		{
 			"id": "test-permissions",

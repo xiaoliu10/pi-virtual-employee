@@ -61,6 +61,17 @@ const DISCIPLINE_MARKERS = [
 	"后来的重跑成功不能反证先前那次成功",
 	"新证据与先前结论冲突时",
 	"显式标注哪些部分是假设",
+	// Goal-oriented path discipline (user ruling 2026-10-28, spay download: the
+	// agent burned 70+ turns retrying one broken write path, then asked the user
+	// to pick between three approaches instead of switching itself).
+	"目标导向：路径自己选，别把选择题抛给用户",
+	"主动切换到下一条可行路径继续执行",
+	"请示只留给三种情况",
+	"同类错误 ≥2 次",
+	// P1 (review): an escalation on an irreversible action must WAIT for an
+	// explicit answer — a one-way risk notice plus silence is not consent.
+	"未获同意前不得执行",
+
 ];
 
 test("execution-discipline rules are present in a default prompt", () => {
@@ -93,6 +104,8 @@ test("data-integrity rules are present in a default prompt", () => {
 test("core rules force a KB lookup BEFORE asking a human — the escape hatch is closed (field 2026-10-06)", () => {
 	const prompt = buildSystemPrompt({ ...BASE, ...ALL_ON });
 	assert.ok(prompt.includes("**不确定先查库、再问人**"), "core rule must demand search_knowledge_base before asking");
+	// BASE_RULES_SUMMARY line (review: the read-only summary could silently regress).
+	assert.ok(BASE_RULES_SUMMARY.some((line) => line.includes("不把实现方式的选择题抛给用户")), "summary must carry the goal-oriented line");
 	assert.match(prompt, /先调 search_knowledge_base 查有没有沉淀过的经验/);
 	assert.ok(prompt.includes("**事实/流程先查知识库**"), "factual lookup rule stays");
 	// The rule appears exactly once — duplicates dilute LLM rule adherence.
