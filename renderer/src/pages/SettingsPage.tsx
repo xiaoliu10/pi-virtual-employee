@@ -1092,10 +1092,13 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 													<div className="rounded-xl bg-slate-50 px-4 py-3 text-xs leading-relaxed text-slate-500">
 														{!miningStatus ? "正在读取挖掘状态…" : (
 															<>
-																<div>上次轮询：{miningStatus.lastTickAt ? new Date(Number(miningStatus.lastTickAt)).toLocaleString() : "尚未运行（开关开启后每小时检查一次）"}</div>
+																<div>上次轮询：{miningStatus.lastTickAt ? new Date(Number(miningStatus.lastTickAt)).toLocaleString() : "尚未轮询（每小时检查一次，与开关无关）"}</div>
 																<div>上次实际挖掘：{miningStatus.lastRunAt ? new Date(Number(miningStatus.lastRunAt)).toLocaleString() : "还没有运行过"}</div>
+																{miningStatus.pendingProposals != null && miningStatus.pendingProposals > 0 && (
+																	<div>待你确认的提案：{miningStatus.pendingProposals} 条</div>
+																)}
 																{miningStatus.lastRunAt && (
-																	<div>扫描会话 {miningStatus.lastMiningScanned ?? "?"} 个 · 产出提案 {miningStatus.lastMiningProposals ?? "?"} 条{miningStatus.pendingProposals != null ? ` · 待确认 ${miningStatus.pendingProposals} 条` : ""}</div>
+																	<div>上次挖掘：扫描会话 {miningStatus.lastMiningScanned ?? "?"} 个 · 产出提案 {miningStatus.lastMiningProposals ?? "?"} 条</div>
 																)}
 																{miningStatus.lastMiningError && <div className="text-red-600">上次出错：{miningStatus.lastMiningError}</div>}
 																{miningStatus.enabled === false && <div className="text-amber-700/80">当前处于关闭状态——关闭期间不会产出任何提案。</div>}

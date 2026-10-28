@@ -27,6 +27,7 @@ import type { HistoryStore } from "../db/history-store.js";
 import { inferConversationOrigin } from "../db/history-store.js";
 import type { WorkItemStore } from "../db/work-item-store.js";
 import { buildMiningPrompt, hasMiningSecrets, isDuplicateGoal, MINING_SYSTEM, parseMiningReply, validateMiningProposal, type ConversationDigest } from "../scheduler/mining.js";
+import { REJECTION_COOLDOWN_MS } from "../scheduler/mining.js";
 import { looksLikeCorrection, type TelemetryStore, type TurnStatus } from "../db/telemetry-store.js";
 import type { ProposalStore } from "./proposals.js";
 import type { PromptLab } from "../db/prompt-lab.js";
@@ -789,8 +790,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 						messages: rows.filter((m) => m.role === "user" && m.content && !hasMiningSecrets(m.content))
 							.map((m) => ({ id: m.id, content: m.content.slice(0, 1000) })),
 					};
+					// Dedup set = open items + RECENTLY REJECTED ones. A rejected
+					// proposal must not be re-mined on the very next message — that
+					// turns "dismiss" into a suggestion loop (review P2-1, and the
+					// settings copy promises a rejection cooldown). It is not
+					// forgotten though: past the cooldown the same signal CAN be
+					// proposed again (dismissed ≠ never).
 					const existingGoals = this.workItems.list()
-						.filter((i) => i.origin_conversation === c.id && !["done", "cancelled"].includes(i.status))
+						.filter((i) => {
+							if (i.origin_conversation !== c.id) return false;
+							if (i.status === "cancelled") return now - (i.updated_at || 0) < REJECTION_COOLDOWN_MS;
+							return i.status !== "done";
+						})
 						.map((i) => i.goal);
 					const mined = source.messages!.length ? parseMiningReply(await this.complete(
 						MINING_SYSTEM,

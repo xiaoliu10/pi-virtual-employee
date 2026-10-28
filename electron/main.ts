@@ -1114,34 +1114,38 @@ ${tailForProgress(decision.text)}`;
 	// in via capabilities.autonomousMining. Checked hourly; fires per its
 	// interval. On-demand mining (manage_work_items action=mine) is unaffected.
 	let lastMiningRun = 0;
+	// Single source for the app_meta key prefix (review P3-4): a second writer
+	// must not silently fork the namespace.
+	const MINING_META_PREFIX = "mining.";
 	const setMiningMeta = (key: string, value: string | number): void => {
 		try {
-			db.prepare("INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(`mining.${key}`, String(value));
+			db.prepare("INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(`${MINING_META_PREFIX}${key}`, String(value));
 		} catch { /* health recording must never break mining */ }
 	};
 	workMiningTimer = setInterval(() => {
 		const mining = config.all().capabilities.autonomousMining;
 		// A disabled switch is itself health state: the settings page shows WHY
 		// there are no proposals instead of the feature silently not existing.
+		// (The tick itself runs hourly regardless; only MINING is gated.)
 		setMiningMeta("lastTickAt", Date.now());
-		setMiningMeta("enabled", mining?.enabled ? 1 : 0);
 		if (!mining?.enabled) return;
 		if (Date.now() - lastMiningRun < mining.intervalHours * 3_600_000) return;
 		lastMiningRun = Date.now();
-		setMiningMeta("lastRunAt", Date.now());
 		void engine
 			.mineRecentWork({ maxProposals: 2 })
 			.then((r) => {
+				// lastRunAt is written ONLY on settle, together with its counts —
+				// writing it up front let a mid-mining exit leave a fresh timestamp
+				// over LAST pass's numbers, i.e. health data that looked
+				// self-consistent but was mismatched (review P2-2).
+				setMiningMeta("lastRunAt", Date.now());
 				setMiningMeta("lastMiningScanned", r.scanned);
 				setMiningMeta("lastMiningProposals", r.proposals.length);
-				if (r.error) {
-					setMiningMeta("lastMiningError", r.error);
-					console.warn("[work] background mining failed:", r.error);
-				} else {
-					setMiningMeta("lastMiningError", "");
-				}
+				setMiningMeta("lastMiningError", r.error || "");
+				if (r.error) console.warn("[work] background mining failed:", r.error);
 			})
 			.catch((err) => {
+				setMiningMeta("lastRunAt", Date.now());
 				setMiningMeta("lastMiningError", (err as Error).message || String(err));
 				console.warn("[work] background mining failed:", (err as Error).message);
 			});

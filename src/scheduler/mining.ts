@@ -1,3 +1,10 @@
+/**
+ * How long a REJECTED proposal keeps the same topic out of re-mining. Rejection
+ * means "not now", not "never": past the cooldown the signal can be proposed
+ * again (ideally with fresh evidence). Matches the settings-page copy.
+ */
+export const REJECTION_COOLDOWN_MS = 7 * 24 * 60 * 60_000;
+
 /** Bounded, source-isolated work proposal mining. History is data, not authority. */
 export const MINING_SYSTEM = `你是虚拟员工的任务挖掘助手。只阅读本次唯一来源会话的对话数据，找出适合自主跟进的工作，整理为待管理员确认的提案，不创建或执行任务。
 

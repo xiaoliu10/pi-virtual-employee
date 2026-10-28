@@ -130,7 +130,7 @@ function harness(t) {
 	engine.miningInFlight = false;
 	engine.workItems = {
 		list: () => items,
-		create: p => { const row = { id: `proposal-${items.length}`, title: p.title, goal: p.goal, origin_conversation: p.originConversation, origin_note: p.originNote, status: p.status }; items.push(row); return row; },
+		create: p => { const row = { id: `proposal-${items.length}`, title: p.title, goal: p.goal, origin_conversation: p.originConversation, origin_note: p.originNote, status: p.status, updated_at: Date.now() }; items.push(row); return row; },
 		setField: (id, _field, value) => { const item = items.find(i => i.id === id); item.conditions = value; return item; },
 	};
 	const pushes = [];
@@ -388,4 +388,36 @@ test("complete supports live/pre-aborted signals and preserves two-argument know
 	assert.equal(await engine.complete("knowledge", "entries"), "knowledge merged");
 	assert.deepEqual(globalThis.miningTestAgents.at(-1).state.tools, []);
 	assert.equal(globalThis.miningTestAgents.at(-1).unsubscribed, true);
+});
+
+test("a rejected proposal cools down 7 days, then may be proposed again (review P2-1)", async t => {
+	const { engine, db, history, items, pushes } = harness(t);
+	history.ensureConversation(source.id, "orders");
+	engine.complete = async (_system, prompt) => {
+		const data = JSON.parse(prompt.split("\n")[1]);
+		const m = data.messages[0];
+		return json(rawProposal({ origin_conversation: data.source_id, evidence_message_id: m.id, evidence: m.content }));
+	};
+	// Pass 1: the signal appears → proposed.
+	insert(db, source.id, "m1", source.messages[0].content);
+	await engine.mineRecentWork();
+	assert.equal(items.length, 1);
+	assert.equal(items[0].status, "proposed");
+	// Admin rejects it NOW.
+	items[0].status = "cancelled";
+	items[0].updated_at = Date.now();
+	// Pass 2: the same TOPIC reappears with DIFFERENT wording (so the goal slips
+	// past isDuplicateGoal's similarity and the COOLDOWN is what must block it).
+	// Before this test the rejected row left the dedup set entirely, so the very
+	// next message re-proposed it: dismiss = loop.
+	insert(db, source.id, "m2", "订单核对的事今天先不用管了。");
+	const second = await engine.mineRecentWork();
+	assert.equal(second.proposals.length, 0, "a just-rejected topic must stay rejected during the cooldown");
+	assert.equal(pushes.length, 1);
+	// Pass 3: 8 days later the topic reappears again → it MAY be proposed again
+	// (rejection means "not now", not "never").
+	items[0].updated_at = Date.now() - 8 * 24 * 3600_000;
+	insert(db, source.id, "m3", "订单核对的流程需要有人长期负责。");
+	const third = await engine.mineRecentWork();
+	assert.equal(third.proposals.length, 1, "past the cooldown the same topic may be proposed again");
 });
