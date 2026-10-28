@@ -227,6 +227,10 @@ export interface AppConfig {
 		 * storage is single-process, and mixing kernels inside one conversation would
 		 * double-write its transcript. */
 		engineKernel?: "legacy" | "pi-session" | "durable";
+		/** v0.2.167 one-time carry-forward marker: an explicit engineKernel choice
+		 * (written by update(), or the migration itself) so the legacy→durable
+		 * bump never overrides a deliberate "legacy". */
+		engineKernelCarried?: boolean;
 		/** npm registry for the pi runtime bootstrap (default chain:
 		 * npmmirror → Gitee mirror → npmjs). Empty = default chain. */
 		piRegistryUrl?: string;
@@ -998,6 +1002,18 @@ export class ConfigStore {
 				// certainly the old default rather than a deliberate choice, so carry it
 				// forward; any OTHER stored value is the user's and is left alone.
 				if (merged.general.oneOffRetentionDays === 7) merged.general.oneOffRetentionDays = 30;
+				// One-time carry-forward (v0.2.167): engineKernel's default flipped
+				// legacy→durable, and every install that ever ran ≤0.2.166 has the OLD
+				// default materialized in its persisted blob (all()/update() write the
+				// whole merged config back) — the deepMerge above would keep that stored
+				// "legacy" forever, so the flip would only ever reach fresh installs.
+				// A stored "legacy" WITHOUT the carry marker is treated as the
+				// materialized old default and bumped to "durable"; the marker then
+				// makes any LATER explicit "legacy" (deliberate opt-out) stick.
+				if (merged.general.engineKernel === "legacy" && !merged.general.engineKernelCarried) {
+					merged.general.engineKernel = "durable";
+					merged.general.engineKernelCarried = true;
+				}
 				const normalized = {
 					...merged,
 					model: normalizeModelConfig(parsed.model ?? merged.model),
@@ -1070,6 +1086,11 @@ export class ConfigStore {
 
 	update(patch: DeepPartial<AppConfig>): AppConfig {
 		// NOTE: kb.research legacy migration runs lazily on the next all() read — no need to duplicate it here.
+		// An explicit engineKernel write is a user decision, not a materialized
+		// default — mark it so the v0.2.167 carry-forward never flips it back.
+		if (patch.general && patch.general.engineKernel != null) {
+			patch = { ...patch, general: { ...patch.general, engineKernelCarried: true } };
+		}
 	const merged = deepMerge(this.all(), patch);
 		const normalized = {
 			...merged,

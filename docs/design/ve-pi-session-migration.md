@@ -1,5 +1,6 @@
 # VE 内核迁移设计：接入 pi-coding-agent（AgentSession 包裹方案）
 
+> 更新（v0.2.167）：本文的默认 `legacy` 指历史灰度期；当前默认 `durable`，存量安装也会一次性迁移。详见 `docs/releases/v0.2.167.md`。
 > 状态：**设计定稿，待 Phase 0 spike 验证后开工**（2026-10-17）
 > 决策记录：用户拍板方向——VE 换 pi-coding-agent 内核，pi runtime 独立分发（默认 GitHub、网络不通走国内源），解决安装包体积红线，统一 VE 与 desktop 内核，插件生态共用。
 > 关联：`docs/design/pi-quality-infrastructure.md`（desktop 侧质量插件）、`docs/design/settle-verify-gate.md`（VE 收尾验证门禁）、pi 官方文档 `docs/sdk.md` / `docs/extensions.md`。
