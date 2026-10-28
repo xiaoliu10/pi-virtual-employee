@@ -472,7 +472,7 @@ const DEFAULTS: AppConfig = {
 	capabilities: {
 		shell: { enabled: false, allowedCommands: ["tasklist", "taskkill", "ping", "ipconfig", "systeminfo", "whoami", "hostname", "netstat", "where"], timeoutSec: 300, backgroundTimeoutSec: 0, pollTimeoutSec: 30 },
 		mcp: { enabled: false, servers: [] },
-		autonomousMining: { enabled: false, intervalHours: 4 },
+		autonomousMining: { enabled: true, intervalHours: 4 },
 	},
 	reports: {
 		enabled: false,
