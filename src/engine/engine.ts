@@ -224,7 +224,7 @@ export interface EngineOptions {
 	 * field behavior); "pi-session" wraps each Agent in a pi AgentSession so
 	 * the extension runtime (plugins) and pi scaffolding attach. Default
 	 * "legacy" — the switch exists for the kernel migration gray rollout. */
-	kernel?: "legacy" | "pi-session";
+	kernel?: "legacy" | "pi-session" | "durable";
 	/** Per-LLM-call timeout (ms). 0 = no timeout. */
 	timeoutMs?: number;
 	/** Test seam: the backoff sleep between transient retries (defaults to a
@@ -275,7 +275,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * the pi agent dir's auth.json (shared with the pi CLI), so account logins
 	 * work everywhere; injectable for tests. */
 	private readonly credentialStore: CredentialStore;
-	private readonly opts: { timeoutMs: number; streamFn?: StreamFn; retrySleepFn?: (ms: number) => Promise<void>; kernel: "legacy" | "pi-session" };
+	private readonly opts: { timeoutMs: number; streamFn?: StreamFn; retrySleepFn?: (ms: number) => Promise<void>; kernel: "legacy" | "pi-session" | "durable" };
 	private readonly skillLoader: SkillLoader;
 	/** Authoring surface for declarative skills (save_to_skill). */
 	private readonly skillWriter: SkillWriter;

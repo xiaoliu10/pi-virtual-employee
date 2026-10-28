@@ -219,9 +219,14 @@ export interface AppConfig {
 	general: {
 		autostart: boolean;
 		/** Conversation kernel (migration gray switch, design doc §12).
-		 * "legacy" = bare-Agent driving (current field behavior); "pi-session"
-		 * = Agent wrapped in a pi AgentSession (extension runtime / plugins). */
-		engineKernel?: "legacy" | "pi-session";
+		 * "legacy"    = bare-Agent driving (current field behavior)
+		 * "pi-session"= Agent wrapped in a pi AgentSession (extension runtime / plugins)
+		 * "durable"   = pi-durable Harness (crash recovery: a restarted process
+		 *               resumes the run instead of losing it — docs/design/crash-recovery.md).
+		 * Still a per-instance switch, not per-conversation: durable ownership of a
+		 * storage is single-process, and mixing kernels inside one conversation would
+		 * double-write its transcript. */
+		engineKernel?: "legacy" | "pi-session" | "durable";
 		/** npm registry for the pi runtime bootstrap (default chain:
 		 * npmmirror → Gitee mirror → npmjs). Empty = default chain. */
 		piRegistryUrl?: string;

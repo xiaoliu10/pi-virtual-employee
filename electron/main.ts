@@ -468,7 +468,11 @@ async function main(): Promise<void> {
 	// "pi-session" needs the pi runtime installed+verified before the engine
 	// exists — a failed bootstrap keeps the app on the legacy kernel (loud log,
 	// settings surface the state) instead of bricking the profile.
-	let kernel: "legacy" | "pi-session" = initialCfg.general.engineKernel ?? "legacy";
+	let kernel: "legacy" | "pi-session" | "durable" = initialCfg.general.engineKernel ?? "legacy";
+	// "durable" (crash recovery, docs/design/crash-recovery.md) needs NO runtime
+	// bootstrap: pi-durable is an ordinary dependency. It rolls back to legacy if
+	// its host cannot open (e.g. the storage file is owned by another instance) —
+	// a failed recovery path must never brick the profile.
 	if (kernel === "pi-session") {
 		const { ensurePiRuntime } = await import("../src/runtime/bootstrap.js");
 		const result = await ensurePiRuntime({
@@ -928,6 +932,40 @@ ${tailForProgress(decision.text)}`;
 		return workService.stop();
 	};
 	app.on("before-quit", () => { void stopWork(); });
+
+	// ── Durable host (crash recovery, docs/design/crash-recovery.md) ──────────
+	// Opens ONLY under the "durable" kernel. Opening owns the profile's SQLite
+	// file (durable has no cross-process lock), so a failure here must degrade to
+	// the legacy kernel instead of blocking startup: a broken recovery path must
+	// never take the app down with it.
+	let durableHost: { resume(): void; close(): Promise<void> } | undefined;
+	if (kernel === "durable") {
+		try {
+			const { openDurableHost } = await import("../src/engine/durable/harness-host.js");
+			const profileName = (() => {
+				const marker = path.join("pi-virtual-employee", "profiles") + path.sep;
+				const at = userData.indexOf(marker);
+				return at >= 0 ? userData.slice(at + marker.length) : "default";
+			})();
+			const host = await openDurableHost({
+				userDataDir: userData,
+				profileName,
+				// Phase 1 keeps the tool surface empty: the recovery contract (resume,
+				// replay policy, identity, gate) is proven before any real tool runs
+				// under it. Wiring the 30+ VE tools is the next slice.
+				tools: [],
+			});
+			durableHost = host;
+			host.resume(); // pick up whatever the last process left unfinished
+			console.log(`[durable] host ready (profile ${profileName}, db ${host.databasePath})`);
+		} catch (err) {
+			console.error(`[durable] host failed to open — keeping the legacy kernel: ${err instanceof Error ? err.message : err}`);
+			kernel = "legacy";
+		}
+	}
+	app.on("will-quit", () => {
+		if (durableHost) void durableHost.close();
+	});
 
 	scheduler.setRunner({
 		async runTask(task, ctx) {
