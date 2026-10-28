@@ -1315,10 +1315,10 @@ ${tailForProgress(decision.text)}`;
 	 * `sinceTs` is exclusive. A tie at the same millisecond is possible, so the
 	 * renderer merges by id — the caller must be idempotent (it is: ids are keys).
 	 */
-	ipcMain.handle("tasks:messagesSince", (_e, id: string, sinceTs: number) => {
-		const rows = Number.isFinite(sinceTs) && sinceTs > 0 ? history.listMessagesSince(id, sinceTs, 500) : history.listMessages(id);
-		const cursor = rows.reduce((max, row) => (row.created_at > max ? row.created_at : max), sinceTs);
-		return { rows, cursor };
+	ipcMain.handle("tasks:messagesSince", (_e, id: string, cursor: { createdAt: number; rowid: number } | undefined) => {
+		// Composite (created_at, rowid) cursor: a ts-only cursor silently drops the
+		// second of two messages that share a millisecond (user turn + instant reply).
+		return history.listMessagesSinceCursor(id, cursor && cursor.createdAt >= 0 ? cursor : undefined, 500);
 	});
 	ipcMain.handle("tasks:delete", (_e, id: string) => {
 		engine.dropSession(id);

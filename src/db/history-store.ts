@@ -190,6 +190,36 @@ export class HistoryStore {
 			.all(conversationId, sinceTs, limit) as MessageRow[];
 	}
 
+	/**
+	 * Incremental page for the console's reconnect path, keyed by a COMPOSITE
+	 * cursor (created_at, rowid).
+	 *
+	 * Why not `created_at > ?` alone (what the single-ts variant does): two
+	 * messages can share a millisecond — a user turn and the assistant reply land
+	 * in the same tick when the reply is instant, and an IM burst does it often.
+	 * With a ts-only cursor the second one is skipped forever, because the cursor
+	 * has already moved past that millisecond. `listMiningMessages` solved this
+	 * the same way; this is the console-side twin.
+	 */
+	listMessagesSinceCursor(conversationId: string, after: MiningCursor | undefined, limit = 500): { rows: MessageRow[]; cursor: MiningCursor } {
+		const rows = (after
+			? this.db
+					.prepare(
+						`SELECT *, rowid AS mining_rowid FROM messages
+						 WHERE conversation_id = ? AND (created_at > ? OR (created_at = ? AND rowid > ?))
+						 ORDER BY created_at ASC, rowid ASC LIMIT ?`,
+					)
+					.all(conversationId, after.createdAt, after.createdAt, after.rowid, limit)
+			: this.db
+					.prepare("SELECT *, rowid AS mining_rowid FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, rowid ASC LIMIT ?")
+					.all(conversationId, limit)) as MiningMessageRow[];
+		const last = rows[rows.length - 1];
+		return {
+			rows,
+			cursor: last ? { createdAt: last.created_at, rowid: last.mining_rowid } : (after ?? { createdAt: 0, rowid: 0 }),
+		};
+	}
+
 	getMiningCursor(conversationId: string): MiningCursor | undefined {
 		return this.db.prepare(
 			"SELECT created_at AS createdAt, message_rowid AS rowid FROM work_mining_cursors WHERE conversation_id = ?",

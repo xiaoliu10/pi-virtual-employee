@@ -67,12 +67,12 @@ export function ChatPage({
 	const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
 	const scrollRef = useRef<HTMLDivElement>(null);
 	/**
-	 * Newest `created_at` this pane has rendered. Drives the incremental reload
-	 * after a reconnect: only messages past this cursor are fetched instead of the
-	 * whole conversation (a long IM chat re-read in full on every activity ping was
-	 * both slow and a full re-render).
+	 * Incremental-reload cursor (created_at + rowid). Composite, because a plain
+	 * timestamp loses the second of two messages written in the same millisecond —
+	 * a user turn and an instant reply do exactly that, and the lost message never
+	 * came back until the pane was reopened.
 	 */
-	const cursorRef = useRef<number>(0);
+	const cursorRef = useRef<{ createdAt: number; rowid: number } | undefined>(undefined);
 
 	useEffect(() => {
 		api.listModels().then(setModelOptions).catch(() => setModelOptions([]));
@@ -88,10 +88,10 @@ export function ChatPage({
 			return;
 		}
 		let cancelled = false;
-		cursorRef.current = 0;
+		cursorRef.current = undefined;
 		api.getMessages(activeId).then((rows) => {
 			if (cancelled) return;
-			cursorRef.current = rows.reduce((max, r) => (r.created_at > max ? r.created_at : max), 0);
+			// Full load starts the cursor fresh; the next incremental call re-derives it.
 			setMessages(
 				rows.map((r) => ({ id: r.id, role: r.role, content: r.content })),
 			);
@@ -116,11 +116,8 @@ export function ChatPage({
 		api.getMessagesSince(convId, cursorRef.current)
 			.then(({ rows, cursor }) => {
 				if (cancelled) return;
-				if (rows.length === 0) {
-					cursorRef.current = Math.max(cursorRef.current, cursor);
-					return;
-				}
-				cursorRef.current = Math.max(cursorRef.current, cursor);
+				cursorRef.current = cursor;
+				if (rows.length === 0) return;
 				setMessages((prev) => {
 					const seen = new Set(prev.map((m) => m.id));
 					const added = rows.filter((r) => !seen.has(r.id)).map((r) => ({ id: r.id, role: r.role, content: r.content }));
