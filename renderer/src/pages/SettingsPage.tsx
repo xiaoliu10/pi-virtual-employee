@@ -843,7 +843,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 														<div key={`person-${idx}`} className="flex items-center gap-2">
 															<input value={p.staffId} onChange={(e) => setSecurity({ people: (draft.security.people ?? []).map((v, i) => (i === idx ? { ...v, staffId: e.target.value } : v)) })} placeholder="钉钉 staffId" className={inputCls} />
 															<input value={p.name ?? ""} onChange={(e) => setSecurity({ people: (draft.security.people ?? []).map((v, i) => (i === idx ? { ...v, name: e.target.value } : v)) })} placeholder="备注名（可选）" className={inputCls + " max-w-[10rem]"} />
-															<select value={p.role} onChange={(e) => setSecurity({ people: (draft.security.people ?? []).map((v, i) => (i === idx ? { ...v, role: e.target.value as "viewer" | "operator" | "admin" } : v)) })} className={inputCls + " max-w-[9rem]"}>
+															<select value={p.role} onChange={(e) => setSecurity({ people: (draft.security.people ?? []).map((v, i) => (i === idx ? { ...v, role: e.target.value as "viewer" | "operator" | "admin" | "owner" } : v)) })} className={inputCls + " max-w-[9rem]"}>
 																<option value="viewer">viewer</option>
 																<option value="operator">operator</option>
 																<option value="admin">admin</option>

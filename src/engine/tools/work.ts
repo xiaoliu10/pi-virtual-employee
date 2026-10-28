@@ -4,7 +4,7 @@ import { Type } from "@earendil-works/pi-ai";
 import type { WorkItemStore } from "../../db/work-item-store.js";
 import type { ConfigStore } from "../../db/config-store.js";
 import { isExplicitConfirmation, type ActorContext } from "./admin.js";
-import { resolveRole } from "../../security/permissions.js";
+import { isOwner, resolveRole } from "../../security/permissions.js";
 import { parseNextCheck } from "../../scheduler/work.js";
 
 function fmtTime(ms: number | null): string {
@@ -44,7 +44,9 @@ function currentAdmin(config: ConfigStore, senderId: string): boolean {
 	const security = config.all().security;
 	const declared = security.adminStaffIds.includes(senderId) ||
 		security.people?.some((person) => person.staffId === senderId && person.role === "admin");
-	return !!declared && resolveRole(config, senderId) === "admin";
+	// owner is a strict superset of admin: accepting only "admin" here would make
+	// granting owner REMOVE ordinary task-management powers.
+	return resolveRole(config, senderId) === "owner" || (!!declared && resolveRole(config, senderId) === "admin");
 }
 
 function failure(reason: string) {
@@ -279,7 +281,12 @@ export function createWorkTools(deps: {
 			// pre-2026-10-04 behavior both depend on this. The old conversation
 			// filter enforced it incidentally; now it must be explicit.
 			if (p.action !== "get" && item.origin_conversation !== conversationId) {
-				return failure("自主任务只能在它的来源会话中变更；请到来源会话操作（此处仅可查看）。");
+				// Owner跨会话变更：租户隔离约束的是「不同的人/群之间」，而不是
+				// 「整个部署的所有者」本身（field 2026-10-28：owner 被拦在自己
+				// 机器的任务外面，只能到来源会话去改）。
+				if (!isOwner(config, actor.senderId)) {
+					return failure("自主任务只能在它的来源会话中变更；请到来源会话操作（此处仅可查看）。部署所有者（owner）可跨会话变更。");
+				}
 			}
 
 			if (p.action === "get") {

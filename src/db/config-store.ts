@@ -429,6 +429,15 @@ export interface AppConfig {
 	security: {
 		adminStaffIds: string[];
 		/**
+		 * Deployment owner(s): a strict superset of admin that may also change
+		 * work items / scheduled tasks ACROSS conversations (the normal rule
+		 * confines changes to the source chat for tenant isolation — correct for
+		 * tenants, wrong for the person who owns the whole box; field 2026-10-28).
+		 * Grant deliberately: an owner credential can reach every conversation's
+		 * tasks and knowledge.
+		 */
+		ownerStaffIds?: string[];
+		/**
 		 * Role-based access control. Roles (per PERSON, resolved from the
 		 * platform-verified senderStaffId — never from message text):
 		 *   viewer   — chat, KB search, memory/learn. Default for unknown senders.
@@ -437,7 +446,7 @@ export interface AppConfig {
 		 *   admin    — everything: full shell, settings, admin/identity ops.
 		 * Source precedence: people[] entry > adminStaffIds (=admin) > defaultRole.
 		 */
-		people?: { staffId: string; name?: string; role: "viewer" | "operator" | "admin" }[];
+		people?: { staffId: string; name?: string; role: "viewer" | "operator" | "admin" | "owner" }[];
 		defaultRole?: "viewer" | "operator" | "admin";
 		/**
 		 * 管理员完全访问模式。开启后，管理员（白名单/角色校验不变）在单聊中
@@ -502,7 +511,7 @@ const DEFAULTS: AppConfig = {
 	},
 	downloads: { enabled: true, dir: "", maxSizeMb: 200, retainDays: 30 },
 	skills: { disabled: [], marketUrl: "" },
-	security: { adminStaffIds: [], people: [], defaultRole: "viewer", conversations: [] },
+	security: { adminStaffIds: [], ownerStaffIds: [], people: [], defaultRole: "viewer", conversations: [] },
 	kb: {
 		enabled: true,
 		mode: "local",
@@ -585,10 +594,10 @@ function normalizeKbResearch(kb: AppConfig["kb"]): AppConfig["kb"] {
 function normalizeSecurity(merged: AppConfig): AppConfig["security"] {
 	const raw = merged.security ?? { adminStaffIds: [] };
 	const adminFullAccess = (merged.security as { adminFullAccess?: unknown } | undefined)?.adminFullAccess === true;
-	const isRole = (v: unknown): v is "viewer" | "operator" | "admin" =>
-		v === "viewer" || v === "operator" || v === "admin";
+	const isRole = (v: unknown): v is "viewer" | "operator" | "admin" | "owner" =>
+		v === "viewer" || v === "operator" || v === "admin" || v === "owner";
 
-	const byId = new Map<string, { staffId: string; name?: string; role: "viewer" | "operator" | "admin" }>();
+	const byId = new Map<string, { staffId: string; name?: string; role: "viewer" | "operator" | "admin" | "owner" }>();
 	for (const entry of Array.isArray(raw.people) ? raw.people : []) {
 		const staffId = typeof entry?.staffId === "string" ? entry.staffId.trim() : "";
 		if (!staffId || !isRole(entry?.role)) continue;
@@ -612,6 +621,10 @@ function normalizeSecurity(merged: AppConfig): AppConfig["security"] {
 
 	return {
 		adminStaffIds: normalizedAdminIds(raw.adminStaffIds),
+		// Normalization rebuilds the security block from known fields, so a new
+		// field that is not listed here is silently DROPPED on every save
+		// (verified: ownerStaffIds became undefined after ConfigStore.update).
+		ownerStaffIds: normalizedAdminIds((raw as { ownerStaffIds?: unknown }).ownerStaffIds),
 		people: [...byId.values()],
 		defaultRole: isRole(raw.defaultRole) ? raw.defaultRole : "viewer",
 		adminFullAccess,
