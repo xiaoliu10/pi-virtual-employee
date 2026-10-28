@@ -43,6 +43,8 @@ testOss(): Promise<{ ok: boolean; detail: string }>;
 	deleteReport(id: string): Promise<boolean>;
 	listTasks(): Promise<ConversationRow[]>;
 	getMessages(id: string): Promise<MessageRow[]>;
+	/** Incremental sync after a reconnect: rows newer than `sinceTs` + the next cursor. */
+	getMessagesSince(id: string, cursor: { createdAt: number; rowid: number } | undefined): Promise<{ rows: MessageRow[]; cursor: { createdAt: number; rowid: number } }>;
 	deleteTask(id: string): Promise<boolean>;
 	getAutostart(): Promise<boolean>;
 	setAutostart(enabled: boolean): Promise<boolean>;

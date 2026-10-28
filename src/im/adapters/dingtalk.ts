@@ -237,6 +237,10 @@ export class DingtalkAdapter implements IMAdapter {
 	 */
 	private cardTemplateId = "";
 	private token: { value: string; expiresAt: number } | null = null;
+	/** Injected by the manager: mid-turn pushes routed through its delivery path
+	 *  (credential gate + push ledger). Absent in tests that drive the socket
+	 *  directly — the adapter then replies through its own session webhook. */
+	onPush?: (conversationId: string, text: string, occurrenceId: string, kind?: string) => Promise<{ ok: boolean; error?: string }>;
 
 	constructor(
 		private readonly reportService?: ReportService,
@@ -385,6 +389,11 @@ export class DingtalkAdapter implements IMAdapter {
 							// The group's own name — the only handle a human has for it (the
 							// client never shows openConversationId). Absent in 1:1 chats.
 							conversationName: (msg as { conversationTitle?: string }).conversationTitle?.trim() || undefined,
+							// Delivery identity for reply-path bookkeeping: the manager derives
+							// (message, time-bucket) heartbeat occurrences from it, so a
+							// redelivered stream message cannot re-push a same-bucket note.
+							messageId: msg.msgId || undefined,
+							channel: "dingtalk",
 							actor: {
 								senderId: msg.senderStaffId || msg.senderId || "",
 								senderName: (msg as { senderNick?: string }).senderNick?.trim() || undefined,
@@ -396,11 +405,21 @@ export class DingtalkAdapter implements IMAdapter {
 						// Push mid-turn progress (e.g. long-task heartbeat) back through the
 						// same session webhook as a lightweight markdown message — never as a
 						// card, so a long turn doesn't flood the chat with stacked cards.
-						onProgress: async (progressText) => {
+						onProgress: async (progressText, opts) => {
 							if (!msg.sessionWebhook) return;
 							const isSingle = msg.conversationType === "1";
 							const audience = this.audienceFor(isSingle, isSingle ? msg.senderStaffId || msg.senderId : undefined);
-							await this.reply(msg.sessionWebhook, gateOutboundText(progressText, audience));
+							const text = gateOutboundText(progressText, audience);
+							// Routed through the manager when it handed us an occurrence
+							// identity: the push path then lives in ONE place (credential
+							// gate + ledger + adapter), instead of the adapter keeping a
+							// second, unledgered implementation of it.
+							if (opts?.occurrenceId && this.onPush) {
+								const pushed = await this.onPush(conversationId, text, opts.occurrenceId, opts.kind ?? "chat-progress");
+								if (!pushed.ok) throw new Error(pushed.error || "推送失败");
+								return;
+							}
+							await this.reply(msg.sessionWebhook, text);
 						},
 						// Deliver a file into this chat as a robot file message (used by the
 						// provide_document tool). On any failure the tool falls back to an

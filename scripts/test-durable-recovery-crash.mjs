@@ -72,8 +72,29 @@ test("a SIGKILL mid-tool resumes the run and never repeats the completed call", 
 		1,
 		"CRITICAL: an interrupted unsafe tool must NOT be silently retried",
 	);
+	// The restarted process must have found UNFINISHED work. Without this, "it
+	// recovered" could mean "it started clean and ran something new" — a mutant
+	// that skips resume() produced byte-identical final output, because
+	// submission.wait() itself starts scheduling (verified by mutation).
 	assert.ok(
-		after.some((e) => e.startsWith("settled:")),
-		"the pending submission reached a terminal state after recovery",
+		after.includes("pre-resume-pending:1"),
+		"the restarted process must see the interrupted submission as pending",
+	);
+	// The submission must reach a DEFINITE terminal state. Accepting any
+	// `settled:*` made this assertion vacuous: a mutant that never called
+	// harness.resume() still recorded `settled:unknown` and passed (review finding).
+	const settled = after.filter((e) => e.startsWith("settled:")).map((e) => e.slice("settled:".length));
+	assert.ok(settled.length > 0, "the pending submission reached a terminal state after recovery");
+	for (const status of settled) {
+		assert.ok(
+			status === "done",
+			`recovery must finish the original submission successfully, got "${status}"`,
+		);
+	}
+	// The interrupted call's outcome must be IN the recovered context — otherwise
+	// "recovered" could just mean "silently dropped".
+	assert.ok(
+		after.includes("interrupted-in-context:true"),
+		"the recovered transcript must carry the interrupted tool's outcome",
 	);
 });

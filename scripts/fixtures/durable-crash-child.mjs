@@ -76,13 +76,38 @@ if (phase === "start") {
 } else {
 	// Resume: the runtime decides what to do with the interrupted call.
 	faux.setResponses([fauxAssistantMessage("recovered")]);
+	// Record the pre-resume state FIRST: it is what proves the process came back to
+	// an unfinished run rather than to a clean slate. (Asserting only on the final
+	// settled status was vacuous — submission.wait() itself starts scheduling, so a
+	// mutant without resume() produced identical output; verified by mutation.)
+	const before = await harness.inspect(BACKGROUND_CONTEXT);
+	record(`pre-resume-pending:${before.submissions.length}`);
 	harness.resume();
-	const pending = await harness.inspect(BACKGROUND_CONTEXT);
-	record(`pending-submissions:${pending.submissions.length}`);
-	for (const item of pending.submissions) {
+	// Observe only: Submission.wait() also enables scheduling and would hide a
+	// missing host resume() call. Read status until the resumed scheduler settles.
+	for (const item of before.submissions) {
 		const submission = await harness.submission(item.id, BACKGROUND_CONTEXT);
-		const settled = await submission?.wait(BACKGROUND_CONTEXT).catch(() => ({ status: "failed" }));
+		let settled;
+		const deadline = Date.now() + 10_000;
+		while (Date.now() < deadline) {
+			settled = await submission?.status(BACKGROUND_CONTEXT);
+			if (settled?.status === "done" || settled?.status === "unanswered") break;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
 		record(`settled:${settled?.status ?? "unknown"}`);
+	}
+	// Prove the recovery carried the interrupted call's outcome into the model's
+	// context. Without this, "recovered" could mean "quietly dropped".
+	try {
+		const entries = await root.entries({}, 20, undefined, BACKGROUND_CONTEXT);
+		record(`entries:${entries.items.map((entry) => entry.kind).join(",")}`);
+		const interruptedSeen = entries.items.some((entry) => {
+			const text = JSON.stringify(entry);
+			return text.includes("interrupted") || text.includes("may have partially run");
+		});
+		record(`interrupted-in-context:${interruptedSeen}`);
+	} catch (err) {
+		record(`entries-error:${err instanceof Error ? err.message : String(err)}`);
 	}
 	await harness.close(BACKGROUND_CONTEXT);
 	process.exit(0);

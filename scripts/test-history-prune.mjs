@@ -105,3 +105,32 @@ test("pruneOldMessages removes aged message bodies + telemetry but keeps every c
 	assert.equal(s.db.prepare("SELECT COUNT(*) n FROM turn_events").get().n, 0, "aged turn telemetry goes");
 	assert.equal(s.db.prepare("SELECT COUNT(*) n FROM tool_events").get().n, 0, "aged tool telemetry goes");
 });
+
+test("incremental page never loses a message written in the same millisecond", async () => {
+	// A user turn and an instant reply land in the same tick. With a timestamp-only
+	// cursor the second one is skipped forever (the cursor already moved past that
+	// ms), which is exactly the "message never appears" symptom on long chats.
+	const { HistoryStore } = await import(pathToFileURL(bundle).href);
+	const db = new DatabaseSync(":memory:");
+	db.exec(`CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, title TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, model_supplier_id TEXT, model_model_id TEXT, origin TEXT NOT NULL DEFAULT 'console');
+		CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT, created_at INTEGER NOT NULL);`);
+	const history = new HistoryStore(db);
+	const conv = "console:same-ms";
+	history.ensureConversation(conv, "t");
+
+	// Two messages, forced into the same millisecond.
+	const now = Date.now();
+	db.prepare("INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)").run("m1", conv, "user", "问题", now);
+	db.prepare("INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)").run("m2", conv, "assistant", "回答", now);
+
+	const first = history.listMessagesSinceCursor(conv, undefined, 1);
+	assert.equal(first.rows.length, 1, "page size respected");
+	assert.equal(first.rows[0].id, "m1");
+	// The composite cursor must still surface m2 — same ts, higher rowid.
+	const second = history.listMessagesSinceCursor(conv, first.cursor, 10);
+	assert.equal(second.rows.length, 1, "CRITICAL: the same-millisecond sibling must not be lost");
+	assert.equal(second.rows[0].id, "m2");
+	// Idempotent tail: nothing further.
+	assert.equal(history.listMessagesSinceCursor(conv, second.cursor, 10).rows.length, 0);
+	db.close();
+});

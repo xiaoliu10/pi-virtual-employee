@@ -22,7 +22,7 @@ import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createModels } from "@earendil-works/pi-ai/models";
+import { createModels, type Models } from "@earendil-works/pi-ai/models";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	Harness,
@@ -35,6 +35,7 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 
 import { toDurableTools } from "./ve-tools.js";
 import { createDurableSettleGate } from "./ve-settle-gate.js";
+import { createInterruptedToolNotice } from "./interrupted-notice.js";
 
 export interface DurableHostOptions {
 	/** Profile-scoped data directory (app.getPath("userData")). */
@@ -43,6 +44,8 @@ export interface DurableHostOptions {
 	profileName: string;
 	/** VE tools to expose; adapted by `ve-tools.ts` (replay policy applied there). */
 	tools: AgentTool<any>[];
+	models?: Models;
+	registrations?: ToolRegistration<any, any>[];
 	/** Extra durable extensions (plugin host). */
 	extensions?: Extension[];
 	/** Disable the settle gate (tests / eval runs). */
@@ -57,6 +60,8 @@ export interface DurableHost {
 	close(): Promise<void>;
 	/** Absolute path of this profile's durable database. */
 	databasePath: string;
+	/** Underlying storage — same single-owner handle the Harness runs on, for reads the Harness does not expose (e.g. scanning submissions on startup). */
+	storage: Awaited<ReturnType<typeof openNodeSqliteStorage>>;
 }
 
 /**
@@ -84,12 +89,15 @@ export function durableDatabasePath(userDataDir: string, profileName: string): s
  * its own layer — this function must not become a second auth path.
  */
 export async function openDurableHost(opts: DurableHostOptions): Promise<DurableHost> {
-	const models = createModels();
+	const models = opts.models ?? createModels();
 	const registry = createRegistry();
 
-	const tools: ToolRegistration<any, any>[] = toDurableTools(opts.tools);
+	const tools: ToolRegistration<any, any>[] = opts.registrations ?? toDurableTools(opts.tools);
 	const extensions: Extension[] = [
 		defineExtension({ name: "ve-tools", tools }),
+		// Rewrite durable's one-line "interrupted" results into an instruction that
+		// tells the model to VERIFY instead of retry (phase 3).
+		createInterruptedToolNotice(),
 		...(opts.settleGate === false ? [] : [createDurableSettleGate()]),
 		...(opts.extensions ?? []),
 	];
@@ -102,6 +110,7 @@ export async function openDurableHost(opts: DurableHostOptions): Promise<Durable
 
 	return {
 		harness,
+		storage,
 		databasePath,
 		resume: () => harness.resume(),
 		close: () => harness.close(BACKGROUND_CONTEXT),

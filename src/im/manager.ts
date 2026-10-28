@@ -22,6 +22,7 @@ import { isAuthorizationPhrase } from "../engine/authorization.js";
 import { startStallWatchdog } from "./watchdog.js";
 import { splitForPush } from "./chunks.js";
 import { gateOutboundText } from "./credential-egress.js";
+import { chatHeartbeatOccurrenceId, DeliveryLedger } from "./delivery-ledger.js";
 import type { AdapterCapabilities, AdapterHealth } from "./types.js";
 
 /** Shared deps handed to adapter factories that need them (e.g. image hosting). */
@@ -35,6 +36,41 @@ export interface AdapterDeps {
 	 * (and every group) gets it withheld. Absent ⇒ no exemption.
 	 */
 	isAdminRecipient?: (staffId: string) => boolean;
+	/**
+	 * Push ledger (docs/design/delivery-reliability.md S1). When present, a push
+	 * carrying an occurrence id is deduplicated against every earlier delivery
+	 * OF THAT OCCURRENCE — including one made by a previous process. Absent ⇒
+	 * pushes behave exactly as before (no identity, no bookkeeping).
+	 */
+	ledger?: DeliveryLedger;
+}
+
+/**
+ * Identity of ONE delivery occurrence. Callers supply it where the push is
+ * triggered by a known event (a scheduler fire, an inbound message); omitting it
+ * leaves the old, un-ledgered behaviour fully intact.
+ */
+export interface PushOptions {
+	occurrenceId?: string;
+	/** Audit-only label stored on the ledger row ('scheduled' | 'chat' | …). */
+	kind?: string;
+}
+
+/**
+ * Result of a proactive push. `skipped` means the ledger already recorded this
+ * occurrence as delivered and NOTHING was sent (callers must not treat it as a
+ * failure). `error` is present only when ok is false.
+ */
+export interface PushResult {
+	ok: boolean;
+	error?: string;
+	skipped?: boolean;
+	/** Set when the ledger adopted a row a previous run left mid-flight: the
+	 *  delivery may have already reached the user (honest at-least-once). */
+	recovered?: boolean;
+	/** The delivery may or may not have reached the user (a previous attempt crashed
+	 *  mid-send). Callers must NOT retry automatically; surface it for a human. */
+	uncertain?: boolean;
 }
 
 /** channel type → factory. Add more real channels (feishu/wecom/…) here. */
@@ -81,6 +117,14 @@ export class IMAdapterManager {
 		this.draining = draining;
 	}
 
+	/**
+	 * Push into a chat under an occurrence identity (ledger-backed): the same
+	 * inbound message may only deliver one progress note, even across restarts.
+	 */
+	async pushToChat(conversationId: string, text: string, occurrenceId: string, kind = "chat"): Promise<PushResult> {
+		return this.pushToConversation(conversationId, text, { occurrenceId, kind });
+	}
+
 	/** Reconcile running adapters with the current config. */
 	async sync(): Promise<void> {
 		const c = this.config.all();
@@ -118,6 +162,8 @@ export class IMAdapterManager {
 				continue;
 			}
 			const adapter = factory(this.deps);
+			// Mid-turn pushes ride the manager's delivery path (single gate + ledger).
+			adapter.onPush = (cid, text, occurrenceId, kind) => this.pushToConversation(cid, text, { occurrenceId, kind });
 			try {
 				await adapter.start(this.makeIO(), {
 					channel: ch.type,
@@ -151,8 +197,49 @@ export class IMAdapterManager {
 	 * Routes by conversation-id prefix to the matching active adapter. Returns
 	 * ok:false when no active channel can push to that conversation (e.g. console /
 	 * http conversations), so the caller can simply log.
+	 *
+	 * With `opts.occurrenceId` the delivery is recorded in the push ledger: an
+	 * occurrence already delivered (in THIS run or a previous one) returns
+	 * { ok:true, skipped:true } without sending, and a failed attempt stays
+	 * retryable under the same id. Without it, behaviour is unchanged.
 	 */
-	async pushToConversation(conversationId: string, text: string): Promise<{ ok: boolean; error?: string }> {
+	async pushToConversation(conversationId: string, text: string, opts: PushOptions = {}): Promise<PushResult> {
+		const occurrenceId = opts.occurrenceId?.trim();
+		// `deps` may be absent on a manager built without a constructor (tests):
+		// treat that exactly like "no ledger configured".
+		const ledger = this.deps?.ledger;
+		if (occurrenceId && ledger) {
+			try {
+				const claim = ledger.claim(occurrenceId, conversationId, { kind: opts.kind });
+				if (claim.skipped) {
+					// Same occurrence already delivered — the whole point of the ledger.
+					console.log(`[im] delivery skipped (occurrence already delivered): ${occurrenceId} → ${conversationId}`);
+					return { ok: true, skipped: true };
+				}
+				if (claim.uncertain) {
+					// A previous process died mid-send. The user may already have the
+					// message, so re-sending would be the duplicate this ledger exists to
+					// prevent; report uncertainty and let the caller decide (never claim
+					// success — that would hide a possible non-delivery).
+					console.warn(`[im] delivery uncertain (crashed mid-send, not re-sending): ${occurrenceId} → ${conversationId}`);
+					return { ok: false, error: `投递状态未知（上次发送中进程中断，可能已送达）：${occurrenceId}`, uncertain: true };
+				}
+				const result = await this.deliver(conversationId, text);
+				// Below ok:false the SAME occurrence may retry (failed is not terminal).
+				if (result.ok) ledger.markDelivered(occurrenceId);
+				else ledger.markFailed(occurrenceId, result.error);
+				return claim.recovered ? { ...result, recovered: true } : result;
+			} catch (err) {
+				// Ledger trouble must never swallow a delivery the user is waiting for:
+				// fall through to the un-ledgered path (worse: a possible duplicate).
+				console.warn(`[im] delivery ledger unavailable, pushing without it: ${(err as Error).message}`);
+			}
+		}
+		return this.deliver(conversationId, text);
+	}
+
+	/** The actual chunked send (credential gate → split → per-part push). */
+	private async deliver(conversationId: string, text: string): Promise<PushResult> {
 		const adapter = this.adapterFor(conversationId);
 		if (!adapter?.push) return { ok: false, error: `没有可推送到 ${conversationId} 的在线渠道` };
 		// Capability gate: a channel that declares itself non-proactive must not
@@ -355,6 +442,15 @@ export class IMAdapterManager {
 					// The note comes from a side-channel LLM pass (progressBrief) for a
 					// concrete ≤100-char progress report; if the turn settles while the
 					// summary is in flight, the stale "仍在进行中" is dropped.
+					//
+					// Delivery ledger (2026-10-27): each heartbeat occurrence is (inbound
+					// message, time bucket) — bucket size = THIS config value that also
+					// drives the timer below, so consecutive timer fires land in consecutive
+					// buckets. A duplicate claim inside one bucket (retried push, a
+					// redelivered stream message after a restart) is suppressed; the NEXT
+					// bucket's beat is a new occurrence — the deliberate v0.2.162 cadence
+					// (one note every `longTaskProgressMin` for as long as the turn runs)
+					// is preserved, only true duplicates are deduped.
 					const onProgress = ctx?.onProgress;
 					const progressMin = this.config.all().general.longTaskProgressMin;
 					let progressInFlight = false;
@@ -364,7 +460,13 @@ export class IMAdapterManager {
 							progressInFlight = true;
 							void this.engine.progressBrief(agent, msg.conversationId)
 								.then((note) => {
-									if (agent.state.isStreaming) return onProgress(note);
+									if (!agent.state.isStreaming) return;
+									// Bucket derived at PUSH time, from the same interval the timer
+									// above was sized with — never a second hardcoded cadence.
+									const occurrenceId = msg.messageId
+										? chatHeartbeatOccurrenceId(msg.channel ?? "im", msg.messageId, Date.now(), progressMin * 60_000)
+										: undefined;
+									return onProgress(note, { occurrenceId: occurrenceId || undefined, kind: "chat-progress" });
 								})
 								.catch((err) => console.warn("[im] progress push failed:", (err as Error).message))
 								.finally(() => {

@@ -44,6 +44,14 @@ const api = {
 	deleteReport: (id: string) => ipcRenderer.invoke("reports:delete", id),
 	listTasks: () => ipcRenderer.invoke("tasks:list"),
 	getMessages: (id: string) => ipcRenderer.invoke("tasks:messages", id),
+	/**
+	 * Messages newer than `sinceTs` plus the cursor to resume from. Used by the
+	 * renderer's reconnect path so a dropped connection re-syncs incrementally
+	 * instead of re-reading the whole conversation. (Missing this bridge made the
+	 * renderer's ChatPage call a non-existent method — review P0.)
+	 */
+	getMessagesSince: (id: string, sinceTs: number): Promise<{ rows: { id: string; conversation_id: string; role: "user" | "assistant"; content: string; created_at: number }[]; cursor: number }> =>
+		ipcRenderer.invoke("tasks:messagesSince", id, sinceTs),
 	deleteTask: (id: string) => ipcRenderer.invoke("tasks:delete", id),
 	getAutostart: (): Promise<boolean> => ipcRenderer.invoke("autostart:get"),
 	setAutostart: (enabled: boolean): Promise<boolean> => ipcRenderer.invoke("autostart:set", enabled),
