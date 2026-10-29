@@ -33,6 +33,8 @@ const RECOVERY_WAIT_MS = 10 * 60_000;
  * is honest here — the gateway genuinely reported nothing.
  */
 const ZERO_USAGE = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+/** A run that DID finish but produced no text at all (see result()). */
+const EMPTY_ANSWER_REPLY = "本次执行已结束，但模型没有返回任何内容（网关可能中断了响应）。请重新描述你的需求，我会再执行一次。";
 function withUsage(message: AssistantMessage): AssistantMessage {
 	return message.usage ? message : { ...message, usage: { ...ZERO_USAGE } };
 }
@@ -223,12 +225,24 @@ export class DurableRuntime {
 			return result;
 		} finally { this.liveContexts.delete(conv.id); this.untrack(conv, id); }
 	}
+	/**
+	 * Read a finished run's answer. A submission that reaches `done` can still
+	 * carry an EMPTY assistant content: the groq/qwen gateway occasionally closes a
+	 * stream after one token (measured 2026-10-29 on the box: done, output=1,
+	 * stopReason=stop, content=[] — and the "execution paused" fallback was pushed
+	 * to the group as if the run had been interrupted). The text is genuinely
+	 * absent, so the reply must say THAT, not "paused" — an honest empty answer
+	 * beats a plausible wrong diagnosis.
+	 */
 	private async result(conv: Conversation, answer?: unknown): Promise<SendResult> {
 		const entries = await conv.entries({}, 20, undefined, context);
 		const entry = answer === undefined ? undefined : entries.items.find((item) => item.id === answer);
 		const message = entry?.model?.find((m) => m.role === "assistant");
 		const reply = message?.role === "assistant" ? message.content.filter((p) => p.type === "text").map((p) => p.text).join("") : "";
-		return reply ? { reply } : { reply: "执行已暂停，请检查恢复状态。", error: "durable submission unanswered" };
+		if (reply) return { reply };
+		return answer === undefined
+			? { reply: "执行已暂停，请检查恢复状态。", error: "durable submission unanswered" }
+			: { reply: EMPTY_ANSWER_REPLY, error: "durable empty answer" };
 	}
 	private async project(conv: Conversation, result: SendResult): Promise<void> {
 		const route = this.routes.get(conv.id)!;

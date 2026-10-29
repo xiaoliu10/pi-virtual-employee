@@ -81,8 +81,7 @@ test('existing-conversation history without usage must not fault the generation 
  }finally{await runtime.close();}
 });
 
-test('provider response without usage is normalized to zero-spend instead of faulting', async t => {
- const history = makeHistory(t);
+test('provider response without usage is normalized to zero-spend instead of faulting', async t => { const history = makeHistory(t);
  const faux=fauxProvider();
  const sessions=new Map();
  const session=id=>{ if(!sessions.has(id)) sessions.set(id,new Agent({streamFn:faux.provider.streamSimple,sessionId:id,initialState:{model:faux.provider.getModels()[0],systemPrompt:'test'}})); return sessions.get(id); };
@@ -95,5 +94,36 @@ test('provider response without usage is normalized to zero-spend instead of fau
   const result=await runtime.send(session('conv-no-usage'),'你好');
   assert.equal(result.reply,'无用量回答');
   assert.equal(result.error,undefined);
+ }finally{await runtime.close();}
+});
+
+test('empty completion is re-asked once, then delivered honestly instead of the paused fallback', async t => {
+ const history=makeHistory(t);
+ const faux=fauxProvider();
+ const sessions=new Map();
+ const session=id=>{ if(!sessions.has(id)) sessions.set(id,new Agent({streamFn:faux.provider.streamSimple,sessionId:id,initialState:{model:faux.provider.getModels()[0],systemPrompt:'test'}})); return sessions.get(id); };
+ const tools=()=>[];
+ // 第一轮空 completion（盒子形态：done, output=1, content=[]）；第二轮正常
+ faux.setResponses([fauxAssistantMessage('',{stopReason:'stop'}),fauxAssistantMessage('重问后的答复')]);
+ const runtime=await DurableRuntime.open({userDataDir:dir,history,session,tools,stream:(id,opts,messages)=>faux.provider.streamSimple(faux.provider.getModels()[0],{messages},opts),withActor:async(id,ctx,text,run)=>run(),onRecovered:async()=>{}});
+ try{
+  const result=await runtime.send(session('conv-empty-then-ok'),'你好');
+  assert.equal(result.reply,'重问后的答复','settle-gate must re-ask an empty completion before delivering');
+  assert.equal(result.error,undefined);
+ }finally{await runtime.close();}
+});
+
+test('a second empty completion settles with the honest empty-answer notice', async t => {
+ const history=makeHistory(t);
+ const faux=fauxProvider();
+ const sessions=new Map();
+ const session=id=>{ if(!sessions.has(id)) sessions.set(id,new Agent({streamFn:faux.provider.streamSimple,sessionId:id,initialState:{model:faux.provider.getModels()[0],systemPrompt:'test'}})); return sessions.get(id); };
+ const tools=()=>[];
+ faux.setResponses([fauxAssistantMessage('',{stopReason:'stop'}),fauxAssistantMessage('',{stopReason:'stop'})]);
+ const runtime=await DurableRuntime.open({userDataDir:dir,history,session,tools,stream:(id,opts,messages)=>faux.provider.streamSimple(faux.provider.getModels()[0],{messages},opts),withActor:async(id,ctx,text,run)=>run(),onRecovered:async()=>{}});
+ try{
+  const result=await runtime.send(session('conv-empty-twice'),'你好');
+  assert.match(result.reply,/模型没有返回任何内容/,'must not report the paused/interrupted diagnosis for a finished run');
+  assert.equal(result.error,'durable empty answer');
  }finally{await runtime.close();}
 });
