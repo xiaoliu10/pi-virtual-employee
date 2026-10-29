@@ -12,6 +12,11 @@ import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, renameSy
 import path from "node:path";
 import util from "node:util";
 import { runInstallTeardown } from "./install-cleanup.js";
+
+/** How soon a crash-recovered work window re-opens: one normal turn later, not a retry storm. */
+const RECOVERED_WORK_DELAY_MS = 60_000;
+import { formatRecoveredNote, planRecoveredDelivery, resolveTaskSourceTarget } from "../src/engine/durable/recovered-delivery.js";
+import { createWorkProgressNotifier, createRunProgressNotifier, resolveWorkProgressTarget } from "../src/scheduler/progress-wiring.js";
 import { openDatabase, closeDatabase } from "../src/db/sqlite.js";
 import { ConfigStore, normalizeModelConfig, type ExternalProviderConfig, type Supplier } from "../src/db/config-store.js";
 import { HistoryStore } from "../src/db/history-store.js";
@@ -24,7 +29,6 @@ import { WorkService, buildWorkLearning } from "../src/scheduler/work-service.js
 import { isAdmin, resolveRole } from "../src/security/permissions.js";
 import { SchedulerService, shouldPushScheduledResult, annotateLatePush } from "../src/scheduler/scheduler-service.js";
 import { normalizeProgressIntervalMin } from "../src/scheduler/progress-notify.js";
-import { createRunProgressNotifier, createWorkProgressNotifier } from "../src/scheduler/progress-wiring.js";
 import {
 	type AutonomousChainState,
 	buildAutonomousTurnPrefix,
@@ -1003,15 +1007,51 @@ ${tailForProgress(decision.text)}`;
 				// A crash between "pushed" and "recorded" leaves the ledger in
 				// `attempting`, which reports `uncertain` and refuses to re-send — the
 				// user never receives the same recovered answer twice.
-				if (history.isReadOnly(conversationId)) {
-					const pushed = await im.pushToConversation(conversationId, result.reply, {
+				// Where the recovered answer belongs (v0.2.174). Window conversations
+				// (work:<itemId> / sched:<taskId>:<runId>) are not read-only and are
+				// watched by nobody, so recovery used to report into a console
+				// conversation the operator never opens — "recovery never happened".
+				// User ruling: route it back to the task's source conversation.
+				const plan = planRecoveredDelivery(conversationId);
+				const deliver = async (target: string, text: string) => {
+					const pushed = await im.pushToConversation(target, text, {
 						occurrenceId,
 						kind: "durable-recovered",
 					});
 					if (pushed.uncertain) {
-						console.warn(`[durable] recovered reply delivery UNKNOWN for ${conversationId} (${occurrenceId}) — not re-sent; needs manual check`);
+						console.warn(`[durable] recovered reply delivery UNKNOWN for ${target} (${occurrenceId}) — not re-sent; needs manual check`);
 					} else if (!pushed.ok) {
-						console.warn(`[durable] recovered reply not delivered to ${conversationId} (${occurrenceId}): ${pushed.error ?? "unknown"}`);
+						console.warn(`[durable] recovered reply not delivered to ${target} (${occurrenceId}): ${pushed.error ?? "unknown"}`);
+					}
+				};
+				if (plan.kind === "direct") {
+					// IM / console conversations keep the original behaviour: the answer
+					// is theirs, unchanged.
+					if (history.isReadOnly(plan.conversationId)) await deliver(plan.conversationId, result.reply);
+				} else if (plan.kind === "task-source") {
+					const row = plan.task === "work"
+						? workItemStore.get(plan.taskId)
+						: scheduledTaskStore.get(plan.taskId);
+					const resolved = resolveTaskSourceTarget(plan as { task: "work" | "scheduled"; taskId: string }, row as never, resolveWorkProgressTarget);
+					if (resolved.kind === "skip") {
+						console.warn(`[durable] recovered ${plan.task} ${plan.taskId} not delivered: ${resolved.reason}`);
+						return;
+					}
+					await deliver(resolved.target, formatRecoveredNote({ title: resolved.noteTitle, reply: result.reply }));
+					// Close the state machine the crash left behind (v0.2.174). The
+					// recovered turn finished the WORK, but the runner that would have
+					// called setStatus died with the process. Without this the item sits
+					// in `working`: listDue() ignores it, nextWakeAt() returns undefined,
+					// and the task silently never runs again. Schedule the next window
+					// like a normal close rather than asking a human to re-derive state.
+					if (resolved.workItemId) {
+						const item = workItemStore.get(resolved.workItemId);
+						if (item?.status === "working") {
+							// setTimeoutStreak/fallbackStreak stay untouched: this is a
+							// crash-recovered close, not a fresh outcome.
+							workItemStore.setStatus(resolved.workItemId, "scheduled", null, Date.now() + RECOVERED_WORK_DELAY_MS, "崩溃恢复后自动顺延");
+							console.log(`[durable] recovered work item ${resolved.workItemId.slice(0, 8)} closed its window and rescheduled`);
+						}
 					}
 				}
 			});
