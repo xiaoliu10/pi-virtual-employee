@@ -1125,6 +1125,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 	/** True when a live turn is running on this conversation (steer-able). */
 	isConversationStreaming(conversationId: string): boolean {
+		// The durable kernel drives the harness itself and never sets
+		// agent.state.isStreaming, so asking only the agent reported "idle" for
+		// every durable turn — heartbeats and steer checks silently no-oped
+		// (v0.2.173; subagent review P1-1).
+		if (this.durableRuntime?.isBusyConversation(conversationId)) return true;
 		const agent = this.sessions.get(conversationId);
 		return Boolean(agent?.state.isStreaming) || this.retryWaits.has(conversationId);
 	}

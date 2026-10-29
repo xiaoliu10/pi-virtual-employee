@@ -117,11 +117,12 @@ test("a scheduled run pushes while its own lifetime flag is set, independent of 
 	t.after(() => mock.timers.reset());
 	const pushed = [];
 	const logs = [];
+	const summarizeCalls = [];
 	let alive = true;
 	const notifier = createRunProgressNotifier({
 		task: { title: "每日对账", conversation_id: "dt:group:g1", silent: 0 },
 		intervalMin: INTERVAL_MIN,
-		summarize: async () => ({ text: "第 2 步：核对差异", degraded: false }),
+		summarize: async () => { summarizeCalls.push(1); return { text: "第 2 步：核对差异", degraded: false }; },
 		push: async (cid, text) => { pushed.push([cid, text]); },
 		isRunAlive: () => alive,
 		isTimedOut: () => false,
@@ -131,8 +132,12 @@ test("a scheduled run pushes while its own lifetime flag is set, independent of 
 	await advance(INTERVAL * 2);
 	assert.equal(pushed.length, 2, "beats flow while the run is alive");
 	alive = false;
+	const callsAtSettle = summarizeCalls.length;
 	await advance(INTERVAL * 2);
 	assert.equal(pushed.length, 2, "a settled run must not keep broadcasting");
+	// The liveness gate must sit BEFORE the side LLM call: checking it after
+	// would keep paying for summaries of a finished run (review P2).
+	assert.equal(summarizeCalls.length, callsAtSettle, "a settled run must not spend another summarize call");
 	notifier.stop();
 });
 
@@ -185,4 +190,36 @@ test("silent tasks and dead runs log WHY a beat was dropped", async (t) => {
 	await advance(INTERVAL);
 	deadNotifier.stop();
 	assert.ok(deadLogs.some((l) => l.includes("no longer alive")), "a settled run logs why it stayed quiet — the exact silence that hid this bug");
+});
+
+test("a durable turn counts as busy even though the agent never reports isStreaming", async (t) => {
+	// The fourth silent gate (subagent review P1-1): the autonomous-chain
+	// heartbeat asked `agent.state.isStreaming`, which the durable kernel never
+	// sets, so the in-turn heartbeat was dead on every durable run. The fix asks
+	// the kernel. This pins the contract the heartbeat depends on
+	// (engine.isConversationStreaming), using a fake durable runtime.
+	const dir2 = mkdtempSync(join(root, "node_modules/.progress-wiring-kernel-"));
+	t.after(() => rmSync(dir2, { recursive: true, force: true }));
+	const kernelBundle = join(dir2, "kernel.mjs");
+	await build({
+		stdin: { contents: `export { DurableRuntime } from "./src/engine/durable/runtime.ts";`, resolveDir: root, loader: "ts" },
+		outfile: kernelBundle,
+		bundle: true,
+		platform: "node",
+		format: "esm",
+		packages: "external",
+	});
+	const { DurableRuntime } = await import(pathToFileURL(kernelBundle).href);
+	assert.equal(typeof DurableRuntime.prototype.isBusyConversation, "function", "the runtime must expose a per-conversation busy query");
+	// Tracked/untracked are the only writers of the active set; drive them the
+	// same way send() does and assert the query follows.
+	const conv = { id: "chain:conv" };
+	const fake = Object.create(DurableRuntime.prototype);
+	fake.active = new Map();
+	assert.equal(fake.isBusyConversation("chain:conv"), false, "an untouched conversation is idle");
+	fake.track(conv, "chain:conv");
+	assert.equal(fake.isBusyConversation("chain:conv"), true, "a tracked submission means a turn is in flight");
+	assert.equal(fake.isBusyConversation("other"), false, "busy is per-conversation, not global");
+	fake.untrack(conv, "chain:conv");
+	assert.equal(fake.isBusyConversation("chain:conv"), false, "settling clears it");
 });

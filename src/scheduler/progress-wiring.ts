@@ -26,8 +26,16 @@ type Log = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
  *
  * The `dt:` prefix matters: `created_by` is a bare staffId, while every push
  * target is a conversation id (`dt:<staffId>`, `dt:group:<id>`). Pushing to the
- * bare id fails delivery, which read as "no progress in the group" too
- * (subagent review of the v0.2.171 wiring).
+ * bare id fails delivery entirely (`adapterFor` accepts only `dt:`), so the
+ * prefixed fallback is what makes a console-created item deliverable at all.
+ *
+ * Scope notes (subagent review, v0.2.173):
+ *  - every CURRENT create path passes `originConversation`
+ *    (tools/work.ts, engine.ts mining), so the `created_by` branch is a
+ *    defensive fallback for legacy/future rows, not the field-failure cause;
+ *  - the prefix is DingTalk's convention. With a second IM channel this must
+ *    move behind the adapter (e.g. `conversationIdForStaff`), because a bare
+ *    staffId carries no channel identity.
  */
 export function resolveWorkProgressTarget(item: { origin_conversation?: string | null; created_by?: string | null }): string | null {
 	const origin = item.origin_conversation?.trim();

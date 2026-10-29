@@ -189,6 +189,13 @@ export class DurableRuntime {
 		const set = this.active.get(id); set?.delete(conv); if (!set?.size) this.active.delete(id);
 	}
 	get busy(): boolean { return this.active.size > 0; }
+	/**
+	 * True while THIS conversation has a submission in flight. The harness is
+	 * driven directly here, so `agent.state.isStreaming` (set only by
+	 * pi-agent-core's own prompt/stream) never reflects durable work — callers
+	 * that need "is a turn running?" must ask the kernel instead (v0.2.173).
+	 */
+	isBusyConversation(id: string): boolean { return (this.active.get(id)?.size ?? 0) > 0; }
 	abort(id: string): boolean {
 		const set = this.active.get(id);
 		for (const conv of set ?? []) void conv.abort(context).catch((err) => console.error("[durable] abort failed", err));

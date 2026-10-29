@@ -653,16 +653,24 @@ async function main(): Promise<void> {
 
 		// In-turn heartbeat (same shape as the IM manager's): every
 		// longTaskProgressMin while a turn is streaming, push a progress note.
+		//
+		// "Is a turn in flight?" must NOT come from agent.state.isStreaming: on the
+		// durable kernel (default since v0.2.167) engine.send returns through
+		// durableRuntime.send and the harness is driven directly, so that flag is
+		// never set — the whole heartbeat was dead and silent (subagent review
+		// P1-1, same root cause as v0.2.173's two call sites). durableRuntime.busy
+		// is the kernel-aware equivalent (engine.isIdle uses it the same way).
 		const progressMin = config.all().general.longTaskProgressMin;
 		let progressInFlight = false;
+		const turnInFlight = (): boolean => engine.isConversationStreaming(chain.convId);
 		const heartbeat = progressMin > 0 && task.conversation_id
 			? setInterval(() => {
-				if (progressInFlight || !agent.state.isStreaming) return;
+				if (progressInFlight || !turnInFlight()) return;
 				progressInFlight = true;
 				void engine.progressBrief(agent, chain.convId)
 					.then((note) => {
 						const hb = note.startsWith("⏳") ? note : `⏳ ${note}`;
-						if (agent.state.isStreaming && shouldPushScheduledResult(task, undefined, hb)) {
+						if (turnInFlight() && shouldPushScheduledResult(task, undefined, hb)) {
 							const cid = task.conversation_id!;
 							void im.pushToConversation(cid, hb, { occurrenceId: chainOccurrence(chain, "heartbeat"), kind: "scheduled-heartbeat" });
 						}
