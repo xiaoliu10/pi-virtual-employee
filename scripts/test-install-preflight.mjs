@@ -195,6 +195,10 @@ test("a real failed install (came back on the old version) still counts exactly 
 		}),
 	);
 	const { mod, restorePlatform } = await makeUpdaterWithDataDir(workDir, "0.2.170");
+	// setupAutoUpdater arms a non-unref'd interval; without this the runner waits
+	// for the event loop forever (that is how a red suite showed up as a 37s
+	// "pending promise" instead of a clean assertion failure).
+	t.after(() => { try { mod.stopUpdater(); } catch { /* already stopped */ } });
 	t.after(restorePlatform);
 	// Startup reconciliation runs from setupAutoUpdater (needs a window-shaped
 	// object, not a real BrowserWindow). A fake is enough: push() only calls
