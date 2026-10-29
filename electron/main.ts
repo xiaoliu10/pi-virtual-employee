@@ -23,7 +23,8 @@ import { WorkItemStore } from "../src/db/work-item-store.js";
 import { WorkService, buildWorkLearning } from "../src/scheduler/work-service.js";
 import { isAdmin, resolveRole } from "../src/security/permissions.js";
 import { SchedulerService, shouldPushScheduledResult, annotateLatePush } from "../src/scheduler/scheduler-service.js";
-import { createProgressNotifier, normalizeProgressIntervalMin } from "../src/scheduler/progress-notify.js";
+import { normalizeProgressIntervalMin } from "../src/scheduler/progress-notify.js";
+import { createRunProgressNotifier, createWorkProgressNotifier } from "../src/scheduler/progress-wiring.js";
 import {
 	type AutonomousChainState,
 	buildAutonomousTurnPrefix,
@@ -652,16 +653,24 @@ async function main(): Promise<void> {
 
 		// In-turn heartbeat (same shape as the IM manager's): every
 		// longTaskProgressMin while a turn is streaming, push a progress note.
+		//
+		// "Is a turn in flight?" must NOT come from agent.state.isStreaming: on the
+		// durable kernel (default since v0.2.167) engine.send returns through
+		// durableRuntime.send and the harness is driven directly, so that flag is
+		// never set — the whole heartbeat was dead and silent (subagent review
+		// P1-1, same root cause as v0.2.173's two call sites). durableRuntime.busy
+		// is the kernel-aware equivalent (engine.isIdle uses it the same way).
 		const progressMin = config.all().general.longTaskProgressMin;
 		let progressInFlight = false;
+		const turnInFlight = (): boolean => engine.isConversationStreaming(chain.convId);
 		const heartbeat = progressMin > 0 && task.conversation_id
 			? setInterval(() => {
-				if (progressInFlight || !agent.state.isStreaming) return;
+				if (progressInFlight || !turnInFlight()) return;
 				progressInFlight = true;
 				void engine.progressBrief(agent, chain.convId)
 					.then((note) => {
 						const hb = note.startsWith("⏳") ? note : `⏳ ${note}`;
-						if (agent.state.isStreaming && shouldPushScheduledResult(task, undefined, hb)) {
+						if (turnInFlight() && shouldPushScheduledResult(task, undefined, hb)) {
 							const cid = task.conversation_id!;
 							void im.pushToConversation(cid, hb, { occurrenceId: chainOccurrence(chain, "heartbeat"), kind: "scheduled-heartbeat" });
 						}
@@ -933,18 +942,16 @@ ${tailForProgress(decision.text)}`;
 		// Work windows report on the TASK cadence (taskProgressMin, default 30),
 		// not the chat cadence: a window runs for maxMinutes and its final report is
 		// the deliverable, so chat-frequency notes are noise (v0.2.171).
-		progress: (item, session, convId) => createProgressNotifier({
-			title: item.title,
-			// Back to where the work came from: the admin who confirmed it, or the
-			// conversation the item was mined from. Neither → no-op (target null).
-			target: item.origin_conversation ?? item.created_by ?? null,
+		// Wiring lives in src/scheduler/progress-wiring.ts so the gate rules are
+		// testable: the field bug here was a GATE, not the notifier (v0.2.173).
+		progress: (item, session, convId) => createWorkProgressNotifier({
+			item,
+			session,
+			conversationId: convId,
 			intervalMin: config.all().general.taskProgressMin,
 			summarize: () => engine.progressBriefDetailed(session, convId),
 			push: (cid, text) => im.pushToConversation(cid, text),
-			isRunning: () => session.state.isStreaming,
-			// A silent item's notes can never be pushed (same rule as scheduled):
-			// A silent item's notes can never be pushed (same rule as scheduled tasks).
-			mayPush: (note) => shouldPushScheduledResult({ conversation_id: item.origin_conversation, silent: 0 }, item.created_by ?? undefined, note),
+			log: (level, msg) => console.log(`[work:progress] ${level} ${msg}`),
 		}),
 		// Work-window pushes stay UN-ledgered on purpose: the WorkService push hook
 		// carries no occurrence identity (neither the window start nor the reminder
@@ -1077,21 +1084,19 @@ ${tailForProgress(decision.text)}`;
 			// scheduler already recorded the failure, and a later "still working"
 			// note would contradict it.
 			const progressIntervalMin = normalizeProgressIntervalMin(config.all().general.taskProgressMin);
-			const notifier = createProgressNotifier({
-				title: task.title,
-				target: task.conversation_id,
+			// The run's own lifetime flag, NOT agent.state.isStreaming: the durable
+			// kernel never sets that flag, so the old gate dropped every beat
+			// silently (v0.2.173 field report).
+			let runAlive = true;
+			const notifier = createRunProgressNotifier({
+				task,
 				intervalMin: progressIntervalMin,
 				summarize: () => engine.progressBriefDetailed(agent, execConvId),
 				// Progress notes share ONE occurrence: repeated intervals must not pile
 				// up duplicates for the same fire (the note itself is a snapshot).
 				push: (cid, text) => pushOnce(cid, text, "progress", "scheduled-progress"),
-				isRunning: () => agent.state.isStreaming,
-				suppress: () => ctx?.isTimedOut() === true,
-				// Static gate BEFORE the side LLM call: a silent task's notes can
-				// never be pushed, so summarize would burn a call every interval
-				// for a push that is always dropped (review P3-1).
-				preflight: () => shouldPushScheduledResult(task, undefined, ""),
-				mayPush: (note) => shouldPushScheduledResult(task, undefined, note),
+				isRunAlive: () => runAlive,
+				isTimedOut: () => ctx?.isTimedOut() === true,
 				log: (level, msg) => console.warn(`[sched:progress] ${level} ${msg}`),
 			});
 			notifier.start();
@@ -1120,6 +1125,10 @@ ${tailForProgress(decision.text)}`;
 				// path is not per-conversation serialized, so a slow progress note
 				// would otherwise land AFTER 「定时任务完成」 in the same chat
 				// (review P2-1, probe ["FINAL","PROGRESS"]).
+				// Clear the lifetime flag BEFORE stopping: a tick already queued in
+				// the event loop must see "settled" and drop its note, otherwise the
+				// final report and a "still working" note race (v0.2.162 P2-1).
+				runAlive = false;
 				notifier.stop();
 				await notifier.drain(5_000);
 				// Scheduled runs are fire-and-forget: each run uses a unique

@@ -42,7 +42,7 @@ export interface ProgressNotifierOptions {
 	 *  never be pushed (silent task) must not burn a summarize per interval
 	 *  (review P3-1). Unlike mayPush this does not see the note text. */
 	preflight?: () => boolean;
-	log?: (level: "WARN" | "ERROR", msg: string) => void;
+	log?: (level: "INFO" | "WARN" | "ERROR", msg: string) => void;
 }
 
 const MIN_INTERVAL_MIN = 5;
@@ -100,8 +100,19 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 
 	const start = () => {
 		// No target (console-created task) or disabled: stay a no-op — never burn
-		// side LLM calls for a push that cannot happen.
-		if (stopped || !opts.target || intervalMs <= 0) return;
+		// side LLM calls for a push that cannot happen. This MUST log: a notifier
+		// that silently installs no timer is indistinguishable from a feature that
+		// was never wired (that silence is what hid the v0.2.173 gate bug for a
+		// whole release).
+		if (!opts.target) {
+			log("INFO", "progress notifier not started: no push target for this run/window");
+			return;
+		}
+		if (intervalMs <= 0) {
+			log("INFO", "progress notifier not started: interval disabled (0)");
+			return;
+		}
+		if (stopped) return;
 		timer = setInterval(() => {
 			void tick();
 		}, intervalMs);
@@ -113,12 +124,30 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 		if (stopped || inFlight) return;
 		// Settled or suppressed (timed-out losing run / turn-boundary window):
 		// a "still working" note would contradict the scheduler's own record.
-		if (!opts.isRunning() || opts.suppress?.()) return;
+		//
+		// Skips are LOGGED. A gate that drops every beat without a trace is
+		// indistinguishable from a feature that was never shipped — exactly how
+		// the durable-kernel `isStreaming` regression (v0.2.173) survived a whole
+		// release: the notifier fired on schedule and said nothing.
+		if (!opts.isRunning()) {
+			log("INFO", "progress tick skipped: run/window is no longer alive");
+			return;
+		}
+		if (opts.suppress?.()) {
+			log("INFO", "progress tick skipped: run is suppressed (timed out or turn boundary)");
+			return;
+		}
 		// Notes that can never be pushed cost an LLM call per interval — check
 		// the static gate (e.g. silent task) before spending anything.
-		if (opts.preflight && !opts.preflight()) return;
+		if (opts.preflight && !opts.preflight()) {
+			log("INFO", "progress tick skipped: preflight gate blocks every push (no target, or silent task)");
+			return;
+		}
 		const target = opts.target;
-		if (!target) return;
+		if (!target) {
+			log("INFO", "progress tick skipped: no target conversation");
+			return;
+		}
 		if (Date.now() < backoffUntil) return;
 
 		inFlight = true;
@@ -152,7 +181,10 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 			// (review P3-2). The engine's own prefix is stripped and rebuilt.
 			const body = text.replace(/^⏳\s*/, "");
 			const note = opts.title ? `⏳ **${opts.title}** ${body}` : `⏳ ${body}`;
-			if (opts.mayPush && !opts.mayPush(note)) return;
+			if (opts.mayPush && !opts.mayPush(note)) {
+				log("INFO", "progress note dropped: mayPush gate rejected it (silent task or missing target)");
+				return;
+			}
 			if (pushes >= maxPushes) {
 				log("WARN", `progress push cap (${maxPushes}) reached — further notes suppressed until the run settles`);
 				return;
