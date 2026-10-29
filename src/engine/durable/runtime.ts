@@ -21,6 +21,21 @@ interface RouteDoc {
 }
 /** How long a recovered run may take to reach a terminal state before we report it as unfinished. */
 const RECOVERY_WAIT_MS = 10 * 60_000;
+/**
+ * Durable's usage ledger (`appendAssistant → recordUsage → addUsage`) reads every
+ * counter of `assistant.usage` unconditionally — an undefined usage faults the
+ * generation with "Cannot read properties of undefined (reading 'totalTokens')"
+ * (measured on the Nova box: 5/5 submissions faulted, every turn a new
+ * conversation, all the same error). OpenAI-compatible gateways that ignore
+ * `stream_options.include_usage` produce exactly such messages, and the legacy
+ * kernel never read usage, so this only surfaced under durable. VE's contract to
+ * durable is therefore: EVERY assistant message carries a full Usage. Zero-spend
+ * is honest here — the gateway genuinely reported nothing.
+ */
+const ZERO_USAGE = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+function withUsage(message: AssistantMessage): AssistantMessage {
+	return message.usage ? message : { ...message, usage: { ...ZERO_USAGE } };
+}
 
 export const Route = defineDoc<RouteDoc>({
 	kind: "ve.execution", version: 1, scope: "conversation", history: "latest", fork: "initial",
@@ -69,9 +84,9 @@ export class DurableRuntime {
 					for await (const event of response) {
 						events.push(event);
 					}
-					events.end(await response.result());
+					events.end(withUsage(await response.result()));
 				} catch (error) {
-					const failed: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "error", errorMessage: error instanceof Error ? error.message : String(error), timestamp: Date.now() };
+					const failed: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: { ...ZERO_USAGE }, stopReason: "error", errorMessage: error instanceof Error ? error.message : String(error), timestamp: Date.now() };
 					events.push({ type: "error", reason: "error", error: failed });
 				}
 			})();
@@ -179,7 +194,15 @@ export class DurableRuntime {
 			Object.assign(route, { conversationId: id, requestId: `ve:${cid}`, staffId: ctx?.actor?.senderId ?? "", name: ctx?.actor?.senderName ?? "", channel: ctx?.actor?.channel ?? "", chatType: ctx?.actor?.chatType ?? "", text });
 			// Import only on a NEW execution; resumed executions use their complete
 			// stored tool transcript and never rehydrate lossy UI messages.
-			for (const row of this.opts.history.listMessages(id)) await tx.appendEntry(cid, { kind: "ve.history", model: [{ role: row.role, content: row.role === "user" ? row.content : [{ type: "text", text: row.content }], timestamp: row.created_at } as Message] });
+			for (const row of this.opts.history.listMessages(id)) {
+				// The history table stores no usage; imported assistant messages must
+				// still satisfy the durable contract (see ZERO_USAGE above) so any
+				// usage aggregation over the transcript cannot trip on undefined.
+				const message = row.role === "user"
+					? { role: "user" as const, content: row.content, timestamp: row.created_at }
+					: { role: "assistant" as const, content: [{ type: "text" as const, text: row.content }], timestamp: row.created_at, usage: { ...ZERO_USAGE } };
+				await tx.appendEntry(cid, { kind: "ve.history", model: [message as Message] });
+			}
 		} }, context);
 		this.routes.set(conv.id, (await this.host.harness.snapshot(Route, conv.id, context))!);
 		const provider = await this.host.harness.snapshot(ProviderDoc, conv.id, context);

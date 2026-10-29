@@ -13,6 +13,14 @@ const dir=await mkdtemp(join(process.cwd(),'node_modules/.durable-runtime-'));
 after(()=>rm(dir,{recursive:true,force:true}));
 await build({stdin:{contents:'export { DurableRuntime } from "./src/engine/durable/runtime.ts"; export { HistoryStore } from "./src/db/history-store.ts";',resolveDir:process.cwd(),loader:'ts'},outfile:join(dir,'runtime.mjs'),bundle:true,platform:'node',format:'esm',packages:'external'});
 const {DurableRuntime,HistoryStore}=await import(pathToFileURL(join(dir,'runtime.mjs')));
+
+function makeHistory(t){
+ const db=new DatabaseSync(':memory:');
+ db.exec(`CREATE TABLE conversations (id TEXT PRIMARY KEY,title TEXT,created_at INTEGER,updated_at INTEGER,origin TEXT,model_supplier_id TEXT,model_model_id TEXT); CREATE TABLE messages (id TEXT PRIMARY KEY,conversation_id TEXT,role TEXT,content TEXT,created_at INTEGER);`);
+ const history=new HistoryStore(db);
+ t.after(()=>db.close());
+ return history;
+}
 test('VE durable runtime executes a real adapted tool and projects one answer',async()=>{
  const db=new DatabaseSync(':memory:');
  db.exec(`CREATE TABLE conversations (id TEXT PRIMARY KEY,title TEXT,created_at INTEGER,updated_at INTEGER,origin TEXT,model_supplier_id TEXT,model_model_id TEXT); CREATE TABLE messages (id TEXT PRIMARY KEY,conversation_id TEXT,role TEXT,content TEXT,created_at INTEGER);`);
@@ -52,4 +60,40 @@ test('failed startup scan closes its host before rejecting and never resumes wor
  } finally {Harness.open = originalOpen;}
  const reopened = await DurableRuntime.open(opts);
  await reopened.close();
+});
+
+test('existing-conversation history without usage must not fault the generation (box 5/5 repro)', async t => {
+ const history = makeHistory(t);
+ // 存量对话：assistant 历史消息不带 usage（history 表本来就不存）——正是盒子上的形态
+ history.ensureConversation('conv-legacy-history','旧对话');
+ history.appendMessage('conv-legacy-history','user','上一轮的问题');
+ history.appendMessage('conv-legacy-history','assistant','上一轮的回答');
+ const faux=fauxProvider();
+ const sessions=new Map();
+ const session=id=>{ if(!sessions.has(id)) sessions.set(id,new Agent({streamFn:faux.provider.streamSimple,sessionId:id,initialState:{model:faux.provider.getModels()[0],systemPrompt:'test'}})); return sessions.get(id); };
+ const tools=()=>[];
+ faux.setResponses([fauxAssistantMessage('新的回答')]);
+ const runtime=await DurableRuntime.open({userDataDir:dir,history,session,tools,stream:(id,opts,messages)=>faux.provider.streamSimple(faux.provider.getModels()[0],{messages},opts),withActor:async(id,ctx,text,run)=>run(),onRecovered:async()=>{}});
+ try{
+  const result=await runtime.send(session('conv-legacy-history'),'新消息');
+  assert.equal(result.reply,'新的回答');
+  assert.equal(result.error,undefined,'submission must reach done, not the unanswered fallback');
+ }finally{await runtime.close();}
+});
+
+test('provider response without usage is normalized to zero-spend instead of faulting', async t => {
+ const history = makeHistory(t);
+ const faux=fauxProvider();
+ const sessions=new Map();
+ const session=id=>{ if(!sessions.has(id)) sessions.set(id,new Agent({streamFn:faux.provider.streamSimple,sessionId:id,initialState:{model:faux.provider.getModels()[0],systemPrompt:'test'}})); return sessions.get(id); };
+ const tools=()=>[];
+ // 模拟网关忽略 include_usage：剥掉响应里的 usage（openai-completions 在无 usage chunk 时就是 undefined）
+ const stripped = async (model,opts,messages)=>{ const response = await faux.provider.streamSimple(model,{messages},opts); const outcome = await response.result(); const {usage, ...rest} = outcome; return { async *[Symbol.asyncIterator](){}, result: async () => rest }; };
+ faux.setResponses([fauxAssistantMessage('无用量回答')]);
+ const runtime=await DurableRuntime.open({userDataDir:dir,history,session,tools,stream:stripped,withActor:async(id,ctx,text,run)=>run(),onRecovered:async()=>{}});
+ try{
+  const result=await runtime.send(session('conv-no-usage'),'你好');
+  assert.equal(result.reply,'无用量回答');
+  assert.equal(result.error,undefined);
+ }finally{await runtime.close();}
 });
