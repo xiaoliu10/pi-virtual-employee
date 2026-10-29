@@ -120,9 +120,21 @@ export class WorkItemStore {
 		return result.changes ? this.get(id) : undefined;
 	}
 	/** A crash may have applied external effects. Never blindly retry these items. */
-	recoverWorking(): void {
-		this.db.prepare(`UPDATE work_items SET status = 'waiting_human', question = ?, next_check_at = NULL, last_remind_at = NULL, remind_count = 0, updated_at = ? WHERE status = 'working'`)
-			.run("应用曾在执行中退出；请管理员核查已发生的操作，再明确恢复。", Date.now());
+	/**
+	 * Startup takeover of windows that were mid-flight when the app died.
+	 *
+	 * `skip` lists items the DURABLE layer already recovered (v0.2.174). Order
+	 * matters: durable recovery runs before workService.start(), so those windows
+	 * have finished their turn — but the runner's own outcome never landed (the
+	 * process died before `setStatus`). Without the skip, this blanket UPDATE
+	 * stamped 「应用曾在执行中退出；请管理员核查」 over work that just completed,
+	 * turning a successful recovery into a manual-intervention request.
+	 */
+	recoverWorking(skip: readonly string[] = []): void {
+		const placeholders = skip.map(() => "?").join(", ");
+		const notIn = skip.length ? ` AND id NOT IN (${placeholders})` : "";
+		this.db.prepare(`UPDATE work_items SET status = 'waiting_human', question = ?, next_check_at = NULL, last_remind_at = NULL, remind_count = 0, updated_at = ? WHERE status = 'working'${notIn}`)
+			.run("应用曾在执行中退出；请管理员核查已发生的操作，再明确恢复。", Date.now(), ...skip);
 		this.changed();
 	}
 

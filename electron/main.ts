@@ -940,6 +940,9 @@ ${tailForProgress(decision.text)}`;
 			},
 		}),
 		release: (convId) => browser.releasePage(convId),
+		// Recovered windows already ran to completion after the crash; the runner's
+		// outcome write is what the crash lost, not the work.
+		recoveredItemIds: () => [...recoveredWorkItemIds],
 		// Work windows report on the TASK cadence (taskProgressMin, default 30),
 		// not the chat cadence: a window runs for maxMinutes and its final report is
 		// the deliverable, so chat-frequency notes are noise (v0.2.171).
@@ -991,6 +994,10 @@ ${tailForProgress(decision.text)}`;
 	// never take the app down with it.
 	let durableHost: { resume(): void; close(): Promise<void> } | undefined;
 	let durableStartupFailed = false;
+	// Work items whose window the durable layer recovered at startup. Reported to
+	// WorkService so its blanket "app exited mid-window" takeover does not stamp
+	// 「请管理员核查」 over work that just completed (v0.2.174).
+	const recoveredWorkItemIds = new Set<string>();
 	if (kernel === "durable") {
 		try {
 			const host = await engine.openDurableRuntime(userData, async (conversationId, result, occurrenceId) => {
@@ -1026,6 +1033,7 @@ ${tailForProgress(decision.text)}`;
 					// is theirs, unchanged.
 					if (history.isReadOnly(plan.conversationId)) await deliver(plan.conversationId, result.reply);
 				} else if (plan.kind === "task-source") {
+					if (plan.task === "work") recoveredWorkItemIds.add(plan.taskId);
 					// The window's own answer is an internal transcript; the source
 					// conversation gets the annotated summary instead.
 					const row = plan.task === "work"
