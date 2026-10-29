@@ -10,10 +10,15 @@
  * happened". User ruling 2026-10-29: the recovered result goes back to the
  * task's SOURCE conversation.
  *
- * Upgrade/restart behaviour is deliberately unchanged: a graceful stop joins
- * in-flight runs and closes cleanly, so nothing is pending to recover — the task
- * layer (work-item / scheduled state machines) resumes at its next due time.
- * This module only covers the real-crash case.
+ * What a graceful close actually does (verified against pi-durable's
+ * `scheduler.js join()`): it ABORTS every in-flight invocation, waits for them,
+ * then writes their tasks back as `pending` — "a close is not a crash". So an
+ * upgrade mid-tool DOES leave recoverable work, and the next open replays it
+ * (test-durable-upgrade covers exactly that). The earlier note here claiming
+ * "a graceful stop leaves nothing to recover" was wrong and is what made the
+ * field report look like "recovery never happens": recovery DID run, its reply
+ * just landed in a conversation nobody opens. That is the defect this module
+ * fixes; the routing — not the recovery — was broken.
  */
 
 /** Console-side window conversations and how to resolve their human target. */
@@ -52,6 +57,48 @@ export function planRecoveredDelivery(conversationId: string): RecoveredDelivery
 	if (!conversationId.trim() || conversationId === "default") return { kind: "none" };
 	// IM conversations (dt:<staffId> / dt:group:<id>) and local console chats.
 	return { kind: "direct", conversationId };
+}
+
+/** The two row shapes the routing needs; kept structural so stores stay out. */
+export interface WorkRowLike {
+	title?: string | null;
+	origin_conversation?: string | null;
+	created_by?: string | null;
+	status?: string | null;
+	origin_note?: string | null;
+}
+export interface ScheduledRowLike {
+	title?: string | null;
+	conversation_id?: string | null;
+}
+
+export type ResolvedRecoveredTarget =
+	| { kind: "push"; target: string; noteTitle: string | null; workItemId?: string }
+	| { kind: "skip"; reason: string };
+
+/**
+ * Resolve a `task-source` plan into a concrete push target.
+ *
+ * Pure (no stores, no IM) so the whole decision chain is testable: the bug this
+ * module fixes lived in exactly this step, and the runner in main.ts cannot be
+ * unit-tested (subagent review P2-2).
+ */
+export function resolveTaskSourceTarget(
+	plan: { task: "work"; taskId: string } | { task: "scheduled"; taskId: string },
+	row: WorkRowLike | ScheduledRowLike | undefined,
+	resolveWorkTarget: (input: { origin_conversation?: string | null; created_by?: string | null }) => string | null,
+): ResolvedRecoveredTarget {
+	if (!row) return { kind: "skip", reason: "owning task row is gone (deleted or renamed)" };
+	if (plan.task === "work") {
+		const work = row as WorkRowLike;
+		const target = resolveWorkTarget({ origin_conversation: work.origin_conversation, created_by: work.created_by });
+		if (!target) return { kind: "skip", reason: "work item has no source conversation and no creator" };
+		return { kind: "push", target, noteTitle: work.title ?? null, workItemId: plan.taskId };
+	}
+	const scheduled = row as ScheduledRowLike;
+	const target = scheduled.conversation_id?.trim();
+	if (!target) return { kind: "skip", reason: "scheduled task has no conversation to report to" };
+	return { kind: "push", target, noteTitle: scheduled.title ?? null };
 }
 
 /**

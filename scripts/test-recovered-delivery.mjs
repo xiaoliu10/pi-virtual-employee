@@ -35,7 +35,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { planRecoveredDelivery, formatRecoveredNote } = await import(pathToFileURL(bundle).href);
+const { planRecoveredDelivery, formatRecoveredNote, resolveTaskSourceTarget } = await import(pathToFileURL(bundle).href);
 
 test("a crashed work window routes its recovered result back to the item's source", () => {
 	assert.deepEqual(
@@ -81,4 +81,31 @@ test("the recovered note is unmistakably a post-crash continuation", () => {
 	assert.match(noTitle, /崩溃后已自动恢复/);
 	const emptyReply = formatRecoveredNote({ title: "任务", reply: "   " });
 	assert.doesNotMatch(emptyReply, /\n\n\s*$/, "an empty reply must not leave a dangling blank body");
+});
+
+test("a work window resolves to its source conversation, or is skipped with a reason", () => {
+	const resolve = ({ origin_conversation, created_by }) => origin_conversation ?? (created_by ? `dt:${created_by}` : null);
+	assert.deepEqual(
+		resolveTaskSourceTarget({ task: "work", taskId: "w1" }, { title: "对账", origin_conversation: "dt:group:g1", created_by: "a" }, resolve),
+		{ kind: "push", target: "dt:group:g1", noteTitle: "对账", workItemId: "w1" },
+	);
+	assert.deepEqual(
+		resolveTaskSourceTarget({ task: "work", taskId: "w2" }, { title: "纯控制台", origin_conversation: null, created_by: "staff9" }, resolve),
+		{ kind: "push", target: "dt:staff9", noteTitle: "纯控制台", workItemId: "w2" },
+		"no source conversation falls back to the creator's 1:1",
+	);
+	const skipped = resolveTaskSourceTarget({ task: "work", taskId: "w3" }, { title: "x", origin_conversation: null, created_by: null }, resolve);
+	assert.equal(skipped.kind, "skip", "no target at all must skip, never push to a console conversation");
+	assert.match(skipped.reason, /no source conversation/);
+	assert.equal(resolveTaskSourceTarget({ task: "work", taskId: "w4" }, undefined, resolve).kind, "skip", "a deleted row skips instead of throwing");
+});
+
+test("a scheduled task resolves to its own conversation, or is skipped", () => {
+	assert.deepEqual(
+		resolveTaskSourceTarget({ task: "scheduled", taskId: "t1" }, { title: "每日对账", conversation_id: "dt:group:g2" }, () => null),
+		{ kind: "push", target: "dt:group:g2", noteTitle: "每日对账" },
+		"the scheduled row's own conversation is the target — not the per-run sched:<id> conversation",
+	);
+	assert.equal(resolveTaskSourceTarget({ task: "scheduled", taskId: "t2" }, { title: "x", conversation_id: null }, () => null).kind, "skip");
+	assert.equal(resolveTaskSourceTarget({ task: "scheduled", taskId: "t3" }, undefined, () => null).kind, "skip");
 });
