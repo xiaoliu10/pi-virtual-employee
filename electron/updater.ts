@@ -45,7 +45,14 @@ const REPLY_FLUSH_DELAY_MS = Number(process.env.VE_INSTALL_REPLY_FLUSH_MS) > 0
 	: 5_000;
 /** Watchdog: how long the app waits for its own graceful exit before the hard
  *  tree-kill hands the install to the detached watchdog. */
-const APP_EXIT_GRACE_MS = 10_000;
+const APP_EXIT_GRACE_MS = Number(process.env.VE_INSTALL_EXIT_GRACE_MS) > 0
+	? Number(process.env.VE_INSTALL_EXIT_GRACE_MS)
+	: 10_000;
+/** How long the legacy fallback may sit without quitting before we reclaim the
+ *  app (see LEGACY_HANDOVER_RECOVERY_MS). Env-injectable for tests. */
+const LEGACY_HANDOVER_RECOVERY_MS = Number(process.env.VE_INSTALL_LEGACY_RECOVERY_MS) > 0
+	? Number(process.env.VE_INSTALL_LEGACY_RECOVERY_MS)
+	: 90_000;
 const WATCHDOG_DIR = "update-watchdog";
 const UPDATE_LOG_DIR = "logs";
 const UPDATE_LOG_FILE = "updater.log";
@@ -67,10 +74,16 @@ const MAX_CONSECUTIVE_INSTALL_FAILURES = 2;
  *  every per-step budget in electron/install-cleanup.ts (27s), otherwise one
  *  slow step starves the rest and the install aborts on OUR cleanup — which is
  *  exactly how a healthy box reached 「安装前清理超过 10 秒」 (v0.2.172). */
-const PREPARE_INSTALL_TIMEOUT_MS = Number(process.env.VE_INSTALL_PREPARE_TIMEOUT_MS) > 0
-	? Number(process.env.VE_INSTALL_PREPARE_TIMEOUT_MS)
-	: 35_000;
+const PREPARE_INSTALL_TIMEOUT_DEFAULT_MS = 35_000;
 // #endregion immutable:updater-breakers
+/**
+ * Test override lives OUTSIDE the guarded region on purpose: an env var that
+ * can shrink the ceiling to 1ms would bypass the "must exceed the step budget
+ * sum" guarantee the region above pins (subagent review P3-4).
+ */
+export const PREPARE_INSTALL_TIMEOUT_MS = Number(process.env.VE_INSTALL_PREPARE_TIMEOUT_MS) > 0
+	? Number(process.env.VE_INSTALL_PREPARE_TIMEOUT_MS)
+	: PREPARE_INSTALL_TIMEOUT_DEFAULT_MS;
 
 interface FailureRecord {
 	attempts: number;
@@ -189,6 +202,7 @@ function markPendingInstall(target: string): void {
  * auto-install forever. Clearing it keeps the counter honest: one attempt, at
  * most one failure.
  */
+// #region immutable:updater-pending-accounting
 function abortPendingInstall(): void {
 	try {
 		const map = loadFailures();
@@ -199,6 +213,25 @@ function abortPendingInstall(): void {
 	} catch (err) {
 		log("WARN", `failed to drop pending install marker: ${err instanceof Error ? err.message : String(err)}`);
 	}
+}
+
+/**
+ * Whether an in-process abort may drop the pending marker.
+ *
+ * Only when NO watchdog owns the attempt. With an armed watchdog the installer
+ * still runs after this PID dies (phase0a waits for it), so that IS a real
+ * attempt and its failure must be counted at next startup — dropping the marker
+ * there would lose a failure and leave the machine breaker blind
+ * (subagent review P1-3). Extracted so the rule is testable: the arm-success +
+ * quit-throws path cannot be driven end-to-end from a stub harness.
+ */
+export function dropPendingMarkerForAbort(handoverArmed: boolean): boolean {
+	if (handoverArmed) {
+		log("WARN", "install preparation aborted AFTER the watchdog took ownership — keeping the pending marker so the attempt is counted at next startup");
+		return false;
+	}
+	abortPendingInstall();
+	return true;
 }
 
 /**
@@ -225,6 +258,8 @@ function reconcilePendingInstall(): void {
 		recordFailure(pending.target, `startup reconciliation: still on ${current} after attempting ${pending.target}`);
 	}
 }
+
+// #endregion immutable:updater-pending-accounting
 
 /**
  * A per-user NSIS install MUST have its uninstall registry entry. A missing
@@ -1158,6 +1193,10 @@ export function quitAndInstall(): void {	if (!enabled() || installing) return;
 	// allow the final response to flush, then close Chromium/IM/HTTP before NSIS
 	// starts; otherwise the old process tree can keep the silent installer stuck.
 	void (async () => {
+		// Per-attempt handover state (see the arm site below): whether a watchdog
+		// owns this attempt, and the legacy-fallback reclaimer.
+		let handoverArmed = false;
+		let legacyRecoveryTimer: NodeJS.Timeout | undefined;
 		try {
 			beginDrain?.();
 			await new Promise((resolve) => setTimeout(resolve, REPLY_FLUSH_DELAY_MS));
@@ -1184,7 +1223,7 @@ export function quitAndInstall(): void {	if (!enabled() || installing) return;
 				]);
 				if (cleanupTimer) clearTimeout(cleanupTimer);
 				if (cleanupOutcome === "timeout") {
-					log("WARN", `install cleanup exceeded ${Math.round(PREPARE_INSTALL_TIMEOUT_MS / 1000)}s — proceeding with install; exit releases remaining handles`);
+					log("WARN", `install cleanup exceeded ${PREPARE_INSTALL_TIMEOUT_MS >= 1_000 ? `${Math.round(PREPARE_INSTALL_TIMEOUT_MS / 1_000)}s` : `${PREPARE_INSTALL_TIMEOUT_MS}ms`} — proceeding with install; exit releases remaining handles`);
 				} else if (cleanupOutcome === "failed") {
 					// A rejected teardown still installs: the watchdog + forced exit
 					// own the NSIS handover from here.
@@ -1197,6 +1236,12 @@ export function quitAndInstall(): void {	if (!enabled() || installing) return;
 			// child ("detached" — caller must skip the tree-kill), or every
 			// mechanism failed ("failed" — legacy fallback below).
 			const armed = startInstallWatchdog();
+			// Remember whether the watchdog owns the attempt: `app.quit()` throwing
+			// AFTER a successful arm must NOT drop the pending marker, because the
+			// watchdog will still run the installer once this PID dies — that is a
+			// real attempt whose failure needs counting at next startup
+			// (subagent review P1-3).
+			handoverArmed = armed !== "failed";
 
 			const hardExitTimer = setTimeout(() => {
 				// Forced exit: outcome is unknowable from here, and the watchdog
@@ -1220,6 +1265,24 @@ export function quitAndInstall(): void {	if (!enabled() || installing) return;
 				// risk: a possible hang beats a certain outage.
 				log("ERROR", "watchdog arm failed on every mechanism — falling back to legacy quitAndInstall (wedge risk accepted)");
 				autoUpdater.quitAndInstall(true, false);
+				// electron-updater's install() swallows its own errors and returns
+				// false WITHOUT quitting in that case. Nothing would then end the IM
+				// drain or clear `installing`: the robot answered 「系统正在安装应用
+				// 更新」 forever and the pending marker turned into a phantom failure
+				// (subagent review P2-3). Reclaim the app if no quit happened.
+				legacyRecoveryTimer = setTimeout(() => {
+					if (installing === false) return;
+					log("ERROR", "legacy install fallback never quit the app — reclaiming (drain off, installing reset, pending dropped)");
+					installing = false;
+					endDrain?.();
+					abortPendingInstall();
+					setState({
+						phase: "error",
+						currentVersion: app.getVersion(),
+						message: "自动安装未能启动（安装器未接手）。请手动运行安装包，或稍后重试。",
+					});
+				}, LEGACY_HANDOVER_RECOVERY_MS);
+				legacyRecoveryTimer.unref?.();
 				return;
 			}
 			// The app NEVER invokes electron-updater's NSIS path: it starts the
@@ -1233,14 +1296,17 @@ export function quitAndInstall(): void {	if (!enabled() || installing) return;
 			app.quit();
 		} catch (err) {
 			installing = false;
+			if (legacyRecoveryTimer) clearTimeout(legacyRecoveryTimer);
 			endDrain?.();
 			const message = err instanceof Error ? err.message : String(err);
 			log("ERROR", `install preparation failed: ${message}`);
-			// NOT an install failure (v0.2.172): we never quit, so NSIS never ran.
-			// Recording it inflated the per-version and machine-wide breakers until
-			// auto-install switched itself off, and the leftover pending marker made
-			// startup reconciliation count the same aborted attempt twice.
-			abortPendingInstall();
+			// NOT an install failure (v0.2.172): nothing was installed, so recording
+			// it inflated the per-version and machine-wide breakers until
+			// auto-install switched itself off. Drop the pending marker ONLY when no
+			// watchdog owns the attempt — with an armed watchdog the install still
+			// runs after we die, and its failure must be counted at next startup
+			// (subagent review P1-3).
+			dropPendingMarkerForAbort(handoverArmed);
 			setState({ phase: "error", currentVersion: app.getVersion(), message: `安装失败：${message}` });
 		}
 	})();

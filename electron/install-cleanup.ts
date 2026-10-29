@@ -24,6 +24,88 @@ export interface CleanupLogger {
 	(message: string, detail?: unknown): void;
 }
 
+/** One teardown step: a name, its own budget, and the work. */
+export interface CleanupStep {
+	name: string;
+	budgetMs: number;
+	run(): Promise<unknown> | unknown;
+}
+
+/** The teardown in the order it must run (DB close stays last, outside this list). */
+export interface TeardownDeps {
+	stopWork: () => Promise<unknown> | unknown;
+	closeDurable?: () => Promise<unknown> | unknown;
+	stopScheduler: () => unknown;
+	disposeShell: () => unknown;
+	stopIm: () => Promise<unknown> | unknown;
+	closeBrowser: () => Promise<unknown> | unknown;
+	closeComputer: () => Promise<unknown> | unknown;
+	closeHttp: () => Promise<unknown> | unknown;
+}
+
+/**
+ * The install teardown, in order, as data. Extracted from main.ts so the
+ * sequence itself is testable: the defect this file fixes was precisely
+ * "one unbounded step in a fixed sequence", and a sequence no test can drive is
+ * a sequence that regresses silently (subagent review P2-4, v0.2.172).
+ *
+ * Ordering is load-bearing: durable closes before the DB (its close writes the
+ * final checkpoint through the DB), and every listener/process closes before
+ * NSIS starts so the installer can overwrite resources.
+ */
+export function installTeardownSteps(deps: TeardownDeps): { steps: CleanupStep[]; syncSteps: { name: string; run(): unknown }[] } {
+	const steps: CleanupStep[] = [
+		{ name: "stop work windows", budgetMs: CLEANUP_BUDGETS.stopWork, run: deps.stopWork },
+	];
+	if (deps.closeDurable) steps.push({ name: "durable host close", budgetMs: CLEANUP_BUDGETS.durableClose, run: deps.closeDurable });
+	steps.push(
+		{ name: "im stopAll", budgetMs: CLEANUP_BUDGETS.imStopAll, run: deps.stopIm },
+		{ name: "browser close", budgetMs: CLEANUP_BUDGETS.browserClose, run: deps.closeBrowser },
+		{ name: "computer close", budgetMs: CLEANUP_BUDGETS.computerClose, run: deps.closeComputer },
+		{ name: "http server close", budgetMs: CLEANUP_BUDGETS.httpClose, run: deps.closeHttp },
+	);
+	// Cheap, synchronous, and not part of the starvation problem: keep them out
+	// of the budgeted list but still in the sequence so they cannot be dropped.
+	const syncSteps = [
+		{ name: "scheduler stop", run: deps.stopScheduler },
+		{ name: "dispose shell commands", run: deps.disposeShell },
+	];
+	return { steps, syncSteps };
+}
+
+/**
+ * Run the whole teardown. Never rejects: every step is bounded, and a failure in
+ * one must not skip the rest (the remaining handles still need releasing).
+ * `syncSteps` run between the first step and the durable close — see
+ * installTeardownSteps for why they are sync.
+ */
+export async function runInstallTeardown(
+	deps: TeardownDeps,
+	warn: CleanupLogger = (message, detail) => console.warn(message, detail ?? ""),
+	info: CleanupLogger = (message) => console.log(message),
+): Promise<{ outcomes: Record<string, CleanupOutcome>; elapsedMs: number }> {
+	const startedAt = Date.now();
+	const outcomes: Record<string, CleanupOutcome> = {};
+	const { steps, syncSteps } = installTeardownSteps(deps);
+	// stopWork first (it may still be writing), then the sync stops, then the
+	// durable close, then the resource closers in declared order.
+	const head = steps.slice(0, 1);
+	const tail = steps.slice(1);
+	for (const step of head) outcomes[step.name] = await runCleanupStep(step.name, step.budgetMs, step.run, warn, info);
+	for (const step of syncSteps) {
+		try {
+			step.run();
+			outcomes[step.name] = "ok";
+		} catch (err) {
+			// Same rule as the async steps: log and continue.
+			warn(`[main] install cleanup: ${step.name} failed (continuing)`, (err as Error)?.constructor?.name ?? typeof err);
+			outcomes[step.name] = "failed";
+		}
+	}
+	for (const step of tail) outcomes[step.name] = await runCleanupStep(step.name, step.budgetMs, step.run, warn, info);
+	return { outcomes, elapsedMs: Date.now() - startedAt };
+}
+
 /**
  * Run one teardown step under a hard budget. Resolves with the outcome — it
  * NEVER rejects, so a caller can chain the remaining steps unconditionally.
@@ -35,6 +117,7 @@ export async function runCleanupStep(
 	budgetMs: number,
 	fn: () => Promise<unknown> | unknown,
 	warn: CleanupLogger = (message, detail) => console.warn(message, detail ?? ""),
+	info: CleanupLogger = (message) => console.log(message),
 ): Promise<CleanupOutcome> {
 	const startedAt = Date.now();
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -53,10 +136,12 @@ export async function runCleanupStep(
 			warn(`[main] install cleanup: ${name} exceeded ${budgetMs}ms — continuing (process exit releases it)`);
 			return "timeout";
 		}
-		// A step that finished but blew its budget is a near miss worth recording:
-		// the budgets are sized to a loaded box, so a near miss predicts the next
-		// field report.
+		// EVERY step logs its duration, not just the slow ones: the whole point is
+		// that the next "install was slow" report names the culprit instead of
+		// needing a fresh field repro (and normal steps are the baseline the slow
+		// ones are read against).
 		if (elapsed > budgetMs / 2) warn(`[main] install cleanup: ${name} slow (${elapsed}ms of ${budgetMs}ms budget)`);
+		else info(`[main] install cleanup: ${name} ok (${elapsed}ms)`);
 		return "ok";
 	} catch (err) {
 		// Content is not logged: teardown errors can carry paths and tokens.
