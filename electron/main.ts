@@ -929,6 +929,22 @@ ${tailForProgress(decision.text)}`;
 			},
 		}),
 		release: (convId) => browser.releasePage(convId),
+		// Work windows report on the TASK cadence (taskProgressMin, default 30),
+		// not the chat cadence: a window runs for maxMinutes and its final report is
+		// the deliverable, so chat-frequency notes are noise (v0.2.171).
+		progress: (item, session, convId) => createProgressNotifier({
+			title: item.title,
+			// Back to where the work came from: the admin who confirmed it, or the
+			// conversation the item was mined from. Neither → no-op (target null).
+			target: item.origin_conversation ?? item.created_by ?? null,
+			intervalMin: config.all().general.taskProgressMin,
+			summarize: () => engine.progressBriefDetailed(session, convId),
+			push: (cid, text) => im.pushToConversation(cid, text),
+			isRunning: () => session.state.isStreaming,
+			// A silent item's notes can never be pushed (same rule as scheduled):
+			// A silent item's notes can never be pushed (same rule as scheduled tasks).
+			mayPush: (note) => shouldPushScheduledResult({ conversation_id: item.origin_conversation, silent: 0 }, item.created_by ?? undefined, note),
+		}),
 		// Work-window pushes stay UN-ledgered on purpose: the WorkService push hook
 		// carries no occurrence identity (neither the window start nor the reminder
 		// attempt), and an id minted here (Date.now()) would be a fresh occurrence on
@@ -1054,12 +1070,12 @@ ${tailForProgress(decision.text)}`;
 			});
 			// Long single-shot runs stream for up to the hard timeout with ZERO
 			// feedback until the final report lands. Broadcast side-LLM progress
-			// notes every longTaskProgressMin (the autonomous chain already had a
-			// heartbeat; this closes the gap for the far more common single-shot
-			// runner). Silent tasks stay silent; timed-out losing runs stop
-			// broadcasting — the scheduler already recorded the failure, and a
-			// later "still working" note would contradict it.
-			const progressIntervalMin = normalizeProgressIntervalMin(config.all().general.longTaskProgressMin);
+			// notes every taskProgressMin (the TASK cadence, default 30 — separate
+			// from the chat-turn cadence longTaskProgressMin since v0.2.171). Silent
+			// tasks stay silent; timed-out losing runs stop broadcasting — the
+			// scheduler already recorded the failure, and a later "still working"
+			// note would contradict it.
+			const progressIntervalMin = normalizeProgressIntervalMin(config.all().general.taskProgressMin);
 			const notifier = createProgressNotifier({
 				title: task.title,
 				target: task.conversation_id,

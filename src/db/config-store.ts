@@ -242,10 +242,20 @@ export interface AppConfig {
 		 */
 		requestTimeoutMin: number;
 		/**
-		 * Long-task progress heartbeat (minutes). When an IM turn runs longer than
-		 * this, a brief in-progress note is pushed to the channel. 0 = disabled.
+		 * Chat-turn progress heartbeat (minutes). When an IM turn runs longer than
+		 * this, a brief in-progress note is pushed to that conversation. 0 = disabled.
+		 * Separate from taskProgressMin: chat turns are watched interactively, task
+		 * runs (scheduled / work windows) are long by design.
 		 */
 		longTaskProgressMin: number;
+		/**
+		 * Scheduled-task / work-window progress heartbeat (minutes). 0 = disabled.
+		 * v0.2.171: split out of longTaskProgressMin — a work window runs for
+		 * maxMinutes and its report is the deliverable, so a chat-cadence note is
+		 * noise. Instances that never set this keep 30 (the intended default);
+		 * ones that had tuned longTaskProgressMin keep their chat cadence.
+		 */
+		taskProgressMin: number;
 		/**
 		 * Turn watchdog (minutes): an IM turn still running after this is aborted
 		 * so a wedged tool/LLM call can't block that conversation forever (the
@@ -480,7 +490,7 @@ const DEFAULTS: AppConfig = {
 	model: { suppliers: [], defaultSupplierId: "", defaultModelId: "", sessionAffinity: true },
 	identity: { name: "客服小派", role: "虚拟客服", duty: "在线为客户提供专业、礼貌、高效的服务", serviceHours: "7×24h" },
 	im: { enabled: false, channels: [], ack: { enabled: true, text: "👍 收到，正在处理…" } },
-	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 15, turnTimeoutMin: 20, maxToolSteps: 20, autoUpdate: true, oneOffRetentionDays: 30, messageRetentionDays: 30, engineKernel: "durable" as const, piRegistryUrl: "" },
+	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 15, taskProgressMin: 30, turnTimeoutMin: 20, maxToolSteps: 20, autoUpdate: true, oneOffRetentionDays: 30, messageRetentionDays: 30, engineKernel: "durable" as const, piRegistryUrl: "" },
 	browser: { enabled: false, headless: true, allowedDomains: [], downloadHost: "" },
 	computer: DEFAULT_COMPUTER_CONFIG,
 	scheduler: { enabled: true },

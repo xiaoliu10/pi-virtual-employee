@@ -52,6 +52,13 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	kbFeatures?(): { search: boolean; learn: boolean };
 	learn?(item: WorkItemRow, result: string): void | Promise<void>;
 	budget?: { maxTurns: number; maxMinutes: number };
+	/** Window progress broadcaster (v0.2.171): main.ts injects the same
+	 * ProgressNotifier factory the scheduled-task runner uses, so a work window
+	 * — which runs for maxMinutes with only its final report as output — reports
+	 * on the task cadence instead of staying silent until it ends. Called once
+	 * per window; the service starts it, then stops and drains it before the
+	 * window's completion push. */
+	progress?(item: WorkItemRow, session: Session, conversationId: string): { start(): void; stop(): void; drain(timeoutMs?: number): Promise<void> } | undefined;
 	clock?: Clock;
 	onError?(error: unknown): void;
 	/** Latest inbound (user) message time in a conversation since a timestamp —
@@ -364,23 +371,34 @@ export class WorkService<Session extends WorkSession> {
 				stallRetriedThisTurn = false;
 				let stallAttempt = 0;
 				let result: { reply?: string; error?: string; deterministic?: boolean };
+				// Progress beats for the whole window (all turns): started before the
+				// first send and stopped+drained in the finally, so a slow in-flight note
+				// can never land after the window's completion push (v0.2.162 P2-1).
+				const notifier = this.opts.progress?.(item, active.session, convId);
+				notifier?.start();
+				try {
 				for (;;) {
-					result = await this.opts.send(active.session, prefix + (turn === 0 ? "请按目标与执行条件推进工作。" : "继续。"), fresh.created_by, fresh.origin_conversation ?? undefined, fresh.created_channel ?? undefined);
-					if (!result.error && !result.deterministic) break;
-					stallAttempt += 1;
-					const step = nextStallStep(stallAttempt);
-					if (step.action !== "retry" || active.stopReason || !this.running) break;
-					stallRetriedThisTurn = true;
-					// Error CONTENT is deliberately not logged (may carry secrets) —
-					// same discipline as the pushed text below.
-					console.warn(`[work] ${item.id.slice(0, 8)} turn ${turn + 1}: send produced no reply; silent retry ${stallAttempt}/${STALL_QUIET_RETRIES} in ${Math.round(step.backoffMs / 1000)}s`);
-					await new Promise<void>((resolve) => { this.clock.setTimeout(resolve, step.backoffMs); });
-					// A stop/cancel/timeout landing DURING the backoff must not be
-					// followed by a fresh full model round (H1, review 2026-10-08):
-					// session.abort() is a no-op on an idle agent, so the re-check
-					// has to live here. Breaking leaves result.error set; the catch
-					// prefers active.stopReason for the terminal phrasing.
-					if (active.stopReason || !this.running) break;
+						result = await this.opts.send(active.session, prefix + (turn === 0 ? "请按目标与执行条件推进工作。" : "继续。"), fresh.created_by, fresh.origin_conversation ?? undefined, fresh.created_channel ?? undefined);
+						if (!result.error && !result.deterministic) break;
+						stallAttempt += 1;
+						const step = nextStallStep(stallAttempt);
+						if (step.action !== "retry" || active.stopReason || !this.running) break;
+						stallRetriedThisTurn = true;
+						// Error CONTENT is deliberately not logged (may carry secrets) —
+						// same discipline as the pushed text below.
+						console.warn(`[work] ${item.id.slice(0, 8)} turn ${turn + 1}: send produced no reply; silent retry ${stallAttempt}/${STALL_QUIET_RETRIES} in ${Math.round(step.backoffMs / 1000)}s`);
+						await new Promise<void>((resolve) => { this.clock.setTimeout(resolve, step.backoffMs); });
+						// A stop/cancel/timeout landing DURING the backoff must not be
+						// followed by a fresh full model round (H1, review 2026-10-08):
+						// session.abort() is a no-op on an idle agent, so the re-check
+						// has to live here. Breaking leaves result.error set; the catch
+						// prefers active.stopReason for the terminal phrasing.
+						if (active.stopReason || !this.running) break;
+				}
+				} finally {
+					notifier?.stop();
+					// Bounded: a wedged relay must not hold the window open.
+					await notifier?.drain(5_000).catch(() => {});
 				}
 				if (result.error) throw new Error(result.error);
 				if (result.deterministic) throw new Error("模型服务中断，未产出回复");
