@@ -152,6 +152,10 @@ export function settleRepairInstruction(note: string): string {
  */
 type ConversationKey = string | number;
 const toolEvidence = new Map<ConversationKey, { anyTool: boolean }>();
+/** Per conversation: has an empty answer already been re-asked once (settle #0). */
+const emptyAnswerRetries = new Set<ConversationKey>();
+/** Injected continuation for an empty completion; one round only (see settle #0). */
+const EMPTY_ANSWER_RETRY_PROMPT = "上一次响应没有生成任何内容。请直接给出你的答复（纯文字，不要解释，不要调用工具）。";
 
 function evidenceFor(conversationId: ConversationKey): { anyTool: boolean } {
 	let entry = toolEvidence.get(conversationId);
@@ -252,6 +256,26 @@ export function createDurableSettleGate() {
 				onYield: async (answer, api, context) => {
 					try {
 						const text = messageText(answer);
+
+							// settle #0: an EMPTY completion — the gateway closed the stream
+							// after one token (measured on the box: done, output=1,
+							// stopReason=stop, content=[]). Nothing was produced to deliver, so
+							// ask once more (usually succeeds); a SECOND empty answer settles so
+							// the honest fallback in result() reaches the user instead of a
+							// "paused" misdiagnosis.
+							if (text.trim().length === 0 && !turnHadToolCalls(answer)) {
+								const key = api.conversationId;
+								const retried = emptyAnswerRetries.has(key);
+								emptyAnswerRetries.delete(key);
+								if (!retried) {
+									emptyAnswerRetries.add(key);
+									console.warn(`[durable-settle-gate] empty assistant answer for ${key} — asking the model once more`);
+									return { continue: EMPTY_ANSWER_RETRY_PROMPT };
+								}
+								console.warn(`[durable-settle-gate] second empty assistant answer for ${key} — settling for the honest fallback`);
+								return undefined;
+							}
+							emptyAnswerRetries.delete(api.conversationId);
 
 						// settle #1: a done claim → ask for the evidence round.
 						if (text.includes(AUTONOMOUS_DONE_MARK)) {
