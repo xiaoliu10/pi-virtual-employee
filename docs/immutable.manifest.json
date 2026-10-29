@@ -55,7 +55,7 @@
 			"path": "electron/updater.ts",
 			"kind": "region",
 			"why": "自动更新熔断阈值（坏版本的最后一道网）",
-			"sha256": "bb25f4ddf2e615261d868fcd26938c355736aa55d17a320dc690bca772308ee2"
+			"sha256": "aacf2209689700290c94f005a7f90107a64c9f94abc5ee967358dd94644686bc"
 		},
 		{
 			"id": "publish-target",
@@ -98,6 +98,20 @@
 			"kind": "region",
 			"why": "一票否决的判定本身：SSI「优化分数」最直接的作弊点是松掉这里",
 			"sha256": "92b60e2a814d1c329ca97311ee9fa1ea5cbd8555853faa359af683672c8f4718"
+		},
+		{
+			"id": "updater-pending-accounting",
+			"path": "electron/updater.ts",
+			"kind": "region",
+			"why": "安装尝试的记账与清账（pending 标记、启动校对、中止时是否丢标记）——这是熔断计数器的输入门，改它等于放宽/收紧自动更新停摆条件",
+			"sha256": "924f01dfaba5f86ba313fdc9f72b60bedc675a333b2c59b4e7923a9fa377283e"
+		},
+		{
+			"id": "test-install-preflight",
+			"path": "scripts/test-install-preflight.mjs",
+			"kind": "file",
+			"why": "安装前清理与熔断记账的回归套件——按文件钉住，防止「改测试而不是改行为」绕过上面的护栏",
+			"sha256": "5e6c8ec66e6a22c28c23aca731133f6d90dda49b28126eef9964e050376ab72c"
 		}
 	]
 }

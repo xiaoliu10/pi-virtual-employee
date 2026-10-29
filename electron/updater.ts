@@ -38,10 +38,21 @@ const IDLE_POLL_MS = 60_000;
 /** Unattended mode: give up waiting for idle after this long. */
 const IDLE_WAIT_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 /** Let the final IM/HTTP response flush after draining new work. */
-const REPLY_FLUSH_DELAY_MS = 5_000;
+/** Final-reply flush window before teardown starts. Env-injectable so the
+ *  install-preflight regression suite does not spend 5s per case. */
+const REPLY_FLUSH_DELAY_MS = Number(process.env.VE_INSTALL_REPLY_FLUSH_MS) > 0
+	? Number(process.env.VE_INSTALL_REPLY_FLUSH_MS)
+	: 5_000;
 /** Watchdog: how long the app waits for its own graceful exit before the hard
  *  tree-kill hands the install to the detached watchdog. */
-const APP_EXIT_GRACE_MS = 10_000;
+const APP_EXIT_GRACE_MS = Number(process.env.VE_INSTALL_EXIT_GRACE_MS) > 0
+	? Number(process.env.VE_INSTALL_EXIT_GRACE_MS)
+	: 10_000;
+/** How long the legacy fallback may sit without quitting before we reclaim the
+ *  app (see LEGACY_HANDOVER_RECOVERY_MS). Env-injectable for tests. */
+const LEGACY_HANDOVER_RECOVERY_MS = Number(process.env.VE_INSTALL_LEGACY_RECOVERY_MS) > 0
+	? Number(process.env.VE_INSTALL_LEGACY_RECOVERY_MS)
+	: 90_000;
 const WATCHDOG_DIR = "update-watchdog";
 const UPDATE_LOG_DIR = "logs";
 const UPDATE_LOG_FILE = "updater.log";
@@ -59,7 +70,20 @@ const MAX_ATTEMPTS_PER_VERSION = 2;
  * work) until one successful manual repair install clears the streak.
  */
 const MAX_CONSECUTIVE_INSTALL_FAILURES = 2;
+/** Outer ceiling for the whole install teardown. MUST stay above the sum of
+ *  every per-step budget in electron/install-cleanup.ts (27s), otherwise one
+ *  slow step starves the rest and the install aborts on OUR cleanup — which is
+ *  exactly how a healthy box reached 「安装前清理超过 10 秒」 (v0.2.172). */
+const PREPARE_INSTALL_TIMEOUT_DEFAULT_MS = 35_000;
 // #endregion immutable:updater-breakers
+/**
+ * Test override lives OUTSIDE the guarded region on purpose: an env var that
+ * can shrink the ceiling to 1ms would bypass the "must exceed the step budget
+ * sum" guarantee the region above pins (subagent review P3-4).
+ */
+export const PREPARE_INSTALL_TIMEOUT_MS = Number(process.env.VE_INSTALL_PREPARE_TIMEOUT_MS) > 0
+	? Number(process.env.VE_INSTALL_PREPARE_TIMEOUT_MS)
+	: PREPARE_INSTALL_TIMEOUT_DEFAULT_MS;
 
 interface FailureRecord {
 	attempts: number;
@@ -168,6 +192,49 @@ function markPendingInstall(target: string): void {
 }
 
 /**
+ * Drop the in-flight marker when we abort BEFORE quitting (v0.2.172).
+ *
+ * markPendingInstall() is written first so a real attempt that never reaches the
+ * target is counted at next startup. But when the attempt is abandoned in-process
+ * (install preparation failed, app never quit), leaving the marker makes startup
+ * reconciliation count the SAME abandoned attempt a second time — one field abort
+ * appeared as 「连续 2 次跨版本失败」 and tripped the machine breaker, disabling
+ * auto-install forever. Clearing it keeps the counter honest: one attempt, at
+ * most one failure.
+ */
+// #region immutable:updater-pending-accounting
+function abortPendingInstall(): void {
+	try {
+		const map = loadFailures();
+		if (!map.pending) return;
+		log("WARN", `install preparation aborted before quit: dropping pending marker for ${map.pending.target} (no attempt was made)`);
+		const { pending: _drop, ...rest } = map;
+		saveFailures(rest);
+	} catch (err) {
+		log("WARN", `failed to drop pending install marker: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
+/**
+ * Whether an in-process abort may drop the pending marker.
+ *
+ * Only when NO watchdog owns the attempt. With an armed watchdog the installer
+ * still runs after this PID dies (phase0a waits for it), so that IS a real
+ * attempt and its failure must be counted at next startup — dropping the marker
+ * there would lose a failure and leave the machine breaker blind
+ * (subagent review P1-3). Extracted so the rule is testable: the arm-success +
+ * quit-throws path cannot be driven end-to-end from a stub harness.
+ */
+export function dropPendingMarkerForAbort(handoverArmed: boolean): boolean {
+	if (handoverArmed) {
+		log("WARN", "install preparation aborted AFTER the watchdog took ownership — keeping the pending marker so the attempt is counted at next startup");
+		return false;
+	}
+	abortPendingInstall();
+	return true;
+}
+
+/**
  * Startup reconciliation of markPendingInstall. MUST run once per app start.
  * Success (running >= target) also clears the machine streak — this is the
  * only place a successful SILENT install (no hard-exit, no watchdog action)
@@ -191,6 +258,8 @@ function reconcilePendingInstall(): void {
 		recordFailure(pending.target, `startup reconciliation: still on ${current} after attempting ${pending.target}`);
 	}
 }
+
+// #endregion immutable:updater-pending-accounting
 
 /**
  * A per-user NSIS install MUST have its uninstall registry entry. A missing
@@ -1124,16 +1193,42 @@ export function quitAndInstall(): void {	if (!enabled() || installing) return;
 	// allow the final response to flush, then close Chromium/IM/HTTP before NSIS
 	// starts; otherwise the old process tree can keep the silent installer stuck.
 	void (async () => {
+		// Per-attempt handover state (see the arm site below): whether a watchdog
+		// owns this attempt, and the legacy-fallback reclaimer.
+		let handoverArmed = false;
+		let legacyRecoveryTimer: NodeJS.Timeout | undefined;
 		try {
 			beginDrain?.();
 			await new Promise((resolve) => setTimeout(resolve, REPLY_FLUSH_DELAY_MS));
 			if (prepareToInstall) {
-				await Promise.race([
-					prepareToInstall(),
-					new Promise<never>((_, reject) =>
-						setTimeout(() => reject(new Error("安装前清理超过 10 秒")), 10_000),
-					),
+				// Teardown is best-effort and CANNOT fail the install (v0.2.172):
+				// our own process quits right after this, and process exit releases
+				// every handle a slow step failed to release (DB addon mapping, IM
+				// sockets, Playwright pages, HTTP keep-alives). The old behaviour —
+				// reject on a 10s ceiling that the per-step budgets alone could exceed
+				// — aborted healthy installs and, worse, recorded the abort as an
+				// install failure (see abortPendingInstall).
+				let cleanupTimer: NodeJS.Timeout | undefined;
+				const cleanupOutcome = await Promise.race([
+					prepareToInstall()
+						.then(() => "ok" as const)
+						.catch((err: unknown) => {
+							// Content suppressed: teardown errors may carry paths/tokens.
+							log("WARN", `install cleanup rejected (${err instanceof Error ? err.constructor.name : typeof err}) — proceeding, exit releases the rest`);
+							return "failed" as const;
+						}),
+					new Promise<"timeout">((resolve) => {
+						cleanupTimer = setTimeout(() => resolve("timeout"), PREPARE_INSTALL_TIMEOUT_MS);
+					}),
 				]);
+				if (cleanupTimer) clearTimeout(cleanupTimer);
+				if (cleanupOutcome === "timeout") {
+					log("WARN", `install cleanup exceeded ${PREPARE_INSTALL_TIMEOUT_MS >= 1_000 ? `${Math.round(PREPARE_INSTALL_TIMEOUT_MS / 1_000)}s` : `${PREPARE_INSTALL_TIMEOUT_MS}ms`} — proceeding with install; exit releases remaining handles`);
+				} else if (cleanupOutcome === "failed") {
+					// A rejected teardown still installs: the watchdog + forced exit
+					// own the NSIS handover from here.
+					log("WARN", "install cleanup incomplete — continuing to watchdog handover");
+				}
 			}
 			// Arm the watchdog synchronously (spawnSync — blocking). When this
 			// returns, the watchdog either exists OUTSIDE our process tree
@@ -1141,6 +1236,12 @@ export function quitAndInstall(): void {	if (!enabled() || installing) return;
 			// child ("detached" — caller must skip the tree-kill), or every
 			// mechanism failed ("failed" — legacy fallback below).
 			const armed = startInstallWatchdog();
+			// Remember whether the watchdog owns the attempt: `app.quit()` throwing
+			// AFTER a successful arm must NOT drop the pending marker, because the
+			// watchdog will still run the installer once this PID dies — that is a
+			// real attempt whose failure needs counting at next startup
+			// (subagent review P1-3).
+			handoverArmed = armed !== "failed";
 
 			const hardExitTimer = setTimeout(() => {
 				// Forced exit: outcome is unknowable from here, and the watchdog
@@ -1164,6 +1265,24 @@ export function quitAndInstall(): void {	if (!enabled() || installing) return;
 				// risk: a possible hang beats a certain outage.
 				log("ERROR", "watchdog arm failed on every mechanism — falling back to legacy quitAndInstall (wedge risk accepted)");
 				autoUpdater.quitAndInstall(true, false);
+				// electron-updater's install() swallows its own errors and returns
+				// false WITHOUT quitting in that case. Nothing would then end the IM
+				// drain or clear `installing`: the robot answered 「系统正在安装应用
+				// 更新」 forever and the pending marker turned into a phantom failure
+				// (subagent review P2-3). Reclaim the app if no quit happened.
+				legacyRecoveryTimer = setTimeout(() => {
+					if (installing === false) return;
+					log("ERROR", "legacy install fallback never quit the app — reclaiming (drain off, installing reset, pending dropped)");
+					installing = false;
+					endDrain?.();
+					abortPendingInstall();
+					setState({
+						phase: "error",
+						currentVersion: app.getVersion(),
+						message: "自动安装未能启动（安装器未接手）。请手动运行安装包，或稍后重试。",
+					});
+				}, LEGACY_HANDOVER_RECOVERY_MS);
+				legacyRecoveryTimer.unref?.();
 				return;
 			}
 			// The app NEVER invokes electron-updater's NSIS path: it starts the
@@ -1177,10 +1296,17 @@ export function quitAndInstall(): void {	if (!enabled() || installing) return;
 			app.quit();
 		} catch (err) {
 			installing = false;
+			if (legacyRecoveryTimer) clearTimeout(legacyRecoveryTimer);
 			endDrain?.();
 			const message = err instanceof Error ? err.message : String(err);
 			log("ERROR", `install preparation failed: ${message}`);
-			recordFailure(targetVersion, message);
+			// NOT an install failure (v0.2.172): nothing was installed, so recording
+			// it inflated the per-version and machine-wide breakers until
+			// auto-install switched itself off. Drop the pending marker ONLY when no
+			// watchdog owns the attempt — with an armed watchdog the install still
+			// runs after we die, and its failure must be counted at next startup
+			// (subagent review P1-3).
+			dropPendingMarkerForAbort(handoverArmed);
 			setState({ phase: "error", currentVersion: app.getVersion(), message: `安装失败：${message}` });
 		}
 	})();
