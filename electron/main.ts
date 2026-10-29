@@ -12,6 +12,8 @@ import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, renameSy
 import path from "node:path";
 import util from "node:util";
 import { runInstallTeardown } from "./install-cleanup.js";
+import { formatRecoveredNote, planRecoveredDelivery } from "../src/engine/durable/recovered-delivery.js";
+import { createWorkProgressNotifier, createRunProgressNotifier, resolveWorkProgressTarget } from "../src/scheduler/progress-wiring.js";
 import { openDatabase, closeDatabase } from "../src/db/sqlite.js";
 import { ConfigStore, normalizeModelConfig, type ExternalProviderConfig, type Supplier } from "../src/db/config-store.js";
 import { HistoryStore } from "../src/db/history-store.js";
@@ -24,7 +26,6 @@ import { WorkService, buildWorkLearning } from "../src/scheduler/work-service.js
 import { isAdmin, resolveRole } from "../src/security/permissions.js";
 import { SchedulerService, shouldPushScheduledResult, annotateLatePush } from "../src/scheduler/scheduler-service.js";
 import { normalizeProgressIntervalMin } from "../src/scheduler/progress-notify.js";
-import { createRunProgressNotifier, createWorkProgressNotifier } from "../src/scheduler/progress-wiring.js";
 import {
 	type AutonomousChainState,
 	buildAutonomousTurnPrefix,
@@ -1003,15 +1004,40 @@ ${tailForProgress(decision.text)}`;
 				// A crash between "pushed" and "recorded" leaves the ledger in
 				// `attempting`, which reports `uncertain` and refuses to re-send — the
 				// user never receives the same recovered answer twice.
-				if (history.isReadOnly(conversationId)) {
-					const pushed = await im.pushToConversation(conversationId, result.reply, {
+				// Where the recovered answer belongs (v0.2.174). Window conversations
+				// (work:<itemId> / sched:<taskId>:<runId>) are not read-only and are
+				// watched by nobody, so recovery used to report into a console
+				// conversation the operator never opens — "recovery never happened".
+				// User ruling: route it back to the task's source conversation.
+				const plan = planRecoveredDelivery(conversationId);
+				const deliver = async (target: string, text: string) => {
+					const pushed = await im.pushToConversation(target, text, {
 						occurrenceId,
 						kind: "durable-recovered",
 					});
 					if (pushed.uncertain) {
-						console.warn(`[durable] recovered reply delivery UNKNOWN for ${conversationId} (${occurrenceId}) — not re-sent; needs manual check`);
+						console.warn(`[durable] recovered reply delivery UNKNOWN for ${target} (${occurrenceId}) — not re-sent; needs manual check`);
 					} else if (!pushed.ok) {
-						console.warn(`[durable] recovered reply not delivered to ${conversationId} (${occurrenceId}): ${pushed.error ?? "unknown"}`);
+						console.warn(`[durable] recovered reply not delivered to ${target} (${occurrenceId}): ${pushed.error ?? "unknown"}`);
+					}
+				};
+				if (plan.kind === "direct") {
+					// IM / console conversations keep the original behaviour: the answer
+					// is theirs, unchanged.
+					if (history.isReadOnly(plan.conversationId)) await deliver(plan.conversationId, result.reply);
+				} else if (plan.kind === "task-source") {
+					// The window's own answer is an internal transcript; the source
+					// conversation gets the annotated summary instead.
+					const row = plan.task === "work"
+						? workItemStore.get(plan.taskId)
+						: scheduledTaskStore.get(plan.taskId);
+					const target = plan.task === "work"
+						? resolveWorkProgressTarget({ origin_conversation: (row as { origin_conversation?: string | null } | undefined)?.origin_conversation, created_by: (row as { created_by?: string | null } | undefined)?.created_by })
+						: ((row as { conversation_id?: string | null } | undefined)?.conversation_id ?? null);
+					if (!target) {
+						console.warn(`[durable] recovered ${plan.task} ${plan.taskId} has no source conversation — nothing pushed`);
+					} else {
+						await deliver(target, formatRecoveredNote({ title: (row as { title?: string } | undefined)?.title, reply: result.reply }));
 					}
 				}
 			});
