@@ -269,6 +269,26 @@ export class HistoryStore {
 	}
 
 	/** Idempotent projection from a durable execution into the UI transcript. */
+
+	/**
+	 * Delete persisted DELIVERY-TIME notices (the durable fallbacks) from every
+	 * conversation's history. They are not employee speech, and replaying them into
+	 * a durable transcript taught the model to imitate them (box, 2026-10-29: a
+	 * session answered with "执行已暂停，请检查恢复状态。" verbatim after three such
+	 * notices had accumulated in its imported history). Idempotent: returns the
+	 * number of rows removed, so a second run removes nothing.
+	 */
+	sweepSyntheticFallbackReplies(): number {
+		const rows = this.db.prepare("SELECT id, content FROM messages WHERE role = 'assistant'").all() as { id: string; content: string }[];
+		const normalized = (text: string) => (text ?? "").replace(/\s+/g, "").trim();
+		// Same distinctive-fragment rule as the durable import: a reworded notice must
+		// not silently stop being swept.
+		const doomed = rows.filter((row) => /执行已暂停|模型没有返回任何内容|请检查恢复状态/.test(normalized(row.content))).map((row) => row.id);
+		if (doomed.length === 0) return 0;
+		const del = this.db.prepare("DELETE FROM messages WHERE id = ?");
+		for (const id of doomed) del.run(id);
+		return doomed.length;
+	}
 	appendMessageOnce(conversationId: string, role: "user" | "assistant", content: string, id: string): void {
 		this.db.prepare("INSERT OR IGNORE INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)").run(id, conversationId, role, content, Date.now());
 		this.touch(conversationId);

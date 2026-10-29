@@ -1185,6 +1185,12 @@ ${tailForProgress(decision.text)}`;
 	// the task list; age out the untouched ones before the UI lists them.
 	pruneOneOffConversations();
 	pruneOldMessages();
+	// One-time, idempotent: durable imports a conversation's persisted history, and
+	// a persisted DELIVERY-TIME notice ("执行已暂停…") taught the model to imitate it
+	// (box, 2026-10-29: a session answered with that text verbatim). Sweep them so no
+	// new session replays them into a transcript.
+	const sweptNotices = history.sweepSyntheticFallbackReplies();
+	if (sweptNotices > 0) console.log(`[main] swept ${sweptNotices} persisted fallback notice(s) from conversation history`);
 	// Delivery ledger: keep terminal rows long past any retry horizon (dropping a
 	// `delivered` row re-opens that occurrence for a duplicate), then age them out.
 	try {
