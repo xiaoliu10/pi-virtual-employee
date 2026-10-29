@@ -11,6 +11,7 @@ import { mkdir, readFile, writeFile, copyFile, readdir, rm } from "node:fs/promi
 import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import util from "node:util";
+import { CLEANUP_BUDGETS, runCleanupStep } from "./install-cleanup.js";
 import { openDatabase, closeDatabase } from "../src/db/sqlite.js";
 import { ConfigStore, normalizeModelConfig, type ExternalProviderConfig, type Supplier } from "../src/db/config-store.js";
 import { HistoryStore } from "../src/db/history-store.js";
@@ -2078,28 +2079,31 @@ ${tailForProgress(decision.text)}`;
 		prepareToInstall: async () => {
 			// electron-updater spawns NSIS before app.quit(). Release every process /
 			// listener that can keep the old app tree alive before calling it.
-			await stopWork();
+			//
+			// EVERY await here is individually bounded (v0.2.172). Before this, the
+			// steps ran unbounded in sequence under ONE 10s ceiling while the durable
+			// close alone was allowed 8s — a box with live IM sockets, a Playwright
+			// page and running task windows blew the ceiling and the install aborted
+			// with 「安装前清理超过 10 秒」, then counted that abort as an install
+			// failure. Teardown is best-effort: process exit releases any handle a
+			// step fails to release, so no step may fail the install.
+			await runCleanupStep("stop work windows", CLEANUP_BUDGETS.stopWork, () => stopWork());
 			// Durable host BEFORE the DB closes: close() waits for running task code
 			// to return and writes the final checkpoint, so an upgrade is a graceful
-			// stop (resumable, not counted as a crash). Bounded so a wedged task
-			// cannot hold the installer open — partial progress is already committed.
-			if (durableHost) {
-				await Promise.race([
-					durableHost.close().catch(() => {}),
-					new Promise<void>((resolve) => setTimeout(resolve, 8_000)),
-				]);
-			}
+			// stop (resumable, not counted as a crash). Partial progress is already
+			// committed, so abandoning a wedged close loses nothing committed.
+			if (durableHost) await runCleanupStep("durable host close", CLEANUP_BUDGETS.durableClose, () => durableHost?.close());
 			scheduler.stop();
 			disposeShellCommands(config);
-			await im.stopAll();
-			await browser.close();
-			await computer.close();
-			await new Promise<void>((resolve) => {
+			await runCleanupStep("im stopAll", CLEANUP_BUDGETS.imStopAll, () => im.stopAll());
+			await runCleanupStep("browser close", CLEANUP_BUDGETS.browserClose, () => browser.close());
+			await runCleanupStep("computer close", CLEANUP_BUDGETS.computerClose, () => computer.close());
+			await runCleanupStep("http server close", CLEANUP_BUDGETS.httpClose, () => new Promise<void>((resolve) => {
 				if (!httpServer.listening) return resolve();
 				httpServer.close(() => resolve());
 				// Node ≥18: close keep-alive connections so close() cannot hang.
 				httpServer.closeAllConnections?.();
-			});
+			}));
 			// Close the SQLite handle LAST so the better-sqlite3 .node addon is
 			// unmapped from the process before NSIS overwrites resources/native.
 			// An open handle keeps the DB + WAL locked (stalls the installer) and

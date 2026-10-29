@@ -38,7 +38,11 @@ const IDLE_POLL_MS = 60_000;
 /** Unattended mode: give up waiting for idle after this long. */
 const IDLE_WAIT_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 /** Let the final IM/HTTP response flush after draining new work. */
-const REPLY_FLUSH_DELAY_MS = 5_000;
+/** Final-reply flush window before teardown starts. Env-injectable so the
+ *  install-preflight regression suite does not spend 5s per case. */
+const REPLY_FLUSH_DELAY_MS = Number(process.env.VE_INSTALL_REPLY_FLUSH_MS) > 0
+	? Number(process.env.VE_INSTALL_REPLY_FLUSH_MS)
+	: 5_000;
 /** Watchdog: how long the app waits for its own graceful exit before the hard
  *  tree-kill hands the install to the detached watchdog. */
 const APP_EXIT_GRACE_MS = 10_000;
@@ -59,6 +63,13 @@ const MAX_ATTEMPTS_PER_VERSION = 2;
  * work) until one successful manual repair install clears the streak.
  */
 const MAX_CONSECUTIVE_INSTALL_FAILURES = 2;
+/** Outer ceiling for the whole install teardown. MUST stay above the sum of
+ *  every per-step budget in electron/install-cleanup.ts (27s), otherwise one
+ *  slow step starves the rest and the install aborts on OUR cleanup — which is
+ *  exactly how a healthy box reached 「安装前清理超过 10 秒」 (v0.2.172). */
+const PREPARE_INSTALL_TIMEOUT_MS = Number(process.env.VE_INSTALL_PREPARE_TIMEOUT_MS) > 0
+	? Number(process.env.VE_INSTALL_PREPARE_TIMEOUT_MS)
+	: 35_000;
 // #endregion immutable:updater-breakers
 
 interface FailureRecord {
@@ -165,6 +176,29 @@ function markPendingInstall(target: string): void {
 	const map = loadFailures();
 	saveFailures({ ...map, pending: { target, fromVersion: app.getVersion(), startedAt: new Date().toISOString() } });
 	log("INFO", `pending install recorded: ${app.getVersion()} -> ${target}`);
+}
+
+/**
+ * Drop the in-flight marker when we abort BEFORE quitting (v0.2.172).
+ *
+ * markPendingInstall() is written first so a real attempt that never reaches the
+ * target is counted at next startup. But when the attempt is abandoned in-process
+ * (install preparation failed, app never quit), leaving the marker makes startup
+ * reconciliation count the SAME abandoned attempt a second time — one field abort
+ * appeared as 「连续 2 次跨版本失败」 and tripped the machine breaker, disabling
+ * auto-install forever. Clearing it keeps the counter honest: one attempt, at
+ * most one failure.
+ */
+function abortPendingInstall(): void {
+	try {
+		const map = loadFailures();
+		if (!map.pending) return;
+		log("WARN", `install preparation aborted before quit: dropping pending marker for ${map.pending.target} (no attempt was made)`);
+		const { pending: _drop, ...rest } = map;
+		saveFailures(rest);
+	} catch (err) {
+		log("WARN", `failed to drop pending install marker: ${err instanceof Error ? err.message : String(err)}`);
+	}
 }
 
 /**
@@ -1128,12 +1162,34 @@ export function quitAndInstall(): void {	if (!enabled() || installing) return;
 			beginDrain?.();
 			await new Promise((resolve) => setTimeout(resolve, REPLY_FLUSH_DELAY_MS));
 			if (prepareToInstall) {
-				await Promise.race([
-					prepareToInstall(),
-					new Promise<never>((_, reject) =>
-						setTimeout(() => reject(new Error("安装前清理超过 10 秒")), 10_000),
-					),
+				// Teardown is best-effort and CANNOT fail the install (v0.2.172):
+				// our own process quits right after this, and process exit releases
+				// every handle a slow step failed to release (DB addon mapping, IM
+				// sockets, Playwright pages, HTTP keep-alives). The old behaviour —
+				// reject on a 10s ceiling that the per-step budgets alone could exceed
+				// — aborted healthy installs and, worse, recorded the abort as an
+				// install failure (see abortPendingInstall).
+				let cleanupTimer: NodeJS.Timeout | undefined;
+				const cleanupOutcome = await Promise.race([
+					prepareToInstall()
+						.then(() => "ok" as const)
+						.catch((err: unknown) => {
+							// Content suppressed: teardown errors may carry paths/tokens.
+							log("WARN", `install cleanup rejected (${err instanceof Error ? err.constructor.name : typeof err}) — proceeding, exit releases the rest`);
+							return "failed" as const;
+						}),
+					new Promise<"timeout">((resolve) => {
+						cleanupTimer = setTimeout(() => resolve("timeout"), PREPARE_INSTALL_TIMEOUT_MS);
+					}),
 				]);
+				if (cleanupTimer) clearTimeout(cleanupTimer);
+				if (cleanupOutcome === "timeout") {
+					log("WARN", `install cleanup exceeded ${Math.round(PREPARE_INSTALL_TIMEOUT_MS / 1000)}s — proceeding with install; exit releases remaining handles`);
+				} else if (cleanupOutcome === "failed") {
+					// A rejected teardown still installs: the watchdog + forced exit
+					// own the NSIS handover from here.
+					log("WARN", "install cleanup incomplete — continuing to watchdog handover");
+				}
 			}
 			// Arm the watchdog synchronously (spawnSync — blocking). When this
 			// returns, the watchdog either exists OUTSIDE our process tree
@@ -1180,7 +1236,11 @@ export function quitAndInstall(): void {	if (!enabled() || installing) return;
 			endDrain?.();
 			const message = err instanceof Error ? err.message : String(err);
 			log("ERROR", `install preparation failed: ${message}`);
-			recordFailure(targetVersion, message);
+			// NOT an install failure (v0.2.172): we never quit, so NSIS never ran.
+			// Recording it inflated the per-version and machine-wide breakers until
+			// auto-install switched itself off, and the leftover pending marker made
+			// startup reconciliation count the same aborted attempt twice.
+			abortPendingInstall();
 			setState({ phase: "error", currentVersion: app.getVersion(), message: `安装失败：${message}` });
 		}
 	})();
