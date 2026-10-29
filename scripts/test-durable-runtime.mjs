@@ -127,3 +127,44 @@ test('a second empty completion settles with the honest empty-answer notice', as
   assert.equal(result.error,'durable empty answer');
  }finally{await runtime.close();}
 });
+
+test('persisted fallback notices are not replayed into the durable transcript', async t => {
+ const history=makeHistory(t);
+ history.ensureConversation('conv-notice','带通知的会话');
+ history.appendMessage('conv-notice','user','帮我查对账');
+ history.appendMessage('conv-notice','assistant','执行已暂停，请检查恢复状态。'); // 历史里的投递通知
+ history.appendMessage('conv-notice','assistant','本轮执行已结束，但模型没有返回任何内容（网关可能中断了响应）。请重新描述你的需求，我会再执行一次。');
+ const faux=fauxProvider();
+ const sessions=new Map();
+ const session=id=>{ if(!sessions.has(id)) sessions.set(id,new Agent({streamFn:faux.provider.streamSimple,sessionId:id,initialState:{model:faux.provider.getModels()[0],systemPrompt:'test'}})); return sessions.get(id); };
+ const tools=()=>[];
+ faux.setResponses([fauxAssistantMessage('对账结果：3 条异常')]);
+ const runtime=await DurableRuntime.open({userDataDir:dir,history,session,tools,stream:(id,opts,messages)=>{
+  // transcript 里不得出现投递通知（否则模型会模仿）
+  const tx=JSON.stringify(messages);
+  assert(!tx.includes('执行已暂停，请检查恢复状态'),'fallback notice must not be imported');
+  assert(!tx.includes('模型没有返回任何内容'),'empty-answer notice must not be imported');
+  assert(tx.includes('帮我查对账'),'the user question must stay');
+  return faux.provider.streamSimple(faux.provider.getModels()[0],{messages},opts);
+ },withActor:async(id,ctx,text,run)=>run(),onRecovered:async()=>{}});
+ try{
+  const result=await runtime.send(session('conv-notice'),'再查一次');
+  assert.equal(result.reply,'对账结果：3 条异常');
+  assert.ok(!result.reply.includes('执行已暂停'),'the model must not imitate the swept notice');
+ }finally{await runtime.close();}
+});
+
+test('sweepSyntheticFallbackReplies removes persisted notices idempotently', t => {
+ const db=new DatabaseSync(':memory:');
+ db.exec(`CREATE TABLE conversations (id TEXT PRIMARY KEY,title TEXT,created_at INTEGER,updated_at INTEGER,origin TEXT,model_supplier_id TEXT,model_model_id TEXT); CREATE TABLE messages (id TEXT PRIMARY KEY,conversation_id TEXT,role TEXT,content TEXT,created_at INTEGER);`);
+ const store=new HistoryStore(db);
+ store.ensureConversation('c1','会话一');
+ store.appendMessage('c1','user','问题');
+ store.appendMessage('c1','assistant','执行已暂停，请检查恢复状态。');
+ store.appendMessage('c1','assistant','正常答复：已完成');
+ store.appendMessage('c1','assistant','\n\n执行已暂停，请检查恢复状态。'); // 带空白的同一句
+ assert.equal(store.sweepSyntheticFallbackReplies(),2);
+ assert.equal(store.sweepSyntheticFallbackReplies(),0,'idempotent');
+ assert.deepEqual(store.listMessages('c1').map(m=>m.content),['问题','正常答复：已完成'],'user question and real reply survive');
+ db.close();
+});

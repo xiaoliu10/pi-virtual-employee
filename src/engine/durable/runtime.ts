@@ -35,6 +35,23 @@ const RECOVERY_WAIT_MS = 10 * 60_000;
 const ZERO_USAGE = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 /** A run that DID finish but produced no text at all (see result()). */
 const EMPTY_ANSWER_REPLY = "本次执行已结束，但模型没有返回任何内容（网关可能中断了响应）。请重新描述你的需求，我会再执行一次。";
+/**
+ * Replies THIS runtime synthesizes when a run produced no answer. They are
+ * delivery-time notices, not employee speech — and every one of them that gets
+ * persisted into the conversation history teaches the model to imitate it:
+ * measured on the box (13:11, v0.2.168), a session whose imported history
+ * carried three "执行已暂停" notices was answered with exactly that text
+ * (stop=stop, 12 tokens) — the model copied its own transcript. So the durable
+ * import drops them instead of replaying them into the transcript.
+ */
+const SYNTHETIC_FALLBACK_REPLIES = ["执行已暂停，请检查恢复状态。", EMPTY_ANSWER_REPLY];
+function isSyntheticFallbackReply(text: string): boolean {
+	const normalized = (text ?? "").replace(/\s+/g, "").trim();
+	// Match on the DISTINCTIVE FRAGMENTS, not the whole sentence: the notice text
+	// is free to be reworded (it already was once), and a rewritten notice must not
+	// silently stop being recognized.
+	return /执行已暂停|模型没有返回任何内容|请检查恢复状态/.test(normalized);
+}
 function withUsage(message: AssistantMessage): AssistantMessage {
 	return message.usage ? message : { ...message, usage: { ...ZERO_USAGE } };
 }
@@ -197,6 +214,10 @@ export class DurableRuntime {
 			// Import only on a NEW execution; resumed executions use their complete
 			// stored tool transcript and never rehydrate lossy UI messages.
 			for (const row of this.opts.history.listMessages(id)) {
+				// Delivery-time notices are not employee speech: importing them would
+				// teach the model to imitate the fallback (observed on the box). The
+				// user's own question stays, so the exchange keeps its context.
+				if (row.role === "assistant" && isSyntheticFallbackReply(row.content)) continue;
 				// The history table stores no usage; imported assistant messages must
 				// still satisfy the durable contract (see ZERO_USAGE above) so any
 				// usage aggregation over the transcript cannot trip on undefined.
