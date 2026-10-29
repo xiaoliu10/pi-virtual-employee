@@ -51,9 +51,6 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	 * references unregistered tools (save_to_knowledge needs learn enabled). */
 	kbFeatures?(): { search: boolean; learn: boolean };
 	learn?(item: WorkItemRow, result: string): void | Promise<void>;
-	/** Item ids whose windows the durable layer recovered at startup; they are
-	 *  excluded from the blanket "app exited mid-window" takeover. */
-	recoveredItemIds?: () => readonly string[];
 	budget?: { maxTurns: number; maxMinutes: number };
 	/** Window progress broadcaster (v0.2.171): main.ts injects the same
 	 * ProgressNotifier factory the scheduled-task runner uses, so a work window
@@ -128,10 +125,7 @@ export class WorkService<Session extends WorkSession> {
 	}
 	start(): void {
 		if (this.running) return;
-		// Items the durable layer already finished recovering must NOT be stamped
-		// 「应用曾在执行中退出」 — their turn completed after the crash, only the
-		// runner's outcome write was lost with the process (v0.2.174).
-		if (!this.recovered) { this.opts.store.recoverWorking(this.opts.recoveredItemIds?.() ?? []); this.recovered = true; }
+		if (!this.recovered) { this.opts.store.recoverWorking(); this.recovered = true; }
 		this.running = true;
 		this.unsubscribe = this.opts.store.subscribe((id) => {
 			if (id && id === this.active?.id) {
