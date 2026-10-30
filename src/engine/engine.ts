@@ -2524,8 +2524,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 					undefined, // env
 					SUMMARIZER_RETRY,
 				);
-			} catch {
-				// fall through to the deterministic fallback below
+			} catch (err) {
+				// A silent catch here cost a whole day of diagnosis (field 2026-10-30,
+				// box Nova): the side pass failed on EVERY beat, the degraded backoff
+				// suppressed the notes, and nothing in the logs said why. The
+				// deterministic fallback keeps the push alive — but the REASON must
+				// land in the log, or the next "为什么没有进度汇报" starts blind.
+				console.warn(`[engine] progress side pass failed (${err instanceof Error ? err.name : typeof err}): ${err instanceof Error ? err.message : String(err)}`.slice(0, 300));
 			} finally {
 				if (conversationId) this.endSideLlmCall(conversationId);
 			}
