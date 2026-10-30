@@ -12,6 +12,7 @@ import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, renameSy
 import path from "node:path";
 import util from "node:util";
 import { runInstallTeardown } from "./install-cleanup.js";
+import { setConfiguredReportHosts } from "../src/im/credential-egress.js";
 
 /** How soon a crash-recovered work window re-opens: one normal turn later, not a retry storm. */
 const RECOVERED_WORK_DELAY_MS = 60_000;
@@ -2109,6 +2110,16 @@ ${tailForProgress(decision.text)}`;
 		return v === "download_only" ? "download_only" : v === true || v === "full" ? "full" : "off";
 	};
 	const firstAdminId = () => config.all().security.adminStaffIds[0];
+	// The egress gate's presigned-URL allowlist must include the host THIS
+	// deployment publishes report links on: reports.oss.endpoint is configurable
+	// (custom CNAME / CDN / self-hosted), and a hard-coded cloud-domain list
+	// redacted every report link on such a box (v0.2.175).
+	const syncReportHosts = () => {
+		const oss = config.all().reports.oss;
+		setConfiguredReportHosts([oss.endpoint, oss.region ? `${oss.bucket}.${oss.region}.aliyuncs.com` : ""].filter(Boolean));
+	};
+	syncReportHosts();
+
 	setupUnattended({
 		enabled: () => updateMode() !== "off",
 		installBlocked: () => updateMode() === "download_only",

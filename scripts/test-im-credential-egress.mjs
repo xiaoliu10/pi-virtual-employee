@@ -34,7 +34,7 @@ const bundle = join(dir, "egress.mjs");
 await build({
 	stdin: {
 		contents: `
-			export { containsConcreteCredential, gateOutboundText, CREDENTIAL_WITHHELD_NOTICE } from "./src/im/credential-egress.ts";
+			export { containsConcreteCredential, gateOutboundText, CREDENTIAL_WITHHELD_NOTICE, setConfiguredReportHosts } from "./src/im/credential-egress.ts";
 			export { DingtalkAdapter } from "./src/im/adapters/dingtalk.ts";
 			export { IMAdapterManager } from "./src/im/manager.ts";
 		`,
@@ -70,7 +70,7 @@ await build({
 		},
 	],
 });
-const { containsConcreteCredential, gateOutboundText, CREDENTIAL_WITHHELD_NOTICE, DingtalkAdapter, IMAdapterManager } =
+const { containsConcreteCredential, gateOutboundText, CREDENTIAL_WITHHELD_NOTICE, setConfiguredReportHosts, DingtalkAdapter, IMAdapterManager } =
 	await import(pathToFileURL(bundle).href);
 
 // ── Layer 1: pure policy ────────────────────────────────────────────────────
@@ -408,4 +408,52 @@ test("card-send failure falls back to markdown carrying the same gated text", as
 		restore();
 		await adapter.stop();
 	}
+});
+
+// ── v0.2.175: presigned links on a CONFIGURED endpoint host ─────────────
+// reports.oss.endpoint is configurable (its own docs name "an internal/CDN
+// domain"). The allowlist used to be the two cloud domains only, so a box
+// pointing OSS at a custom host had EVERY report link redacted in group pushes
+// (field 2026-10-29). The gate now accepts hosts the deployment configures —
+// without loosening the grant shape or the dot-boundary rule.
+const CUSTOM_SIG = "N9him7VHYYIEdIftaIY5iHWf2iU%3D";
+const linkOn = (host) => `https://${host}/reports/x/r.html?OSSAccessKeyId=LTAIZHYtKQegFGXe&Expires=1795654871&Signature=${CUSTOM_SIG}`;
+
+test("a presigned link on a configured report host is NOT redacted", () => {
+	setConfiguredReportHosts(["https://oss.orion-corp.com"]);
+	const url = linkOn("oss.orion-corp.com");
+	assert.equal(gateOutboundText(url, "restricted"), url, "the deployment's own report link must survive the gate");
+});
+
+test("without configuration the same custom host stays redacted (no blanket relaxation)", () => {
+	setConfiguredReportHosts([]);
+	const url = linkOn("oss.orion-corp.com");
+	assert.notEqual(gateOutboundText(url, "restricted"), url, "an unconfigured host keeps the original behaviour");
+});
+
+test("the configured host widens WHICH host, never the grant shape", () => {
+	setConfiguredReportHosts(["orion-corp.com"]);
+	// Same host, but a real password alongside the grant: still redacted.
+	const withPassword = `https://orion-corp.com/r.html?password=Hunter2Secret&OSSAccessKeyId=LTAIZHYtKQegFGXe&Signature=${CUSTOM_SIG}`;
+	const out = gateOutboundText(withPassword, "restricted");
+	assert.ok(!out.includes("Hunter2"), "a credential param on an exempt host is still redacted");
+	// Signature without the matching key id is not a grant.
+	const halfGrant = `https://orion-corp.com/r.html?Signature=${CUSTOM_SIG}`;
+	assert.notEqual(gateOutboundText(halfGrant, "restricted"), halfGrant, "a lone Signature param is not a presigned grant");
+});
+
+test("subdomains match, but a look-alike suffix does not", () => {
+	setConfiguredReportHosts(["orion-corp.com"]);
+	const sub = linkOn("cdn.orion-corp.com");
+	assert.equal(gateOutboundText(sub, "restricted"), sub, "a subdomain of a configured host qualifies");
+	const lookalike = linkOn("evilorion-corp.com");
+	assert.notEqual(gateOutboundText(lookalike, "restricted"), lookalike, "a string suffix is not a subdomain (dot boundary required)");
+	const parent = linkOn("orion.com");
+	assert.notEqual(gateOutboundText(parent, "restricted"), parent, "the parent domain is not covered by a child");
+});
+
+test("the cloud defaults keep working regardless of configuration", () => {
+	setConfiguredReportHosts([]);
+	const oss = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.html?OSSAccessKeyId=LTAIZHYtKQegFGXe&Expires=1795654871&Signature=N9him7VHYYIEdIftaIY5iHWf2iU%3D";
+	assert.equal(gateOutboundText(oss, "restricted"), oss, "aliyuncs.com needs no configuration");
 });

@@ -108,6 +108,48 @@ const URL_TOKEN_PARAM_SOURCE_BODY =
  * through; and only aliyuncs.com/amazonaws.com hosts qualify, so "Signature="
  * on an arbitrary host is never mistaken for a grant.
  */
+/**
+ * Extra hosts the deployment itself publishes report links on (v0.2.175).
+ *
+ * The default allowlist below is the two cloud object-storage domains. But
+ * `reports.oss.endpoint` is configurable — its own docs name "an internal/CDN
+ * domain" as a supported value — and a deployment pointing OSS at a custom
+ * host (CNAME, CDN, self-hosted MinIO) produced presigned links on a host the
+ * gate refused to recognise, so every report link in a group was redacted
+ * (field 2026-10-29, box agent "orion"). The gate cannot hard-code what the
+ * config declares; main.ts seeds this from `config.reports.oss.endpoint`.
+ *
+ * Security note: this only widens WHICH host may carry a grant, never the
+ * grant shape. The two-factor rule stays — a host listed here still needs the
+ * matching param pair AND every non-grant credential param is still redacted.
+ */
+const configuredReportHosts = new Set<string>();
+
+/** Register hosts (from config, never from message content) whose presigned URLs are legitimate. */
+export function setConfiguredReportHosts(hosts: Iterable<string>): void {
+	configuredReportHosts.clear();
+	for (const raw of hosts) {
+		const host = hostFrom(raw);
+		if (host) configuredReportHosts.add(host);
+	}
+}
+
+function hostFrom(raw: string | undefined | null): string {
+	const value = raw?.trim();
+	if (!value) return "";
+	try {
+		// Accept a bare host ("oss.example.com") or a full endpoint URL.
+		return (value.includes("://") ? new URL(value) : new URL(`https://${value}`)).hostname.toLowerCase();
+	} catch {
+		return "";
+	}
+}
+
+/** True when `host` is `suffix` or a subdomain of it (never a mere string suffix). */
+function hostMatches(host: string, suffix: string): boolean {
+	return host === suffix || host.endsWith(`.${suffix}`);
+}
+
 function isPresignedObjectUrl(url: string): boolean {
 	// Host allowlist first (review P2): without it, ANY host's "Signature=<real
 	// secret>" param would be treated as an access grant and left in place.
@@ -118,7 +160,15 @@ function isPresignedObjectUrl(url: string): boolean {
 	} catch {
 		return false;
 	}
-	if (!host.endsWith(".aliyuncs.com") && !host.endsWith(".amazonaws.com")) return false;
+	const knownCloudHost = hostMatches(host, "aliyuncs.com") || hostMatches(host, "amazonaws.com");
+	// One-directional on purpose: the URL's host must be, or be a subdomain of,
+	// a CONFIGURED host. The reverse direction would let a longer configured
+	// value ("evilorion-corp.com") vouch for a shorter message host
+	// ("orion-corp.com" as a string suffix) — and, with a bare suffix test,
+	// "evilorion-corp.com" would match "orion-corp.com". hostMatches anchors on
+	// a dot boundary, so neither can happen.
+	const configuredHost = [...configuredReportHosts].some((h) => hostMatches(host, h));
+	if (!knownCloudHost && !configuredHost) return false;
 	return (
 		(/[?&]OSSAccessKeyId=/.test(url) && /[?&]Signature=/.test(url)) ||
 		(/[?&]X-Amz-Signature=/.test(url) && /[?&]X-Amz-Credential=/.test(url))
