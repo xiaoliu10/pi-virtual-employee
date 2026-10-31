@@ -16,6 +16,22 @@ const SHARED_CSS = `
 * { box-sizing: border-box; margin: 0; padding: 0; }
 button { font-family: inherit; cursor: pointer; }
 input, textarea { font-family: inherit; }
+/* ── 过程展示（v0.2.179）：工具调用行 / 思考折叠 / 流式光标 ── */
+.step { display:flex; align-items:center; gap:6px; margin:4px 0; font-size:12px; color:#86909c; }
+.step .st-ico { font-size:12px; }
+.step .st-spin { display:inline-block; width:14px; text-align:center; color:#4f6ef7; }
+.step .st-spin::after { content:"⋯"; }
+.step.ok .st-spin { color:#00b42a; }
+.step.ok .st-spin::after { content:"✓"; }
+.step.bad { color:#f53f3f; }
+.step.bad .st-spin { color:#f53f3f; }
+.step.bad .st-spin::after { content:"✗"; }
+.think { margin:4px 0; border:1px solid #eef0f4; border-radius:8px; overflow:hidden; }
+.think-h { padding:6px 10px; font-size:12px; color:#86909c; cursor:pointer; user-select:none; background:#f7f8fa; }
+.think-b { padding:8px 10px; font-size:12px; color:#4e5969; white-space:pre-wrap; word-break:break-word; max-height:220px; overflow-y:auto; background:#fafbfc; }
+.think-b.hidden { display:none; }
+.msg.streaming::after { content:"▍"; color:#4f6ef7; animation:ve-blink 1s step-start infinite; }
+@keyframes ve-blink { 50% { opacity:0; }
 `;
 
 /**
@@ -150,6 +166,90 @@ export function renderWidgetLoader(): string {
     });
   }
 
+  // ── 过程展示（v0.2.179）：流式文本 / 思考 / 工具调用，参考桌面控制台 ──
+  // 一个回合可能跑几分钟且中间有多次工具调用；只等最终回复的交互在业务
+  // 页面里等于「点了没反应」。渲染规则：
+  //   thinking_delta → 折叠的「思考过程」面板（灰色小字，默认收起）
+  //   delta          → 流式追加到当前 AI 气泡
+  //   tool_start/end → 「调用工具 …」过程行，进行中转圈，结束标 ✓/✗
+  //   replace        → 服务端凭据门禁整条替换时，重置当前气泡
+  function streamChat(messageText, handlers) {
+    fetch(base + "/api/widget/chat", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + token,
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "X-VE-Ticket": ticket
+      },
+      body: JSON.stringify({ message: messageText })
+    }).then(function (res) {
+      if (!res.ok || !res.body) {
+        return res.json().catch(function () { return {}; }).then(function (d) {
+          handlers.onerror((d && d.error) || ("请求失败（" + res.status + "）"));
+        });
+      }
+      // The durable kernel serves plain JSON (no process events exist there);
+      // render it through the same path as a final reply instead of hanging.
+      var ctype = res.headers.get("content-type") || "";
+      if (ctype.indexOf("text/event-stream") === -1) {
+        return res.json().then(function (d) {
+          if (d && d.reply != null) handlers.onevent({ type: "replace", text: d.reply });
+          else if (d && d.error) { handlers.onerror(d.error); return; }
+          handlers.onend();
+        });
+      }
+      var reader = res.body.getReader();
+      var dec = new TextDecoder();
+      var buf = "";
+      function pump() {
+        return reader.read().then(function (chunk) {
+          if (chunk.done) { handlers.onend(); return; }
+          buf += dec.decode(chunk.value, { stream: true });
+          var frames = buf.split("\\n\\n");
+          buf = frames.pop();
+          frames.forEach(function (frame) {
+            var line = frame.split("\\n").find(function (l) { return l.indexOf("data:") === 0; });
+            if (!line) return;
+            try { handlers.onevent(JSON.parse(line.slice(5))); } catch (e) { /* 忽略坏帧 */ }
+          });
+          return pump();
+        });
+      }
+      return pump();
+    }).catch(function (e) { handlers.onerror("网络错误：" + e); });
+  }
+
+  function addStep(msgs, label) {
+    var step = document.createElement("div");
+    step.className = "step";
+    step.innerHTML = '<span class="st-ico">⚙</span><span class="st-txt"></span><span class="st-spin"></span>';
+    step.querySelector(".st-txt").textContent = label;
+    msgs.appendChild(step);
+    scrollEnd();
+    return step;
+  }
+  function finishStep(step, label, ok, ms) {
+    if (!step) return;
+    step.querySelector(".st-txt").textContent = label + (ms != null ? "（" + Math.round(ms / 100) / 10 + "s）" : "");
+    step.querySelector(".st-spin").textContent = ok ? "✓" : "✗";
+    step.classList.add(ok ? "ok" : "bad");
+  }
+  function addThinking(msgs) {
+    var wrap = document.createElement("div");
+    wrap.className = "think";
+    var head = document.createElement("div");
+    head.className = "think-h";
+    head.textContent = "💭 思考过程";
+    var bodyEl = document.createElement("div");
+    bodyEl.className = "think-b hidden";
+    head.addEventListener("click", function () { bodyEl.classList.toggle("hidden"); });
+    wrap.appendChild(head); wrap.appendChild(bodyEl);
+    msgs.appendChild(wrap);
+    scrollEnd();
+    return bodyEl;
+  }
+
   function send(text) {
     text = (text || "").trim();
     if (!text || state.busy) return;
@@ -162,15 +262,80 @@ export function renderWidgetLoader(): string {
     state.busy = true;
     q(".send").disabled = true;
     addMsg("me", text);
-    var pending = addMsg("ai", "正在思考…");
-    api("/api/widget/chat", { method: "POST", body: JSON.stringify({ message: text, user: user }) })
-      .then(function (r) {
-        pending.remove();
-        if (!r.ok) addMsg("err", (r.data && r.data.error) || ("请求失败（" + r.status + "）"));
-        else addMsg("ai", r.data.reply || "（空回复）");
-      })
-      .catch(function (e) { pending.remove(); addMsg("err", "网络错误：" + e); })
-      .finally(function () { state.busy = false; q(".send").disabled = false; q(".box").focus(); });
+    // Placeholder keeps legacy/durable kernels (no process events) readable —
+    // the first real event clears it.
+    var box = addMsg("ai", "正在思考…");
+    box.classList.add("streaming");
+    var m = msgs();
+    var aiText = "";          // 当前气泡累计文本
+    var thinkEl = null;       // 思考面板
+    var thinkText = "";
+    var tools = {};           // toolCallId → step 元素
+    var lastTool = null;
+    var ended = false;
+
+    function finish() {
+      if (ended) return;
+      ended = true;
+      box.classList.remove("streaming");
+      if (!box.textContent || box.textContent === "正在思考…") box.textContent = aiText || "（空回复）";
+      state.busy = false;
+      q(".send").disabled = false;
+      q(".box").focus();
+      scrollEnd();
+    }
+
+    streamChat(text, {
+      onerror: function (msg) { box.remove(); addMsg("err", msg); finish(); },
+      onend: function () { finish(); },
+      onevent: function (ev) {
+        switch (ev.type) {
+          case "delta":
+            aiText += ev.text;
+            box.textContent = aiText;
+            scrollEnd();
+            break;
+          case "replace":
+            aiText = ev.text;
+            box.textContent = aiText || "（内容已按安全策略隐藏）";
+            scrollEnd();
+            break;
+          case "tool_start":
+            if (!aiText) box.textContent = "";
+            lastTool = addStep(m, "调用工具 " + ev.toolName + " …");
+            if (ev.toolCallId) tools[ev.toolCallId] = lastTool;
+            scrollEnd();
+            break;
+          case "tool_end": {
+            var step = (ev.toolCallId && tools[ev.toolCallId]) || lastTool;
+            finishStep(step, "工具 " + ev.toolName, !ev.isError, ev.durationMs);
+            break;
+          }
+          case "thinking_delta":
+            if (!aiText) box.textContent = "";
+            if (!thinkEl) thinkEl = addThinking(m);
+            thinkText += ev.text;
+            thinkEl.textContent = thinkText;
+            scrollEnd();
+            break;
+          case "thinking_replace":
+            if (!aiText) box.textContent = "";
+            if (!thinkEl) thinkEl = addThinking(m);
+            thinkText = ev.text;
+            thinkEl.textContent = thinkText;
+            scrollEnd();
+            break;
+          case "error":
+            box.remove();
+            addMsg("err", ev.message || "处理失败");
+            finish();
+            break;
+          case "done":
+            finish();
+            break;
+        }
+      }
+    });
   }
 
   function open() {
@@ -259,6 +424,7 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
   var ticket = hash.get("ticket") || qs.get("ticket") || "";
   var busy = false;
   function el(id) { return document.getElementById(id); }
+  function scrollEnd() { var b = el("body"); b.scrollTop = b.scrollHeight; }
   function add(cls, text) {
     var d = document.createElement("div");
     d.className = "msg " + cls; d.textContent = text;
@@ -288,6 +454,83 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     });
     if (cfg.disclaimer) el("dis").textContent = cfg.disclaimer;
   }).catch(function () {});
+  // ── 过程展示（v0.2.179）：与浮窗同一套渲染规则 ──
+  function streamChat(messageText, handlers) {
+    fetch("/api/widget/chat", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + token,
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "X-VE-Ticket": ticket
+      },
+      body: JSON.stringify({ message: messageText })
+    }).then(function (res) {
+      if (!res.ok || !res.body) {
+        return res.json().catch(function () { return {}; }).then(function (d) {
+          handlers.onerror((d && d.error) || ("请求失败（" + res.status + "）"));
+        });
+      }
+      // The durable kernel serves plain JSON (no process events exist there);
+      // render it through the same path as a final reply instead of hanging.
+      var ctype = res.headers.get("content-type") || "";
+      if (ctype.indexOf("text/event-stream") === -1) {
+        return res.json().then(function (d) {
+          if (d && d.reply != null) handlers.onevent({ type: "replace", text: d.reply });
+          else if (d && d.error) { handlers.onerror(d.error); return; }
+          handlers.onend();
+        });
+      }
+      var reader = res.body.getReader();
+      var dec = new TextDecoder();
+      var buf = "";
+      function pump() {
+        return reader.read().then(function (chunk) {
+          if (chunk.done) { handlers.onend(); return; }
+          buf += dec.decode(chunk.value, { stream: true });
+          var frames = buf.split("\\n\\n");
+          buf = frames.pop();
+          frames.forEach(function (frame) {
+            var line = frame.split("\\n").find(function (l) { return l.indexOf("data:") === 0; });
+            if (!line) return;
+            try { handlers.onevent(JSON.parse(line.slice(5))); } catch (e) { /* 忽略坏帧 */ }
+          });
+          return pump();
+        });
+      }
+      return pump();
+    }).catch(function (e) { handlers.onerror("网络错误：" + e); });
+  }
+  function addStep(list, label) {
+    var step = document.createElement("div");
+    step.className = "step";
+    step.innerHTML = '<span class="st-ico">⚙</span><span class="st-txt"></span><span class="st-spin"></span>';
+    step.querySelector(".st-txt").textContent = label;
+    list.appendChild(step);
+    scrollEnd();
+    return step;
+  }
+  function finishStep(step, label, ok, ms) {
+    if (!step) return;
+    step.querySelector(".st-txt").textContent = label + (ms != null ? "（" + Math.round(ms / 100) / 10 + "s）" : "");
+    step.querySelector(".st-spin").textContent = ok ? "✓" : "✗";
+    step.classList.add(ok ? "ok" : "bad");
+  }
+  function addThinking(list) {
+    var wrap = document.createElement("div");
+    wrap.className = "think";
+    var head = document.createElement("div");
+    head.className = "think-h";
+    head.textContent = "💭 思考过程";
+    var bodyEl = document.createElement("div");
+    bodyEl.className = "think-b hidden";
+    head.addEventListener("click", function () { bodyEl.classList.toggle("hidden"); });
+    wrap.appendChild(head); wrap.appendChild(bodyEl);
+    list.appendChild(wrap);
+    scrollEnd();
+    return bodyEl;
+  }
+
   function send(text) {
     text = (text || "").trim();
     if (!text || busy) return;
@@ -297,15 +540,72 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     }
     busy = true; el("send").disabled = true;
     add("me", text);
-    var p = add("ai", "正在思考…");
-    api("/api/widget/chat", { method: "POST", body: JSON.stringify({ message: text, user: user }) })
-      .then(function (r) {
-        p.remove();
-        if (!r.ok) add("err", (r.data && r.data.error) || ("请求失败（" + r.status + "）"));
-        else add("ai", r.data.reply || "（空回复）");
-      })
-      .catch(function (e) { p.remove(); add("err", "网络错误：" + e); })
-      .finally(function () { busy = false; el("send").disabled = false; el("box").focus(); });
+    var list = el("msgs");
+    var box = add("ai", "正在思考…");
+    box.classList.add("streaming");
+    var aiText = "";
+    var thinkEl = null;
+    var thinkText = "";
+    var tools = {};
+    var lastTool = null;
+    var ended = false;
+    function finish() {
+      if (ended) return;
+      ended = true;
+      box.classList.remove("streaming");
+      if (!box.textContent || box.textContent === "正在思考…") box.textContent = aiText || "（空回复）";
+      busy = false; el("send").disabled = false; el("box").focus();
+      scrollEnd();
+    }
+    streamChat(text, {
+      onerror: function (msg) { box.remove(); add("err", msg); finish(); },
+      onend: function () { finish(); },
+      onevent: function (ev) {
+        switch (ev.type) {
+          case "delta":
+            aiText += ev.text;
+            box.textContent = aiText;
+            scrollEnd();
+            break;
+          case "replace":
+            aiText = ev.text;
+            box.textContent = aiText || "（内容已按安全策略隐藏）";
+            scrollEnd();
+            break;
+          case "tool_start":
+            if (!aiText) box.textContent = "";
+            lastTool = addStep(list, "调用工具 " + ev.toolName + " …");
+            if (ev.toolCallId) tools[ev.toolCallId] = lastTool;
+            scrollEnd();
+            break;
+          case "tool_end": {
+            var step = (ev.toolCallId && tools[ev.toolCallId]) || lastTool;
+            finishStep(step, "工具 " + ev.toolName, !ev.isError, ev.durationMs);
+            break;
+          }
+          case "thinking_delta":
+            if (!aiText) box.textContent = "";
+            if (!thinkEl) thinkEl = addThinking(list);
+            thinkText += ev.text;
+            thinkEl.textContent = thinkText;
+            scrollEnd();
+            break;
+          case "thinking_replace":
+            if (!aiText) box.textContent = "";
+            if (!thinkEl) thinkEl = addThinking(list);
+            thinkText = ev.text;
+            thinkEl.textContent = thinkText;
+            scrollEnd();
+            break;
+          case "error":
+            box.remove(); add("err", ev.message || "处理失败"); finish();
+            break;
+          case "done":
+            finish();
+            break;
+        }
+      }
+    });
   }
   el("send").addEventListener("click", function () { send(el("box").value); el("box").value = ""; });
   el("box").addEventListener("keydown", function (e) {

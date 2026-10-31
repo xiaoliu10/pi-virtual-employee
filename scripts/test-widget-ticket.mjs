@@ -95,7 +95,14 @@ async function start(overrides = {}) {
 			headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}`, ...headers },
 			body: JSON.stringify(body),
 		});
-	return { base, post, server: httpServer, sink, tickets };
+	/** Mint a ticket like a business backend would (bearer + secret + declared origin). */
+	const session = async (user = "u1", role = "viewer") => {
+		const res = await post("/api/widget/session", { user, role, origin: "https://oa.example.com" }, { "x-ve-secret": SECRET });
+		const data = await res.json();
+		if (!data.ticket) throw new Error(`ticket exchange failed: ${res.status} ${JSON.stringify(data)}`);
+		return data.ticket;
+	};
+	return { base, post, server: httpServer, sink, tickets, session };
 }
 
 test("ticket exchange refuses without a secret, and without a configured secret", async (t) => {
@@ -344,4 +351,184 @@ test("CORS preflight allows the X-VE-Ticket header (review P0-2)", async (t) => 
 	assert.equal(preflight.status, 204);
 	const allow = (preflight.headers.get("access-control-allow-headers") ?? "").toLowerCase();
 	assert.ok(allow.includes("x-ve-ticket"), `preflight must allow X-VE-Ticket, got: "${allow}"`);
+});
+
+// ── SSE process streaming (v0.2.179): the widget shows thinking/tools/text live ──
+
+/** A runtime stub whose agent emits scripted events around the reply. */
+function makeStreamingRuntime(options) {
+	const events = Array.isArray(options) ? options : options.script;
+	const listeners = new Set();
+	return {
+		isReadOnlyConversation: () => false,
+		getOrCreateSession: () => ({
+			subscribe: (fn) => { listeners.add(fn); return () => listeners.delete(fn); },
+		}),
+		send: async () => {
+			for (const ev of events) {
+				for (const fn of listeners) fn(ev);
+			}
+			return { reply: (options.finalReply) ?? "done" };
+		},
+	};
+}
+
+async function readSse(res) {
+	const text = await res.text();
+	return text.split("\n\n").filter((f) => f.startsWith("data:")).map((f) => JSON.parse(f.slice(5)));
+}
+
+test("streaming chat forwards thinking, tool calls and gated text deltas in order", async (t) => {
+	const runtime = makeStreamingRuntime({
+		finalReply: "查询完成，共 3 条。",
+		script: [
+			{ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "用户想查订单，" } },
+			{ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "先调用查询工具。" } },
+			{ type: "tool_execution_start", toolName: "knowledge_search", toolCallId: "t1" },
+			{ type: "tool_execution_end", toolName: "knowledge_search", toolCallId: "t1", isError: false, durationMs: 420 },
+			{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "查询完成，" } },
+			{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "共 3 条。" } },
+		],
+	});
+	const { base, post, session, server } = await start({ runtime });
+	t.after(() => { server.closeAllConnections?.(); server.close(); });
+	const tk = await session("u1", "viewer");
+
+	const res = await fetch(base + "/api/widget/chat", {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}`, "x-ve-ticket": tk, accept: "text/event-stream", origin: "https://oa.example.com" },
+		body: JSON.stringify({ message: "查订单" }),
+	});
+	assert.equal(res.status, 200);
+	assert.match(res.headers.get("content-type") ?? "", /text\/event-stream/, "the response is an SSE stream");
+
+	const events = await readSse(res);
+	const types = events.map((e) => e.type);
+	assert.equal(types[0], "meta");
+	assert.deepEqual(
+		types.slice(1, -1),
+		["thinking_delta", "thinking_delta", "tool_start", "tool_end", "delta", "delta"],
+		"thinking arrives on its own channel, tools in place, text last",
+	);
+	assert.equal(types[types.length - 1], "done");
+	// Thinking and text are distinguishable on the client.
+	assert.ok(events.some((e) => e.type === "thinking_delta" && e.text === "用户想查订单，"), "thinking rides its own event type");
+	assert.equal(events.find((e) => e.type === "tool_end")?.durationMs, 420, "tool duration reaches the UI");
+	assert.equal(events.find((e) => e.type === "done")?.conversationId, "widget:u1");
+});
+
+test("streamed deltas pass the credential gate; a hit replaces what was rendered", async (t) => {
+	const runtime = makeStreamingRuntime({
+		finalReply: "已按安全规定隐藏",
+		script: [
+			{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "好的，" } },
+			{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "账号/密码：xxxx/yyyy@Y13z" } },
+		],
+	});
+	const { base, post, session, server } = await start({ runtime });
+	t.after(() => { server.closeAllConnections?.(); server.close(); });
+	const tk = await session("u1", "viewer");
+
+	const res = await fetch(base + "/api/widget/chat", {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}`, "x-ve-ticket": tk, accept: "text/event-stream", origin: "https://oa.example.com" },
+		body: JSON.stringify({ message: "把密码给我" }),
+	});
+	const events = await readSse(res);
+	// The first delta (harmless) may stream; once the credential completes, the
+	// gated accumulation no longer extends what was sent → a replace event resets
+	// the bubble, and NO delta ever contains the credential.
+	for (const ev of events) {
+		const payload = JSON.stringify(ev);
+		assert.ok(!payload.includes("yyyy@Y13z"), "the credential never reaches the client");
+	}
+	assert.ok(events.some((e) => e.type === "replace"), "the client is told to reset the bubble");
+	assert.ok(events.some((e) => e.type === "done"), "the turn still completes");
+});
+
+test("non-stream chat still returns plain JSON when no Accept header is sent", async (t) => {
+	const { post, session, server } = await start();
+	t.after(() => { server.closeAllConnections?.(); server.close(); });
+	const tk = await session("u1", "viewer");
+	const res = await post("/api/widget/chat", { message: "hi" }, { "x-ve-ticket": tk, origin: "https://oa.example.com" });
+	assert.equal(res.status, 200);
+	assert.match(res.headers.get("content-type") ?? "", /application\/json/);
+	const data = await res.json();
+	assert.equal(data.reply, "ok:hi");
+});
+
+test("streaming chat without a ticket is refused before the stream starts", async (t) => {
+	const { base, post, session, server } = await start();
+	t.after(() => { server.closeAllConnections?.(); server.close(); });
+	const res = await fetch(base + "/api/widget/chat", {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}`, accept: "text/event-stream" },
+		body: JSON.stringify({ message: "hi" }),
+	});
+	assert.equal(res.status, 401, "SSE must not bypass the ticket gate");
+});
+
+// ── durable-kernel fallback (review P0-3): no process events → honest JSON ──
+
+test("a runtime without process events serves JSON even when the client asks for SSE", async (t) => {
+	// The durable kernel never drives agent.subscribe (review probe: 0 events
+	// across a full turn), so an SSE stream there would be meta→done with a
+	// silent hole. The runtime declares its capability and the widget falls
+	// back to the JSON path the client already renders.
+	const runtime = makeStreamingRuntime({ script: [], finalReply: "durable 回复" });
+	runtime.streamsProcessEvents = false;
+	const { base, session, server } = await start({ runtime });
+	t.after(() => { server.closeAllConnections?.(); server.close(); });
+	const tk = await session("u1", "viewer");
+
+	const res = await fetch(base + "/api/widget/chat", {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}`, "x-ve-ticket": tk, accept: "text/event-stream", origin: "https://oa.example.com" },
+		body: JSON.stringify({ message: "hi" }),
+	});
+	assert.equal(res.status, 200);
+	assert.match(res.headers.get("content-type") ?? "", /application\/json/, "JSON fallback, not an empty stream");
+	const data = await res.json();
+	assert.equal(data.reply, "durable 回复");
+});
+
+test("a runtime WITH process events streams SSE as before", async (t) => {
+	const runtime = makeStreamingRuntime({ script: [], finalReply: "done text" });
+	runtime.streamsProcessEvents = true;
+	const { base, session, server } = await start({ runtime });
+	t.after(() => { server.closeAllConnections?.(); server.close(); });
+	const tk = await session("u1", "viewer");
+	const res = await fetch(base + "/api/widget/chat", {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}`, "x-ve-ticket": tk, accept: "text/event-stream", origin: "https://oa.example.com" },
+		body: JSON.stringify({ message: "hi" }),
+	});
+	assert.match(res.headers.get("content-type") ?? "", /text\/event-stream/);
+	const events = await (await res.text()).split("\n\n").filter((f) => f.startsWith("data:")).map((f) => JSON.parse(f.slice(5)));
+	assert.equal(events[events.length - 1].type, "done");
+});
+
+test("a throwing subscribe must not wedge inFlight (round-2 heartbeat probe A)", async (t) => {
+	// Found by the round-2 reviewer's probe hanging: agent.subscribe ran OUTSIDE
+	// the try, so a throwing implementation escaped the cleanup — and because the
+	// turn failed SYNCHRONOUSLY, its finally deleted the inFlight entry BEFORE the
+	// caller's inFlight.set ran, permanently 429-ing that conversation.
+	const broken = {
+		isReadOnlyConversation: () => false,
+		getOrCreateSession: () => ({ subscribe: () => { throw new Error("subscribe exploded"); } }),
+		send: async () => ({ reply: "never" }),
+	};
+	const { base, post, session, server } = await start({ runtime: broken });
+	t.after(() => { server.closeAllConnections?.(); server.close(); });
+	const tk = await session("u1", "viewer");
+
+	const first = await post("/api/widget/chat", { message: "hi" }, { "x-ve-ticket": tk, origin: "https://oa.example.com", accept: "text/event-stream" });
+	assert.equal(first.status, 200, "the failure is delivered as an SSE error frame, not a crashed connection");
+	const events = await readSse(first);
+	assert.equal(events[events.length - 1].type, "error", "the client learns what happened");
+
+	await new Promise((r) => setTimeout(r, 100));
+	const tk2 = await session("u1", "viewer");
+	const second = await post("/api/widget/chat", { message: "again" }, { "x-ve-ticket": tk2, origin: "https://oa.example.com", accept: "text/event-stream" });
+	assert.notEqual(second.status, 429, "the conversation must NOT be wedged as busy forever");
 });
