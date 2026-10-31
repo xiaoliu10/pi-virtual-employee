@@ -1309,7 +1309,11 @@ ${tailForProgress(decision.text)}`;
 				portAttempts: WIDGET_PORT_ATTEMPTS,
 				config: () => {
 					const w = config.all().widget;
-					return { title: w.title, suggestions: w.suggestions, disclaimer: w.disclaimer, token: w.token, allowedOrigins: w.allowedOrigins, secret: w.secret, maxRole: w.maxRole };
+					return {
+						title: w.title, suggestions: w.suggestions, disclaimer: w.disclaimer,
+						token: w.token, allowedOrigins: w.allowedOrigins, secret: w.secret, maxRole: w.maxRole,
+						launcher: { icon: w.launcherIcon, iconUrl: w.launcherIconUrl, size: w.launcherSize },
+					};
 				},
 				runtime: engine,
 				expose: w.expose,

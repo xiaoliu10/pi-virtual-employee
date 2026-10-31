@@ -29,7 +29,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { gateOutboundText } from "../im/credential-egress.js";
 import type { AgentEvent } from "@earendil-works/pi-agent-core";
 import type { EmployeeRuntime } from "../engine/engine.js";
-import { renderWidgetPage, renderWidgetLoader } from "./widget-assets.js";
+import { renderWidgetPage, renderWidgetLoader, type LauncherLook } from "./widget-assets.js";
 import { TicketStore, secretMatches, widgetConversationKey, type WidgetRole } from "./widget-ticket.js";
 
 export interface WidgetConfigSnapshot {
@@ -46,6 +46,8 @@ export interface WidgetConfigSnapshot {
 	secret?: string;
 	/** Highest role a ticket may carry (default admin; owner is never reachable). */
 	maxRole?: WidgetRole;
+	/** Launcher look; omitted by older callers → legacy text bubble. */
+	launcher?: LauncherLook;
 }
 
 export interface WidgetDeps {
@@ -253,7 +255,10 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 		// deployer's to embed), so they are served without auth.
 		if (req.method === "GET" && url === "/widget.js") {
 			res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-cache" });
-			return res.end(renderWidgetLoader());
+			// Read the look per request so a settings change lands on the next page
+			// load without restarting the listener.
+			const launcherCfg = deps.config().launcher;
+			return res.end(renderWidgetLoader(launcherCfg));
 		}
 		if (req.method === "GET" && url === "/widget") {
 			res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" });
@@ -278,6 +283,9 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 				title: cfg.title,
 				suggestions: cfg.suggestions,
 				disclaimer: cfg.disclaimer,
+				// Launcher look travels with the live config so a size/icon change
+				// lands without re-fetching the loader script.
+				launcher: cfg.launcher ?? { icon: "text", iconUrl: "", size: 52 },
 			}, cfg.allowedOrigins.length ? origin : "*");
 		}
 

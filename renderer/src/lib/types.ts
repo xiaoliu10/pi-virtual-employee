@@ -175,6 +175,10 @@ export interface AppConfig {
 		secret: string;
 		/** Highest role a ticket may carry; owner is never reachable. */
 		maxRole: "viewer" | "operator" | "admin";
+		/** Launcher look: legacy text, built-in robot/spark mark, or a custom image URL. */
+		launcherIcon: "text" | "robot" | "spark" | "url";
+		launcherIconUrl: string;
+		launcherSize: number;
 		/** Peers allowed to assert X-Forwarded-For (reverse-proxy deployments). */
 		trustedProxies: string[];
 	};

@@ -399,6 +399,22 @@ export interface AppConfig {
 		 */
 		maxRole: "viewer" | "operator" | "admin";
 		/**
+		 * Launcher look (v0.2.180). Business systems embed the widget as a small
+		 * floating entry point, and the default text bubble reads as a placeholder
+		 * next to their own UI (the ETC integration shipped its own hand-drawn
+		 * button instead of using ours).
+		 *
+		 *   "text"  — the legacy "AI" letters (default: existing embeds are unchanged)
+		 *   "robot" — built-in robot mark, no network, no CSP concerns
+		 *   "spark" — built-in spark/AI mark
+		 *   "url"   — an image at launcherIconUrl (business-system-controlled asset)
+		 */
+		launcherIcon: "text" | "robot" | "spark" | "url";
+		/** Image used when launcherIcon === "url". http(s) only; see loader CSP notes. */
+		launcherIconUrl: string;
+		/** Launcher diameter in px (44-72). Smaller reads better next to dense admin UIs. */
+		launcherSize: number;
+		/**
 		 * Peer addresses allowed to declare the real client via X-Forwarded-For
 		 * (v0.2.178). Needed behind nginx, where every request arrives from
 		 * 127.0.0.1 and address binding would otherwise be meaningless. Entries
@@ -560,6 +576,9 @@ const DEFAULTS: AppConfig = {
 		allowedOrigins: [],
 		secret: "",
 		maxRole: "admin" as const,
+		launcherIcon: "text" as const,
+		launcherIconUrl: "",
+		launcherSize: 52,
 		trustedProxies: [],
 	},
 	reports: {
