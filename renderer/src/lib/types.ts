@@ -168,7 +168,6 @@ export interface AppConfig {
 		expose: "loopback" | "lan";
 		token: string;
 		title: string;
-		subtitle: string;
 		suggestions: string[];
 		disclaimer: string;
 		allowedOrigins: string[];

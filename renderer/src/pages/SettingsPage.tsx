@@ -1138,7 +1138,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 																onChange={(e) => setWidget({ port: Math.min(65535, Math.max(1, Math.floor(Number(e.target.valueAsNumber) || 17880))) })}
 																className={inputCls} />
 														</Field>
-														<Field label="暴露范围" hint="仅本机=只接受 127.0.0.1（适合同机反代）；局域网=绑定 0.0.0.0 供其它机器访问，必须设置访问令牌。">
+														<Field label="暴露范围" hint="仅本机=只接受 127.0.0.1（适合同机反代）；局域网=绑定 0.0.0.0 供其它机器访问，必须设置访问令牌，且需在服务器防火墙放行该端口（Windows 首次监听会弹防火墙授权）。">
 															<select value={draft.widget.expose} onChange={(e) => setWidget({ expose: e.target.value === "lan" ? "lan" : "loopback" })} className={inputCls}>
 																<option value="loopback">仅本机（127.0.0.1）</option>
 																<option value="lan">局域网（0.0.0.0）</option>
@@ -1174,8 +1174,9 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 													{draft.widget.enabled && (
 														<div className="rounded-xl bg-slate-50 px-4 py-3 text-xs leading-relaxed text-slate-500">
 															<div className="font-medium text-slate-700">接入方式（重启应用后生效）</div>
-															<div className="mt-1">整页嵌入：<code className="font-mono">{`http://<本机地址>:${draft.widget.port}/widget?token=${draft.widget.token ? "***" : "<令牌>"}&user=<用户标识>`}</code></div>
+															<div className="mt-1">整页嵌入：<code className="font-mono">{`http://<本机地址>:${draft.widget.port}/widget#token=${draft.widget.token ? "***" : "<令牌>"}&user=<用户标识>`}</code>（令牌放 # 号后，不会进服务器日志；整页链接含令牌，勿外发）</div>
 															<div>浮窗嵌入：在业务系统页面加入 <code className="font-mono">{`<script src="http://<本机地址>:${draft.widget.port}/widget.js" data-token="..." data-user="..."></script>`}</code></div>
+															<div className="mt-1 text-amber-700/80">安全边界：小组件用户固定为最低权限（仅对话与知识检索），不受「默认角色」设置影响；请勿在人员管理里创建 widget-user- 开头的员工，以免与小组件身份冲突。</div>
 														</div>
 													)}
 												</div>

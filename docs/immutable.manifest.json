@@ -27,7 +27,7 @@
 			"path": "src/security/permissions.ts",
 			"kind": "region",
 			"why": "角色解析与能力判定：所有权限结论的唯一出处",
-			"sha256": "721b2518e78278975cac413329fdfba9459f9f7046b734b054ab38732d6e83a0"
+			"sha256": "bfb1e85cd65e88eadf30d67d6ac7587ea40436325023aae7d12177d11526f8b8"
 		},
 		{
 			"id": "rbac-defaults",

@@ -19,6 +19,7 @@ import { after, test } from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { build } from "esbuild";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -27,14 +28,19 @@ process.on("exit", () => { try { rmSync(dir, { recursive: true, force: true }); 
 
 const bundle = join(dir, "widget.mjs");
 await build({
-	stdin: { contents: `export * from "./src/widget/widget-service.ts";`, resolveDir: root, loader: "ts" },
+	stdin: { contents: `
+		export * from "./src/widget/widget-service.ts";
+		export { inferConversationOrigin } from "./src/db/history-store.ts";
+		export { isLocalConversation, checkPermission } from "./src/security/permissions.ts";
+		export { ConfigStore } from "./src/db/config-store.ts";
+	`, resolveDir: root, loader: "ts" },
 	outfile: bundle,
 	bundle: true,
 	platform: "node",
 	format: "esm",
 	packages: "external",
 });
-const { startWidgetServer } = await import(pathToFileURL(bundle).href);
+const { startWidgetServer, inferConversationOrigin, isLocalConversation, checkPermission, ConfigStore } = await import(pathToFileURL(bundle).href);
 
 const TOKEN = "test-token-abc123";
 
@@ -68,7 +74,11 @@ async function start(overrides = {}) {
 		port: 0,
 		log: () => {},
 	});
-	after(() => server.close());
+	after(() => {
+		// undici's keep-alive socket would make close() wait forever.
+		server.closeAllConnections?.();
+		server.close();
+	});
 	const base = `http://127.0.0.1:${port}`;
 	const get = (path, headers = {}) => fetch(base + path, { headers });
 	const post = (path, body, headers = {}) => fetch(base + path, {
@@ -155,4 +165,72 @@ test("a read-only conversation is refused instead of silently swallowed", async 
 	const { base, post } = await start({ runtime });
 	const res = await post("/api/widget/chat", { message: "hi" }, bearer(TOKEN));
 	assert.equal(res.status, 403);
+});
+
+// ── review fixes (v0.2.176): trust boundary + role ceiling + abuse limits ──
+
+test("widget conversations are REMOTE: not the local console, so no admin trust", async () => {
+	// The P0: "widget:x" used to infer "console", which made isLocalConversation
+	// true — remember() then wrote PROFILE-scope memory (injected into every
+	// admin session) and actorless tool calls resolved as admin.
+	assert.equal(inferConversationOrigin("widget:oa_user_7"), "widget");
+	assert.equal(isLocalConversation("widget:oa_user_7"), false);
+	// The other surfaces keep their meaning.
+	assert.equal(isLocalConversation("some-uuid"), true);
+	assert.equal(isLocalConversation("dt:group:g1"), false);
+});
+
+test("widget channel actors are clamped to viewer even when defaultRole is operator", async () => {
+	const db = new DatabaseSync(":memory:");
+	db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
+	const config = new ConfigStore(db);
+	config.update({ security: { defaultRole: "operator" } });
+	const actor = { senderId: "widget-user-oa_7", channel: "widget", chatType: "single" };
+	const shell = checkPermission(config, actor, "widget:oa_7", "shell");
+	assert.equal(shell.ok, false, "defaultRole=operator must NOT lift the widget ceiling");
+	assert.equal(checkPermission(config, actor, "widget:oa_7", "chat").ok, true, "chat stays allowed");
+	const imPeer = { senderId: "im-stranger", channel: "dingtalk", chatType: "single" };
+	assert.equal(checkPermission(config, imPeer, "dt:group:g1", "shell").ok, true, "the IM unknown-sender path keeps its configured defaultRole");
+	db.close();
+});
+
+test("oversized bodies and messages are refused with explicit statuses", async (t) => {
+	const { base, post } = await start({});
+	// 300KB body → connection destroyed by the body cap (fetch surfaces an error).
+	await assert.rejects(
+		post("/api/widget/chat", { message: "x".repeat(300 * 1024) }, bearer(TOKEN)),
+		undefined,
+		"a 300KB body is cut off by the read cap",
+	);
+	const long = await post("/api/widget/chat", { message: "字".repeat(4001) }, bearer(TOKEN));
+	assert.equal(long.status, 400, "an over-long message is refused");
+	const data = await long.json();
+	assert.match(data.error, /消息过长/);
+});
+
+test("one in-flight turn per conversation: a second concurrent chat is 429", async (t) => {
+	let release;
+	const gate = new Promise((r) => { release = r; });
+	const runtime = makeRuntime({ send: () => gate.then(() => ({ reply: "done" })) });
+	const { base, post } = await start({ runtime });
+	const first = post("/api/widget/chat", { message: "慢任务", user: "u1" }, bearer(TOKEN));
+	await new Promise((r) => setTimeout(r, 60));
+	const second = await post("/api/widget/chat", { message: "插队", user: "u1" }, bearer(TOKEN));
+	assert.equal(second.status, 429, "the same conversation is busy");
+	// Release BEFORE the u2 probe: the stub gates ALL sends on this promise, so
+	// awaiting another send before releasing would deadlock the test itself.
+	release();
+	const other = await post("/api/widget/chat", { message: "另一用户", user: "u2" }, bearer(TOKEN));
+	assert.notEqual(other.status, 429, "a different user's conversation is independent");
+	const firstRes = await first;
+	assert.equal(firstRes.status, 200);
+});
+
+test("chat bursts are rate limited per token+client", async (t) => {
+	const { base, post } = await start({});
+	let last;
+	for (let i = 0; i < 31; i += 1) {
+		last = await post("/api/widget/chat", { message: `m${i}`, user: `burst${i}` }, bearer(TOKEN));
+	}
+	assert.equal(last.status, 429, "the 31st chat inside one minute is refused");
 });

@@ -381,7 +381,6 @@ export interface AppConfig {
 		token: string;
 		/** Panel title / greeting headline / suggestion chips shown in the widget UI. */
 		title: string;
-		subtitle: string;
 		suggestions: string[];
 		/** Footer disclaimer rendered inside the widget. */
 		disclaimer: string;
@@ -537,7 +536,6 @@ const DEFAULTS: AppConfig = {
 		expose: "loopback" as const,
 		token: "",
 		title: "AI 助理",
-		subtitle: "你好，我是你的 AI 助理",
 		suggestions: ["你是谁？", "你能帮我做什么？"],
 		disclaimer: "内容由 AI 生成，仅供参考，请自行判断后使用。",
 		allowedOrigins: [],

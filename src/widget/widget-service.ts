@@ -25,14 +25,13 @@
  *    `allowedOrigins` (when non-empty) gates CORS and the embed referer.
  */
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { gateOutboundText } from "../im/credential-egress.js";
 import type { EmployeeRuntime } from "../engine/engine.js";
 import { renderWidgetPage, renderWidgetLoader } from "./widget-assets.js";
 
 export interface WidgetConfigSnapshot {
 	title: string;
-	subtitle: string;
 	suggestions: string[];
 	disclaimer: string;
 	token: string;
@@ -58,10 +57,25 @@ function sendJson(res: ServerResponse, status: number, body: unknown, origin?: s
 	res.end(JSON.stringify(body));
 }
 
+const MAX_BODY_BYTES = 256 * 1024;
+const MAX_MESSAGE_CHARS = 4_000;
+/** Chat attempts per token+client per minute (review P1-4: a runaway loop must not own the model channel). */
+const RATE_LIMIT_PER_MIN = 30;
+
 function readJsonBody(req: IncomingMessage): Promise<{ message?: string; conversationId?: string; user?: string }> {
 	return new Promise((resolve, reject) => {
 		let raw = "";
-		req.on("data", (chunk) => (raw += chunk));
+		let bytes = 0;
+		req.on("data", (chunk) => {
+			bytes += chunk.length;
+			// Review P1-4: a multi-GB body must be cut off, not buffered.
+			if (bytes > MAX_BODY_BYTES) {
+				req.destroy();
+				reject(new Error("body-too-large"));
+				return;
+			}
+			raw += chunk;
+		});
 		req.on("error", reject);
 		req.on("end", () => {
 			if (!raw) return resolve({});
@@ -72,6 +86,26 @@ function readJsonBody(req: IncomingMessage): Promise<{ message?: string; convers
 			}
 		});
 	});
+}
+
+/** Sliding-window rate limiter keyed per token+client address (in-memory, v1). */
+const rateBuckets = new Map<string, number[]>();
+function rateLimited(key: string, now = Date.now()): boolean {
+	const windowStart = now - 60_000;
+	const hits = (rateBuckets.get(key) ?? []).filter((ts) => ts > windowStart);
+	hits.push(now);
+	rateBuckets.set(key, hits);
+	if (rateBuckets.size > 10_000) {
+		for (const [k, v] of rateBuckets) if (v.every((ts) => ts <= windowStart)) rateBuckets.delete(k);
+	}
+	return hits.length > RATE_LIMIT_PER_MIN;
+}
+
+/** Constant-time token comparison (review P3-10). */
+function tokenMatches(presented: string, expected: string): boolean {
+	const a = Buffer.from(presented, "utf8");
+	const b = Buffer.from(expected, "utf8");
+	return a.length === b.length && timingSafeEqual(a, b);
 }
 
 /** Origin of a request per CORS semantics, or "" for same-origin/no-Origin. */
@@ -118,6 +152,10 @@ function widgetActor(user: string | undefined, staffPrefix: string): { senderId:
 	return { senderId: `${staffPrefix}${clean || "anon"}`, channel: "widget", chatType: "single" };
 }
 
+/** One in-flight turn per conversation (review P1-4: legacy-kernel degradation
+ *  has no per-conversation serialization, and double-prompting one Agent throws). */
+const inFlight = new Map<string, Promise<unknown>>();
+
 export function startWidgetServer(deps: WidgetDeps): Promise<{ port: number; server: Server }> {
 	const log = deps.log ?? ((message: string) => console.log(message));
 	const server = createServer(async (req, res) => {
@@ -140,7 +178,7 @@ export function startWidgetServer(deps: WidgetDeps): Promise<{ port: number; ser
 		// deployer's to embed), so they are served without auth.
 		if (req.method === "GET" && url === "/widget.js") {
 			res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-cache" });
-			return res.end(renderWidgetLoader({ origin: allowed ? origin : "" }));
+			return res.end(renderWidgetLoader());
 		}
 		if (req.method === "GET" && url === "/widget") {
 			res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" });
@@ -152,14 +190,17 @@ export function startWidgetServer(deps: WidgetDeps): Promise<{ port: number; ser
 		// Everything below the asset line requires the bearer token.
 		const auth = req.headers.authorization ?? "";
 		const presented = BEARER.exec(auth)?.[1] ?? "";
-		if (!cfg.token || presented !== cfg.token) {
+		if (!cfg.token || !tokenMatches(presented, cfg.token)) {
 			return sendJson(res, 401, { error: "小组件令牌缺失或不正确" });
+		}
+		const clientKey = `${presented.slice(0, 8)}:${req.socket.remoteAddress ?? "?"}`;
+		if (req.method === "POST" && url === "/api/widget/chat" && rateLimited(clientKey)) {
+			return sendJson(res, 429, { error: "请求过于频繁，请稍后再试" }, cfg.allowedOrigins.length ? origin : "*");
 		}
 
 		if (req.method === "GET" && url === "/api/widget/config") {
 			return sendJson(res, 200, {
 				title: cfg.title,
-				subtitle: cfg.subtitle,
 				suggestions: cfg.suggestions,
 				disclaimer: cfg.disclaimer,
 			}, cfg.allowedOrigins.length ? origin : "*");
@@ -174,32 +215,50 @@ export function startWidgetServer(deps: WidgetDeps): Promise<{ port: number; ser
 			}
 			const message = body.message?.trim();
 			if (!message) return sendJson(res, 400, { error: "Missing 'message' field" }, cfg.allowedOrigins.length ? origin : "*");
+			if (message.length > MAX_MESSAGE_CHARS) {
+				return sendJson(res, 400, { error: `消息过长（最多 ${MAX_MESSAGE_CHARS} 字）` }, cfg.allowedOrigins.length ? origin : "*");
+			}
 
 			// Per-end-user conversations: the business system passes its own user
 			// key; the widget namespace keeps these out of IM/console surfaces.
 			const userKey = (body.conversationId ?? body.user ?? randomUUID()).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64) || randomUUID().slice(0, 8);
 			const conversationId = `widget:${userKey}`;
+			const corsOrigin = cfg.allowedOrigins.length ? origin : "*";
 
 			if (deps.runtime.isReadOnlyConversation(conversationId)) {
-				return sendJson(res, 403, { error: "该会话为只读", conversationId });
+				return sendJson(res, 403, { error: "该会话为只读", conversationId }, corsOrigin);
+			}
+			const pending = inFlight.get(conversationId);
+			if (pending) {
+				return sendJson(res, 429, { error: "该会话正在处理上一条消息，请稍候", conversationId }, corsOrigin);
 			}
 			let agent: ReturnType<EmployeeRuntime["getOrCreateSession"]>;
 			try {
 				agent = deps.runtime.getOrCreateSession(conversationId);
 			} catch (err) {
-				return sendJson(res, 500, { error: err instanceof Error ? err.message : String(err), conversationId });
+				console.warn(`[widget] session create failed for ${conversationId}:`, err instanceof Error ? err.message : err);
+				return sendJson(res, 500, { error: "处理失败，请稍后再试", conversationId }, corsOrigin);
 			}
-			try {
-				const actor = widgetActor(body.user, "widget-user-");
-				const { reply, error } = await deps.runtime.send(agent, message, { actor });
-				if (error) return sendJson(res, 502, { error, conversationId }, cfg.allowedOrigins.length ? origin : "*");
-				// Same gate as an IM group push: the business system's users are NOT
-				// the admin, so credential-bearing replies are withheld, not sent.
-				const safe = gateOutboundText(reply ?? "", "restricted");
-				return sendJson(res, 200, { conversationId, reply: safe }, cfg.allowedOrigins.length ? origin : "*");
-			} catch (err) {
-				return sendJson(res, 500, { error: err instanceof Error ? err.message : String(err), conversationId }, cfg.allowedOrigins.length ? origin : "*");
-			}
+			const turn = (async () => {
+				try {
+					const actor = widgetActor(body.user, "widget-user-");
+					const { reply, error } = await deps.runtime.send(agent, message, { actor });
+					if (error) return sendJson(res, 502, { error, conversationId }, corsOrigin);
+					// Same gate as an IM group push: the business system's users are NOT
+					// the admin, so credential-bearing replies are withheld, not sent.
+					const safe = gateOutboundText(reply ?? "", "restricted");
+					return sendJson(res, 200, { conversationId, reply: safe }, corsOrigin);
+				} catch (err) {
+					// Internal errors may carry paths/kernel details — fixed text outward,
+					// detail server-side only (review P2-7).
+					console.warn(`[widget] chat failed for ${conversationId}:`, err instanceof Error ? err.message : err);
+					return sendJson(res, 500, { error: "处理失败，请稍后再试", conversationId }, corsOrigin);
+				} finally {
+					inFlight.delete(conversationId);
+				}
+			})();
+			inFlight.set(conversationId, turn);
+			return turn;
 		}
 
 		return sendJson(res, 404, { error: "Not found" });

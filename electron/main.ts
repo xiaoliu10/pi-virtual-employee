@@ -1264,7 +1264,7 @@ ${tailForProgress(decision.text)}`;
 			const started = await startWidgetServer({
 				config: () => {
 					const w = config.all().widget;
-					return { title: w.title, subtitle: w.subtitle, suggestions: w.suggestions, disclaimer: w.disclaimer, token: w.token, allowedOrigins: w.allowedOrigins };
+					return { title: w.title, suggestions: w.suggestions, disclaimer: w.disclaimer, token: w.token, allowedOrigins: w.allowedOrigins };
 				},
 				runtime: engine,
 				expose: w.expose,
@@ -1276,7 +1276,12 @@ ${tailForProgress(decision.text)}`;
 		}
 	};
 	void startWidget();
-	app.on("will-quit", () => { try { widgetServer?.close(); } catch { /* best effort */ } });
+	app.on("will-quit", () => {
+		try {
+			widgetServer?.closeAllConnections?.();
+			widgetServer?.close();
+		} catch { /* best effort */ }
+	});
 
 	// Preload skills so the first session already has them.
 	await engine.refreshSkills().catch((err) => console.error("[engine] skill load failed", err));

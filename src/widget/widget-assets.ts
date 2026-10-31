@@ -18,11 +18,6 @@ button { font-family: inherit; cursor: pointer; }
 input, textarea { font-family: inherit; }
 `;
 
-export interface LoaderOptions {
-	/** When the request came from an allowed origin, embed it so the loader can talk to the API cross-origin. */
-	origin: string;
-}
-
 /**
  * The embeddable loader. Usage on the business system's page:
  *
@@ -30,9 +25,10 @@ export interface LoaderOptions {
  *           data-token="..." data-user="endUserKey" data-title="业务助理"></script>
  *
  * `data-*` beats server config when present, so one deployment can serve many
- * business systems with different titles without extra endpoints.
+ * business systems with different titles without extra endpoints. The API base
+ * derives from the script's own URL — no configuration beyond the script tag.
  */
-export function renderWidgetLoader(_options: LoaderOptions): string {
+export function renderWidgetLoader(): string {
 	return `(function () {
   "use strict";
   var script = document.currentScript;
@@ -190,6 +186,7 @@ export function renderWidgetPage(): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>AI 助理</title>
 <style>
 ${SHARED_CSS}
@@ -237,9 +234,13 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
 <script>
 (function () {
   "use strict";
+  // Token via FRAGMENT preferred (#token=): fragments are not sent to the
+  // server and stay out of access logs (review P2-5). Query still works for
+  // convenience, but the settings page documents the fragment form.
+  var hash = new URLSearchParams(location.hash.slice(1));
   var qs = new URLSearchParams(location.search);
-  var token = qs.get("token") || "";
-  var user = qs.get("user") || "";
+  var token = hash.get("token") || qs.get("token") || "";
+  var user = hash.get("user") || qs.get("user") || "";
   var busy = false;
   function el(id) { return document.getElementById(id); }
   function add(cls, text) {

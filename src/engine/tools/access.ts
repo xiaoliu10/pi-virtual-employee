@@ -184,6 +184,7 @@ function conversationLine(deps: AccessToolDeps, c: { id: string; title: string |
 		c.origin === "im" ? "IM 会话"
 		: c.origin === "scheduled" ? "定时任务会话"
 		: c.origin === "eval" ? "提示词评测会话（可忽略）"
+		: c.origin === "widget" ? "嵌入小组件会话"
 		: "本机控制台会话";
 	return `  · ${c.title?.trim() || "（未命名）"}${c.origin === "im" ? "" : `【${label}】`} → ${c.id}${n ? `（已记录 ${n} 人）` : ""}`;
 }
