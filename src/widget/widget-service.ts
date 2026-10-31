@@ -86,14 +86,30 @@ function normalizeAddress(value: string | undefined): string {
  * address a stolen ticket was bound to.
  */
 function clientAddress(req: IncomingMessage, trustedProxies: string[]): string {
+	const peers = trustedProxies.map((p) => normalizeAddress(p));
 	const peer = normalizeAddress(req.socket.remoteAddress);
-	if (trustedProxies.length === 0 || !trustedProxies.includes(peer)) return peer;
+	if (peers.length === 0 || !peers.includes(peer)) return peer;
 	const forwarded = req.headers["x-forwarded-for"];
 	const value = Array.isArray(forwarded) ? forwarded[0] : forwarded;
 	if (!value) return peer;
-	// The left-most entry is the original client; later entries are proxies.
-	const original = value.split(",")[0];
-	return normalizeAddress(original);
+	// Walk from the RIGHT and skip trusted proxies; the first untrusted entry is
+	// the real client. Taking the left-most value is forgeable: nginx's default
+	// `proxy_add_x_forwarded_for` APPENDS to a client-supplied header, so an
+	// attacker behind the proxy can prepend a victim's address and inherit a
+	// ticket bound to it (code review P1-1).
+	// The chain is only authentic if the LAST hop is one of our trusted proxies:
+	// a real proxy always appends the address it received the request from, so the
+	// right-most entry names the proxy itself. A client that forges the whole
+	// header (no proxy involved) therefore fails this check and is treated as a
+	// direct peer — the forged chain is ignored. This is the fail-closed form of
+	// the standard "walk from the right" algorithm.
+	const hops = value.split(",").map((h) => normalizeAddress(h));
+	if (!peers.includes(hops[hops.length - 1])) return peer;
+	for (let i = hops.length - 2; i >= 0; i -= 1) {
+		if (!peers.includes(hops[i])) return hops[i];
+	}
+	// Every hop is a trusted proxy (unusual): fall back to the peer itself.
+	return peer;
 }
 
 /** Is a request's Origin listed? Reuses the same boundary rules as CORS below. */
@@ -204,11 +220,6 @@ function originAllowed(origin: string, allowed: string[]): boolean {
  * adminStaffIds unless an admin literally adds that id), so the business
  * system's end users get conversation + knowledge search and nothing more.
  */
-function widgetActor(user: string | undefined, staffPrefix: string): { senderId: string; channel: "widget"; chatType: "single" } {
-	const clean = (user ?? "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
-	return { senderId: `${staffPrefix}${clean || "anon"}`, channel: "widget", chatType: "single" };
-}
-
 /** One in-flight turn per conversation (review P1-4: legacy-kernel degradation
  *  has no per-conversation serialization, and double-prompting one Agent throws). */
 const inFlight = new Map<string, Promise<unknown>>();
@@ -224,7 +235,12 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 		if (origin && allowed) {
 			res.setHeader("Access-Control-Allow-Origin", origin);
 			res.setHeader("Vary", "Origin");
-			res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+			// X-VE-Ticket is a custom header, so every chat request from an embedded
+			// page is preceded by a CORS preflight. Omitting it here makes the BROWSER
+			// reject the actual request — the flagship cross-origin embed would fail
+			// on every message while server-side tests (which do not implement CORS)
+			// stayed green (code review P0-2).
+			res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-VE-Ticket");
 			res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
 		}
 		if (req.method === "OPTIONS") {
@@ -295,6 +311,14 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 			// address would be wrong — the chat comes from the end user's browser.
 			const consumerOrigin = (body.origin ?? "").trim() || origin;
 			const consumerIp = (body.clientIp ?? "").trim();
+			// A ticket with NEITHER a declared origin NOR a declared client IP would
+			// redeem from anywhere, which defeats the point of a ticket (code review
+			// P2-1). Refuse it and make the integration declare its consumer.
+			if (!consumerOrigin && !consumerIp) {
+				return sendJson(res, 400, {
+					error: "换票必须声明 origin（业务系统页面地址）或 clientIp（使用者客户端地址）之一，否则票据无法绑定来源",
+				});
+			}
 			const record = tickets.issue(
 				{
 					user,
@@ -431,7 +455,8 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 		if (!err) {
 			const addr = server.address();
 			const port = typeof addr === "object" && addr ? addr.port : candidate;
-			if (port !== deps.port) log(`[widget] port ${deps.port} was taken; bound ${port} instead`);
+			// port 0 means "let the OS pick", so a differing result is expected, not a collision.
+			if (deps.port !== 0 && port !== deps.port) log(`[widget] port ${deps.port} was taken; bound ${port} instead`);
 			log(`[widget] assistant widget on ${host}:${port} (expose=${deps.expose})`);
 			return { port, server };
 		}

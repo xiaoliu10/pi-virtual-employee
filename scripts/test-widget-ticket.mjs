@@ -118,13 +118,13 @@ test("a ticket carries the granted role into the runtime actor", async (t) => {
 	const { post, server, sink } = await start();
 	t.after(() => { server.closeAllConnections?.(); server.close(); });
 
-	const minted = await post("/api/widget/session", { user: "zhangsan", role: "admin" }, { "x-ve-secret": SECRET });
+	const minted = await post("/api/widget/session", { user: "zhangsan", role: "admin" }, { "x-ve-secret": SECRET, origin: "https://oa.example.com" });
 	assert.equal(minted.status, 200);
 	const { ticket, role } = await minted.json();
 	assert.equal(role, "admin", "the exchange reports what was actually granted");
 	assert.ok(ticket, "a ticket is returned");
 
-	const chat = await post("/api/widget/chat", { message: "hi" }, { "x-ve-ticket": ticket });
+	const chat = await post("/api/widget/chat", { message: "hi" }, { "x-ve-ticket": ticket, origin: "https://oa.example.com" });
 	assert.equal(chat.status, 200);
 	assert.equal(sink.length, 1, "the message reached the runtime");
 	assert.equal(sink[0].actor.verifiedRole, "admin", "the role travels via the verified ticket");
@@ -136,7 +136,8 @@ test("the role is capped at admin; owner is unreachable whatever is claimed", as
 	t.after(() => { server.closeAllConnections?.(); server.close(); });
 
 	for (const claimed of ["owner", "superuser", "", undefined, "ADMIN "]) {
-		const r = await post("/api/widget/session", { user: "u", role: claimed }, { "x-ve-secret": SECRET });
+		const r = await post("/api/widget/session", { user: "u", role: claimed }, { "x-ve-secret": SECRET, origin: "https://oa.example.com" });
+		assert.equal(r.status, 200, "the mint itself succeeds");
 		const body = await r.json();
 		assert.notEqual(body.role, "owner", `claimed "${claimed}" must never become owner`);
 		assert.ok(["viewer", "operator", "admin"].includes(body.role), `granted a known role for "${claimed}"`);
@@ -193,9 +194,9 @@ test("chat without a ticket is refused even with a valid bearer token", async (t
 	assert.equal(sink.length, 0);
 
 	// A body-level role claim must be ignored entirely.
-	const minted = await post("/api/widget/session", { user: "u1", role: "viewer" }, { "x-ve-secret": SECRET });
+	const minted = await post("/api/widget/session", { user: "u1", role: "viewer" }, { "x-ve-secret": SECRET, origin: "https://oa.example.com" });
 	const { ticket } = await minted.json();
-	const chat = await post("/api/widget/chat", { message: "hi", user: "someone-else", role: "admin" }, { "x-ve-ticket": ticket });
+	const chat = await post("/api/widget/chat", { message: "hi", user: "someone-else", role: "admin" }, { "x-ve-ticket": ticket, origin: "https://oa.example.com" });
 	assert.equal(chat.status, 200);
 	assert.equal(sink[0].actor.verifiedRole, "viewer", "the body's role claim is ignored");
 	assert.equal(sink[0].actor.senderId, "widget-user-u1", "the body cannot switch the identity");
@@ -284,9 +285,10 @@ test("X-Forwarded-For is ignored unless the peer is a trusted proxy", async (t) 
 	);
 	assert.equal(forged.status, 401, "an untrusted peer cannot forge its way to the bound address");
 
-	// With 127.0.0.1 trusted, the header IS honoured (nginx case).
-	const trusting = await start({ tickets, trustedProxies: ["127.0.0.1"] });
-	t.after(() => { trusting.server.closeAllConnections?.(); trusting.server.close(); });
+	// With 127.0.0.1 trusted, the header IS honoured — but only when the chain's
+	// LAST hop names the trusted proxy itself (a real proxy always appends the
+	// address it received the request from). A forged chain whose last hop is not
+	// a trusted proxy is ignored wholesale.
 	const proxied = await start({ tickets, trustedProxies: ["127.0.0.1"] });
 	t.after(() => { proxied.server.closeAllConnections?.(); proxied.server.close(); });
 	const viaProxy = await proxied.post(
@@ -294,12 +296,52 @@ test("X-Forwarded-For is ignored unless the peer is a trusted proxy", async (t) 
 		{ message: "hi" },
 		{ "x-ve-ticket": minted.ticket, "x-forwarded-for": "10.0.0.9, 127.0.0.1" },
 	);
-	assert.equal(viaProxy.status, 200, "a trusted proxy's X-Forwarded-For selects the left-most client");
+	assert.equal(viaProxy.status, 200, "nginx append-semantics chain ends with the proxy");
 
-	const wrongClient = await proxied.post(
+	const forgedChain = await proxied.post(
 		"/api/widget/chat",
 		{ message: "hi" },
 		{ "x-ve-ticket": minted.ticket, "x-forwarded-for": "10.0.0.99" },
 	);
+	assert.equal(forgedChain.status, 401, "a chain NOT ending in a trusted proxy is ignored (forged)");
+
+	// THE attack P1-1 describes: the attacker's real address IS the trusted proxy
+	// (direct loopback client), and the forged chain contains exactly the bound
+	// address. Left-most wins → the ticket redeems. The fail-closed check (last
+	// hop must be the trusted proxy) rejects it because the chain's last hop is
+	// 10.0.0.9, not a proxy.
+	const inherit = await proxied.post(
+		"/api/widget/chat",
+		{ message: "hi" },
+		{ "x-ve-ticket": minted.ticket, "x-forwarded-for": "10.0.0.9" },
+	);
+	assert.equal(inherit.status, 401, "a forged single-value XFF cannot inherit the bound address");
+
+	const wrongClient = await proxied.post(
+		"/api/widget/chat",
+		{ message: "hi" },
+		{ "x-ve-ticket": minted.ticket, "x-forwarded-for": "10.0.0.99, 127.0.0.1" },
+	);
 	assert.equal(wrongClient.status, 401, "a different forwarded client is still refused");
+});
+
+test("CORS preflight allows the X-VE-Ticket header (review P0-2)", async (t) => {
+	// undici does not implement CORS, so this browser-only failure mode needs an
+	// explicit assertion: every cross-origin chat fetch sends an OPTIONS preflight
+	// listing its custom headers, and the response MUST advertise X-VE-Ticket —
+	// otherwise the browser rejects the actual request before it is ever sent.
+	const { base, server } = await start();
+	t.after(() => { server.closeAllConnections?.(); server.close(); });
+
+	const preflight = await fetch(base + "/api/widget/chat", {
+		method: "OPTIONS",
+		headers: {
+			Origin: "https://oa.example.com",
+			"Access-Control-Request-Method": "POST",
+			"Access-Control-Request-Headers": "content-type, authorization, x-ve-ticket",
+		},
+	});
+	assert.equal(preflight.status, 204);
+	const allow = (preflight.headers.get("access-control-allow-headers") ?? "").toLowerCase();
+	assert.ok(allow.includes("x-ve-ticket"), `preflight must allow X-VE-Ticket, got: "${allow}"`);
 });

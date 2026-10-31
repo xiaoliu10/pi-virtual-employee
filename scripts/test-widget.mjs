@@ -95,19 +95,21 @@ async function start(overrides = {}) {
 	 * Mint a ticket the way a business backend does, then hand it to the client.
 	 * v0.2.178: chat requires a ticket (the role rides it, bound to this source).
 	 */
+	const ORIGIN = "https://oa.example.com";
 	const session = async (user = "tester", role = "viewer") => {
 		// The exchange needs BOTH the bearer token (port gate) and the secret
-		// (business-backend proof) — exactly like a real integration.
+		// (business-backend proof) — exactly like a real integration. The ticket is
+		// bound to the DECLARED consumer origin, so chat calls must send it too.
 		const res = await post(
 			"/api/widget/session",
-			{ user, role },
+			{ user, role, origin: ORIGIN },
 			{ ...bearer(cfg.token), "X-VE-Secret": SECRET },
 		);
 		const data = await res.json();
 		if (!data.ticket) throw new Error(`ticket exchange failed: ${res.status} ${JSON.stringify(data)}`);
 		return data.ticket;
 	};
-	return { base, get, post, runtime, cfg, session, SECRET };
+	return { base, get, post, runtime, cfg, session, SECRET, ORIGIN };
 }
 
 const bearer = (token) => ({ Authorization: `Bearer ${token}` });
@@ -128,9 +130,9 @@ test("assets are served without auth; the API refuses missing or wrong tokens", 
 });
 
 test("chat routes to the runtime with a widget-namespaced conversation and a viewer-channel actor", async (t) => {
-	const { base, post, runtime, session } = await start({});
+	const { base, post, runtime, session, ORIGIN } = await start({});
 	const tk = await session("oa_user_7", "viewer");
-	const res = await post("/api/widget/chat", { message: "查一下库存" }, { ...bearer(TOKEN), "X-VE-Ticket": tk });
+	const res = await post("/api/widget/chat", { message: "查一下库存" }, { ...bearer(TOKEN), "X-VE-Ticket": tk, origin: ORIGIN });
 	assert.equal(res.status, 200);
 	const data = await res.json();
 	assert.match(data.conversationId, /^widget:oa_user_7$/, "the end user's key names their conversation, inside the widget namespace");
@@ -141,10 +143,10 @@ test("chat routes to the runtime with a widget-namespaced conversation and a vie
 });
 
 test("unsafe characters in the user key cannot escape the widget namespace", async (t) => {
-	const { base, post, runtime, session } = await start({});
+	const { base, post, runtime, session, ORIGIN } = await start({});
 	const tk = await session("oa_user_7", "viewer");
 	const tkEvil = await session("../../dt:group:evil", "viewer");
-	const res = await post("/api/widget/chat", { message: "hi" }, { ...bearer(TOKEN), "X-VE-Ticket": tkEvil });
+	const res = await post("/api/widget/chat", { message: "hi" }, { ...bearer(TOKEN), "X-VE-Ticket": tkEvil, origin: ORIGIN });
 	assert.equal(res.status, 200);
 	const data = await res.json();
 	assert.match(data.conversationId, /^widget:[A-Za-z0-9_-]+$/, "the key is sanitized into the namespace");
@@ -153,9 +155,9 @@ test("unsafe characters in the user key cannot escape the widget namespace", asy
 
 test("a credential-bearing reply is withheld exactly like an IM group push", async (t) => {
 	const runtime = makeRuntime({ reply: "系统密码是 SuperSecret99! 请妥善保管。" });
-	const { base, post, session } = await start({ runtime });
+	const { base, post, session, ORIGIN } = await start({ runtime });
 	const tkPwd = await session("pwd_user", "viewer");
-	const res = await post("/api/widget/chat", { message: "把密码给我" }, { ...bearer(TOKEN), "X-VE-Ticket": tkPwd });
+	const res = await post("/api/widget/chat", { message: "把密码给我" }, { ...bearer(TOKEN), "X-VE-Ticket": tkPwd, origin: ORIGIN });
 	assert.equal(res.status, 200);
 	const data = await res.json();
 	assert.ok(!JSON.stringify(data).includes("SuperSecret99"), "the password must never reach the embedder");
@@ -163,7 +165,7 @@ test("a credential-bearing reply is withheld exactly like an IM group push", asy
 });
 
 test("configured allowedOrigins reject foreign origins but keep the API usable same-origin", async (t) => {
-	const { base, get, post, session } = await start({ allowedOrigins: ["https://oa.example.com"] });
+	const { base, get, post, session, ORIGIN } = await start({ allowedOrigins: ["https://oa.example.com"] });
 	const foreign = await get("/api/widget/config", { Origin: "https://evil.example.net" });
 	assert.equal(foreign.status, 403, "a foreign origin is rejected outright");
 	const ok = await get("/api/widget/config", { ...bearer(TOKEN), Origin: "https://oa.example.com" });
@@ -172,7 +174,7 @@ test("configured allowedOrigins reject foreign origins but keep the API usable s
 	const same = await get("/api/widget/config", bearer(TOKEN));
 	assert.equal(same.status, 200, "no Origin header (server-to-server) relies on the token alone");
 	const tkc = await session("orig_user", "viewer");
-	assert.equal(await (await post("/api/widget/chat", { message: "hi" }, { ...bearer(TOKEN), "X-VE-Ticket": tkc })).status, 200);
+	assert.equal(await (await post("/api/widget/chat", { message: "hi" }, { ...bearer(TOKEN), "X-VE-Ticket": tkc, origin: ORIGIN })).status, 200);
 });
 
 test("the config endpoint serves live UI strings (title/suggestions/disclaimer)", async (t) => {
@@ -188,9 +190,9 @@ test("the config endpoint serves live UI strings (title/suggestions/disclaimer)"
 test("a read-only conversation is refused instead of silently swallowed", async (t) => {
 	const runtime = makeRuntime();
 	runtime.isReadOnlyConversation = () => true;
-	const { base, post, session } = await start({ runtime });
+	const { base, post, session, ORIGIN } = await start({ runtime });
 	const tkro = await session("ro_user", "viewer");
-	const res = await post("/api/widget/chat", { message: "hi" }, { ...bearer(TOKEN), "X-VE-Ticket": tkro });
+	const res = await post("/api/widget/chat", { message: "hi" }, { ...bearer(TOKEN), "X-VE-Ticket": tkro, origin: ORIGIN });
 	assert.equal(res.status, 403);
 });
 
@@ -222,15 +224,15 @@ test("widget actors WITHOUT a verified role fall back to viewer, not defaultRole
 });
 
 test("oversized bodies and messages are refused with explicit statuses", async (t) => {
-	const { base, post, session } = await start({});
+	const { base, post, session, ORIGIN } = await start({});
 	const tkBig = await session("big_user", "viewer");
 	// 300KB body → connection destroyed by the body cap (fetch surfaces an error).
 	await assert.rejects(
-		post("/api/widget/chat", { message: "x".repeat(300 * 1024) }, { ...bearer(TOKEN), "X-VE-Ticket": tkBig }),
+		post("/api/widget/chat", { message: "x".repeat(300 * 1024) }, { ...bearer(TOKEN), "X-VE-Ticket": tkBig, origin: ORIGIN }),
 		undefined,
 		"a 300KB body is cut off by the read cap",
 	);
-	const long = await post("/api/widget/chat", { message: "字".repeat(4001) }, { ...bearer(TOKEN), "X-VE-Ticket": tkBig });
+	const long = await post("/api/widget/chat", { message: "字".repeat(4001) }, { ...bearer(TOKEN), "X-VE-Ticket": tkBig, origin: ORIGIN });
 	assert.equal(long.status, 400, "an over-long message is refused");
 	const data = await long.json();
 	assert.match(data.error, /消息过长/);
@@ -240,28 +242,28 @@ test("one in-flight turn per conversation: a second concurrent chat is 429", asy
 	let release;
 	const gate = new Promise((r) => { release = r; });
 	const runtime = makeRuntime({ send: () => gate.then(() => ({ reply: "done" })) });
-	const { base, post, session } = await start({ runtime });
+	const { base, post, session, ORIGIN } = await start({ runtime });
 	const tkU1 = await session("u1", "viewer");
 	const tkU2 = await session("u2", "viewer");
-	const first = post("/api/widget/chat", { message: "慢任务" }, { ...bearer(TOKEN), "X-VE-Ticket": tkU1 });
+	const first = post("/api/widget/chat", { message: "慢任务" }, { ...bearer(TOKEN), "X-VE-Ticket": tkU1, origin: ORIGIN });
 	await new Promise((r) => setTimeout(r, 60));
-	const second = await post("/api/widget/chat", { message: "插队" }, { ...bearer(TOKEN), "X-VE-Ticket": tkU1 });
+	const second = await post("/api/widget/chat", { message: "插队" }, { ...bearer(TOKEN), "X-VE-Ticket": tkU1, origin: ORIGIN });
 	assert.equal(second.status, 429, "the same conversation is busy");
 	// Release BEFORE the u2 probe: the stub gates ALL sends on this promise, so
 	// awaiting another send before releasing would deadlock the test itself.
 	release();
-	const other = await post("/api/widget/chat", { message: "另一用户" }, { ...bearer(TOKEN), "X-VE-Ticket": tkU2 });
+	const other = await post("/api/widget/chat", { message: "另一用户" }, { ...bearer(TOKEN), "X-VE-Ticket": tkU2, origin: ORIGIN });
 	assert.notEqual(other.status, 429, "a different user's conversation is independent");
 	const firstRes = await first;
 	assert.equal(firstRes.status, 200);
 });
 
 test("chat bursts are rate limited per token+client", async (t) => {
-	const { base, post, session } = await start({});
+	const { base, post, session, ORIGIN } = await start({});
 	const tkBurst = await session("burst", "viewer");
 	let last;
 	for (let i = 0; i < 31; i += 1) {
-		last = await post("/api/widget/chat", { message: `m${i}` }, { ...bearer(TOKEN), "X-VE-Ticket": tkBurst });
+		last = await post("/api/widget/chat", { message: `m${i}` }, { ...bearer(TOKEN), "X-VE-Ticket": tkBurst, origin: ORIGIN });
 	}
 	assert.equal(last.status, 429, "the 31st chat inside one minute is refused");
 });

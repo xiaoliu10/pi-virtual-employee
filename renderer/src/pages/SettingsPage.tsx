@@ -1193,7 +1193,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 																className="shrink-0 rounded-lg border border-slate-300 px-3 text-xs text-slate-600 hover:bg-slate-50">重新生成</button>
 														</div>
 													</Field>
-													<Field label="允许最高角色" hint="业务系统声明的角色会被限制在此范围内。owner 是部署者专属，任何情况下都不会授予小组件。">
+													<Field label="允许最高角色" hint="业务系统声明的角色会被限制在此范围内。admin 可管理配置与任务（含 shell/settings 等管理工具）；owner 是部署者专属，任何情况下都不会授予小组件。注意：票据声明的角色是小组件会话的最终权限，不受「默认角色」影响。">
 														<select value={draft.widget.maxRole} onChange={(e) => setWidget({ maxRole: e.target.value === "viewer" ? "viewer" : e.target.value === "operator" ? "operator" : "admin" })} className={inputCls}>
 															<option value="viewer">viewer（仅对话与检索）</option>
 															<option value="operator">operator（可用浏览器/命令）</option>
@@ -1216,6 +1216,7 @@ X-VE-Secret: <接入密钥>
   "clientIp": "10.0.0.9" }
 
 → { "ticket": "...", "role": "admin", "expiresIn": 300 }`}</pre>
+														<div className="mt-1">user 请传业务系统里稳定的 ASCII 标识（工号/用户 id）；含中文或特殊字符会被清洗成 <code className="font-mono">anon</code>，导致不同用户共享同一会话。</div>
 														<div className="mt-1"><b>origin / clientIp 声明「这张票将交给谁用」</b>——换票是后端发起的，对话是浏览器发起的，两者地址天然不同。省略 clientIp 则只按 Origin 绑定（较弱）；声明了 clientIp 就钉死到该地址，票据被拷走也用不了。</div>
 														<div className="mt-1">前端只携带 ticket（<code className="font-mono">data-ticket</code>），永远不接触接入密钥。票据 5 分钟有效。</div>
 													</div>

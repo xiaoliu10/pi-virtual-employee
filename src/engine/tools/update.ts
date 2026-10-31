@@ -1,7 +1,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { ConfigStore } from "../../db/config-store.js";
-import { hasAnyAdmin, isAdmin } from "../../security/permissions.js";
+import { effectiveActorRole, hasAnyAdmin, isAdmin } from "../../security/permissions.js";
 import {
 	isExplicitConfirmation,
 	maskId,
@@ -66,7 +66,9 @@ function requireUpdateAdmin(
 	if (!hasAnyAdmin(deps.config)) {
 		return refuse("管理员尚未设置。请先在单聊中使用 manage_admin 的 claim 动作认领首位管理员。");
 	}
-	if (!isAdmin(deps.config, actor.senderId)) {
+	// effectiveActorRole: a widget ticket's verified admin passes the same gates
+	// as a local admin (code review P1-2b).
+	if (!["admin", "owner"].includes(effectiveActorRole(deps.config, actor))) {
 		return refuse("你不是本系统的管理员，无权执行更新管理操作。如需权限请联系现有管理员指派。");
 	}
 	const confirmed = isExplicitConfirmation(actor.text);
