@@ -63,11 +63,42 @@ export interface WidgetDeps {
 	onBindAttempt?: (port: number) => void;
 	/** Session tickets; injectable so tests can control TTL/clock. */
 	tickets?: TicketStore;
+	/**
+	 * Peer addresses allowed to speak for the real client via X-Forwarded-For
+	 * (e.g. ["127.0.0.1"] behind a local nginx). Empty = never trust the header.
+	 */
+	trustedProxies?: string[];
 }
 
-/** Client address as seen by this listener (binding key for tickets). */
-function clientAddress(req: IncomingMessage): string {
-	return (req.socket.remoteAddress ?? "?").replace(/^::ffff:/, "");
+/** Strip the IPv4-mapped IPv6 prefix so "::ffff:10.0.0.1" and "10.0.0.1" compare equal. */
+function normalizeAddress(value: string | undefined): string {
+	const raw = (value ?? "").trim().replace(/^::ffff:/, "");
+	return raw || "?";
+}
+
+/**
+ * Client address for ticket binding.
+ *
+ * Behind nginx every request arrives from 127.0.0.1, which would make address
+ * binding meaningless (every user looks identical). X-Forwarded-For is
+ * therefore honoured ONLY when the request comes from a configured trusted
+ * proxy — otherwise a client could simply forge the header and claim to be the
+ * address a stolen ticket was bound to.
+ */
+function clientAddress(req: IncomingMessage, trustedProxies: string[]): string {
+	const peer = normalizeAddress(req.socket.remoteAddress);
+	if (trustedProxies.length === 0 || !trustedProxies.includes(peer)) return peer;
+	const forwarded = req.headers["x-forwarded-for"];
+	const value = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+	if (!value) return peer;
+	// The left-most entry is the original client; later entries are proxies.
+	const original = value.split(",")[0];
+	return normalizeAddress(original);
+}
+
+/** Is a request's Origin listed? Reuses the same boundary rules as CORS below. */
+function declaredOrigin(req: IncomingMessage): string {
+	return (req.headers.origin as string | undefined)?.trim() ?? "";
 }
 
 const BEARER = /^Bearer\s+(.+)$/i;
@@ -246,7 +277,7 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 				log("[widget] /session refused: no widget secret configured");
 				return sendJson(res, 503, { error: "小组件未配置接入密钥，请在设置页生成后重试" });
 			}
-			let body: { user?: string; role?: string };
+			let body: { user?: string; role?: string; origin?: string; clientIp?: string };
 			try {
 				body = await readJsonBody(req);
 			} catch {
@@ -254,17 +285,22 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 			}
 			const presentedSecret = SECRET_HEADER.exec(req.headers["x-ve-secret"] as string ?? "")?.[1] ?? "";
 			if (!secretMatches(presentedSecret, cfg.secret)) {
-				log(`[widget] /session rejected: bad secret from ${clientAddress(req)}`);
+				log(`[widget] /session rejected: bad secret from ${clientAddress(req, deps.trustedProxies ?? [])}`);
 				return sendJson(res, 401, { error: "接入密钥不正确" });
 			}
 			const user = (body.user ?? "").trim();
 			if (!user) return sendJson(res, 400, { error: "缺少 user（业务系统的用户标识）" });
+			// The backend declares WHERE the ticket will be used: the browser's
+			// Origin and (optionally) its IP. Binding to the minting backend's own
+			// address would be wrong — the chat comes from the end user's browser.
+			const consumerOrigin = (body.origin ?? "").trim() || origin;
+			const consumerIp = (body.clientIp ?? "").trim();
 			const record = tickets.issue(
 				{
 					user,
 					role: body.role,
-					address: clientAddress(req),
-					origin,
+					address: consumerIp ? normalizeAddress(consumerIp) : "*",
+					origin: consumerOrigin,
 					conversationKey: widgetConversationKey(user),
 				},
 				cfg.maxRole,
@@ -283,11 +319,11 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 			// The role comes from a TICKET, never from the request body: a body field
 			// is one devtools keystroke away from being anything.
 			const presentedTicket = TICKET_HEADER.exec(req.headers["x-ve-ticket"] as string ?? "")?.[1] ?? "";
-			const redeemed = tickets.redeem(presentedTicket, { address: clientAddress(req), origin });
+			const redeemed = tickets.redeem(presentedTicket, { address: clientAddress(req, deps.trustedProxies ?? []), origin });
 			if (!redeemed.ok) {
 				// Log every rejection with its reason — a bare 401 is undebuggable when
 				// a proxy rewrites the client address and the ticket stops redeeming.
-				log(`[widget] /chat rejected (${redeemed.reason}) from ${clientAddress(req)}`);
+				log(`[widget] /chat rejected (${redeemed.reason}) from ${clientAddress(req, deps.trustedProxies ?? [])}`);
 				return sendJson(res, 401, {
 					error:
 						redeemed.reason === "expired" ? "会话票据已过期，请重新获取"

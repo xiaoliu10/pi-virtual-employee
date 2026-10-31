@@ -1200,15 +1200,24 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 															<option value="admin">admin（可改配置与管理任务）</option>
 														</select>
 													</Field>
+													<Field label="信任的反向代理（每行一个，留空 = 不信任）" hint="部署在 nginx 等代理后面时，所有请求都来自 127.0.0.1，来源绑定会失效。把代理地址填进来（如 127.0.0.1），来自它的请求才采用 X-Forwarded-For 作为真实客户端地址；其它来源伪造该头会被忽略。">
+														<textarea rows={2} value={draft.widget.trustedProxies.join("\n")}
+															onChange={(e) => setWidget({ trustedProxies: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) })}
+															className={inputCls + " h-auto py-2 font-mono text-xs"} />
+													</Field>
 													<div className="rounded-xl bg-slate-50 px-4 py-3 text-xs leading-relaxed text-slate-500">
 														<div className="font-medium text-slate-700">接入方需要实现的一步（换票）</div>
-														<div className="mt-1">业务系统后端调用一次，把返回的 ticket 传给前端：</div>
+														<div className="mt-1">业务系统后端调用一次，把返回的 ticket 传给前端页面：</div>
 														<pre className="mt-1 overflow-x-auto rounded-md bg-white p-2 font-mono text-[11px] text-slate-600">{`POST http://<VE地址>:${draft.widget.port}/api/widget/session
+Authorization: Bearer <访问令牌>
 X-VE-Secret: <接入密钥>
-{ "user": "zhangsan", "role": "admin" }
+{ "user": "zhangsan", "role": "admin",
+  "origin": "https://oa.example.com",
+  "clientIp": "10.0.0.9" }
 
 → { "ticket": "...", "role": "admin", "expiresIn": 300 }`}</pre>
-														<div className="mt-1">前端只携带 ticket（<code className="font-mono">data-ticket</code>），不接触接入密钥。票据 5 分钟有效，且绑定换取时的客户端地址与来源，转到别的机器立即失效。</div>
+														<div className="mt-1"><b>origin / clientIp 声明「这张票将交给谁用」</b>——换票是后端发起的，对话是浏览器发起的，两者地址天然不同。省略 clientIp 则只按 Origin 绑定（较弱）；声明了 clientIp 就钉死到该地址，票据被拷走也用不了。</div>
+														<div className="mt-1">前端只携带 ticket（<code className="font-mono">data-ticket</code>），永远不接触接入密钥。票据 5 分钟有效。</div>
 													</div>
 													<div className="grid grid-cols-2 gap-3">
 														<Field label="浮窗标题" hint="显示在小组件头部与欢迎语中，如「业务助理」。">

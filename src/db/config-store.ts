@@ -398,6 +398,13 @@ export interface AppConfig {
 		 * from a widget regardless of this value — owner is the deployment owner.
 		 */
 		maxRole: "viewer" | "operator" | "admin";
+		/**
+		 * Peer addresses allowed to declare the real client via X-Forwarded-For
+		 * (v0.2.178). Needed behind nginx, where every request arrives from
+		 * 127.0.0.1 and address binding would otherwise be meaningless. Entries
+		 * outside this list have the header IGNORED, so a client cannot forge it.
+		 */
+		trustedProxies: string[];
 	};
 	/**
 	 * Report / artifact center. Generated reports (scheduled-task outputs, etc.)
@@ -553,6 +560,7 @@ const DEFAULTS: AppConfig = {
 		allowedOrigins: [],
 		secret: "",
 		maxRole: "admin" as const,
+		trustedProxies: [],
 	},
 	reports: {
 		enabled: false,

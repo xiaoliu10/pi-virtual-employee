@@ -84,6 +84,7 @@ async function start(overrides = {}) {
 		port: 0,
 		log: () => {},
 		tickets,
+		trustedProxies: overrides.trustedProxies ?? [],
 	});
 	// startWidgetServer resolves { port, server } — keep the http.Server for teardown.
 	const httpServer = server.server;
@@ -227,4 +228,78 @@ test("RBAC grants admin from a verified ticket but never owner, and ignores defa
 	assert.equal(checkPermission(config, operatorActor, "widget:u3", "shell").ok, true, "operator may run commands");
 	assert.equal(checkPermission(config, operatorActor, "widget:u3", "settings").ok, false,
 		"operator must NOT reach admin-tier capabilities (settings)");
+});
+
+// ── consumer-declared binding + trusted-proxy handling (v0.2.178 follow-up) ──
+
+test("a ticket binds to the DECLARED consumer origin/ip, not the minting backend", async (t) => {
+	// Real deployment: the backend mints from 10.0.0.5, the browser chats from
+	// 10.0.0.9. Binding to the minting address would break every integration.
+	const { post, server } = await start();
+	t.after(() => { server.closeAllConnections?.(); server.close(); });
+
+	const minted = await post(
+		"/api/widget/session",
+		{ user: "u1", role: "admin", origin: "https://oa.example.com", clientIp: "10.0.0.9" },
+		{ "x-ve-secret": SECRET },
+	);
+	assert.equal(minted.status, 200);
+	const { ticket } = await minted.json();
+
+	// The chat arrives from the test client, NOT from 10.0.0.9 → refused.
+	const rejected = await post("/api/widget/chat", { message: "hi" }, { "x-ve-ticket": ticket, origin: "https://oa.example.com" });
+	assert.equal(rejected.status, 401, "the declared client IP is enforced");
+	const body = await rejected.json();
+	assert.match(body.error, /来源不匹配/, "and the reason is reported");
+});
+
+test("omitting clientIp binds by Origin only (weaker but usable)", async (t) => {
+	const { post, server, sink } = await start();
+	t.after(() => { server.closeAllConnections?.(); server.close(); });
+
+	const minted = await post("/api/widget/session", { user: "u2", role: "viewer", origin: "https://oa.example.com" }, { "x-ve-secret": SECRET });
+	const { ticket } = await minted.json();
+
+	const wrongOrigin = await post("/api/widget/chat", { message: "hi" }, { "x-ve-ticket": ticket, origin: "https://evil.example" });
+	assert.equal(wrongOrigin.status, 401, "a different Origin is refused");
+
+	const ok = await post("/api/widget/chat", { message: "hi" }, { "x-ve-ticket": ticket, origin: "https://oa.example.com" });
+	assert.equal(ok.status, 200, "the declared Origin works from any address");
+	assert.equal(sink[0].actor.verifiedRole, "viewer");
+});
+
+test("X-Forwarded-For is ignored unless the peer is a trusted proxy", async (t) => {
+	// The forgery this blocks: a client claims the address a stolen ticket was
+	// bound to by simply sending X-Forwarded-For.
+	const tickets = new TicketStore();
+	const minted = tickets.issue({ user: "u", role: "admin", address: "10.0.0.9", origin: "", conversationKey: "u" });
+
+	// No trusted proxies configured → the header cannot change the identity.
+	const untrusted = await start({ tickets });
+	t.after(() => { untrusted.server.closeAllConnections?.(); untrusted.server.close(); });
+	const forged = await untrusted.post(
+		"/api/widget/chat",
+		{ message: "hi" },
+		{ "x-ve-ticket": minted.ticket, "x-forwarded-for": "10.0.0.9" },
+	);
+	assert.equal(forged.status, 401, "an untrusted peer cannot forge its way to the bound address");
+
+	// With 127.0.0.1 trusted, the header IS honoured (nginx case).
+	const trusting = await start({ tickets, trustedProxies: ["127.0.0.1"] });
+	t.after(() => { trusting.server.closeAllConnections?.(); trusting.server.close(); });
+	const proxied = await start({ tickets, trustedProxies: ["127.0.0.1"] });
+	t.after(() => { proxied.server.closeAllConnections?.(); proxied.server.close(); });
+	const viaProxy = await proxied.post(
+		"/api/widget/chat",
+		{ message: "hi" },
+		{ "x-ve-ticket": minted.ticket, "x-forwarded-for": "10.0.0.9, 127.0.0.1" },
+	);
+	assert.equal(viaProxy.status, 200, "a trusted proxy's X-Forwarded-For selects the left-most client");
+
+	const wrongClient = await proxied.post(
+		"/api/widget/chat",
+		{ message: "hi" },
+		{ "x-ve-ticket": minted.ticket, "x-forwarded-for": "10.0.0.99" },
+	);
+	assert.equal(wrongClient.status, 401, "a different forwarded client is still refused");
 });

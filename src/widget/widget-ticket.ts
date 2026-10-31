@@ -77,7 +77,15 @@ export class TicketStore {
 		this.#now = options.now ?? Date.now;
 	}
 
-	/** Mint a ticket bound to the given source. */
+	/**
+	 * Mint a ticket bound to the source that will actually USE it.
+	 *
+	 * The exchange is made by the business system's BACKEND, while the chat comes
+	 * from the END USER'S BROWSER — different addresses by nature. So the caller
+	 * declares the consumer explicitly (origin, and optionally the client IP it
+	 * will be used from), and the ticket binds to that declaration. Without this,
+	 * a correctly configured integration would fail with address-mismatch.
+	 */
 	issue(input: { user: string; role: unknown; address: string; origin: string; conversationKey: string }, ceiling?: WidgetRole): { ticket: string; record: TicketRecord } {
 		this.sweep();
 		const now = this.#now();
@@ -114,9 +122,14 @@ export class TicketStore {
 			return { ok: false, reason: "expired" };
 		}
 		// Source binding: a stolen ticket must not work from anywhere else.
-		if (record.address !== source.address) return { ok: false, reason: "address-mismatch" };
-		// Origin is part of the binding only when the ticket was minted with one;
-		// server-to-server mints legitimately have none.
+		// The address is the one DECLARED at mint time (the browser's, not the
+		// minting backend's); a wildcard "*" means the caller did not pin an IP,
+		// in which case Origin is the only (softer) binding.
+		if (record.address !== "*" && record.address !== source.address) {
+			return { ok: false, reason: "address-mismatch" };
+		}
+		// Origin binds whenever one was declared; a mint with no origin is only
+		// legitimate for server-to-server callers, which never use /chat.
 		if (record.origin && record.origin !== source.origin) return { ok: false, reason: "origin-mismatch" };
 		return { ok: true, record };
 	}

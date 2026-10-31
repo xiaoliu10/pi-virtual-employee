@@ -175,6 +175,8 @@ export interface AppConfig {
 		secret: string;
 		/** Highest role a ticket may carry; owner is never reachable. */
 		maxRole: "viewer" | "operator" | "admin";
+		/** Peers allowed to assert X-Forwarded-For (reverse-proxy deployments). */
+		trustedProxies: string[];
 	};
 	reports: {
 		enabled: boolean;

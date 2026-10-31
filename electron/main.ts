@@ -1314,6 +1314,7 @@ ${tailForProgress(decision.text)}`;
 				runtime: engine,
 				expose: w.expose,
 				port: w.port,
+				trustedProxies: w.trustedProxies,
 			});
 			widgetServer = started.server;
 			if (started.port !== w.port) {
