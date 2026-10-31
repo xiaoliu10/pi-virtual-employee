@@ -467,3 +467,43 @@ test("streaming chat without a ticket is refused before the stream starts", asyn
 	});
 	assert.equal(res.status, 401, "SSE must not bypass the ticket gate");
 });
+
+// ── durable-kernel fallback (review P0-3): no process events → honest JSON ──
+
+test("a runtime without process events serves JSON even when the client asks for SSE", async (t) => {
+	// The durable kernel never drives agent.subscribe (review probe: 0 events
+	// across a full turn), so an SSE stream there would be meta→done with a
+	// silent hole. The runtime declares its capability and the widget falls
+	// back to the JSON path the client already renders.
+	const runtime = makeStreamingRuntime({ script: [], finalReply: "durable 回复" });
+	runtime.streamsProcessEvents = false;
+	const { base, session, server } = await start({ runtime });
+	t.after(() => { server.closeAllConnections?.(); server.close(); });
+	const tk = await session("u1", "viewer");
+
+	const res = await fetch(base + "/api/widget/chat", {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}`, "x-ve-ticket": tk, accept: "text/event-stream", origin: "https://oa.example.com" },
+		body: JSON.stringify({ message: "hi" }),
+	});
+	assert.equal(res.status, 200);
+	assert.match(res.headers.get("content-type") ?? "", /application\/json/, "JSON fallback, not an empty stream");
+	const data = await res.json();
+	assert.equal(data.reply, "durable 回复");
+});
+
+test("a runtime WITH process events streams SSE as before", async (t) => {
+	const runtime = makeStreamingRuntime({ script: [], finalReply: "done text" });
+	runtime.streamsProcessEvents = true;
+	const { base, session, server } = await start({ runtime });
+	t.after(() => { server.closeAllConnections?.(); server.close(); });
+	const tk = await session("u1", "viewer");
+	const res = await fetch(base + "/api/widget/chat", {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}`, "x-ve-ticket": tk, accept: "text/event-stream", origin: "https://oa.example.com" },
+		body: JSON.stringify({ message: "hi" }),
+	});
+	assert.match(res.headers.get("content-type") ?? "", /text\/event-stream/);
+	const events = await (await res.text()).split("\n\n").filter((f) => f.startsWith("data:")).map((f) => JSON.parse(f.slice(5)));
+	assert.equal(events[events.length - 1].type, "done");
+});

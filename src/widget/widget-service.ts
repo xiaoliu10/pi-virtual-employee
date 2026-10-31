@@ -395,7 +395,13 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 			// at a frozen bubble, which the field called out as unusable. With
 			// Accept: text/event-stream we forward the same process events the
 			// desktop console shows: thinking, tool calls, and streaming text.
-			const wantsStream = (req.headers.accept ?? "").includes("text/event-stream");
+			const wantsStream =
+				(req.headers.accept ?? "").includes("text/event-stream") &&
+				// The durable kernel (the DEFAULT) never drives agent.subscribe, so an
+				// SSE stream would carry only meta→done — silently no process events
+				// (review P0-3). Fall back to the JSON path there; the client renders
+				// its "thinking…" placeholder either way.
+				deps.runtime.streamsProcessEvents !== false;
 			const actor = {
 				senderId: `widget-user-${ticket.conversationKey}`,
 				channel: "widget" as const,
@@ -417,6 +423,12 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 					const sse = (payload: Record<string, unknown>): void => {
 						if (!res.writableEnded) res.write(`data: ${JSON.stringify(payload)}\n\n`);
 					};
+					// Comment-only heartbeat keeps long silent tool executions (minutes)
+					// alive through proxies with default read timeouts. Clients ignore
+					// frames that do not start with "data:".
+					const heartbeat = setInterval(() => {
+						if (!res.writableEnded) res.write(": ping\n\n");
+					}, 15_000);
 					sse({ type: "meta", conversationId });
 
 					/**
@@ -496,6 +508,7 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 						sse({ type: "error", message: "处理失败，请稍后再试" });
 					} finally {
 						unsubscribe();
+						clearInterval(heartbeat);
 						if (!res.writableEnded) res.end();
 						inFlight.delete(conversationId);
 					}

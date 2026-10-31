@@ -189,17 +189,27 @@ export function renderWidgetLoader(): string {
           handlers.onerror((d && d.error) || ("请求失败（" + res.status + "）"));
         });
       }
+      // The durable kernel serves plain JSON (no process events exist there);
+      // render it through the same path as a final reply instead of hanging.
+      var ctype = res.headers.get("content-type") || "";
+      if (ctype.indexOf("text/event-stream") === -1) {
+        return res.json().then(function (d) {
+          if (d && d.reply != null) handlers.onevent({ type: "replace", text: d.reply });
+          else if (d && d.error) { handlers.onerror(d.error); return; }
+          handlers.onend();
+        });
+      }
       var reader = res.body.getReader();
       var dec = new TextDecoder();
       var buf = "";
       function pump() {
         return reader.read().then(function (chunk) {
           if (chunk.done) { handlers.onend(); return; }
-          buf += dec.decode(chunk, { stream: true });
-          var frames = buf.split("\n\n");
+          buf += dec.decode(chunk.value, { stream: true });
+          var frames = buf.split("\\n\\n");
           buf = frames.pop();
           frames.forEach(function (frame) {
-            var line = frame.split("\n").find(function (l) { return l.indexOf("data:") === 0; });
+            var line = frame.split("\\n").find(function (l) { return l.indexOf("data:") === 0; });
             if (!line) return;
             try { handlers.onevent(JSON.parse(line.slice(5))); } catch (e) { /* 忽略坏帧 */ }
           });
@@ -252,11 +262,14 @@ export function renderWidgetLoader(): string {
     state.busy = true;
     q(".send").disabled = true;
     addMsg("me", text);
-    var box = addMsg("ai", "");
+    // Placeholder keeps legacy/durable kernels (no process events) readable —
+    // the first real event clears it.
+    var box = addMsg("ai", "正在思考…");
     box.classList.add("streaming");
     var m = msgs();
     var aiText = "";          // 当前气泡累计文本
     var thinkEl = null;       // 思考面板
+    var thinkText = "";
     var tools = {};           // toolCallId → step 元素
     var lastTool = null;
     var ended = false;
@@ -265,7 +278,7 @@ export function renderWidgetLoader(): string {
       if (ended) return;
       ended = true;
       box.classList.remove("streaming");
-      if (!aiText && !box.textContent) box.textContent = "（空回复）";
+      if (!box.textContent || box.textContent === "正在思考…") box.textContent = aiText || "（空回复）";
       state.busy = false;
       q(".send").disabled = false;
       q(".box").focus();
@@ -288,6 +301,7 @@ export function renderWidgetLoader(): string {
             scrollEnd();
             break;
           case "tool_start":
+            if (!aiText) box.textContent = "";
             lastTool = addStep(m, "调用工具 " + ev.toolName + " …");
             if (ev.toolCallId) tools[ev.toolCallId] = lastTool;
             scrollEnd();
@@ -298,8 +312,17 @@ export function renderWidgetLoader(): string {
             break;
           }
           case "thinking_delta":
+            if (!aiText) box.textContent = "";
             if (!thinkEl) thinkEl = addThinking(m);
-            thinkEl.textContent += ev.text;
+            thinkText += ev.text;
+            thinkEl.textContent = thinkText;
+            scrollEnd();
+            break;
+          case "thinking_replace":
+            if (!aiText) box.textContent = "";
+            if (!thinkEl) thinkEl = addThinking(m);
+            thinkText = ev.text;
+            thinkEl.textContent = thinkText;
             scrollEnd();
             break;
           case "error":
@@ -448,17 +471,27 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
           handlers.onerror((d && d.error) || ("请求失败（" + res.status + "）"));
         });
       }
+      // The durable kernel serves plain JSON (no process events exist there);
+      // render it through the same path as a final reply instead of hanging.
+      var ctype = res.headers.get("content-type") || "";
+      if (ctype.indexOf("text/event-stream") === -1) {
+        return res.json().then(function (d) {
+          if (d && d.reply != null) handlers.onevent({ type: "replace", text: d.reply });
+          else if (d && d.error) { handlers.onerror(d.error); return; }
+          handlers.onend();
+        });
+      }
       var reader = res.body.getReader();
       var dec = new TextDecoder();
       var buf = "";
       function pump() {
         return reader.read().then(function (chunk) {
           if (chunk.done) { handlers.onend(); return; }
-          buf += dec.decode(chunk, { stream: true });
-          var frames = buf.split("\n\n");
+          buf += dec.decode(chunk.value, { stream: true });
+          var frames = buf.split("\\n\\n");
           buf = frames.pop();
           frames.forEach(function (frame) {
-            var line = frame.split("\n").find(function (l) { return l.indexOf("data:") === 0; });
+            var line = frame.split("\\n").find(function (l) { return l.indexOf("data:") === 0; });
             if (!line) return;
             try { handlers.onevent(JSON.parse(line.slice(5))); } catch (e) { /* 忽略坏帧 */ }
           });
@@ -508,10 +541,11 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     busy = true; el("send").disabled = true;
     add("me", text);
     var list = el("msgs");
-    var box = add("ai", "");
+    var box = add("ai", "正在思考…");
     box.classList.add("streaming");
     var aiText = "";
     var thinkEl = null;
+    var thinkText = "";
     var tools = {};
     var lastTool = null;
     var ended = false;
@@ -519,7 +553,7 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
       if (ended) return;
       ended = true;
       box.classList.remove("streaming");
-      if (!aiText && !box.textContent) box.textContent = "（空回复）";
+      if (!box.textContent || box.textContent === "正在思考…") box.textContent = aiText || "（空回复）";
       busy = false; el("send").disabled = false; el("box").focus();
       scrollEnd();
     }
@@ -539,6 +573,7 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
             scrollEnd();
             break;
           case "tool_start":
+            if (!aiText) box.textContent = "";
             lastTool = addStep(list, "调用工具 " + ev.toolName + " …");
             if (ev.toolCallId) tools[ev.toolCallId] = lastTool;
             scrollEnd();
@@ -549,8 +584,17 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
             break;
           }
           case "thinking_delta":
+            if (!aiText) box.textContent = "";
             if (!thinkEl) thinkEl = addThinking(list);
-            thinkEl.textContent += ev.text;
+            thinkText += ev.text;
+            thinkEl.textContent = thinkText;
+            scrollEnd();
+            break;
+          case "thinking_replace":
+            if (!aiText) box.textContent = "";
+            if (!thinkEl) thinkEl = addThinking(list);
+            thinkText = ev.text;
+            thinkEl.textContent = thinkText;
             scrollEnd();
             break;
           case "error":

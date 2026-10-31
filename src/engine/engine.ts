@@ -130,6 +130,16 @@ export interface EmployeeRuntime {
 	activeSessionCount(): number;
 	/** True for conversations created by an IM channel — read-only in the console. */
 	isReadOnlyConversation(conversationId: string): boolean;
+	/**
+	 * Whether `agent.subscribe` receives live process events (text/thinking
+	 * deltas, tool executions) during `send`. Legacy/pi-session kernels drive the
+	 * Agent directly, so it does. The durable kernel (the DEFAULT since v0.2.167)
+	 * drives the harness's own pipeline and never calls agent.prompt, so agent
+	 * subscriptions observe NOTHING — measured in review: 0 events across a full
+	 * durable turn. SSE consumers (the widget) must fall back to JSON when this
+	 * is false instead of streaming an empty channel.
+	 */
+	readonly streamsProcessEvents?: boolean;
 }
 
 function extractText(message: AgentMessage): string {
@@ -532,6 +542,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 	get modelId(): string {
 		const c = this.config.all();
 		return c.model.defaultModelId || this.availableModels()[0]?.modelId || "unknown";
+	}
+
+	/** Only the legacy kernel drives the Agent (and thus its subscribers) live. */
+	get streamsProcessEvents(): boolean {
+		return this.opts.kernel !== "durable";
 	}
 
 	/**
