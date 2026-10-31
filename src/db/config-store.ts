@@ -386,6 +386,18 @@ export interface AppConfig {
 		disclaimer: string;
 		/** When non-empty, only these origins may embed (CORS + Referrer check). Empty = any origin (fine on loopback). */
 		allowedOrigins: string[];
+		/**
+		 * Secret the business system's BACKEND presents to exchange (user, role) for
+		 * a session ticket (v0.2.178). Never reaches a browser: with it, anyone
+		 * could mint themselves an admin ticket. Empty = ticket exchange disabled
+		 * (chat then refuses, since a widget session requires a ticket).
+		 */
+		secret: string;
+		/**
+		 * Highest role a ticket may carry, default admin. `owner` is never reachable
+		 * from a widget regardless of this value — owner is the deployment owner.
+		 */
+		maxRole: "viewer" | "operator" | "admin";
 	};
 	/**
 	 * Report / artifact center. Generated reports (scheduled-task outputs, etc.)
@@ -539,6 +551,8 @@ const DEFAULTS: AppConfig = {
 		suggestions: ["你是谁？", "你能帮我做什么？"],
 		disclaimer: "内容由 AI 生成，仅供参考，请自行判断后使用。",
 		allowedOrigins: [],
+		secret: "",
+		maxRole: "admin" as const,
 	},
 	reports: {
 		enabled: false,

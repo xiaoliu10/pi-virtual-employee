@@ -1142,7 +1142,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 											<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
 												<div className="text-sm font-medium text-slate-800">助理小组件（嵌入业务系统）</div>
 												<div className="mt-1 text-xs leading-relaxed text-slate-400">
-													把本员工作为一个浮窗 AI 助理嵌入到自己的管理后台：业务系统引入一段 script 即可在右下角出现对话浮窗。小组件使用独立的访问令牌，会话以普通用户（仅对话与知识检索）权限运行，回复内容经过与 IM 群相同的敏感凭据拦截。
+													把本员工作为一个浮窗 AI 助理嵌入到自己的管理后台：业务系统引入一段 script 即可在右下角出现对话浮窗。接入需要两道凭据——访问令牌（请求门禁）与接入密钥（业务后端换取会话票据），票据绑定来源地址；业务方声明的用户角色最高到 admin（owner 永远不可达），回复内容经过与 IM 群相同的敏感凭据拦截。
 												</div>
 												<div className="mt-3 space-y-3">
 													<label className="flex cursor-pointer items-center justify-between rounded-xl border border-indigo-200 bg-indigo-50/50 px-4 py-3">
@@ -1185,6 +1185,31 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 																className="shrink-0 rounded-lg border border-slate-300 px-3 text-xs text-slate-600 hover:bg-slate-50">重新生成</button>
 														</div>
 													</Field>
+													<Field label="接入密钥（仅业务系统后端持有）" hint="业务系统后端用它调用 POST /api/widget/session 换取会话票据。此密钥绝不能写进前端页面——拿到它就能签发任意角色的票据。留空则换票接口关闭，小组件将无法对话。">
+														<div className="flex gap-2">
+															<input value={draft.widget.secret} onChange={(e) => setWidget({ secret: e.target.value })} placeholder="留空则不接受换票" className={inputCls + " font-mono"} />
+															<button type="button"
+																onClick={() => { const b = new Uint8Array(24); crypto.getRandomValues(b); setWidget({ secret: Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("") }); }}
+																className="shrink-0 rounded-lg border border-slate-300 px-3 text-xs text-slate-600 hover:bg-slate-50">重新生成</button>
+														</div>
+													</Field>
+													<Field label="允许最高角色" hint="业务系统声明的角色会被限制在此范围内。owner 是部署者专属，任何情况下都不会授予小组件。">
+														<select value={draft.widget.maxRole} onChange={(e) => setWidget({ maxRole: e.target.value === "viewer" ? "viewer" : e.target.value === "operator" ? "operator" : "admin" })} className={inputCls}>
+															<option value="viewer">viewer（仅对话与检索）</option>
+															<option value="operator">operator（可用浏览器/命令）</option>
+															<option value="admin">admin（可改配置与管理任务）</option>
+														</select>
+													</Field>
+													<div className="rounded-xl bg-slate-50 px-4 py-3 text-xs leading-relaxed text-slate-500">
+														<div className="font-medium text-slate-700">接入方需要实现的一步（换票）</div>
+														<div className="mt-1">业务系统后端调用一次，把返回的 ticket 传给前端：</div>
+														<pre className="mt-1 overflow-x-auto rounded-md bg-white p-2 font-mono text-[11px] text-slate-600">{`POST http://<VE地址>:${draft.widget.port}/api/widget/session
+X-VE-Secret: <接入密钥>
+{ "user": "zhangsan", "role": "admin" }
+
+→ { "ticket": "...", "role": "admin", "expiresIn": 300 }`}</pre>
+														<div className="mt-1">前端只携带 ticket（<code className="font-mono">data-ticket</code>），不接触接入密钥。票据 5 分钟有效，且绑定换取时的客户端地址与来源，转到别的机器立即失效。</div>
+													</div>
 													<div className="grid grid-cols-2 gap-3">
 														<Field label="浮窗标题" hint="显示在小组件头部与欢迎语中，如「业务助理」。">
 															<input value={draft.widget.title} onChange={(e) => setWidget({ title: e.target.value })} className={inputCls} />

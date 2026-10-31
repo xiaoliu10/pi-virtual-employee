@@ -195,13 +195,24 @@ export function checkPermission(
 	if (actor) senderId = actor.senderId || undefined;
 	else if (isLocalConversation(conversationId)) return { ok: true, role: "admin" };
 	let role = resolveRole(config, senderId);
-	// Widget-channel ceiling (v0.2.176 review P1-3): the embedded assistant's
-	// bearer token reaches BUSINESS systems' end users, so its actors must never
-	// hold more than viewer — regardless of security.defaultRole (which exists
-	// for the admin's own IM unknown-senders, a trust context a widget cannot
-	// share) or a people[] entry colliding with the widget sender id. Clamping
-	// (not refusing) keeps viewer-level capabilities working.
-	if (actor?.channel === "widget" && ROLE_RANK[role] > ROLE_RANK.viewer) role = "viewer";
+	// Widget channel (v0.2.178): the embedded assistant serves a BUSINESS system's
+	// own users, who have accounts over there. A business-side admin SHOULD be an
+	// admin here — but only when that claim is cryptographically vouched for, which
+	// is what actor.verifiedRole means: the widget ticket exchange sets it after the
+	// business backend signed (user, role) with the widget secret, and the ticket is
+	// bound to the caller's address.
+	//
+	// Two hard rules, both deliberate:
+	//   - owner is unreachable: it is the DEPLOYMENT owner, not a business role, so
+	//     no ticket can grant it (WIDGET_MAX_ROLE stops at admin).
+	//   - no verifiedRole means viewer, NOT defaultRole: security.defaultRole exists
+	//     for the admin's own IM unknown-senders, a trust context a widget does not
+	//     share.
+	if (actor?.channel === "widget") {
+		const verified = actor.verifiedRole;
+		const granted = verified && ROLE_RANK[verified] <= ROLE_RANK.admin ? verified : "viewer";
+		role = ROLE_RANK[role] > ROLE_RANK[granted] ? granted : role;
+	}
 	const raw = conversationFloors(config, conversationId)[capability];
 	const floor = asRole(raw);
 	// A configured-but-unparseable floor fails CLOSED (treated as admin-only)
