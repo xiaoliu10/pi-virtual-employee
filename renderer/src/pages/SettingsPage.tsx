@@ -351,16 +351,18 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 	 * each keep their own port; before this, a collision only produced one WARN in
 	 * main.log while the settings page still claimed the widget was enabled.
 	 */
-	const [widgetStatus, setWidgetStatus] = useState<{ running: boolean; port: number; error?: string; reassignedFrom?: number } | null>(null);
+	const [widgetStatus, setWidgetStatus] = useState<{ running: boolean; starting?: boolean; port: number; error?: string; reassignedFrom?: number } | null>(null);
 	const [widgetBusy, setWidgetBusy] = useState(false);
 	useEffect(() => {
 		let alive = true;
 		const load = () => api.getWidgetStatus().then((s) => { if (alive) setWidgetStatus(s); }).catch(() => {});
 		load();
-		// Re-read after a save (port change) so the panel reflects the new truth.
-		// Config pushes arrive over IPC (api.onConfigChanged), not a DOM event.
-		const off = api.onConfigChanged?.(load);
-		return () => { alive = false; off?.(); };
+		// Startup finishes AFTER this page mounts, so a pull-only panel would sit on
+		// "not started" until an unrelated config event (code review P2-2). Subscribe
+		// to the listener's own state pushes; config edits also re-read.
+		const offStatus = api.onWidgetStatusChanged?.((s) => { if (alive) setWidgetStatus(s); });
+		const offCfg = api.onConfigChanged?.(load);
+		return () => { alive = false; offStatus?.(); offCfg?.(); };
 	}, []);
 	const [saving, setSaving] = useState(false);
 	const [error, setError] = useState<string | null>(null);
@@ -1203,7 +1205,11 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 													</Field>
 													{draft.widget.enabled && widgetStatus && (
 														<div className={`rounded-xl px-4 py-3 text-xs leading-relaxed ${widgetStatus.error ? "bg-rose-50 text-rose-700" : widgetStatus.running ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>
-															{widgetStatus.running ? (
+															{widgetStatus.starting && !widgetStatus.running ? (
+																<>
+																	<span className="font-medium">正在启动…</span>探测并绑定端口，稍后自动刷新。
+																</>
+															) : widgetStatus.running ? (
 																<>
 																	<span className="font-medium">服务运行中</span>：{draft.widget.expose === "lan" ? "0.0.0.0" : "127.0.0.1"}:{widgetStatus.port}
 																	{widgetStatus.reassignedFrom ? `（原端口 ${widgetStatus.reassignedFrom} 被占用，已自动改用 ${widgetStatus.port} 并记住）` : ""}

@@ -1264,6 +1264,12 @@ ${tailForProgress(decision.text)}`;
 	type WidgetState = {
 		enabled: boolean;
 		running: boolean;
+		/**
+		 * Startup is async (`void startWidget()`), so without this the settings page
+		 * reads running=false right after mount and renders "尚未生效，请重启" for a
+		 * widget that is about to come up (code review P2-2).
+		 */
+		starting: boolean;
 		port: number;
 		expose: "loopback" | "lan";
 		/** Human-readable failure reason when running=false but enabled=true. */
@@ -1271,42 +1277,55 @@ ${tailForProgress(decision.text)}`;
 		/** True when the configured port was busy and another one was persisted. */
 		reassignedFrom?: number;
 	};
-	let widgetState: WidgetState = { enabled: false, running: false, port: config.all().widget.port, expose: config.all().widget.expose };
+	let widgetState: WidgetState = { enabled: false, running: false, starting: false, port: config.all().widget.port, expose: config.all().widget.expose };
+	/** Push the widget state to an open settings page (startup completes off-screen). */
+	const publishWidgetState = () => {
+		const wc = mainWindow?.webContents;
+		if (wc && !wc.isDestroyed()) wc.send("widget:statusChanged", widgetState);
+	};
 	const startWidget = async () => {
 		const w = config.all().widget;
-		widgetState = { enabled: w.enabled, running: false, port: w.port, expose: w.expose };
-		if (!w.enabled) return;
+		widgetState = { enabled: w.enabled, running: false, starting: w.enabled, port: w.port, expose: w.expose };
+		if (!w.enabled) {
+			publishWidgetState();
+			return;
+		}
+		publishWidgetState();
 		if (w.expose === "lan" && !w.token.trim()) {
-			widgetState.error = "局域网模式必须设置访问令牌（否则等于开放中继），服务未启动";
+			widgetState = { ...widgetState, starting: false, error: "局域网模式必须设置访问令牌（否则等于开放中继），服务未启动" };
 			console.warn("[widget] enabled with expose=lan but no token — NOT starting (open relay guard)");
+			publishWidgetState();
 			return;
 		}
 		try {
 			const { startWidgetServer } = await import("../src/widget/widget-service.js");
-			const { allocateWidgetPort } = await import("../src/widget/port-alloc.js");
-			// Pick a free port ONCE and persist it: business systems embed a literal
-			// URL, so the address must be stable across restarts. Only a genuinely
-			// busy configured port triggers a reassignment.
-			const alloc = await allocateWidgetPort(w.expose, w.port);
-			if (alloc.changed) {
-				config.update({ widget: { port: alloc.port } });
-				widgetState.reassignedFrom = w.port;
-				console.warn(`[widget] port ${w.port} busy (${alloc.reason ?? "?"}) → using ${alloc.port} and persisting it for this profile`);
-			}
+			const { WIDGET_PORT_BASE, WIDGET_PORT_ATTEMPTS } = await import("../src/widget/port-alloc.js");
+			// The BIND decides the port, not a prior probe: probing then binding leaves
+			// a window another profile can win (code review P2-1). startWidgetServer
+			// retries forward on EADDRINUSE, and only the port that actually bound is
+			// persisted — business systems embed a literal URL, so it must be stable.
 			const started = await startWidgetServer({
+				portBase: w.port >= WIDGET_PORT_BASE ? w.port : WIDGET_PORT_BASE,
+				portAttempts: WIDGET_PORT_ATTEMPTS,
 				config: () => {
 					const w = config.all().widget;
 					return { title: w.title, suggestions: w.suggestions, disclaimer: w.disclaimer, token: w.token, allowedOrigins: w.allowedOrigins };
 				},
 				runtime: engine,
 				expose: w.expose,
-				port: alloc.port,
+				port: w.port,
 			});
 			widgetServer = started.server;
-			widgetState = { ...widgetState, running: true, port: started.port };
+			if (started.port !== w.port) {
+				config.update({ widget: { port: started.port } });
+				console.warn(`[widget] port ${w.port} busy → bound ${started.port} and persisted it for this profile`);
+			}
+			widgetState = { ...widgetState, running: true, starting: false, port: started.port, reassignedFrom: started.port !== w.port ? w.port : undefined };
+			publishWidgetState();
 		} catch (err) {
-			widgetState.error = err instanceof Error ? err.message : String(err);
+			widgetState = { ...widgetState, running: false, starting: false, error: err instanceof Error ? err.message : String(err) };
 			console.warn("[widget] failed to start:", widgetState.error);
+			publishWidgetState();
 		}
 	};
 	void startWidget();
@@ -1446,6 +1465,19 @@ ${tailForProgress(decision.text)}`;
 		const w = config.all().widget;
 		const alloc = await allocateWidgetPort(w.expose, w.port);
 		if (alloc.changed) config.update({ widget: { port: alloc.port } });
+		// The running listener keeps its OLD port until restart, so widgetState must
+		// reflect that: reporting the new port as "running" would make the embed URL
+		// in the UI point at a port nothing is listening on yet.
+		widgetState = {
+			...widgetState,
+			// A live listener still owns the old port — say so instead of claiming the
+			// new one is serving.
+			running: widgetState.running,
+			error: widgetState.running
+				? `端口已改为 ${alloc.port}，重启应用后生效（当前仍监听 ${widgetState.port}）`
+				: widgetState.error,
+			reassignedFrom: alloc.changed ? w.port : widgetState.reassignedFrom,
+		};
 		const wc = mainWindow?.webContents;
 		if (wc && !wc.isDestroyed()) wc.send("config:changed");
 		return { port: alloc.port, changed: alloc.changed, reason: alloc.reason };

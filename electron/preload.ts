@@ -14,6 +14,12 @@ const api = {
 	getWidgetStatus: () => ipcRenderer.invoke("widget:status"),
 	/** Pick and persist a free widget port for THIS profile (multi-profile safety). */
 	allocateWidgetPort: () => ipcRenderer.invoke("widget:allocatePort"),
+	/** Push channel for widget listener state (startup completes after the page mounts). */
+	onWidgetStatusChanged: (cb: (s: unknown) => void): (() => void) => {
+		const listener = (_e: unknown, s: unknown) => cb(s);
+		ipcRenderer.on("widget:statusChanged", listener);
+		return () => ipcRenderer.removeListener("widget:statusChanged", listener);
+	},
 	setConfig: (patch: unknown) => ipcRenderer.invoke("config:set", patch),
 	manageComputer: (action: string) => ipcRenderer.invoke("computer:manage", action),
 	pickComputerDriver: () => ipcRenderer.invoke("computer:pickDriver"),

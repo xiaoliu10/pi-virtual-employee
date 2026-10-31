@@ -119,7 +119,10 @@ test("exhausting the window reports the original reason instead of guessing", as
 	}
 });
 
-test("startWidgetServer says 'port busy' in words, not just EADDRINUSE", async () => {
+test("an occupied port is reported in words when the forward window is also closed", async () => {
+	// v0.2.177 semantics: a taken port is retried forward, so a bare single
+	// collision no longer fails. The readable message still has to appear when
+	// NOTHING in the window is bindable (window of 1 = no forward room).
 	const port = await ephemeralPort();
 	const held = await occupy("0.0.0.0", port);
 	try {
@@ -129,6 +132,8 @@ test("startWidgetServer says 'port busy' in words, not just EADDRINUSE", async (
 				runtime: { isReadOnlyConversation: () => false, getOrCreateSession: () => ({}), send: async () => ({ reply: "" }) },
 				expose: "lan",
 				port,
+				portBase: port,
+				portAttempts: 0,
 				log: () => {},
 			}),
 			(err) => {
@@ -145,4 +150,96 @@ test("startWidgetServer says 'port busy' in words, not just EADDRINUSE", async (
 
 test("the default window starts at 17880 (documented default, not a magic number)", () => {
 	assert.equal(WIDGET_PORT_BASE, 17880);
+});
+
+// ── code review P2-1 / P2-2 (commit 8c53a4a) ──
+
+test("bind-time retry: losing the probe race still ends up listening (P2-1)", async () => {
+	// The old design probed, then bound. Another profile could win the port in
+	// between and the loser just failed with EADDRINUSE. Now the BIND retries
+	// forward, so the loser still comes up — on a different port.
+	const base = await ephemeralPort();
+	// macOS quirk (measured): a 0.0.0.0 holder does NOT stop a later 127.0.0.1
+	// bind. To create a REAL collision for a loopback listener, hold both.
+	const winnerAll = await occupy("0.0.0.0", base);
+	const winnerLo = await occupy("127.0.0.1", base);
+	const rt = { isReadOnlyConversation: () => false, getOrCreateSession: () => ({}), send: async () => ({ reply: "" }) };
+	try {
+		const { port, server } = await startWidgetServer({
+			config: () => ({ title: "t", suggestions: [], disclaimer: "d", token: "tok", allowedOrigins: [] }),
+			runtime: rt,
+			expose: "loopback",
+			port: base,
+			portBase: base,
+			portAttempts: 5,
+			log: () => {},
+		});
+		assert.notEqual(port, base, "the taken port is not the one reported");
+		assert.ok(port > base && port <= base + 5, "forward within the window, got " + port);
+		const url = "http://127.0.0.1:" + port + "/api/widget/config";
+		const res = await fetch(url, { headers: { authorization: "Bearer tok" } });
+		assert.equal(res.status, 200, "the recovered listener actually serves");
+		server.closeAllConnections?.();
+		server.close();
+	} finally {
+		await new Promise((r) => winnerLo.close(r));
+		await new Promise((r) => winnerAll.close(r));
+	}
+});
+
+test("bind-time retry gives up with a reason after the window is exhausted (P2-1)", async () => {
+	const base = await ephemeralPort();
+	const winners = [];
+	for (let i = 0; i <= 2; i += 1) {
+		winners.push(await occupy("0.0.0.0", base + i));
+		winners.push(await occupy("127.0.0.1", base + i));
+	}
+	try {
+		await assert.rejects(
+			startWidgetServer({
+				config: () => ({ title: "t", suggestions: [], disclaimer: "d", token: "tok", allowedOrigins: [] }),
+				runtime: { isReadOnlyConversation: () => false, getOrCreateSession: () => ({}), send: async () => ({ reply: "" }) },
+				expose: "loopback",
+				port: base,
+				portBase: base,
+				portAttempts: 2,
+				log: () => {},
+			}),
+			(err) => {
+				assert.equal(err.code, "EADDRINUSE");
+				assert.match(err.message, /自动顺延/, "the message says the forward attempts also failed");
+				return true;
+			},
+		);
+	} finally {
+		for (const w of winners) await new Promise((r) => w.close(r));
+	}
+});
+
+test("a non-collision error is NOT retried: exactly ONE bind attempt", async () => {
+	// THE PROVABLE FORM: count bind attempts. An EADDRINUSE walk retries; any other
+	// error must stop at the first attempt. This distinguishes the two behaviours
+	// regardless of which error code finally surfaces.
+	const attempts = [];
+	let err;
+	try {
+		await startWidgetServer({
+			config: () => ({ title: "t", suggestions: [], disclaimer: "d", token: "tok", allowedOrigins: [] }),
+			runtime: { isReadOnlyConversation: () => false, getOrCreateSession: () => ({}), send: async () => ({ reply: "" }) },
+			expose: "loopback",
+			port: 17880,
+			portBase: 17880,
+			portAttempts: 20,
+			log: () => {},
+			onBindAttempt: (p) => attempts.push(p),
+			// @ts-expect-error test-only override: TEST-NET-3 (RFC 5737) is never
+			// assigned locally, so bind fails with EADDRNOTAVAIL — not a collision.
+			_bindHostOverride: "203.0.113.1",
+		});
+	} catch (e) {
+		err = e;
+	}
+	if (!err) return; // environment allowed it — nothing to assert
+	assert.equal(attempts.length, 1, "a non-collision error must not walk the port window");
+	assert.doesNotMatch(err.message, /已被占用/, "it must not be misreported as a busy port");
 });

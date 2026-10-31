@@ -22,6 +22,8 @@ export interface RendererApi {
 	getWidgetStatus(): Promise<{
 		enabled: boolean;
 		running: boolean;
+		/** Startup in progress (async; the page mounts before the listener binds). */
+		starting?: boolean;
 		port: number;
 		expose: "loopback" | "lan";
 		error?: string;
@@ -29,6 +31,7 @@ export interface RendererApi {
 	}>;
 	/** Pick + persist a free widget port for THIS profile. */
 	allocateWidgetPort(): Promise<{ port: number; changed: boolean; reason?: string }>;
+	onWidgetStatusChanged(cb: (s: { enabled: boolean; running: boolean; starting?: boolean; port: number; expose: "loopback" | "lan"; error?: string; reassignedFrom?: number }) => void): () => void;
 	manageComputer(action: "status" | "install" | "connect" | "disconnect"): Promise<import("../../src/shared/computer").ComputerStatus>;
 	pickComputerDriver(): Promise<string | null>;
 	previewPrompt(): Promise<string>;
