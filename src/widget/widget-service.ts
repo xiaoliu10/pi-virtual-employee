@@ -45,7 +45,13 @@ export interface WidgetDeps {
 	/** Where the widget server binds: "loopback" (default) or "lan" (0.0.0.0). */
 	expose: "loopback" | "lan";
 	port: number;
+	/** Start of the forward-retry window when `port` is taken (defaults to `port`). */
+	portBase?: number;
+	/** How many forward ports to try before giving up (default 20). */
+	portAttempts?: number;
 	log?: (message: string) => void;
+	/** Test/instrumentation hook: called once per bind attempt with the port. */
+	onBindAttempt?: (port: number) => void;
 }
 
 const BEARER = /^Bearer\s+(.+)$/i;
@@ -156,7 +162,7 @@ function widgetActor(user: string | undefined, staffPrefix: string): { senderId:
  *  has no per-conversation serialization, and double-prompting one Agent throws). */
 const inFlight = new Map<string, Promise<unknown>>();
 
-export function startWidgetServer(deps: WidgetDeps): Promise<{ port: number; server: Server }> {
+export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: number; server: Server }> {
 	const log = deps.log ?? ((message: string) => console.log(message));
 	const server = createServer(async (req, res) => {
 		const url = (req.url ?? "").split("?")[0];
@@ -264,14 +270,55 @@ export function startWidgetServer(deps: WidgetDeps): Promise<{ port: number; ser
 		return sendJson(res, 404, { error: "Not found" });
 	});
 
-	return new Promise((resolve, reject) => {
-		server.once("error", reject);
-		const host = deps.expose === "lan" ? "0.0.0.0" : "127.0.0.1";
-		server.listen(deps.port, host, () => {
-			const addr = server.address();
-			const port = typeof addr === "object" && addr ? addr.port : deps.port;
-			log(`[widget] assistant widget on ${host}:${port} (expose=${deps.expose})`);
-			resolve({ port, server });
+	// Listen, retrying forward on a lost race (code review P2-1).
+	//
+	// Probing a port and then binding it are two separate steps, so another
+	// profile can take the port in between; the earlier design probed once and
+	// then failed outright with EADDRINUSE. A probe cannot close that window — only
+	// the successful bind can. So we let the bind itself pick: try the requested
+	// port, and on EADDRINUSE walk WIDGET_PORT_ATTEMPTS ports forward from the
+	// base. The port that actually bound is what the caller persists.
+	const host = (deps as { _bindHostOverride?: string })._bindHostOverride ?? (deps.expose === "lan" ? "0.0.0.0" : "127.0.0.1");
+	const base = deps.portBase ?? deps.port;
+	const attempts = deps.portAttempts ?? 20;
+	let candidate = deps.port;
+	let lastError: NodeJS.ErrnoException | undefined;
+	let tried = 0;
+	for (;;) {
+		deps.onBindAttempt?.(candidate);
+		const err = await new Promise<NodeJS.ErrnoException | undefined>((resolve) => {
+			const onError = (e: NodeJS.ErrnoException) => {
+				server.removeListener("listening", onListening);
+				resolve(e);
+			};
+			const onListening = () => {
+				server.removeListener("error", onError);
+				resolve(undefined);
+			};
+			server.once("error", onError);
+			server.once("listening", onListening);
+			server.listen(candidate, host);
 		});
-	});
+		if (!err) {
+			const addr = server.address();
+			const port = typeof addr === "object" && addr ? addr.port : candidate;
+			if (port !== deps.port) log(`[widget] port ${deps.port} was taken; bound ${port} instead`);
+			log(`[widget] assistant widget on ${host}:${port} (expose=${deps.expose})`);
+			return { port, server };
+		}
+		lastError = err;
+		// Only a port collision is retryable: EACCES (privileged port) or a bad host
+		// means every candidate fails the same way.
+		if (err.code !== "EADDRINUSE" || tried >= attempts) break;
+		const next = base + tried;
+		tried += 1;
+		if (next > 65_535 || next === candidate) continue;
+		candidate = next;
+	}
+	const code = lastError?.code ?? "UNKNOWN";
+	const hint =
+		code === "EADDRINUSE" ? `端口 ${deps.port} 已被占用（可能是同机另一个 profile 的实例），且自动顺延的 ${tried} 个端口也都不可用`
+		: code === "EACCES" ? `无权限绑定端口 ${deps.port}（1024 以下端口需要管理员权限）`
+		: lastError?.message ?? "未知错误";
+	throw Object.assign(new Error(hint), { code });
 }

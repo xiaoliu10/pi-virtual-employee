@@ -1252,16 +1252,61 @@ ${tailForProgress(decision.text)}`;
 	// "lan" refuses to start without a token — a 0.0.0.0 agent with no auth is
 	// not a misconfiguration, it is an open relay.
 	let widgetServer: Server | undefined;
+	/**
+	 * Runtime state of the widget listener, surfaced to the settings page.
+	 *
+	 * Multi-profile machines (--profile Nova / Orion / …) each keep their own
+	 * config, and every profile used to default to 17880 — so the second one to
+	 * start silently died on EADDRINUSE while the UI still said "enabled". The
+	 * state below is the single source of truth for "is it actually listening,
+	 * and if not, why" (review 2026-10-31).
+	 */
+	type WidgetState = {
+		enabled: boolean;
+		running: boolean;
+		/**
+		 * Startup is async (`void startWidget()`), so without this the settings page
+		 * reads running=false right after mount and renders "尚未生效，请重启" for a
+		 * widget that is about to come up (code review P2-2).
+		 */
+		starting: boolean;
+		port: number;
+		expose: "loopback" | "lan";
+		/** Human-readable failure reason when running=false but enabled=true. */
+		error?: string;
+		/** True when the configured port was busy and another one was persisted. */
+		reassignedFrom?: number;
+	};
+	let widgetState: WidgetState = { enabled: false, running: false, starting: false, port: config.all().widget.port, expose: config.all().widget.expose };
+	/** Push the widget state to an open settings page (startup completes off-screen). */
+	const publishWidgetState = () => {
+		const wc = mainWindow?.webContents;
+		if (wc && !wc.isDestroyed()) wc.send("widget:statusChanged", widgetState);
+	};
 	const startWidget = async () => {
 		const w = config.all().widget;
-		if (!w.enabled) return;
+		widgetState = { enabled: w.enabled, running: false, starting: w.enabled, port: w.port, expose: w.expose };
+		if (!w.enabled) {
+			publishWidgetState();
+			return;
+		}
+		publishWidgetState();
 		if (w.expose === "lan" && !w.token.trim()) {
+			widgetState = { ...widgetState, starting: false, error: "局域网模式必须设置访问令牌（否则等于开放中继），服务未启动" };
 			console.warn("[widget] enabled with expose=lan but no token — NOT starting (open relay guard)");
+			publishWidgetState();
 			return;
 		}
 		try {
 			const { startWidgetServer } = await import("../src/widget/widget-service.js");
+			const { WIDGET_PORT_BASE, WIDGET_PORT_ATTEMPTS } = await import("../src/widget/port-alloc.js");
+			// The BIND decides the port, not a prior probe: probing then binding leaves
+			// a window another profile can win (code review P2-1). startWidgetServer
+			// retries forward on EADDRINUSE, and only the port that actually bound is
+			// persisted — business systems embed a literal URL, so it must be stable.
 			const started = await startWidgetServer({
+				portBase: w.port >= WIDGET_PORT_BASE ? w.port : WIDGET_PORT_BASE,
+				portAttempts: WIDGET_PORT_ATTEMPTS,
 				config: () => {
 					const w = config.all().widget;
 					return { title: w.title, suggestions: w.suggestions, disclaimer: w.disclaimer, token: w.token, allowedOrigins: w.allowedOrigins };
@@ -1271,8 +1316,16 @@ ${tailForProgress(decision.text)}`;
 				port: w.port,
 			});
 			widgetServer = started.server;
+			if (started.port !== w.port) {
+				config.update({ widget: { port: started.port } });
+				console.warn(`[widget] port ${w.port} busy → bound ${started.port} and persisted it for this profile`);
+			}
+			widgetState = { ...widgetState, running: true, starting: false, port: started.port, reassignedFrom: started.port !== w.port ? w.port : undefined };
+			publishWidgetState();
 		} catch (err) {
-			console.warn("[widget] failed to start:", err instanceof Error ? err.message : err);
+			widgetState = { ...widgetState, running: false, starting: false, error: err instanceof Error ? err.message : String(err) };
+			console.warn("[widget] failed to start:", widgetState.error);
+			publishWidgetState();
 		}
 	};
 	void startWidget();
@@ -1395,6 +1448,40 @@ ${tailForProgress(decision.text)}`;
 		return result.canceled ? null : result.filePaths[0] ?? null;
 	});
 	ipcMain.handle("config:get", () => config.all());
+	/**
+	 * Widget listener status for the settings page. `running` is the truth from
+	 * THIS process (the listener either bound or it did not); `error` carries the
+	 * reason when it did not, so a port collision with another profile is visible
+	 * instead of sitting in main.log.
+	 */
+	ipcMain.handle("widget:status", () => widgetState);
+	/**
+	 * Find a free port for this profile and persist it. Exposed as a button so a
+	 * user can re-pick deterministically instead of waiting for a restart probe;
+	 * the same allocation also runs automatically at startup.
+	 */
+	ipcMain.handle("widget:allocatePort", async () => {
+		const { allocateWidgetPort } = await import("../src/widget/port-alloc.js");
+		const w = config.all().widget;
+		const alloc = await allocateWidgetPort(w.expose, w.port);
+		if (alloc.changed) config.update({ widget: { port: alloc.port } });
+		// The running listener keeps its OLD port until restart, so widgetState must
+		// reflect that: reporting the new port as "running" would make the embed URL
+		// in the UI point at a port nothing is listening on yet.
+		widgetState = {
+			...widgetState,
+			// A live listener still owns the old port — say so instead of claiming the
+			// new one is serving.
+			running: widgetState.running,
+			error: widgetState.running
+				? `端口已改为 ${alloc.port}，重启应用后生效（当前仍监听 ${widgetState.port}）`
+				: widgetState.error,
+			reassignedFrom: alloc.changed ? w.port : widgetState.reassignedFrom,
+		};
+		const wc = mainWindow?.webContents;
+		if (wc && !wc.isDestroyed()) wc.send("config:changed");
+		return { port: alloc.port, changed: alloc.changed, reason: alloc.reason };
+	});
 	ipcMain.handle("config:set", async (_e, patch) => {
 		const updated = config.update(patch);
 		// Push to the renderer: a config written from IM (manage_access /
