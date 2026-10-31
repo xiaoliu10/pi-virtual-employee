@@ -27,6 +27,7 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { gateOutboundText } from "../im/credential-egress.js";
+import type { AgentEvent } from "@earendil-works/pi-agent-core";
 import type { EmployeeRuntime } from "../engine/engine.js";
 import { renderWidgetPage, renderWidgetLoader } from "./widget-assets.js";
 import { TicketStore, secretMatches, widgetConversationKey, type WidgetRole } from "./widget-ticket.js";
@@ -389,18 +390,122 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 				console.warn(`[widget] session create failed for ${conversationId}:`, err instanceof Error ? err.message : err);
 				return sendJson(res, 500, { error: "处理失败，请稍后再试", conversationId }, corsOrigin);
 			}
+			// Streaming mode (v0.2.179): a chat turn can run for minutes with tool
+			// calls in the middle — a bare request/response leaves the user staring
+			// at a frozen bubble, which the field called out as unusable. With
+			// Accept: text/event-stream we forward the same process events the
+			// desktop console shows: thinking, tool calls, and streaming text.
+			const wantsStream = (req.headers.accept ?? "").includes("text/event-stream");
+			const actor = {
+				senderId: `widget-user-${ticket.conversationKey}`,
+				channel: "widget" as const,
+				chatType: "single" as const,
+				// The ONLY place this field is set: role came from a ticket the
+				// business backend signed for and that is bound to this caller.
+				verifiedRole: ticket.role,
+			};
+
+			if (wantsStream) {
+				const turn = (async () => {
+					res.writeHead(200, {
+						"Content-Type": "text/event-stream; charset=utf-8",
+						"Cache-Control": "no-cache, no-transform",
+						Connection: "keep-alive",
+						"X-Accel-Buffering": "no",
+						...(corsOrigin ? { "Access-Control-Allow-Origin": corsOrigin } : {}),
+					});
+					const sse = (payload: Record<string, unknown>): void => {
+						if (!res.writableEnded) res.write(`data: ${JSON.stringify(payload)}\n\n`);
+					};
+					sse({ type: "meta", conversationId });
+
+					/**
+					 * Gate-streaming state. Every text/thinking increment must pass the
+					 * same outbound credential gate as a complete reply — the widget's
+					 * audience is the business system's users, not the local admin. We
+					 * accumulate the full text and only ever send increments of the
+					 * GATED version, so a credential that spans deltas is caught the
+					 * moment it is complete; if the gate replaces the whole text, a
+					 * `replace` event resets what the client has rendered.
+					 */
+					const makeGatedChannel = (eventType: "delta" | "thinking_delta") => {
+						let full = "";
+						let sent = "";
+						return {
+							push: (incoming: string): void => {
+								full += incoming;
+								const safe = gateOutboundText(full, "restricted");
+								if (safe === sent) return;
+								if (safe.startsWith(sent)) {
+									sse({ type: eventType, text: safe.slice(sent.length) });
+								} else {
+									sse({ type: eventType === "delta" ? "replace" : "thinking_replace", text: safe });
+								}
+								sent = safe;
+							},
+							get sentText() {
+								return sent;
+							},
+						};
+					};
+					const textChannel = makeGatedChannel("delta");
+					const thinkingChannel = makeGatedChannel("thinking_delta");
+					const pushText = (s: string) => textChannel.push(s);
+					const pushThinking = (s: string) => thinkingChannel.push(s);
+
+					const unsubscribe = agent.subscribe((event: AgentEvent) => {
+						switch (event.type) {
+							case "message_update": {
+								// The delta event carries exactly the new bytes — no need to
+								// diff the message snapshot.
+								const a = event.assistantMessageEvent;
+								if (a.type === "text_delta") pushText(a.delta);
+								else if (a.type === "thinking_delta") pushThinking(a.delta);
+								break;
+							}
+							case "tool_execution_start":
+								sse({ type: "tool_start", toolName: event.toolName, toolCallId: event.toolCallId });
+								break;
+							case "tool_execution_end":
+								sse({ type: "tool_end", toolName: event.toolName, toolCallId: event.toolCallId, isError: event.isError === true, durationMs: event.durationMs });
+								break;
+							default:
+								break;
+						}
+					});
+
+					try {
+						const { reply, error } = await deps.runtime.send(agent, message, { actor });
+						if (error) {
+							sse({ type: "error", message: error });
+						} else {
+							// The final reply may differ from the streamed accumulation
+							// (settle-gate re-ask, compaction trims): gate it and make the
+							// client converge on the authoritative text.
+							const final = gateOutboundText(reply ?? "", "restricted");
+							// Converge only when the authoritative text differs from what was
+							// streamed (settle-gate re-ask etc.) — an identical final must not
+							// make the bubble flash.
+							if (final && final !== textChannel.sentText) {
+								sse({ type: "replace", text: final });
+							}
+							sse({ type: "done", conversationId });
+						}
+					} catch (err) {
+						console.warn(`[widget] chat failed for ${conversationId}:`, err instanceof Error ? err.message : err);
+						sse({ type: "error", message: "处理失败，请稍后再试" });
+					} finally {
+						unsubscribe();
+						if (!res.writableEnded) res.end();
+						inFlight.delete(conversationId);
+					}
+				})();
+				inFlight.set(conversationId, turn);
+				return turn;
+			}
+
 			const turn = (async () => {
 				try {
-					// Role from the verified ticket — this is what makes a business-side
-					// admin actually an admin here (capped at admin, never owner).
-					const actor = {
-						senderId: `widget-user-${ticket.conversationKey}`,
-						channel: "widget" as const,
-						chatType: "single" as const,
-						// The ONLY place this field is set: role came from a ticket the
-						// business backend signed for and that is bound to this caller.
-						verifiedRole: ticket.role,
-					};
 					const { reply, error } = await deps.runtime.send(agent, message, { actor });
 					if (error) return sendJson(res, 502, { error, conversationId }, corsOrigin);
 					// Same gate as an IM group push: the business system's users are NOT
