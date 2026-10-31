@@ -465,28 +465,31 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 					const pushText = (s: string) => textChannel.push(s);
 					const pushThinking = (s: string) => thinkingChannel.push(s);
 
-					const unsubscribe = agent.subscribe((event: AgentEvent) => {
-						switch (event.type) {
-							case "message_update": {
-								// The delta event carries exactly the new bytes — no need to
-								// diff the message snapshot.
-								const a = event.assistantMessageEvent;
-								if (a.type === "text_delta") pushText(a.delta);
-								else if (a.type === "thinking_delta") pushThinking(a.delta);
-								break;
-							}
-							case "tool_execution_start":
-								sse({ type: "tool_start", toolName: event.toolName, toolCallId: event.toolCallId });
-								break;
-							case "tool_execution_end":
-								sse({ type: "tool_end", toolName: event.toolName, toolCallId: event.toolCallId, isError: event.isError === true, durationMs: event.durationMs });
-								break;
-							default:
-								break;
-						}
-					});
-
+					// ALL teardown belongs to the try/finally below: a throwing
+					// subscribe implementation must not leak the heartbeat interval or
+					// wedge inFlight (review round 2, heartbeat probe A).
+					let unsubscribe: () => void = () => {};
 					try {
+						unsubscribe = agent.subscribe((event: AgentEvent) => {
+							switch (event.type) {
+								case "message_update": {
+									// The delta event carries exactly the new bytes — no need to
+									// diff the message snapshot.
+									const a = event.assistantMessageEvent;
+									if (a.type === "text_delta") pushText(a.delta);
+									else if (a.type === "thinking_delta") pushThinking(a.delta);
+									break;
+								}
+								case "tool_execution_start":
+									sse({ type: "tool_start", toolName: event.toolName, toolCallId: event.toolCallId });
+									break;
+								case "tool_execution_end":
+									sse({ type: "tool_end", toolName: event.toolName, toolCallId: event.toolCallId, isError: event.isError === true, durationMs: event.durationMs });
+									break;
+								default:
+									break;
+							}
+						});
 						const { reply, error } = await deps.runtime.send(agent, message, { actor });
 						if (error) {
 							sse({ type: "error", message: error });
@@ -510,10 +513,16 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 						unsubscribe();
 						clearInterval(heartbeat);
 						if (!res.writableEnded) res.end();
-						inFlight.delete(conversationId);
 					}
 				})();
+				// Register the guard BEFORE the turn body runs its finally: a
+				// synchronously-failing turn (e.g. subscribe throws on line one) would
+				// otherwise delete the entry before it was ever set, and every
+				// subsequent request for that conversation would 429 forever.
 				inFlight.set(conversationId, turn);
+				void turn.finally(() => {
+					if (inFlight.get(conversationId) === turn) inFlight.delete(conversationId);
+				});
 				return turn;
 			}
 

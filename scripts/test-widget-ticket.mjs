@@ -507,3 +507,28 @@ test("a runtime WITH process events streams SSE as before", async (t) => {
 	const events = await (await res.text()).split("\n\n").filter((f) => f.startsWith("data:")).map((f) => JSON.parse(f.slice(5)));
 	assert.equal(events[events.length - 1].type, "done");
 });
+
+test("a throwing subscribe must not wedge inFlight (round-2 heartbeat probe A)", async (t) => {
+	// Found by the round-2 reviewer's probe hanging: agent.subscribe ran OUTSIDE
+	// the try, so a throwing implementation escaped the cleanup — and because the
+	// turn failed SYNCHRONOUSLY, its finally deleted the inFlight entry BEFORE the
+	// caller's inFlight.set ran, permanently 429-ing that conversation.
+	const broken = {
+		isReadOnlyConversation: () => false,
+		getOrCreateSession: () => ({ subscribe: () => { throw new Error("subscribe exploded"); } }),
+		send: async () => ({ reply: "never" }),
+	};
+	const { base, post, session, server } = await start({ runtime: broken });
+	t.after(() => { server.closeAllConnections?.(); server.close(); });
+	const tk = await session("u1", "viewer");
+
+	const first = await post("/api/widget/chat", { message: "hi" }, { "x-ve-ticket": tk, origin: "https://oa.example.com", accept: "text/event-stream" });
+	assert.equal(first.status, 200, "the failure is delivered as an SSE error frame, not a crashed connection");
+	const events = await readSse(first);
+	assert.equal(events[events.length - 1].type, "error", "the client learns what happened");
+
+	await new Promise((r) => setTimeout(r, 100));
+	const tk2 = await session("u1", "viewer");
+	const second = await post("/api/widget/chat", { message: "again" }, { "x-ve-ticket": tk2, origin: "https://oa.example.com", accept: "text/event-stream" });
+	assert.notEqual(second.status, 429, "the conversation must NOT be wedged as busy forever");
+});
