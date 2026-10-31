@@ -4,6 +4,32 @@
 
 开源前的内部迭代细节不在此逐一罗列（完整历史见 git log）；以下从开源基线版本开始记录。
 
+## v0.2.180 — Configurable launcher icon / 浮钮图标可配置
+
+### English
+
+The widget's entry point is no longer locked to a text bubble: a business system can choose a built-in robot or spark mark, or its own image, and set the size.
+
+- `launcherIcon`: `text` (default) | `robot` | `spark` | `url`
+- `launcherIconUrl`: used when the icon is `url`
+- `launcherSize`: 52 by default, clamped to 44–72
+
+Built-in marks are inline SVG, so embedding the widget never requires a CSP allowance for an image host. Custom images must be `http(s)` (other schemes fall back to the text mark), are loaded with `no-referrer`, and degrade to the legacy "AI" bubble if they fail to load.
+
+The default stays `text`, so existing embeds look exactly as before.
+
+### 中文
+
+小组件的入口不再固定为文字气泡：业务系统可以选择内置的机器人或星火图标，也可以用自己的图片，并调整尺寸。
+
+- `launcherIcon`：`text`（默认）| `robot` | `spark` | `url`
+- `launcherIconUrl`：图标为 `url` 时使用
+- `launcherSize`：默认 52，限制在 44–72
+
+内置图标是内联 SVG，嵌入方无需为图片域名配置 CSP 白名单。自定义图片仅接受 `http(s)`（其它协议回退为文字图标），以 `no-referrer` 加载，加载失败时回退为原有「AI」文字气泡，不会留下空白圆。
+
+默认值保持 `text`，现有接入方的界面完全不变。
+
 ## v0.2.179 — Live process display in the embedded assistant / 嵌入助理的过程实时展示
 
 ### English
