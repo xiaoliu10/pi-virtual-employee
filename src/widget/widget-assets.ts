@@ -12,6 +12,36 @@
  * Shift+Enter for newline, and a small AI disclaimer footer.
  */
 
+/**
+ * Built-in launcher marks (v0.2.180).
+ *
+ * Inline SVG on purpose: a business system that embeds us must not have to
+ * whitelist an image host (CSP) just to get an entry point, and the mark must
+ * not disappear when it has no internet. `currentColor` lets it inherit the
+ * launcher's white-on-gradient treatment.
+ */
+const LAUNCHER_ICONS = {
+	robot: '<svg viewBox="0 0 24 24" width="56%" height="56%" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+		'<rect x="4" y="7" width="16" height="12" rx="4"/>' +
+		'<path d="M12 3.6V7"/>' +
+		'<circle cx="12" cy="3" r="1.3" fill="currentColor" stroke="none"/>' +
+		'<circle cx="9.2" cy="12.6" r="1.35" fill="currentColor" stroke="none"/>' +
+		'<circle cx="14.8" cy="12.6" r="1.35" fill="currentColor" stroke="none"/>' +
+		'<path d="M9.6 16.2h4.8"/>' +
+		'<path d="M2.8 11.4v3.2M21.2 11.4v3.2"/>' +
+		'</svg>',
+	spark: '<svg viewBox="0 0 24 24" width="60%" height="60%" fill="currentColor" aria-hidden="true">' +
+		'<path d="M12 2.6l1.7 5.2a3 3 0 0 0 1.9 1.9l5.2 1.7-5.2 1.7a3 3 0 0 0-1.9 1.9L12 20.2l-1.7-5.2a3 3 0 0 0-1.9-1.9L3.2 11.4l5.2-1.7a3 3 0 0 0 1.9-1.9z"/>' +
+		'</svg>',
+} as const;
+
+/** Launcher look passed to the loader (mirrors the stored widget config). */
+export interface LauncherLook {
+	icon: "text" | "robot" | "spark" | "url";
+	iconUrl: string;
+	size: number;
+}
+
 const SHARED_CSS = `
 * { box-sizing: border-box; margin: 0; padding: 0; }
 button { font-family: inherit; cursor: pointer; }
@@ -44,7 +74,14 @@ input, textarea { font-family: inherit; }
  * business systems with different titles without extra endpoints. The API base
  * derives from the script's own URL — no configuration beyond the script tag.
  */
-export function renderWidgetLoader(): string {
+export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl: "", size: 52 }): string {
+	// Server-side defaults; the client also re-applies whatever /api/widget/config
+	// returns, so a config change does not require re-fetching this script.
+	const size = Math.min(72, Math.max(44, Math.round(look.size || 52)));
+	const iconMarkup =
+		look.icon === "robot" ? LAUNCHER_ICONS.robot
+		: look.icon === "spark" ? LAUNCHER_ICONS.spark
+		: "";
 	return `(function () {
   "use strict";
   var script = document.currentScript;
@@ -68,10 +105,13 @@ export function renderWidgetLoader(): string {
   document.body.appendChild(host);
 
   var css = ${JSON.stringify(SHARED_CSS)} + \`
-  .launcher { position:absolute; right:24px; bottom:24px; width:56px; height:56px; border-radius:50%;
-    border:none; background:linear-gradient(135deg,#4f6ef7,#7a5cf0); color:#fff; font-size:13px; font-weight:600;
-    box-shadow:0 6px 20px rgba(79,110,247,.4); display:flex; align-items:center; justify-content:center; }
-  .launcher:hover { transform:scale(1.05); }
+  .launcher { position:absolute; right:24px; bottom:24px; width:${size}px; height:${size}px; border-radius:50%;
+    border:none; background:linear-gradient(135deg,#4f6ef7,#7a5cf0); color:#fff; font-size:${Math.max(11, Math.round(size * 0.23))}px; font-weight:600;
+    box-shadow:0 6px 20px rgba(79,110,247,.4); display:flex; align-items:center; justify-content:center;
+    transition:transform .18s ease, box-shadow .18s ease; }
+  .launcher:hover { transform:scale(1.06); box-shadow:0 8px 26px rgba(79,110,247,.5); }
+  .launcher img { width:100%; height:100%; object-fit:cover; border-radius:50%; display:block; }
+  .launcher svg { display:block; }
   .panel { position:absolute; right:24px; bottom:92px; width:380px; max-width:calc(100vw - 32px);
     height:560px; max-height:calc(100vh - 130px); background:#fff; border-radius:14px;
     box-shadow:0 12px 48px rgba(0,0,0,.18); display:flex; flex-direction:column; overflow:hidden;
@@ -117,9 +157,46 @@ export function renderWidgetLoader(): string {
 
   var launcher = document.createElement("button");
   launcher.className = "launcher";
-  launcher.textContent = "AI";
   launcher.title = "AI 助理";
+  // Look is applied from a single place so the live config can override it.
+  applyLauncher(${JSON.stringify(look.icon)}, ${JSON.stringify(look.iconUrl || "")}, ${size});
   root.appendChild(launcher);
+
+  /**
+   * Render the entry point. Order of preference:
+   *   url  → the business system's own image (only http/https; anything else
+   *          falls back rather than injecting an unvetted scheme)
+   *   robot/spark → bundled inline SVG (no network, no CSP whitelist needed)
+   *   text → the legacy "AI" letters, so existing embeds look unchanged
+   */
+  function applyLauncher(icon, iconUrl, px) {
+    var size = Math.min(72, Math.max(44, px || 52));
+    launcher.style.width = size + "px";
+    launcher.style.height = size + "px";
+    launcher.style.fontSize = Math.max(11, Math.round(size * 0.23)) + "px";
+    launcher.textContent = "";
+    // String check, not a regex literal: this code lives inside a TS template
+    // literal, where backslash-escapes are collapsed before the browser sees
+    // them (/^https?:\/\//i degenerates into a broken literal).
+    var raw = String(iconUrl || "");
+    var lower = raw.toLowerCase();
+    var safeUrl = (lower.indexOf("http://") === 0 || lower.indexOf("https://") === 0) ? raw : "";
+    if (icon === "url" && safeUrl) {
+      var img = document.createElement("img");
+      img.alt = "";
+      img.referrerPolicy = "no-referrer";
+      // A broken/blocked image must not leave an empty circle.
+      img.addEventListener("error", function () {
+        launcher.textContent = "AI";
+      });
+      img.src = safeUrl;
+      launcher.appendChild(img);
+      return;
+    }
+    var preset = icon === "robot" ? ${JSON.stringify(LAUNCHER_ICONS.robot)} : icon === "spark" ? ${JSON.stringify(LAUNCHER_ICONS.spark)} : "";
+    if (preset) { launcher.innerHTML = preset; return; }
+    launcher.textContent = "AI";
+  }
 
   function q(sel) { return panel.querySelector(sel); }
   function body() { return q(".body"); }
@@ -137,6 +214,7 @@ export function renderWidgetLoader(): string {
 
   function renderCfg(cfg) {
     state.cfg = cfg;
+    if (cfg.launcher) applyLauncher(cfg.launcher.icon, cfg.launcher.iconUrl, cfg.launcher.size);
     q(".head .t").textContent = titleOverride || cfg.title || "AI 助理";
     q(".hero").innerHTML = "";
     var hero = q(".hero");

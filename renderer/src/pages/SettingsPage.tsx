@@ -1193,6 +1193,27 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 																className="shrink-0 rounded-lg border border-slate-300 px-3 text-xs text-slate-600 hover:bg-slate-50">重新生成</button>
 														</div>
 													</Field>
+													<div className="grid grid-cols-2 gap-3">
+														<Field label="浮钮图标" hint="右下角入口的外观。默认「文字 AI」保持原有接入方不变；robot/spark 是内置矢量图标，无需外部图片域名，也不受业务页面 CSP 影响。">
+															<select value={draft.widget.launcherIcon} onChange={(e) => setWidget({ launcherIcon: (["text", "robot", "spark", "url"] as const).includes(e.target.value as never) ? (e.target.value as "text" | "robot" | "spark" | "url") : "text" })} className={inputCls}>
+																<option value="text">文字「AI」（默认，兼容现状）</option>
+																<option value="robot">机器人（内置 SVG）</option>
+																<option value="spark">星火 AI（内置 SVG）</option>
+																<option value="url">自定义图片地址</option>
+															</select>
+														</Field>
+														<Field label="浮钮尺寸（像素）" hint="建议 48–56：管理后台右侧通常已有其它浮动入口，过大会互相遮挡。范围 44–72。">
+															<input type="number" min={44} max={72}
+																value={draft.widget.launcherSize}
+																onChange={(e) => setWidget({ launcherSize: Math.min(72, Math.max(44, Math.floor(Number(e.target.valueAsNumber) || 52))) })}
+																className={inputCls} />
+														</Field>
+													</div>
+													{draft.widget.launcherIcon === "url" && (
+														<Field label="图标图片地址" hint="仅支持 http/https。图片由业务页面加载，其域名需在业务系统自己的 CSP img-src 白名单内；加载失败会自动回退成「AI」文字，不会留空白圆。">
+															<input value={draft.widget.launcherIconUrl} onChange={(e) => setWidget({ launcherIconUrl: e.target.value })} placeholder="https://your-system.example.com/avatar.png" className={inputCls + " font-mono"} />
+														</Field>
+													)}
 													<Field label="允许最高角色" hint="业务系统声明的角色会被限制在此范围内。admin 可管理配置与任务（含 shell/settings 等管理工具）；owner 是部署者专属，任何情况下都不会授予小组件。注意：票据声明的角色是小组件会话的最终权限，不受「默认角色」影响。">
 														<select value={draft.widget.maxRole} onChange={(e) => setWidget({ maxRole: e.target.value === "viewer" ? "viewer" : e.target.value === "operator" ? "operator" : "admin" })} className={inputCls}>
 															<option value="viewer">viewer（仅对话与检索）</option>
