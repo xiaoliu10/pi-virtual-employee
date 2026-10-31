@@ -60,6 +60,7 @@ import { buildSystemPrompt, defaultCoreRules } from "../src/engine/prompt.js";
 import { AUTH_IPC } from "../src/shared/auth.js";
 import type { AuthLoginState } from "../src/shared/auth.js";
 import { startHttpTransport } from "../src/transport/http.js";
+import type { Server } from "node:http";
 import { setupAutoUpdater, getUpdateState, lastCheckTime, checkNow, downloadNow, quitAndInstall, installNow as installNowUpdate, stopUpdater, setupUnattended, updateCapability, requestUpdateAndInstall, type UpdateState } from "./updater.js";
 import type { UpdateToolStatus } from "../src/engine/tools/update.js";
 import { IMAdapterManager, availableChannels } from "../src/im/manager.js";
@@ -1244,6 +1245,38 @@ ${tailForProgress(decision.text)}`;
 	const httpPort = Number(process.env.PORT) || 0;
 	const { port, server: httpServer } = await startHttpTransport(engine, { port: httpPort });
 	console.log(`[main] employee http transport on 127.0.0.1:${port}`);
+
+	// Embeddable assistant widget (v0.2.176): a separate listener business
+	// systems embed against. Enabled/port/expose apply on restart; token/title/
+	// suggestions/origins are read LIVE per request, so edits land without one.
+	// "lan" refuses to start without a token — a 0.0.0.0 agent with no auth is
+	// not a misconfiguration, it is an open relay.
+	let widgetServer: Server | undefined;
+	const startWidget = async () => {
+		const w = config.all().widget;
+		if (!w.enabled) return;
+		if (w.expose === "lan" && !w.token.trim()) {
+			console.warn("[widget] enabled with expose=lan but no token — NOT starting (open relay guard)");
+			return;
+		}
+		try {
+			const { startWidgetServer } = await import("../src/widget/widget-service.js");
+			const started = await startWidgetServer({
+				config: () => {
+					const w = config.all().widget;
+					return { title: w.title, subtitle: w.subtitle, suggestions: w.suggestions, disclaimer: w.disclaimer, token: w.token, allowedOrigins: w.allowedOrigins };
+				},
+				runtime: engine,
+				expose: w.expose,
+				port: w.port,
+			});
+			widgetServer = started.server;
+		} catch (err) {
+			console.warn("[widget] failed to start:", err instanceof Error ? err.message : err);
+		}
+	};
+	void startWidget();
+	app.on("will-quit", () => { try { widgetServer?.close(); } catch { /* best effort */ } });
 
 	// Preload skills so the first session already has them.
 	await engine.refreshSkills().catch((err) => console.error("[engine] skill load failed", err));

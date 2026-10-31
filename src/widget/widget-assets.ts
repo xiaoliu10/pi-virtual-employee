@@ -1,0 +1,295 @@
+/**
+ * Widget assets (v0.2.176): the embeddable loader and the full chat page.
+ *
+ * Both are self-contained (no framework, no external assets) and rendered from
+ * template functions so per-deployment strings (title/subtitle/suggestions)
+ * are injected server-side from the live config. The loader mounts a Shadow
+ * DOM so the host page's CSS can never break the panel (and vice versa).
+ *
+ * Visual reference: Aliyun console's AI 助理 — a round launcher bottom-right,
+ * expanding into a light panel with a header (title + close), a greeting
+ * headline, suggestion chips, a message list, an auto-growing input with
+ * Shift+Enter for newline, and a small AI disclaimer footer.
+ */
+
+const SHARED_CSS = `
+* { box-sizing: border-box; margin: 0; padding: 0; }
+button { font-family: inherit; cursor: pointer; }
+input, textarea { font-family: inherit; }
+`;
+
+export interface LoaderOptions {
+	/** When the request came from an allowed origin, embed it so the loader can talk to the API cross-origin. */
+	origin: string;
+}
+
+/**
+ * The embeddable loader. Usage on the business system's page:
+ *
+ *   <script src="http://ve-host:17880/widget.js"
+ *           data-token="..." data-user="endUserKey" data-title="业务助理"></script>
+ *
+ * `data-*` beats server config when present, so one deployment can serve many
+ * business systems with different titles without extra endpoints.
+ */
+export function renderWidgetLoader(_options: LoaderOptions): string {
+	return `(function () {
+  "use strict";
+  var script = document.currentScript;
+  if (!script) return;
+  var base = script.src.replace(/\\/widget\\.js.*$/, "");
+  var token = script.getAttribute("data-token") || "";
+  var user = script.getAttribute("data-user") || "";
+  var titleOverride = script.getAttribute("data-title") || "";
+
+  var state = { open: false, busy: false, cfg: null, messages: [] };
+
+  var host = document.createElement("div");
+  host.style.cssText = "position:fixed;right:0;bottom:0;z-index:2147483000;width:0;height:0;";
+  var root = host.attachShadow ? host.attachShadow({ mode: "open" }) : host;
+  document.body.appendChild(host);
+
+  var css = ${JSON.stringify(SHARED_CSS)} + \`
+  .launcher { position:absolute; right:24px; bottom:24px; width:56px; height:56px; border-radius:50%;
+    border:none; background:linear-gradient(135deg,#4f6ef7,#7a5cf0); color:#fff; font-size:13px; font-weight:600;
+    box-shadow:0 6px 20px rgba(79,110,247,.4); display:flex; align-items:center; justify-content:center; }
+  .launcher:hover { transform:scale(1.05); }
+  .panel { position:absolute; right:24px; bottom:92px; width:380px; max-width:calc(100vw - 32px);
+    height:560px; max-height:calc(100vh - 130px); background:#fff; border-radius:14px;
+    box-shadow:0 12px 48px rgba(0,0,0,.18); display:flex; flex-direction:column; overflow:hidden;
+    font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; }
+  .head { padding:14px 16px; display:flex; align-items:center; justify-content:space-between;
+    border-bottom:1px solid #eef0f4; }
+  .head .t { font-size:15px; font-weight:600; color:#1f2329; }
+  .head button { background:none; border:none; font-size:16px; color:#86909c; padding:4px; }
+  .body { flex:1; overflow-y:auto; padding:16px; background:#f7f8fa; }
+  .hero { font-size:20px; font-weight:700; color:#1f2329; line-height:1.4; margin:6px 0 14px; }
+  .hero em { font-style:normal; color:#4f6ef7; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
+  .chip { padding:8px 12px; background:#fff; border:1px solid #e5e6eb; border-radius:10px;
+    font-size:13px; color:#4e5969; text-align:left; }
+  .chip:hover { border-color:#4f6ef7; color:#4f6ef7; }
+  .msg { max-width:86%; padding:10px 12px; border-radius:12px; font-size:14px; line-height:1.6;
+    color:#1f2329; margin-bottom:10px; white-space:pre-wrap; word-break:break-word; }
+  .msg.ai { background:#fff; border:1px solid #e5e6eb; border-top-left-radius:4px; }
+  .msg.me { background:#4f6ef7; color:#fff; margin-left:auto; border-top-right-radius:4px; }
+  .msg.err { background:#fff7e8; border:1px solid #ffd591; color:#ad6800; }
+  .foot { border-top:1px solid #eef0f4; padding:10px 12px 6px; background:#fff; }
+  .box { width:100%; height:64px; resize:none; border:1px solid #e5e6eb; border-radius:10px;
+    padding:8px 10px; font-size:14px; color:#1f2329; outline:none; }
+  .box:focus { border-color:#4f6ef7; }
+  .sendrow { display:flex; justify-content:flex-end; padding-top:6px; }
+  .send { background:#4f6ef7; border:none; color:#fff; border-radius:8px; padding:6px 16px; font-size:13px; }
+  .send:disabled { background:#c9cdd4; }
+  .dis { text-align:center; font-size:11px; color:#c9cdd4; padding:4px 0 6px; }
+  .hidden { display:none !important; }
+  \`;
+  var style = document.createElement("style");
+  style.textContent = css;
+  root.appendChild(style);
+
+  var panel = document.createElement("div");
+  panel.className = "panel hidden";
+  panel.innerHTML =
+    '<div class="head"><span class="t"></span><button title="收起">─</button></div>' +
+    '<div class="body"><div class="hero"></div><div class="chips"></div><div class="msgs"></div></div>' +
+    '<div class="foot"><textarea class="box" placeholder="请将您遇到的问题告诉我，使用 Shift + Enter 换行"></textarea>' +
+    '<div class="sendrow"><button class="send">发送</button></div><div class="dis"></div></div>';
+  root.appendChild(panel);
+
+  var launcher = document.createElement("button");
+  launcher.className = "launcher";
+  launcher.textContent = "AI";
+  launcher.title = "AI 助理";
+  root.appendChild(launcher);
+
+  function q(sel) { return panel.querySelector(sel); }
+  function body() { return q(".body"); }
+  function msgs() { return q(".msgs"); }
+  function scrollEnd() { body().scrollTop = body().scrollHeight; }
+
+  function addMsg(cls, text) {
+    var el = document.createElement("div");
+    el.className = "msg " + cls;
+    el.textContent = text;
+    msgs().appendChild(el);
+    scrollEnd();
+    return el;
+  }
+
+  function renderCfg(cfg) {
+    state.cfg = cfg;
+    q(".head .t").textContent = titleOverride || cfg.title || "AI 助理";
+    q(".hero").innerHTML = "";
+    var hero = q(".hero");
+    hero.appendChild(document.createTextNode("你好，我是 "));
+    var em = document.createElement("em");
+    em.textContent = titleOverride || cfg.title || "AI 助理";
+    hero.appendChild(em);
+    var chips = q(".chips");
+    chips.innerHTML = "";
+    (cfg.suggestions || []).forEach(function (s) {
+      if (!s) return;
+      var b = document.createElement("button");
+      b.className = "chip"; b.textContent = s;
+      b.addEventListener("click", function () { send(s); });
+      chips.appendChild(b);
+    });
+    q(".dis").textContent = cfg.disclaimer || "内容由 AI 生成，仅供参考。";
+  }
+
+  function api(path, options) {
+    options = options || {};
+    options.headers = { "Authorization": "Bearer " + token, "Content-Type": "application/json" };
+    return fetch(base + path, options).then(function (r) {
+      return r.json().then(function (data) { return { ok: r.ok, status: r.status, data: data }; });
+    });
+  }
+
+  function send(text) {
+    text = (text || "").trim();
+    if (!text || state.busy) return;
+    state.busy = true;
+    q(".send").disabled = true;
+    addMsg("me", text);
+    var pending = addMsg("ai", "正在思考…");
+    api("/api/widget/chat", { method: "POST", body: JSON.stringify({ message: text, user: user }) })
+      .then(function (r) {
+        pending.remove();
+        if (!r.ok) addMsg("err", (r.data && r.data.error) || ("请求失败（" + r.status + "）"));
+        else addMsg("ai", r.data.reply || "（空回复）");
+      })
+      .catch(function (e) { pending.remove(); addMsg("err", "网络错误：" + e); })
+      .finally(function () { state.busy = false; q(".send").disabled = false; q(".box").focus(); });
+  }
+
+  function open() {
+    state.open = true;
+    panel.classList.remove("hidden");
+    if (!state.cfg) {
+      api("/api/widget/config").then(function (r) {
+        renderCfg(r.ok ? r.data : { title: titleOverride || "AI 助理", suggestions: [], disclaimer: "" });
+      }).catch(function () { renderCfg({ title: titleOverride || "AI 助理", suggestions: [], disclaimer: "" }); });
+    }
+    q(".box").focus();
+  }
+  function close() { state.open = false; panel.classList.add("hidden"); }
+  launcher.addEventListener("click", function () { state.open ? close() : open(); });
+  panel.querySelector(".head button").addEventListener("click", close);
+  q(".send").addEventListener("click", function () { send(q(".box").value); q(".box").value = ""; });
+  q(".box").addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(q(".box").value); q(".box").value = ""; }
+  });
+})();`;
+}
+
+/** Full-page variant: same conversation API, standalone layout for iframe/link embedding. */
+export function renderWidgetPage(): string {
+	return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 助理</title>
+<style>
+${SHARED_CSS}
+body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; background:#f7f8fa;
+  display:flex; justify-content:center; }
+.wrap { width:100%; max-width:720px; display:flex; flex-direction:column; height:100vh; background:#fff; }
+.head { padding:16px 20px; border-bottom:1px solid #eef0f4; font-size:16px; font-weight:600; color:#1f2329; }
+.body { flex:1; overflow-y:auto; padding:20px; }
+.hero { font-size:24px; font-weight:700; color:#1f2329; margin-bottom:16px; }
+.hero em { font-style:normal; color:#4f6ef7; }
+.chips { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:20px; }
+.chip { padding:10px 14px; background:#fff; border:1px solid #e5e6eb; border-radius:10px;
+  font-size:14px; color:#4e5969; cursor:pointer; text-align:left; }
+.chip:hover { border-color:#4f6ef7; color:#4f6ef7; }
+.msg { max-width:80%; padding:12px 14px; border-radius:12px; font-size:14px; line-height:1.6;
+  color:#1f2329; margin-bottom:12px; white-space:pre-wrap; word-break:break-word; }
+.msg.ai { background:#f7f8fa; border:1px solid #e5e6eb; }
+.msg.me { background:#4f6ef7; color:#fff; margin-left:auto; }
+.msg.err { background:#fff7e8; border:1px solid #ffd591; color:#ad6800; }
+.foot { border-top:1px solid #eef0f4; padding:14px 20px 8px; }
+.box { width:100%; height:72px; resize:none; border:1px solid #e5e6eb; border-radius:10px;
+  padding:10px 12px; font-size:14px; outline:none; }
+.box:focus { border-color:#4f6ef7; }
+.sendrow { display:flex; justify-content:flex-end; padding-top:8px; }
+.send { background:#4f6ef7; border:none; color:#fff; border-radius:8px; padding:8px 20px; font-size:14px; }
+.send:disabled { background:#c9cdd4; }
+.dis { text-align:center; font-size:12px; color:#c9cdd4; padding:6px 0; }
+.hidden { display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="head" id="t">AI 助理</div>
+  <div class="body" id="body">
+    <div class="hero" id="hero"></div>
+    <div class="chips" id="chips"></div>
+    <div id="msgs"></div>
+  </div>
+  <div class="foot">
+    <textarea class="box" id="box" placeholder="请将您遇到的问题告诉我，使用 Shift + Enter 换行"></textarea>
+    <div class="sendrow"><button class="send" id="send">发送</button></div>
+    <div class="dis" id="dis">内容由 AI 生成，仅供参考，请自行判断后使用。</div>
+  </div>
+</div>
+<script>
+(function () {
+  "use strict";
+  var qs = new URLSearchParams(location.search);
+  var token = qs.get("token") || "";
+  var user = qs.get("user") || "";
+  var busy = false;
+  function el(id) { return document.getElementById(id); }
+  function add(cls, text) {
+    var d = document.createElement("div");
+    d.className = "msg " + cls; d.textContent = text;
+    el("msgs").appendChild(d); el("body").scrollTop = el("body").scrollHeight;
+    return d;
+  }
+  function api(path, options) {
+    options = options || {};
+    options.headers = { "Authorization": "Bearer " + token, "Content-Type": "application/json" };
+    return fetch(path, options).then(function (r) {
+      return r.json().then(function (data) { return { ok: r.ok, status: r.status, data: data }; });
+    });
+  }
+  api("/api/widget/config").then(function (r) {
+    var cfg = r.data || {};
+    if (cfg.title) el("t").textContent = cfg.title;
+    el("hero").innerHTML = "";
+    el("hero").appendChild(document.createTextNode("你好，我是 "));
+    var em = document.createElement("em"); em.textContent = cfg.title || "AI 助理"; el("hero").appendChild(em);
+    (cfg.suggestions || []).forEach(function (s) {
+      if (!s) return;
+      var b = document.createElement("button"); b.className = "chip"; b.textContent = s;
+      b.addEventListener("click", function () { send(s); });
+      el("chips").appendChild(b);
+    });
+    if (cfg.disclaimer) el("dis").textContent = cfg.disclaimer;
+  }).catch(function () {});
+  function send(text) {
+    text = (text || "").trim();
+    if (!text || busy) return;
+    busy = true; el("send").disabled = true;
+    add("me", text);
+    var p = add("ai", "正在思考…");
+    api("/api/widget/chat", { method: "POST", body: JSON.stringify({ message: text, user: user }) })
+      .then(function (r) {
+        p.remove();
+        if (!r.ok) add("err", (r.data && r.data.error) || ("请求失败（" + r.status + "）"));
+        else add("ai", r.data.reply || "（空回复）");
+      })
+      .catch(function (e) { p.remove(); add("err", "网络错误：" + e); })
+      .finally(function () { busy = false; el("send").disabled = false; el("box").focus(); });
+  }
+  el("send").addEventListener("click", function () { send(el("box").value); el("box").value = ""; });
+  el("box").addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(el("box").value); el("box").value = ""; }
+  });
+})();
+</script>
+</body>
+</html>`;
+}
