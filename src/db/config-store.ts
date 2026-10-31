@@ -360,6 +360,34 @@ export interface AppConfig {
 		};
 	};
 	/**
+	 * Embeddable AI-assistant widget (v0.2.176): business systems embed a
+	 * floating chat panel (or link the full page) that talks to this employee.
+	 *
+	 * SECURITY MODEL: the widget token is an ACCESS token, not an admin
+	 * credential — widget conversations run as a viewer-role actor (conversation
+	 * and knowledge search only; capability tools stay gated by the normal role
+	 * checks). The token is visible to whoever can load the embedding page, so it
+	 * must be rotatable (settings page) and is only meaningful together with
+	 * `allowedOrigins` when exposed beyond loopback.
+	 */
+	widget: {
+		/** Master switch. The server starts only when true (restart to apply). */
+		enabled: boolean;
+		/** Fixed port: business systems need a stable address (unlike the ephemeral console transport). */
+		port: number;
+		/** "loopback" binds 127.0.0.1 (reverse proxy / same-host embedding only); "lan" binds 0.0.0.0 and REQUIRES a token. */
+		expose: "loopback" | "lan";
+		/** Bearer token for the widget API. Empty while disabled; generated from the settings page. */
+		token: string;
+		/** Panel title / greeting headline / suggestion chips shown in the widget UI. */
+		title: string;
+		suggestions: string[];
+		/** Footer disclaimer rendered inside the widget. */
+		disclaimer: string;
+		/** When non-empty, only these origins may embed (CORS + Referrer check). Empty = any origin (fine on loopback). */
+		allowedOrigins: string[];
+	};
+	/**
 	 * Report / artifact center. Generated reports (scheduled-task outputs, etc.)
 	 * are persisted locally (with run history) and pushed to a configurable Gitee
 	 * repo; the IM push carries a shareable link. EVERY field is instance-specific
@@ -501,6 +529,16 @@ const DEFAULTS: AppConfig = {
 		shell: { enabled: false, allowedCommands: ["tasklist", "taskkill", "ping", "ipconfig", "systeminfo", "whoami", "hostname", "netstat", "where"], timeoutSec: 300, backgroundTimeoutSec: 0, pollTimeoutSec: 30 },
 		mcp: { enabled: false, servers: [] },
 		autonomousMining: { enabled: true, intervalHours: 4 },
+	},
+	widget: {
+		enabled: false,
+		port: 17880,
+		expose: "loopback" as const,
+		token: "",
+		title: "AI 助理",
+		suggestions: ["你是谁？", "你能帮我做什么？"],
+		disclaimer: "内容由 AI 生成，仅供参考，请自行判断后使用。",
+		allowedOrigins: [],
 	},
 	reports: {
 		enabled: false,

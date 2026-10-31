@@ -194,7 +194,14 @@ export function checkPermission(
 	let senderId: string | undefined;
 	if (actor) senderId = actor.senderId || undefined;
 	else if (isLocalConversation(conversationId)) return { ok: true, role: "admin" };
-	const role = resolveRole(config, senderId);
+	let role = resolveRole(config, senderId);
+	// Widget-channel ceiling (v0.2.176 review P1-3): the embedded assistant's
+	// bearer token reaches BUSINESS systems' end users, so its actors must never
+	// hold more than viewer — regardless of security.defaultRole (which exists
+	// for the admin's own IM unknown-senders, a trust context a widget cannot
+	// share) or a people[] entry colliding with the widget sender id. Clamping
+	// (not refusing) keeps viewer-level capabilities working.
+	if (actor?.channel === "widget" && ROLE_RANK[role] > ROLE_RANK.viewer) role = "viewer";
 	const raw = conversationFloors(config, conversationId)[capability];
 	const floor = asRole(raw);
 	// A configured-but-unparseable floor fails CLOSED (treated as admin-only)

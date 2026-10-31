@@ -354,5 +354,10 @@ export function inferConversationOrigin(id: string): string {
 	// Prompt-lab evaluation runs: isolated, never persisted, excluded from telemetry
 	// so the improvement loop does not measure its own experiments.
 	if (id.startsWith("eval:")) return "eval";
+	// Embedded-assistant widget conversations (v0.2.176): served to BUSINESS
+	// systems' end users over a bearer-token HTTP surface. They are REMOTE and
+	// untrusted — never treat them as the local console (RBAC trust boundary),
+	// and never let them write profile-scope memory.
+	if (id.startsWith("widget:")) return "widget";
 	return "console";
 }

@@ -162,6 +162,16 @@ export interface AppConfig {
 		shell: { enabled: boolean; allowedCommands: string[]; timeoutSec: number; backgroundTimeoutSec: number; pollTimeoutSec: number };
 		autonomousMining: { enabled: boolean; intervalHours: number };
 	};
+	widget: {
+		enabled: boolean;
+		port: number;
+		expose: "loopback" | "lan";
+		token: string;
+		title: string;
+		suggestions: string[];
+		disclaimer: string;
+		allowedOrigins: string[];
+	};
 	reports: {
 		enabled: boolean;
 		target: "gitee" | "oss";

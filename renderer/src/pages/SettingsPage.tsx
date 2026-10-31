@@ -469,6 +469,8 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 		} : value);
 	const setSecurity = (patch: Partial<AppConfig["security"]>) =>
 		setDraft((value) => value ? { ...value, security: { ...value.security, ...patch } } : value);
+	const setWidget = (patch: Partial<AppConfig["widget"]>) =>
+		setDraft((value) => value ? { ...value, widget: { ...value.widget, ...patch } } : value);
 
 	const cancel = () => {
 		setDraft(config);
@@ -1116,6 +1118,67 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 															</>
 														)}
 													</div>
+												</div>
+											</div>
+
+											<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
+												<div className="text-sm font-medium text-slate-800">助理小组件（嵌入业务系统）</div>
+												<div className="mt-1 text-xs leading-relaxed text-slate-400">
+													把本员工作为一个浮窗 AI 助理嵌入到自己的管理后台：业务系统引入一段 script 即可在右下角出现对话浮窗。小组件使用独立的访问令牌，会话以普通用户（仅对话与知识检索）权限运行，回复内容经过与 IM 群相同的敏感凭据拦截。
+												</div>
+												<div className="mt-3 space-y-3">
+													<label className="flex cursor-pointer items-center justify-between rounded-xl border border-indigo-200 bg-indigo-50/50 px-4 py-3">
+														<div><div className="text-sm font-medium text-slate-800">启用小组件服务</div><div className="mt-0.5 text-xs text-indigo-700/70">开启后按下方端口提供嵌入脚本与对话接口（启用/停用或改端口后需重启应用生效）。</div></div>
+														<input type="checkbox" checked={draft.widget.enabled} onChange={(e) => setWidget({ enabled: e.target.checked })} className="h-5 w-5 accent-indigo-500" />
+													</label>
+													<div className="grid grid-cols-2 gap-3">
+														<Field label="端口" hint="业务系统访问的固定端口，默认 17880。">
+															<input type="number" min={1} max={65535}
+																value={draft.widget.port}
+																onChange={(e) => setWidget({ port: Math.min(65535, Math.max(1, Math.floor(Number(e.target.valueAsNumber) || 17880))) })}
+																className={inputCls} />
+														</Field>
+														<Field label="暴露范围" hint="仅本机=只接受 127.0.0.1（适合同机反代）；局域网=绑定 0.0.0.0 供其它机器访问，必须设置访问令牌，且需在服务器防火墙放行该端口（Windows 首次监听会弹防火墙授权）。">
+															<select value={draft.widget.expose} onChange={(e) => setWidget({ expose: e.target.value === "lan" ? "lan" : "loopback" })} className={inputCls}>
+																<option value="loopback">仅本机（127.0.0.1）</option>
+																<option value="lan">局域网（0.0.0.0）</option>
+															</select>
+														</Field>
+													</div>
+													<Field label="访问令牌" hint="业务系统嵌入时携带的 Bearer 令牌。局域网模式下必填；泄露或人员变动时点「重新生成」轮换即可（旧令牌立即失效）。">
+														<div className="flex gap-2">
+															<input value={draft.widget.token} onChange={(e) => setWidget({ token: e.target.value })} placeholder="留空并启用局域网模式将无法启动" className={inputCls + " font-mono"} />
+															<button type="button"
+																onClick={() => { const b = new Uint8Array(24); crypto.getRandomValues(b); setWidget({ token: Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("") }); }}
+																className="shrink-0 rounded-lg border border-slate-300 px-3 text-xs text-slate-600 hover:bg-slate-50">重新生成</button>
+														</div>
+													</Field>
+													<div className="grid grid-cols-2 gap-3">
+														<Field label="浮窗标题" hint="显示在小组件头部与欢迎语中，如「业务助理」。">
+															<input value={draft.widget.title} onChange={(e) => setWidget({ title: e.target.value })} className={inputCls} />
+														</Field>
+														<Field label="底部声明" hint="展示在小组件输入框下方的免责声明。">
+															<input value={draft.widget.disclaimer} onChange={(e) => setWidget({ disclaimer: e.target.value })} className={inputCls} />
+														</Field>
+													</div>
+													<Field label="建议问题（每行一个）" hint="展示在欢迎语下方，点击即发送。留空则不显示。">
+														<textarea rows={3} value={draft.widget.suggestions.join("\n")}
+															onChange={(e) => setWidget({ suggestions: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) })}
+															className={inputCls + " h-auto py-2 font-mono text-xs"} />
+													</Field>
+													<Field label="允许的来源（每行一个，留空 = 不限制）" hint="局域网模式下建议填业务系统的访问地址（如 https://oa.example.com）；配置后其它来源的浏览器请求会被拒绝。">
+														<textarea rows={2} value={draft.widget.allowedOrigins.join("\n")}
+															onChange={(e) => setWidget({ allowedOrigins: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) })}
+															className={inputCls + " h-auto py-2 font-mono text-xs"} />
+													</Field>
+													{draft.widget.enabled && (
+														<div className="rounded-xl bg-slate-50 px-4 py-3 text-xs leading-relaxed text-slate-500">
+															<div className="font-medium text-slate-700">接入方式（重启应用后生效）</div>
+															<div className="mt-1">整页嵌入：<code className="font-mono">{`http://<本机地址>:${draft.widget.port}/widget#token=${draft.widget.token ? "***" : "<令牌>"}&user=<用户标识>`}</code>（令牌放 # 号后，不会进服务器日志；整页链接含令牌，勿外发）</div>
+															<div>浮窗嵌入：在业务系统页面加入 <code className="font-mono">{`<script src="http://<本机地址>:${draft.widget.port}/widget.js" data-token="..." data-user="..."></script>`}</code></div>
+															<div className="mt-1 text-amber-700/80">安全边界：小组件用户固定为最低权限（仅对话与知识检索），不受「默认角色」设置影响；请勿在人员管理里创建 widget-user- 开头的员工，以免与小组件身份冲突。</div>
+														</div>
+													)}
 												</div>
 											</div>
 
