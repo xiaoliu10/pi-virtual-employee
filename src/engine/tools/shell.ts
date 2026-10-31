@@ -34,7 +34,7 @@ import type { ConfigStore } from "../../db/config-store.js";
 import { MAX_TIMEOUT_SEC } from "../../shared/timeouts.js";
 import { CommandSession } from "../command-session.js";
 import { maskId, refuse, isSchedulerActor, isExplicitConfirmation, type ActorContext } from "./admin.js";
-import { resolveRole, type Role } from "../../security/permissions.js";
+import { effectiveActorRole, resolveRole, type Role } from "../../security/permissions.js";
 
 /**
  * Role-tiered command gate (replaces the admin-only gate for run_command):
@@ -68,7 +68,7 @@ function gateCommandRole(
 	}
 	if (!actor) return refuse("当前会话没有经过验证的发送者身份，无法执行命令。");
 	if (!actor.senderId) return refuse("无法识别发送者身份（senderId 为空），拒绝执行。");
-	const role = resolveRole(deps.config, actor.senderId);
+	const role = effectiveActorRole(deps.config, actor);
 	if (role === "viewer") {
 		return refuse("当前用户没有命令执行权限（需要 operator 及以上）。如需开通请联系管理员在 security.people 中指派角色。");
 	}

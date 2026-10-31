@@ -154,7 +154,9 @@ export function createRememberTool(deps: {
 				const actor = deps.resolveActor();
 				const local = isLocalConversation(deps.conversationId);
 				const ctx = deriveMemoryContext(actor, deps.conversationId);
-				const role: Role = local ? "admin" : resolveRole(deps.config, actor?.senderId);
+				const role: Role = local ? "admin" : (actor?.channel === "widget"
+					? (actor.verifiedRole && ["admin", "operator", "viewer"].includes(actor.verifiedRole) ? actor.verifiedRole : "viewer")
+					: resolveRole(deps.config, actor?.senderId));
 				const isAdmin = (): boolean => role === "admin";
 				const isAtLeastOperator = (): boolean => role !== "viewer";
 

@@ -171,6 +171,12 @@ export interface AppConfig {
 		suggestions: string[];
 		disclaimer: string;
 		allowedOrigins: string[];
+		/** Secret for the business backend's ticket exchange (never reaches a browser). */
+		secret: string;
+		/** Highest role a ticket may carry; owner is never reachable. */
+		maxRole: "viewer" | "operator" | "admin";
+		/** Peers allowed to assert X-Forwarded-For (reverse-proxy deployments). */
+		trustedProxies: string[];
 	};
 	reports: {
 		enabled: boolean;

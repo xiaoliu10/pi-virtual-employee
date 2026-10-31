@@ -37,6 +37,12 @@ export function renderWidgetLoader(): string {
   var token = script.getAttribute("data-token") || "";
   var user = script.getAttribute("data-user") || "";
   var titleOverride = script.getAttribute("data-title") || "";
+  // SESSION TICKET (v0.2.178). The browser must never hold the widget secret —
+  // with it, anyone could mint themselves an admin ticket. So the business
+  // system's BACKEND calls POST /api/widget/session {user, role} once and puts
+  // the resulting short-lived ticket here. The ticket is bound to that caller's
+  // address + Origin, so copying it to another machine does not work.
+  var ticket = script.getAttribute("data-ticket") || "";
 
   var state = { open: false, busy: false, cfg: null, messages: [] };
 
@@ -136,7 +142,9 @@ export function renderWidgetLoader(): string {
 
   function api(path, options) {
     options = options || {};
-    options.headers = { "Authorization": "Bearer " + token, "Content-Type": "application/json" };
+    var headers = { "Authorization": "Bearer " + token, "Content-Type": "application/json" };
+    if (path === "/api/widget/chat" && ticket) headers["X-VE-Ticket"] = ticket;
+    options.headers = headers;
     return fetch(base + path, options).then(function (r) {
       return r.json().then(function (data) { return { ok: r.ok, status: r.status, data: data }; });
     });
@@ -145,6 +153,12 @@ export function renderWidgetLoader(): string {
   function send(text) {
     text = (text || "").trim();
     if (!text || state.busy) return;
+    if (!ticket) {
+      // Explicit guidance beats a bare 401: the integration step is on the
+      // business system's backend, not in this page.
+      addMsg("err", "未配置会话票据（data-ticket）。请业务系统后端先调用 POST /api/widget/session 换取票据，再写入本页面。");
+      return;
+    }
     state.busy = true;
     q(".send").disabled = true;
     addMsg("me", text);
@@ -241,6 +255,8 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
   var qs = new URLSearchParams(location.search);
   var token = hash.get("token") || qs.get("token") || "";
   var user = hash.get("user") || qs.get("user") || "";
+  // Ticket comes from the business backend, same as the loader path.
+  var ticket = hash.get("ticket") || qs.get("ticket") || "";
   var busy = false;
   function el(id) { return document.getElementById(id); }
   function add(cls, text) {
@@ -251,7 +267,9 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
   }
   function api(path, options) {
     options = options || {};
-    options.headers = { "Authorization": "Bearer " + token, "Content-Type": "application/json" };
+    var headers = { "Authorization": "Bearer " + token, "Content-Type": "application/json" };
+    if (path.indexOf("/api/widget/chat") === 0 && ticket) headers["X-VE-Ticket"] = ticket;
+    options.headers = headers;
     return fetch(path, options).then(function (r) {
       return r.json().then(function (data) { return { ok: r.ok, status: r.status, data: data }; });
     });
@@ -273,6 +291,10 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
   function send(text) {
     text = (text || "").trim();
     if (!text || busy) return;
+    if (!ticket) {
+      addMsg("err", "未配置会话票据（#ticket=）。请业务系统后端先调用 POST /api/widget/session 换取票据。");
+      return;
+    }
     busy = true; el("send").disabled = true;
     add("me", text);
     var p = add("ai", "正在思考…");

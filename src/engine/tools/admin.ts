@@ -23,7 +23,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { ConfigStore } from "../../db/config-store.js";
 import type { InboundActor } from "../../im/types.js";
-import { hasAnyAdmin, isAdmin } from "../../security/permissions.js";
+import { effectiveActorRole, hasAnyAdmin, isAdmin, ROLE_RANK } from "../../security/permissions.js";
 
 /** The actor context a tool call executes under (undefined = non-IM channel). */
 export type ActorContext = (InboundActor & { text: string }) | undefined;
@@ -116,7 +116,9 @@ export function requireConfirmedAdmin(
 	if (!hasAnyAdmin(deps.config)) {
 		return refuse("管理员尚未设置。请先在单聊中使用 manage_admin 的 claim 动作认领首位管理员。");
 	}
-	if (!isAdmin(deps.config, actor.senderId)) {
+	// effectiveActorRole (not raw isAdmin): a widget ticket's verified admin must
+	// pass the same gates a local admin does (code review P1-2b).
+	if (ROLE_RANK[effectiveActorRole(deps.config, actor)] < ROLE_RANK.admin) {
 		return refuse("你不是本系统的管理员，无权执行此操作。如需管理员权限，请联系现有管理员在单聊中添加，或用 manage_access 指派 admin 角色。");
 	}
 	// 管理员完全访问模式：管理员身份本身就是授权，口令只对非管理员时代有意义。

@@ -1242,7 +1242,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 		if (!pending) {
 			return "当前没有待授权的操作，无需回复「确认授权」。若刚才的权限拒绝已过期（超过 10 分钟），请让对方重新发起一次请求。";
 		}
-		const role = resolveRole(this.config, actor?.senderId ?? null);
+		// effectiveActorRole: widget tickets participate in authorization too —
+		// a ticketed admin confirming in the embedded assistant is the same act of
+		// authority as an IM admin replying (code review P1-2b).
+		const role = actor?.channel === "widget"
+			? (actor.verifiedRole && ["admin"].includes(actor.verifiedRole) ? "admin" : actor.verifiedRole ?? "viewer")
+			: resolveRole(this.config, actor?.senderId ?? null);
 		if (role !== "admin") {
 			return `只有管理员可以授权这个操作（你当前是 ${role}）。「确认授权」未生效，任务保持待授权状态（10 分钟内有效），请管理员回复。`;
 		}

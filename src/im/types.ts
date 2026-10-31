@@ -46,6 +46,16 @@ export interface InboundActor {
 	memoryConversationId?: string;
 	/** Original channel for a synthetic scheduler/work actor (used for stable scoped-memory owner). */
 	memoryChannel?: string;
+	/**
+	 * Role asserted by a VERIFIED upstream, currently only the widget ticket
+	 * exchange (v0.2.178): the business system's backend signed for it with the
+	 * widget secret, and the ticket is bound to the caller's address.
+	 *
+	 * This is NOT a user-writable field. Adapters must never populate it from
+	 * message content, and RBAC only honours it for the widget channel — see
+	 * checkPermission. Absent = fall back to normal role resolution.
+	 */
+	verifiedRole?: "viewer" | "operator" | "admin";
 }
 
 export interface InboundMessage {

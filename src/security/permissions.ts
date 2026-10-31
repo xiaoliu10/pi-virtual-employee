@@ -38,7 +38,7 @@ import type { InboundActor } from "../im/types.js";
  */
 export type Role = "viewer" | "operator" | "admin" | "owner";
 
-const ROLE_RANK: Record<Role, number> = { viewer: 0, operator: 1, admin: 2, owner: 3 };
+export const ROLE_RANK: Record<Role, number> = { viewer: 0, operator: 1, admin: 2, owner: 3 };
 
 export const CAPABILITY_LABEL: Record<string, string> = {
 	chat: "对话服务",
@@ -130,6 +130,26 @@ export function isAdmin(config: ConfigStore, senderId: string | undefined | null
 	return ROLE_RANK[resolveRole(config, senderId)] >= ROLE_RANK.admin;
 }
 
+/**
+ * Effective role for an actor, honouring a widget ticket's verified role.
+ *
+ * A handful of tools guard THEMSELVES (shell/managed settings/…) instead of
+ * going through checkPermission. All of them resolve by senderId, which for a
+ * widget actor is widget-user-<key> — an identity the local config has never
+ * heard of, so these gates would refuse a ticketed admin while checkPermission
+ * happily admits it: an incoherent permission set (code review P1-2b). This is
+ * the ONE place that knows how a verified role maps to authority; self-guarding
+ * tools must use it instead of raw resolveRole.
+ */
+export function effectiveActorRole(config: ConfigStore, actor: { senderId: string; channel?: string; verifiedRole?: "viewer" | "operator" | "admin" } | undefined | null): Role {
+	if (!actor) return "viewer";
+	if (actor.channel === "widget") {
+		const verified = actor.verifiedRole;
+		return verified && ROLE_RANK[verified] <= ROLE_RANK.admin ? verified : "viewer";
+	}
+	return resolveRole(config, actor.senderId);
+}
+
 /** True only for the deployment owner (cross-conversation authority). */
 export function isOwner(config: ConfigStore, senderId: string | undefined | null): boolean {
 	return resolveRole(config, senderId) === "owner";
@@ -195,13 +215,29 @@ export function checkPermission(
 	if (actor) senderId = actor.senderId || undefined;
 	else if (isLocalConversation(conversationId)) return { ok: true, role: "admin" };
 	let role = resolveRole(config, senderId);
-	// Widget-channel ceiling (v0.2.176 review P1-3): the embedded assistant's
-	// bearer token reaches BUSINESS systems' end users, so its actors must never
-	// hold more than viewer — regardless of security.defaultRole (which exists
-	// for the admin's own IM unknown-senders, a trust context a widget cannot
-	// share) or a people[] entry colliding with the widget sender id. Clamping
-	// (not refusing) keeps viewer-level capabilities working.
-	if (actor?.channel === "widget" && ROLE_RANK[role] > ROLE_RANK.viewer) role = "viewer";
+	// Widget channel (v0.2.178): the embedded assistant serves a BUSINESS system's
+	// own users, who have accounts over there. A business-side admin SHOULD be an
+	// admin here — but only when that claim is cryptographically vouched for, which
+	// is what actor.verifiedRole means: the widget ticket exchange sets it after the
+	// business backend signed (user, role) with the widget secret, and the ticket is
+	// bound to the caller's address.
+	//
+	// Two hard rules, both deliberate:
+	//   - owner is unreachable: it is the DEPLOYMENT owner, not a business role, so
+	//     no ticket can grant it (WIDGET_MAX_ROLE stops at admin).
+	//   - no verifiedRole means viewer, NOT defaultRole: security.defaultRole exists
+	//     for the admin's own IM unknown-senders, a trust context a widget does not
+	//     share.
+	if (actor?.channel === "widget") {
+		const verified = actor.verifiedRole;
+		// The TICKET is the authority for a widget actor — full stop. Falling back
+		// to resolveRole(senderId) would cap the ticket at security.defaultRole and
+		// local-config quirks the business system cannot even see, so a minted
+		// admin was advertised in the UI yet refused by admin-tier capabilities
+		// (code review P1-2). There is no vote between two authorities: the ticket
+		// wins, resolved to viewer when it carries no verified role.
+		role = verified && ROLE_RANK[verified] <= ROLE_RANK.admin ? verified : "viewer";
+	}
 	const raw = conversationFloors(config, conversationId)[capability];
 	const floor = asRole(raw);
 	// A configured-but-unparseable floor fails CLOSED (treated as admin-only)
@@ -250,7 +286,13 @@ export function describeAccess(
 ): { senderId?: string; senderName?: string; role: Role; local: boolean; allowed: string[]; denied: string[] } {
 	const local = isLocalConversation(conversationId);
 	const senderId = actor?.senderId || undefined;
-	const role = local ? "admin" : resolveRole(config, senderId);
+	// Report the EFFECTIVE role (widget tickets included) — the allowed/denied
+	// lists below are computed from checkPermission, which honours verifiedRole,
+	// so a plain resolveRole here would self-report a role the session does not
+	// actually have (code review P3-4).
+	const role = local ? "admin" : actor?.channel === "widget"
+		? (actor.verifiedRole && ROLE_RANK[actor.verifiedRole] <= ROLE_RANK.admin ? actor.verifiedRole : "viewer")
+		: resolveRole(config, senderId);
 	const allowed: string[] = [];
 	const denied: string[] = [];
 	for (const [capability, label] of Object.entries(CAPABILITY_LABEL)) {

@@ -29,6 +29,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { gateOutboundText } from "../im/credential-egress.js";
 import type { EmployeeRuntime } from "../engine/engine.js";
 import { renderWidgetPage, renderWidgetLoader } from "./widget-assets.js";
+import { TicketStore, secretMatches, widgetConversationKey, type WidgetRole } from "./widget-ticket.js";
 
 export interface WidgetConfigSnapshot {
 	title: string;
@@ -36,6 +37,14 @@ export interface WidgetConfigSnapshot {
 	disclaimer: string;
 	token: string;
 	allowedOrigins: string[];
+	/**
+	 * Secret the BUSINESS system's backend uses to exchange (user, role) for a
+	 * session ticket. It must never reach a browser: with it, anyone could mint
+	 * themselves an admin ticket.
+	 */
+	secret?: string;
+	/** Highest role a ticket may carry (default admin; owner is never reachable). */
+	maxRole?: WidgetRole;
 }
 
 export interface WidgetDeps {
@@ -52,9 +61,67 @@ export interface WidgetDeps {
 	log?: (message: string) => void;
 	/** Test/instrumentation hook: called once per bind attempt with the port. */
 	onBindAttempt?: (port: number) => void;
+	/** Session tickets; injectable so tests can control TTL/clock. */
+	tickets?: TicketStore;
+	/**
+	 * Peer addresses allowed to speak for the real client via X-Forwarded-For
+	 * (e.g. ["127.0.0.1"] behind a local nginx). Empty = never trust the header.
+	 */
+	trustedProxies?: string[];
+}
+
+/** Strip the IPv4-mapped IPv6 prefix so "::ffff:10.0.0.1" and "10.0.0.1" compare equal. */
+function normalizeAddress(value: string | undefined): string {
+	const raw = (value ?? "").trim().replace(/^::ffff:/, "");
+	return raw || "?";
+}
+
+/**
+ * Client address for ticket binding.
+ *
+ * Behind nginx every request arrives from 127.0.0.1, which would make address
+ * binding meaningless (every user looks identical). X-Forwarded-For is
+ * therefore honoured ONLY when the request comes from a configured trusted
+ * proxy — otherwise a client could simply forge the header and claim to be the
+ * address a stolen ticket was bound to.
+ */
+function clientAddress(req: IncomingMessage, trustedProxies: string[]): string {
+	const peers = trustedProxies.map((p) => normalizeAddress(p));
+	const peer = normalizeAddress(req.socket.remoteAddress);
+	if (peers.length === 0 || !peers.includes(peer)) return peer;
+	const forwarded = req.headers["x-forwarded-for"];
+	const value = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+	if (!value) return peer;
+	// Walk from the RIGHT and skip trusted proxies; the first untrusted entry is
+	// the real client. Taking the left-most value is forgeable: nginx's default
+	// `proxy_add_x_forwarded_for` APPENDS to a client-supplied header, so an
+	// attacker behind the proxy can prepend a victim's address and inherit a
+	// ticket bound to it (code review P1-1).
+	// The chain is only authentic if the LAST hop is one of our trusted proxies:
+	// a real proxy always appends the address it received the request from, so the
+	// right-most entry names the proxy itself. A client that forges the whole
+	// header (no proxy involved) therefore fails this check and is treated as a
+	// direct peer — the forged chain is ignored. This is the fail-closed form of
+	// the standard "walk from the right" algorithm.
+	const hops = value.split(",").map((h) => normalizeAddress(h));
+	if (!peers.includes(hops[hops.length - 1])) return peer;
+	for (let i = hops.length - 2; i >= 0; i -= 1) {
+		if (!peers.includes(hops[i])) return hops[i];
+	}
+	// Every hop is a trusted proxy (unusual): fall back to the peer itself.
+	return peer;
+}
+
+/** Is a request's Origin listed? Reuses the same boundary rules as CORS below. */
+function declaredOrigin(req: IncomingMessage): string {
+	return (req.headers.origin as string | undefined)?.trim() ?? "";
 }
 
 const BEARER = /^Bearer\s+(.+)$/i;
+/** Business-backend secret header for the ticket exchange. */
+const SECRET_HEADER = /^\s*(.+?)\s*$/;
+/** Session ticket header for chat calls. */
+const TICKET_HEADER = /^\s*(.+?)\s*$/;
 
 function sendJson(res: ServerResponse, status: number, body: unknown, origin?: string): void {
 	const headers: Record<string, string> = { "Content-Type": "application/json; charset=utf-8" };
@@ -153,17 +220,13 @@ function originAllowed(origin: string, allowed: string[]): boolean {
  * adminStaffIds unless an admin literally adds that id), so the business
  * system's end users get conversation + knowledge search and nothing more.
  */
-function widgetActor(user: string | undefined, staffPrefix: string): { senderId: string; channel: "widget"; chatType: "single" } {
-	const clean = (user ?? "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
-	return { senderId: `${staffPrefix}${clean || "anon"}`, channel: "widget", chatType: "single" };
-}
-
 /** One in-flight turn per conversation (review P1-4: legacy-kernel degradation
  *  has no per-conversation serialization, and double-prompting one Agent throws). */
 const inFlight = new Map<string, Promise<unknown>>();
 
 export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: number; server: Server }> {
 	const log = deps.log ?? ((message: string) => console.log(message));
+	const tickets = deps.tickets ?? new TicketStore();
 	const server = createServer(async (req, res) => {
 		const url = (req.url ?? "").split("?")[0];
 		const cfg = deps.config();
@@ -172,7 +235,12 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 		if (origin && allowed) {
 			res.setHeader("Access-Control-Allow-Origin", origin);
 			res.setHeader("Vary", "Origin");
-			res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+			// X-VE-Ticket is a custom header, so every chat request from an embedded
+			// page is preceded by a CORS preflight. Omitting it here makes the BROWSER
+			// reject the actual request — the flagship cross-origin embed would fail
+			// on every message while server-side tests (which do not implement CORS)
+			// stayed green (code review P0-2).
+			res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-VE-Ticket");
 			res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
 		}
 		if (req.method === "OPTIONS") {
@@ -212,12 +280,88 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 			}, cfg.allowedOrigins.length ? origin : "*");
 		}
 
-		if (req.method === "POST" && url === "/api/widget/chat") {
-			let body: { message?: string; conversationId?: string; user?: string };
+		/**
+		 * Exchange (user, role) for a short-lived ticket. Called by the BUSINESS
+		 * system's BACKEND, never by a browser: it requires the secret, and the
+		 * resulting ticket is bound to the caller's address + Origin, so it cannot
+		 * be relayed to a different client.
+		 */
+		if (req.method === "POST" && url === "/api/widget/session") {
+			if (!cfg.secret) {
+				// A token without a secret means the deployment has not been through
+				// the v0.2.178 settings step — refuse rather than fall back to "no auth".
+				log("[widget] /session refused: no widget secret configured");
+				return sendJson(res, 503, { error: "小组件未配置接入密钥，请在设置页生成后重试" });
+			}
+			let body: { user?: string; role?: string; origin?: string; clientIp?: string };
 			try {
 				body = await readJsonBody(req);
 			} catch {
-				return sendJson(res, 400, { error: "Invalid JSON body" }, cfg.allowedOrigins.length ? origin : "*");
+				return sendJson(res, 400, { error: "Invalid JSON body" });
+			}
+			const presentedSecret = SECRET_HEADER.exec(req.headers["x-ve-secret"] as string ?? "")?.[1] ?? "";
+			if (!secretMatches(presentedSecret, cfg.secret)) {
+				log(`[widget] /session rejected: bad secret from ${clientAddress(req, deps.trustedProxies ?? [])}`);
+				return sendJson(res, 401, { error: "接入密钥不正确" });
+			}
+			const user = (body.user ?? "").trim();
+			if (!user) return sendJson(res, 400, { error: "缺少 user（业务系统的用户标识）" });
+			// The backend declares WHERE the ticket will be used: the browser's
+			// Origin and (optionally) its IP. Binding to the minting backend's own
+			// address would be wrong — the chat comes from the end user's browser.
+			const consumerOrigin = (body.origin ?? "").trim() || origin;
+			const consumerIp = (body.clientIp ?? "").trim();
+			// A ticket with NEITHER a declared origin NOR a declared client IP would
+			// redeem from anywhere, which defeats the point of a ticket (code review
+			// P2-1). Refuse it and make the integration declare its consumer.
+			if (!consumerOrigin && !consumerIp) {
+				return sendJson(res, 400, {
+					error: "换票必须声明 origin（业务系统页面地址）或 clientIp（使用者客户端地址）之一，否则票据无法绑定来源",
+				});
+			}
+			const record = tickets.issue(
+				{
+					user,
+					role: body.role,
+					address: consumerIp ? normalizeAddress(consumerIp) : "*",
+					origin: consumerOrigin,
+					conversationKey: widgetConversationKey(user),
+				},
+				cfg.maxRole,
+			);
+			return sendJson(res, 200, {
+				ticket: record.ticket,
+				// Echo what was ACTUALLY granted, so the business system can tell the
+				// difference between "asked for admin" and "got admin".
+				role: record.record.role,
+				expiresIn: Math.max(0, Math.round((record.record.expiresAt - Date.now()) / 1000)),
+			});
+		}
+
+		if (req.method === "POST" && url === "/api/widget/chat") {
+			const corsOriginForChat = cfg.allowedOrigins.length ? origin : "*";
+			// The role comes from a TICKET, never from the request body: a body field
+			// is one devtools keystroke away from being anything.
+			const presentedTicket = TICKET_HEADER.exec(req.headers["x-ve-ticket"] as string ?? "")?.[1] ?? "";
+			const redeemed = tickets.redeem(presentedTicket, { address: clientAddress(req, deps.trustedProxies ?? []), origin });
+			if (!redeemed.ok) {
+				// Log every rejection with its reason — a bare 401 is undebuggable when
+				// a proxy rewrites the client address and the ticket stops redeeming.
+				log(`[widget] /chat rejected (${redeemed.reason}) from ${clientAddress(req, deps.trustedProxies ?? [])}`);
+				return sendJson(res, 401, {
+					error:
+						redeemed.reason === "expired" ? "会话票据已过期，请重新获取"
+						: redeemed.reason === "address-mismatch" || redeemed.reason === "origin-mismatch" ? "会话票据与来源不匹配"
+						: "缺少或无效的会话票据",
+				}, corsOriginForChat);
+			}
+			const ticket = redeemed.record;
+
+			let body: { message?: string; conversationId?: string };
+			try {
+				body = await readJsonBody(req);
+			} catch {
+				return sendJson(res, 400, { error: "Invalid JSON body" }, corsOriginForChat);
 			}
 			const message = body.message?.trim();
 			if (!message) return sendJson(res, 400, { error: "Missing 'message' field" }, cfg.allowedOrigins.length ? origin : "*");
@@ -225,11 +369,11 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 				return sendJson(res, 400, { error: `消息过长（最多 ${MAX_MESSAGE_CHARS} 字）` }, cfg.allowedOrigins.length ? origin : "*");
 			}
 
-			// Per-end-user conversations: the business system passes its own user
-			// key; the widget namespace keeps these out of IM/console surfaces.
-			const userKey = (body.conversationId ?? body.user ?? randomUUID()).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64) || randomUUID().slice(0, 8);
-			const conversationId = `widget:${userKey}`;
-			const corsOrigin = cfg.allowedOrigins.length ? origin : "*";
+			// Per-end-user conversations: the key comes from the TICKET (minted by the
+			// business backend), so a client cannot point its conversation at another
+			// user's namespace by editing the request.
+			const conversationId = `widget:${ticket.conversationKey}`;
+			const corsOrigin = corsOriginForChat;
 
 			if (deps.runtime.isReadOnlyConversation(conversationId)) {
 				return sendJson(res, 403, { error: "该会话为只读", conversationId }, corsOrigin);
@@ -247,7 +391,16 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 			}
 			const turn = (async () => {
 				try {
-					const actor = widgetActor(body.user, "widget-user-");
+					// Role from the verified ticket — this is what makes a business-side
+					// admin actually an admin here (capped at admin, never owner).
+					const actor = {
+						senderId: `widget-user-${ticket.conversationKey}`,
+						channel: "widget" as const,
+						chatType: "single" as const,
+						// The ONLY place this field is set: role came from a ticket the
+						// business backend signed for and that is bound to this caller.
+						verifiedRole: ticket.role,
+					};
 					const { reply, error } = await deps.runtime.send(agent, message, { actor });
 					if (error) return sendJson(res, 502, { error, conversationId }, corsOrigin);
 					// Same gate as an IM group push: the business system's users are NOT
@@ -302,7 +455,8 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 		if (!err) {
 			const addr = server.address();
 			const port = typeof addr === "object" && addr ? addr.port : candidate;
-			if (port !== deps.port) log(`[widget] port ${deps.port} was taken; bound ${port} instead`);
+			// port 0 means "let the OS pick", so a differing result is expected, not a collision.
+			if (deps.port !== 0 && port !== deps.port) log(`[widget] port ${deps.port} was taken; bound ${port} instead`);
 			log(`[widget] assistant widget on ${host}:${port} (expose=${deps.expose})`);
 			return { port, server };
 		}
