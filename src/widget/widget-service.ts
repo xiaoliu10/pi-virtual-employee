@@ -265,7 +265,16 @@ export function startWidgetServer(deps: WidgetDeps): Promise<{ port: number; ser
 	});
 
 	return new Promise((resolve, reject) => {
-		server.once("error", reject);
+		server.once("error", (err: NodeJS.ErrnoException) => {
+			// Tag the failure so the caller can tell the user WHY it did not start
+			// (port taken by another profile vs. firewall/permission on 0.0.0.0).
+			const code = err.code ?? "UNKNOWN";
+			const hint =
+				code === "EADDRINUSE" ? `端口 ${deps.port} 已被占用（可能是同机另一个 profile 的实例）`
+				: code === "EACCES" ? `无权限绑定端口 ${deps.port}（1024 以下端口需要管理员权限）`
+				: err.message;
+			reject(Object.assign(new Error(hint), { code }));
+		});
 		const host = deps.expose === "lan" ? "0.0.0.0" : "127.0.0.1";
 		server.listen(deps.port, host, () => {
 			const addr = server.address();

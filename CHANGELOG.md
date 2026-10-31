@@ -4,6 +4,26 @@
 
 开源前的内部迭代细节不在此逐一罗列（完整历史见 git log）；以下从开源基线版本开始记录。
 
+## v0.2.177 — Widget port allocation across profiles / 多 profile 小组件端口自动分配
+
+### English
+
+Running several profiles on one machine (`--profile Nova`, `--profile Orion`, …) used to break the widget: every profile defaulted to port 17880, so the second listener died on `EADDRINUSE` while the settings page still showed "enabled".
+
+- **Automatic port allocation**: at startup the widget probes the configured port, and if it is busy walks forward from 17880 to the first free one, then **persists it into that profile's config** — the address stays stable across restarts, which matters because business systems embed a literal URL.
+- **Manual "自动分配" button** in Settings → 助理小组件 to re-pick deterministically without a restart.
+- **Failures are visible now**: the settings page shows "服务运行中 :17881" or the actual reason ("端口 17880 已被占用（可能是同机另一个 profile 的实例）") instead of one line in `main.log`.
+- **Cross-mode conflict detection**: probing only the widget's own bind host is wrong — measured on macOS, a `0.0.0.0` holder does NOT block a later `127.0.0.1` bind (SO_REUSEADDR), so a loopback profile could claim a port a lan profile already owned. Ports are now treated as taken when **any** interface holds them.
+
+### 中文
+
+同机跑多个 profile（`--profile Nova`、`--profile Orion` 等）时小组件会坏：每个 profile 都默认 17880，第二个监听直接 `EADDRINUSE` 死掉，而设置页还显示「已启用」。
+
+- **自动分配端口**：启动时探测配置端口，被占用就从 17880 往后找第一个空闲端口，并**写回该 profile 的配置**——重启后地址不变，因为业务系统嵌入的是写死的 URL。
+- 设置页新增**「自动分配」按钮**，不用重启就能确定性地重选。
+- **失败可见**：设置页直接显示「服务运行中 :17881」或真实原因（「端口 17880 已被占用（可能是同机另一个 profile 的实例）」），不再只是 `main.log` 里一行 WARN。
+- **跨暴露模式冲突检测**：只探自己的绑定地址是错的——macOS 实测，`0.0.0.0` 已占用并不阻止之后 `127.0.0.1` 绑定（SO_REUSEADDR），loopback profile 会抢走 lan profile 已占的端口。现在只要求**任一接口**占用即判定为不可用。
+
 ## v0.2.176 — Embeddable assistant widget for business systems / 可嵌入业务系统的 AI 助理小组件
 
 ### English

@@ -1252,15 +1252,47 @@ ${tailForProgress(decision.text)}`;
 	// "lan" refuses to start without a token — a 0.0.0.0 agent with no auth is
 	// not a misconfiguration, it is an open relay.
 	let widgetServer: Server | undefined;
+	/**
+	 * Runtime state of the widget listener, surfaced to the settings page.
+	 *
+	 * Multi-profile machines (--profile Nova / Orion / …) each keep their own
+	 * config, and every profile used to default to 17880 — so the second one to
+	 * start silently died on EADDRINUSE while the UI still said "enabled". The
+	 * state below is the single source of truth for "is it actually listening,
+	 * and if not, why" (review 2026-10-31).
+	 */
+	type WidgetState = {
+		enabled: boolean;
+		running: boolean;
+		port: number;
+		expose: "loopback" | "lan";
+		/** Human-readable failure reason when running=false but enabled=true. */
+		error?: string;
+		/** True when the configured port was busy and another one was persisted. */
+		reassignedFrom?: number;
+	};
+	let widgetState: WidgetState = { enabled: false, running: false, port: config.all().widget.port, expose: config.all().widget.expose };
 	const startWidget = async () => {
 		const w = config.all().widget;
+		widgetState = { enabled: w.enabled, running: false, port: w.port, expose: w.expose };
 		if (!w.enabled) return;
 		if (w.expose === "lan" && !w.token.trim()) {
+			widgetState.error = "局域网模式必须设置访问令牌（否则等于开放中继），服务未启动";
 			console.warn("[widget] enabled with expose=lan but no token — NOT starting (open relay guard)");
 			return;
 		}
 		try {
 			const { startWidgetServer } = await import("../src/widget/widget-service.js");
+			const { allocateWidgetPort } = await import("../src/widget/port-alloc.js");
+			// Pick a free port ONCE and persist it: business systems embed a literal
+			// URL, so the address must be stable across restarts. Only a genuinely
+			// busy configured port triggers a reassignment.
+			const alloc = await allocateWidgetPort(w.expose, w.port);
+			if (alloc.changed) {
+				config.update({ widget: { port: alloc.port } });
+				widgetState.reassignedFrom = w.port;
+				console.warn(`[widget] port ${w.port} busy (${alloc.reason ?? "?"}) → using ${alloc.port} and persisting it for this profile`);
+			}
 			const started = await startWidgetServer({
 				config: () => {
 					const w = config.all().widget;
@@ -1268,11 +1300,13 @@ ${tailForProgress(decision.text)}`;
 				},
 				runtime: engine,
 				expose: w.expose,
-				port: w.port,
+				port: alloc.port,
 			});
 			widgetServer = started.server;
+			widgetState = { ...widgetState, running: true, port: started.port };
 		} catch (err) {
-			console.warn("[widget] failed to start:", err instanceof Error ? err.message : err);
+			widgetState.error = err instanceof Error ? err.message : String(err);
+			console.warn("[widget] failed to start:", widgetState.error);
 		}
 	};
 	void startWidget();
@@ -1395,6 +1429,27 @@ ${tailForProgress(decision.text)}`;
 		return result.canceled ? null : result.filePaths[0] ?? null;
 	});
 	ipcMain.handle("config:get", () => config.all());
+	/**
+	 * Widget listener status for the settings page. `running` is the truth from
+	 * THIS process (the listener either bound or it did not); `error` carries the
+	 * reason when it did not, so a port collision with another profile is visible
+	 * instead of sitting in main.log.
+	 */
+	ipcMain.handle("widget:status", () => widgetState);
+	/**
+	 * Find a free port for this profile and persist it. Exposed as a button so a
+	 * user can re-pick deterministically instead of waiting for a restart probe;
+	 * the same allocation also runs automatically at startup.
+	 */
+	ipcMain.handle("widget:allocatePort", async () => {
+		const { allocateWidgetPort } = await import("../src/widget/port-alloc.js");
+		const w = config.all().widget;
+		const alloc = await allocateWidgetPort(w.expose, w.port);
+		if (alloc.changed) config.update({ widget: { port: alloc.port } });
+		const wc = mainWindow?.webContents;
+		if (wc && !wc.isDestroyed()) wc.send("config:changed");
+		return { port: alloc.port, changed: alloc.changed, reason: alloc.reason };
+	});
 	ipcMain.handle("config:set", async (_e, patch) => {
 		const updated = config.update(patch);
 		// Push to the renderer: a config written from IM (manage_access /

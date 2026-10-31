@@ -346,6 +346,22 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 	const [tab, setTab] = useState<Tab>("model");
 	const [contentTab, setContentTab] = useState<ContentTab>("resources");
 	const [draft, setDraft] = useState<AppConfig | null>(config);
+	/**
+	 * Live widget listener state. Multi-profile machines (--profile Nova/Orion…)
+	 * each keep their own port; before this, a collision only produced one WARN in
+	 * main.log while the settings page still claimed the widget was enabled.
+	 */
+	const [widgetStatus, setWidgetStatus] = useState<{ running: boolean; port: number; error?: string; reassignedFrom?: number } | null>(null);
+	const [widgetBusy, setWidgetBusy] = useState(false);
+	useEffect(() => {
+		let alive = true;
+		const load = () => api.getWidgetStatus().then((s) => { if (alive) setWidgetStatus(s); }).catch(() => {});
+		load();
+		// Re-read after a save (port change) so the panel reflects the new truth.
+		// Config pushes arrive over IPC (api.onConfigChanged), not a DOM event.
+		const off = api.onConfigChanged?.(load);
+		return () => { alive = false; off?.(); };
+	}, []);
 	const [saving, setSaving] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [channelTypes, setChannelTypes] = useState<string[]>(["echo", "dingtalk"]);
@@ -1132,11 +1148,25 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 														<input type="checkbox" checked={draft.widget.enabled} onChange={(e) => setWidget({ enabled: e.target.checked })} className="h-5 w-5 accent-indigo-500" />
 													</label>
 													<div className="grid grid-cols-2 gap-3">
-														<Field label="端口" hint="业务系统访问的固定端口，默认 17880。">
-															<input type="number" min={1} max={65535}
-																value={draft.widget.port}
-																onChange={(e) => setWidget({ port: Math.min(65535, Math.max(1, Math.floor(Number(e.target.valueAsNumber) || 17880))) })}
-																className={inputCls} />
+														<Field label="端口" hint="业务系统访问的固定端口，默认 17880。同机多 profile（如 Nova/Orion）各自需要不同端口——启动时会自动避开被占用的端口并记住；也可点「自动分配」立即选一个空闲端口。">
+															<div className="flex gap-2">
+																<input type="number" min={1} max={65535}
+																	value={draft.widget.port}
+																	onChange={(e) => setWidget({ port: Math.min(65535, Math.max(1, Math.floor(Number(e.target.valueAsNumber) || 17880))) })}
+																	className={inputCls} />
+																<button type="button"
+																	disabled={widgetBusy}
+																	onClick={async () => {
+																		setWidgetBusy(true);
+																		try {
+																			const r = await api.allocateWidgetPort();
+																			setWidget({ port: r.port });
+																		} finally { setWidgetBusy(false); }
+																	}}
+																	className="shrink-0 rounded-xl border border-slate-200 px-3 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-50">
+																	{widgetBusy ? "…" : "自动分配"}
+																</button>
+															</div>
 														</Field>
 														<Field label="暴露范围" hint="仅本机=只接受 127.0.0.1（适合同机反代）；局域网=绑定 0.0.0.0 供其它机器访问，必须设置访问令牌，且需在服务器防火墙放行该端口（Windows 首次监听会弹防火墙授权）。">
 															<select value={draft.widget.expose} onChange={(e) => setWidget({ expose: e.target.value === "lan" ? "lan" : "loopback" })} className={inputCls}>
@@ -1171,6 +1201,25 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 															onChange={(e) => setWidget({ allowedOrigins: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) })}
 															className={inputCls + " h-auto py-2 font-mono text-xs"} />
 													</Field>
+													{draft.widget.enabled && widgetStatus && (
+														<div className={`rounded-xl px-4 py-3 text-xs leading-relaxed ${widgetStatus.error ? "bg-rose-50 text-rose-700" : widgetStatus.running ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>
+															{widgetStatus.running ? (
+																<>
+																	<span className="font-medium">服务运行中</span>：{draft.widget.expose === "lan" ? "0.0.0.0" : "127.0.0.1"}:{widgetStatus.port}
+																	{widgetStatus.reassignedFrom ? `（原端口 ${widgetStatus.reassignedFrom} 被占用，已自动改用 ${widgetStatus.port} 并记住）` : ""}
+																</>
+															) : widgetStatus.error ? (
+																<>
+																	<span className="font-medium">服务未启动</span>：{widgetStatus.error}
+																	{/\.(重新|换一个)|占用/.test(widgetStatus.error) ? "（点上方「自动分配」换一个空闲端口后保存并重启）" : ""}
+																</>
+															) : (
+																<>
+																	<span className="font-medium">服务未启动</span>：当前配置尚未生效，保存并重启应用后开始监听 {draft.widget.port}。
+																</>
+															)}
+														</div>
+													)}
 													{draft.widget.enabled && (
 														<div className="rounded-xl bg-slate-50 px-4 py-3 text-xs leading-relaxed text-slate-500">
 															<div className="font-medium text-slate-700">接入方式（重启应用后生效）</div>

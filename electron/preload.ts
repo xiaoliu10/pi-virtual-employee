@@ -10,6 +10,10 @@ import type { AuthCatalogResponse, AuthLoginState, AuthQuotaResponse } from "../
 const api = {
 	getServerPort: (): Promise<number> => ipcRenderer.invoke("server:port"),
 	getConfig: () => ipcRenderer.invoke("config:get"),
+	/** Widget listener status (running / port / failure reason) for the settings page. */
+	getWidgetStatus: () => ipcRenderer.invoke("widget:status"),
+	/** Pick and persist a free widget port for THIS profile (multi-profile safety). */
+	allocateWidgetPort: () => ipcRenderer.invoke("widget:allocatePort"),
 	setConfig: (patch: unknown) => ipcRenderer.invoke("config:set", patch),
 	manageComputer: (action: string) => ipcRenderer.invoke("computer:manage", action),
 	pickComputerDriver: () => ipcRenderer.invoke("computer:pickDriver"),
