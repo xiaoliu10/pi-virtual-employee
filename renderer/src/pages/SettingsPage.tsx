@@ -27,19 +27,68 @@ interface McpRowDraft {
 	enabled: boolean;
 }
 
-/** Parse `KEY=VALUE` (or `Key: value`) lines; skips blanks and malformed lines. */
-function parseKeyValueLines(raw: string, sep: "=" | ":"): Record<string, string> {
-	const out: Record<string, string> = {};
-	for (const line of raw.split("\n")) {
-		const trimmed = line.trim();
-		if (!trimmed) continue;
-		const at = trimmed.indexOf(sep);
-		if (at <= 0) continue;
-		const key = trimmed.slice(0, at).trim();
-		const value = trimmed.slice(at + 1).trim();
-		if (key) out[key] = value;
+/**
+ * Encode a key/value map for the env/headers textareas.
+ *
+ * Values round-trip EXACTLY: a value that contains a newline, or has leading /
+ * trailing spaces, is written as a JSON string literal (`KEY="..."`); plain
+ * values stay human-readable. Without this a multiline PEM credential was split
+ * into separate entries and indentation was silently stripped on save (review).
+ */
+function encodeKeyValueLines(entries: Record<string, string>, sep: "=" | ":"): string {
+	const joiner = sep === "=" ? "=" : ": ";
+	return Object.entries(entries)
+		.map(([key, value]) => {
+			// Only values that a plain single line cannot represent are quoted:
+			// newlines (split into separate entries) and leading/trailing spaces
+			// (trimmed away by the reader). Interior spaces and the separator are
+			// preserved by the first-occurrence split, so they stay readable.
+			// A value that itself starts with a quote would be misread as an encoded
+			// literal — quote it so the encoding is unambiguous.
+			const needsJson = value.includes("\n") || value.includes("\r") || value !== value.trim() || value.startsWith('"');
+			const rendered = needsJson ? JSON.stringify(value) : value;
+			return `${key}${joiner}${rendered}`;
+		})
+		.join("\n");
+}
+
+/**
+ * Parse `KEY=VALUE` (or `Key: value`) lines; skips blanks and malformed lines.
+ * A value wrapped in double quotes is read as a JSON string literal, so values
+ * encoded by `encodeKeyValueLines` come back byte-identical. It returns the
+ * malformed lines so callers can REFUSE to save instead of dropping secrets.
+ */
+function parseKeyValueLines(raw: string, sep: "=" | ":"): { values: Record<string, string>; errors: string[] } {
+	const values: Record<string, string> = {};
+	const errors: string[] = [];
+	const lines = raw.split("\n");
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		const at = line.search(sep === "=" ? /=/ : /:/);
+		if (at <= 0) {
+			errors.push(`无法解析：${line.slice(0, 40)}`);
+			continue;
+		}
+		const key = line.slice(0, at).trim();
+		let value = line.slice(at + 1);
+		if (sep === ":") value = value.replace(/^\s+/, "");
+		if (value.startsWith('"')) {
+			try {
+				const parsed: unknown = JSON.parse(value);
+				if (typeof parsed !== "string") throw new Error("not a string");
+				value = parsed;
+			} catch {
+				errors.push(`${key}: 引号包裹的值不是合法字符串`);
+				continue;
+			}
+		}
+		if (!key) {
+			errors.push(`缺少键名：${line.slice(0, 40)}`);
+			continue;
+		}
+		values[key] = value;
 	}
-	return out;
+	return { values, errors };
 }
 
 /** Whitespace-split with `"double"` and `'single'` quoting (paths with spaces). */
@@ -90,9 +139,9 @@ function serverToRow(server: { name: string; command?: string; args?: string[]; 
 		// Windows paths). The old space-joined form round-tripped corrupted
 		// because the parser had no escape handling (review P3).
 		argsRaw: (server.args ?? []).length ? JSON.stringify(server.args) : "",
-		envRaw: Object.entries(server.env ?? {}).map(([k, v]) => `${k}=${v}`).join("\n"),
+		envRaw: encodeKeyValueLines(server.env ?? {}, "="),
 		url: server.url ?? "",
-		headersRaw: Object.entries(server.headers ?? {}).map(([k, v]) => `${k}: ${v}`).join("\n"),
+		headersRaw: encodeKeyValueLines(server.headers ?? {}, ":"),
 		timeoutSecRaw: server.timeoutSec != null ? String(server.timeoutSec) : "",
 		enabled: server.enabled !== false,
 	};
@@ -106,14 +155,14 @@ function rowToServer(row: McpRowDraft): { name: string; enabled: boolean } & Rec
 	if (row.transport === "http") {
 		if (row.url.trim()) out.url = row.url.trim();
 		const headers = parseKeyValueLines(row.headersRaw, ":");
-		if (Object.keys(headers).length) out.headers = headers;
+		if (Object.keys(headers.values).length) out.headers = headers.values;
 	} else {
 		if (row.command.trim()) out.command = row.command.trim();
 		if (row.cwd.trim()) out.cwd = row.cwd.trim();
 		const parsedArgs = parseArgsJson(row.argsRaw);
 		if (parsedArgs.ok && parsedArgs.args.length) out.args = parsedArgs.args;
 		const env = parseKeyValueLines(row.envRaw, "=");
-		if (Object.keys(env).length) out.env = env;
+		if (Object.keys(env.values).length) out.env = env.values;
 	}
 	return out as { name: string; enabled: boolean } & Record<string, unknown>;
 }
@@ -636,12 +685,15 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 		const rows = mcpRows ?? [];
 		const problems: string[] = [];
 		for (const row of rows) {
+			const label = row.name || "(未命名)";
 			if (row.transport === "stdio") {
 				const args = parseArgsJson(row.argsRaw);
-				if (!args.ok) problems.push(`${row.name || "(未命名)"}: ${args.reason}`);
-				if (!row.command.trim()) problems.push(`${row.name || "(未命名)"}: 缺少可执行文件（stdio 传输）`);
-			} else if (!row.url.trim()) {
-				problems.push(`${row.name || "(未命名)"}: 缺少 URL（HTTP 传输）`);
+				if (!args.ok) problems.push(`${label}: ${args.reason}`);
+				if (!row.command.trim()) problems.push(`${label}: 缺少可执行文件（stdio 传输）`);
+				for (const err of parseKeyValueLines(row.envRaw, "=").errors) problems.push(`${label} env ${err}`);
+			} else {
+				if (!row.url.trim()) problems.push(`${label}: 缺少 URL（HTTP 传输）`);
+				for (const err of parseKeyValueLines(row.headersRaw, ":").errors) problems.push(`${label} headers ${err}`);
 			}
 		}
 		const servers = rows.map(rowToServer);

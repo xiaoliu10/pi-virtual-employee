@@ -518,8 +518,19 @@ async function main(): Promise<void> {
 	}, { timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000, kernel });
 	// stdio MCP transports own child processes — disconnect them on quit
 	// (best-effort: will-quit cannot await, fire and forget).
-	app.on("will-quit", () => {
-		void engine.disposeMcp().catch(() => {});
+	// Electron's will-quit cannot await, and the process dies with the event loop:
+	// a fire-and-forget dispose() can lose the race and leave stdio children alive
+	// (review P1). Delay the quit once, with a hard bound, so the cleanup finishes.
+	let mcpQuitGuard = false;
+	app.on("will-quit", (event) => {
+		if (mcpQuitGuard) return;
+		event.preventDefault();
+		mcpQuitGuard = true;
+		const bounded = Promise.race([
+			engine.disposeMcp().catch(() => {}),
+			new Promise((resolve) => setTimeout(resolve, 3000)),
+		]);
+		void bounded.finally(() => app.quit());
 	});
 	engine.setComputerService(computer);
 	// Run telemetry: the employee's own record of how its turns went (my_stats tool;
@@ -1493,7 +1504,15 @@ ${tailForProgress(decision.text)}`;
 		const manager = createMcpManager();
 		try {
 			const { report } = await manager.refresh({
-				all: () => ({ capabilities: { mcp: { enabled: true, servers: [server] } } }),
+				// A per-server switch that is off must not make the probe fail with no
+				// reason: refresh() filters disabled entries, so the report would have
+				// no matching row (review). The probe connects regardless — testing a
+				// disabled row is exactly how you decide whether to enable it.
+				all: () => ({
+					capabilities: {
+						mcp: { enabled: true, servers: [{ ...(server as Record<string, unknown>), enabled: true }] },
+					},
+				}),
 			} as never);
 			const entry = report.find((r) => r.name === normalized.value.name);
 			const tools = entry?.ok

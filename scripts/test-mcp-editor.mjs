@@ -38,9 +38,9 @@ function grab(name) {
 
 const ifaceAt = lines.findIndex((l) => l.startsWith("interface McpRowDraft"));
 const decl = lines.slice(ifaceAt, ifaceAt + 14).join("\n");
-const helpers = [decl, ...["parseKeyValueLines", "parseArgsJson", "serverToRow", "rowToServer"].map(grab)].join("\n\n");
+const helpers = [decl, ...["encodeKeyValueLines", "parseKeyValueLines", "parseArgsJson", "serverToRow", "rowToServer"].map(grab)].join("\n\n");
 const probe = `${helpers}
-export { parseArgsJson, serverToRow, rowToServer };`;
+export { parseArgsJson, parseKeyValueLines, encodeKeyValueLines, serverToRow, rowToServer };`;
 
 const workDir = join(root, "node_modules/.mcp-editor-test");
 mkdirSync(workDir, { recursive: true });
@@ -54,7 +54,7 @@ await build({
 	packages: "external",
 	logLevel: "silent",
 });
-const { parseArgsJson, serverToRow, rowToServer } = await import(pathToFileURL(join(workDir, "helpers.mjs")).href);
+const { parseArgsJson, parseKeyValueLines, encodeKeyValueLines, serverToRow, rowToServer } = await import(pathToFileURL(join(workDir, "helpers.mjs")).href);
 
 test("args round-trip is lossless (spaces, quotes, apostrophes, empty, Windows paths)", () => {
 	const nasty = ["-y", "C:\\Program Files\\x\\server.js", "it's", 'say "hi"', "", "a\\b"];
@@ -89,4 +89,27 @@ test("cwd, env, timeout and the HTTP shape survive an edit round-trip", () => {
 test("row uids are unique (probe results are keyed by them)", () => {
 	const ids = new Set(Array.from({ length: 50 }, (_, i) => serverToRow({ name: `s${i}` }).uid));
 	assert.equal(ids.size, 50, "uids must never collide across rows");
+});
+
+test("env/headers values round-trip exactly (multiline PEM, leading/trailing spaces)", () => {
+	const pem = ["-----BEGIN-----", "AAA", "BBB", "-----END-----"].join("\n");
+	const entries = { PEM: pem, PAD: "  spaced  ", PLAIN: "v with spaces = ok", QUOTED: '"already quoted"' };
+	const encoded = encodeKeyValueLines(entries, "=");
+	const back = parseKeyValueLines(encoded, "=");
+	assert.deepEqual(back.errors, [], "encoding must produce parseable lines");
+	assert.deepEqual(back.values, entries, "every value survives byte-identically");
+	assert.match(encoded, /PLAIN=v with spaces = ok/, "plain values stay human-readable");
+});
+
+test("headers round-trip on the colon separator too", () => {
+	const headers = { Authorization: "Bearer x", "X-Multi": "a\nb", "X-Pad": " y " };
+	const back = parseKeyValueLines(encodeKeyValueLines(headers, ":"), ":");
+	assert.deepEqual(back.errors, []);
+	assert.deepEqual(back.values, headers);
+});
+
+test("malformed env/header lines are reported (so save can refuse)", () => {
+	const bad = parseKeyValueLines("NO_SEPARATOR\n=orphan", "=");
+	assert.equal(bad.errors.length, 2, "both the missing separator and the missing key are reported");
+	assert.deepEqual(bad.values, {});
 });
