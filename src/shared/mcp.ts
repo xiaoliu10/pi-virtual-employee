@@ -29,12 +29,17 @@ export interface McpServerConfig {
 
 export const MCP_NAME_RE = /^[A-Za-z0-9_-]+$/;
 
-/** Interpolate `${NAME}` from the process environment; missing vars become "". */
-export function interpolateEnv(value: string, env: NodeJS.ProcessEnv = process.env): string {
+/** Interpolate `${NAME}` from the process environment; missing vars become "".
+ * `env: null` means "no interpolation" — the persisted config keeps the literal
+ * `${NAME}` reference and only the CONNECT path resolves it, so rotating an env
+ * var takes effect without re-saving (and secrets never get frozen to plaintext
+ * in the config DB). */
+export function interpolateEnv(value: string, env: NodeJS.ProcessEnv | null = process.env): string {
+	if (env === null) return value;
 	return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name: string) => env[name] ?? "");
 }
 
-const stringRecord = (value: unknown, env: NodeJS.ProcessEnv): Record<string, string> | undefined => {
+const stringRecord = (value: unknown, env: NodeJS.ProcessEnv | null): Record<string, string> | undefined => {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const out: Record<string, string> = {};
 	for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
@@ -44,7 +49,7 @@ const stringRecord = (value: unknown, env: NodeJS.ProcessEnv): Record<string, st
 };
 
 /** Normalize one raw server entry; returns the error reason instead of throwing. */
-export function normalizeMcpServer(raw: unknown, env: NodeJS.ProcessEnv = process.env): { ok: true; value: McpServerConfig } | { ok: false; reason: string } {
+export function normalizeMcpServer(raw: unknown, env: NodeJS.ProcessEnv | null = process.env): { ok: true; value: McpServerConfig } | { ok: false; reason: string } {
 	if (raw == null || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, reason: "条目必须是对象" };
 	const record = raw as Record<string, unknown>;
 	const name = typeof record.name === "string" ? record.name.trim() : "";
@@ -78,7 +83,7 @@ export function normalizeMcpServer(raw: unknown, env: NodeJS.ProcessEnv = proces
 /** Normalize a raw servers value: an array of entries, or a record keyed by
  * name (the standard mcpServers shape). Invalid entries are skipped and
  * reported; the rest still connect (same contract as pi's mcp.json). */
-export function normalizeMcpServers(raw: unknown, env: NodeJS.ProcessEnv = process.env): { servers: McpServerConfig[]; errors: string[] } {
+export function normalizeMcpServers(raw: unknown, env: NodeJS.ProcessEnv | null = process.env): { servers: McpServerConfig[]; errors: string[] } {
 	const servers: McpServerConfig[] = [];
 	const errors: string[] = [];
 	const seen = new Set<string>();

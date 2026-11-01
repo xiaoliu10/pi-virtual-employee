@@ -116,7 +116,9 @@ export class McpManager {
 
 	private async runRefresh(config: ConfigStore): Promise<{ changed: boolean; report: McpRefreshReport[] }> {
 		const mcpConfig = config.all().capabilities?.mcp;
-		const { servers, errors } = normalizeMcpServers(mcpConfig?.servers);
+		// Config stores `${ENV}` references verbatim; resolve them HERE, at connect
+		// time, so rotating an env var needs no re-save (review: persisted plaintext).
+		const { servers, errors } = normalizeMcpServers(mcpConfig?.servers, process.env);
 		const enabled = mcpConfig?.enabled === true ? servers.filter((s) => s.enabled !== false) : [];
 		const report: McpRefreshReport[] = errors.map((error) => ({ name: "(配置)", ok: false, tools: 0, error }));
 		const nextCache = new Map<string, ServerConn>();

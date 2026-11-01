@@ -159,6 +159,40 @@ test("dispose during an in-flight refresh wins: late connections are closed, not
 	assert.equal(refreshed.changed, false, "a refresh invalidated by dispose reports no change");
 });
 
+test("persisted config keeps ${ENV} references; connections resolve them at connect time", async () => {
+	// normalizeMcpServers(raw, null) is the PERSIST path: no interpolation, so a
+	// secret is never frozen into the config DB (review P2).
+	const persisted = normalizeMcpServers([{ name: "s", url: "https://x/mcp", headers: { Authorization: "Bearer ${TOK}" } }], null);
+	assert.equal(persisted.servers[0].headers.Authorization, "Bearer ${TOK}", "reference survives persistence");
+
+	// The manager resolves references right before connecting.
+	process.env.MCP_TEST_TOK = "secret-1";
+	const seen = [];
+	const manager = new McpManager({
+		connect: async (server) => {
+			seen.push(server.headers?.Authorization);
+			return { transport: {}, async listTools() { return { tools: [] }; }, async callTool() { return { content: [] }; }, async close() {} };
+		},
+	});
+	const config = { all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "s", url: "https://x/mcp", headers: { Authorization: "Bearer ${MCP_TEST_TOK}" } }] } } }) };
+	await manager.refresh(config);
+	await manager.dispose();
+	assert.deepEqual(seen, ["Bearer secret-1"], "connection sees the resolved value");
+
+	// Rotating the env var takes effect on the next refresh without re-saving.
+	process.env.MCP_TEST_TOK = "secret-2";
+	const manager2 = new McpManager({
+		connect: async (server) => {
+			seen.push(server.headers?.Authorization);
+			return { transport: {}, async listTools() { return { tools: [] }; }, async callTool() { return { content: [] }; }, async close() {} };
+		},
+	});
+	await manager2.refresh(config);
+	await manager2.dispose();
+	assert.equal(seen.at(-1), "Bearer secret-2", "rotation needs no re-save");
+	delete process.env.MCP_TEST_TOK;
+});
+
 test("stripMcpToolPrefix removes the exact server prefix (underscores included)", () => {
 	assert.equal(stripMcpToolPrefix("my_server", "mcp__my_server__t"), "t");
 	assert.equal(stripMcpToolPrefix("a", "mcp__a__t"), "t");

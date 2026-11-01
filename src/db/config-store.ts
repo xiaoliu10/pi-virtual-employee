@@ -739,7 +739,11 @@ function normalizeCapabilities(merged: AppConfig): AppConfig["capabilities"] {
 			.map((c) => c.trim().toLowerCase().replace(/\.(exe|bat|cmd|com|ps1|js)$/i, ""))
 			.filter((c) => c === "*" || /^[a-z0-9._-]+$/.test(c)))]
 		: [];
-	const { servers: mcpServers } = normalizeMcpServers(merged.capabilities?.mcp?.servers);
+	// Persist MCP entries VERBATIM (env: null → no interpolation): `${NAME}`
+	// references stay literal in the DB and are resolved only when connecting.
+	// Interpolating here froze secrets into plaintext on every save and made a
+	// rotated env var take effect only after re-saving (review finding).
+	const { servers: mcpServers } = normalizeMcpServers(merged.capabilities?.mcp?.servers, null);
 	return {
 		shell: {
 			enabled: shell?.enabled === true,

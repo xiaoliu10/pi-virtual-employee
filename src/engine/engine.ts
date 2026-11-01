@@ -377,6 +377,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** MCP connector (external servers' tools bridged as native tools). */
 	private mcpManager!: McpManager;
 
+	/** Re-read capabilities.mcp and reconnect (called after a settings save so a
+	 * newly added server is live without an app restart). Marked changed only
+	 * when the tool surface moved, so an unrelated save is a cheap no-op. */
+	async refreshMcpTools(): Promise<void> {
+		await this.refreshMcp();
+	}
+
 	/** Close every MCP connection (stdio transports own child processes). */
 	async disposeMcp(): Promise<void> {
 		await this.mcpManager.dispose();

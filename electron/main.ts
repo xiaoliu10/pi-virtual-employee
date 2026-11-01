@@ -1486,7 +1486,9 @@ ${tailForProgress(decision.text)}`;
 	ipcMain.handle("mcp:test", async (_e, server: unknown) => {
 		const { createMcpManager } = await import("../src/engine/tools/mcp.js");
 		const { normalizeMcpServer, stripMcpToolPrefix } = await import("../src/shared/mcp.js");
-		const normalized = normalizeMcpServer(server);
+		// Validate the row as the user typed it (references preserved), then probe
+		// with real resolution — a probe must behave like the live connection.
+		const normalized = normalizeMcpServer(server, null);
 		if (!normalized.ok) return { ok: false as const, error: normalized.reason, tools: [] };
 		const manager = createMcpManager();
 		try {
@@ -1548,6 +1550,11 @@ ${tailForProgress(decision.text)}`;
 		await im.sync().catch((err) => console.error("[im] sync failed", err));
 		engine.setRequestTimeoutMs((updated.general.requestTimeoutMin || 0) * 60_000);
 		await engine.invalidate(); // prompt/skill/tool composition may have changed
+		// The MCP server list lives in the same patch: connect/disconnect NOW
+		// instead of waiting for a restart, or the settings page's "保存后自动
+		// 重连" promise is false and a successful 测试连接 misleads (review P1).
+		// change-gated internally, so a non-MCP save stays a cheap no-op.
+		await engine.refreshMcpTools();
 		return updated;
 	});
 
