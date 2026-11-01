@@ -45,7 +45,7 @@ import type { DownloadService } from "../downloads/download-service.js";
 import { buildSystemPrompt, buildTools } from "./definition.js";
 import type { UpdateOperations } from "./tools/update.js";
 import { hasActiveShellCommands } from "./tools/shell.js";
-import { checkPermission, isLocalConversation, resolveRole } from "../security/permissions.js";
+import {ROLE_RANK, checkPermission, isLocalConversation, resolveRole} from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
@@ -1263,7 +1263,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 		const role = actor?.channel === "widget"
 			? (actor.verifiedRole && ["admin"].includes(actor.verifiedRole) ? "admin" : actor.verifiedRole ?? "viewer")
 			: resolveRole(this.config, actor?.senderId ?? null);
-		if (role !== "admin") {
+		// owner is a superset of admin: it must be able to authorize too.
+		if (ROLE_RANK[role] < ROLE_RANK.admin) {
 			return `只有管理员可以授权这个操作（你当前是 ${role}）。「确认授权」未生效，任务保持待授权状态（10 分钟内有效），请管理员回复。`;
 		}
 		const grant = this.authorizations.consume(conversationId);

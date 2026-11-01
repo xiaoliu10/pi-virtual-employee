@@ -34,7 +34,7 @@ import type { ConfigStore } from "../../db/config-store.js";
 import { MAX_TIMEOUT_SEC } from "../../shared/timeouts.js";
 import { CommandSession } from "../command-session.js";
 import { maskId, refuse, isSchedulerActor, isExplicitConfirmation, type ActorContext } from "./admin.js";
-import { effectiveActorRole, resolveRole, type Role } from "../../security/permissions.js";
+import { effectiveActorRole, resolveRole, ROLE_RANK, type Role } from "../../security/permissions.js";
 
 /**
  * Role-tiered command gate (replaces the admin-only gate for run_command):
@@ -75,7 +75,10 @@ function gateCommandRole(
 	// Admin: no interactive confirmation — the verified admin initiator IS the
 	// authorization (user ruling 2026-09-29; every run stays audited). Only
 	// operators confirm per message.
-	if (opts.needConfirmation && role !== "admin" && !isExplicitConfirmation(actor.text)) {
+	// owner is a strict superset of admin (rank comparison, not a literal):
+	// gating the confirmation on !== "admin" made granting owner REMOVE the
+	// admin's confirmation-free shell — the field bug from 2026-10-31.
+	if (opts.needConfirmation && ROLE_RANK[role] < ROLE_RANK.admin && !isExplicitConfirmation(actor.text)) {
 		return refuse("该操作会执行命令。请明确说明要执行的操作，并在当前消息中包含「确认」（或同义明确肯定语）。");
 	}
 	return { actor, role };
@@ -418,7 +421,7 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 			// Operator: allowlist + composition-free single command (the original
 			// restricted-shell contract). Admin: full shell — the jump box is a
 			// dedicated VM, admins are human-verified, and every run is audited.
-			if (gate.role !== "admin") {
+			if (ROLE_RANK[gate.role] < ROLE_RANK.admin) {
 				const gateResult = checkWhitelist(raw, shell.allowedCommands);
 				if (!gateResult.ok) return refuse(gateResult.reason);
 			}
