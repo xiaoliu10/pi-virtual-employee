@@ -278,6 +278,40 @@ test("waiting for in-flight calls is bounded (a hung server cannot pin a process
 	await manager.dispose();
 });
 
+test("retire actually makes progress while a call is in flight (no deadlock in the wait loop)", async () => {
+	// Regression for a hang: the wait used `setTimeout(...).unref() ?? setTimeout(...)`,
+	// and unref() returns the Timeout — so `??` never fired and the resolve callback
+	// was dropped. The connection was then NEVER closed and its child process
+	// outlived the app. The only way to catch that is to assert the close happens.
+	let releaseCall;
+	const closed = [];
+	const manager = new McpManager({
+		connect: async () => ({
+			transport: {},
+			async listTools() { return { tools: [{ name: "slow" }] }; },
+			callTool() {
+				return new Promise((resolve) => { releaseCall = () => resolve({ content: [{ type: "text", text: "ok" }] }); });
+			},
+			async close() { closed.push("retired"); },
+		}),
+	});
+	await manager.refresh({ all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "x", command: "a" }] } } }) });
+	const running = manager.tools()[0].execute("t1", {});
+	for (let i = 0; i < 20 && typeof releaseCall !== "function"; i += 1) await Promise.resolve();
+	// Drop the server while the call is parked, then settle it.
+	const dropped = manager.refresh({ all: () => ({ capabilities: { mcp: { enabled: true, servers: [] } } }) });
+	await new Promise((r) => setTimeout(r, 60));
+	assert.deepEqual(closed, [], "still waiting: the call has not settled");
+	releaseCall();
+	await running;
+	await dropped;
+	// The retire loop must OBSERVE the settled call within a couple of poll ticks.
+	const deadline = Date.now() + 3000;
+	while (closed.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+	assert.deepEqual(closed, ["retired"], "the retired connection is closed once the call settles (a hanging wait loop would leave this empty)");
+	await manager.dispose();
+});
+
 /** Fake MCP client: canned listTools + scripted callTool results. */
 function fakeClient({ tools, result, error }) {
 	const client = {

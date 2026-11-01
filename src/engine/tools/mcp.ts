@@ -32,6 +32,14 @@ const DEFAULT_TIMEOUT_SEC = 60;
 
 const mcpToolName = (server: string, tool: string): string => `mcp__${server}__${tool}`;
 
+/** Wait `ms` with an unref'd timer, so a pending retire never keeps the process
+ * alive on its own (a quit must not wait for a 30s grace period). */
+const sleep = (ms: number): Promise<void> =>
+	new Promise((resolve) => {
+		const timer = setTimeout(resolve, ms);
+		timer.unref?.();
+	});
+
 let clientSeq = 0;
 const nextClientId = (): number => {
 	clientSeq += 1;
@@ -219,7 +227,7 @@ export class McpManager {
 	private async retire(conn: ServerConn): Promise<void> {
 		const deadline = Date.now() + RETIRE_GRACE_MS;
 		while (conn.inflight > 0 && Date.now() < deadline) {
-			await new Promise((resolve) => setTimeout(resolve, 50).unref?.() ?? setTimeout(resolve, 50));
+			await sleep(50);
 		}
 		if (conn.inflight > 0) {
 			console.warn(`[mcp] ${conn.config.name}: 关闭连接时仍有 ${conn.inflight} 个调用在途（已等待 ${RETIRE_GRACE_MS / 1000} 秒上限）`);
