@@ -6,6 +6,7 @@
  * streams chat through it), the IM adapter manager, and autostart. All
  * GUI-facing state (config, tasks, autostart) flows over IPC.
  */
+import os from "node:os";
 import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from "electron";
 import { mkdir, readFile, writeFile, copyFile, readdir, rm } from "node:fs/promises";
 import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
@@ -1459,7 +1460,18 @@ ${tailForProgress(decision.text)}`;
 	 * reason when it did not, so a port collision with another profile is visible
 	 * instead of sitting in main.log.
 	 */
-	ipcMain.handle("widget:status", () => widgetState);
+	// LAN addresses for "copy embed snippet": 0.0.0.0 is what the listener binds
+	// in lan mode, but what an integrator needs is a real host address to aim at.
+	ipcMain.handle("widget:status", () => {
+		let lanAddresses: string[] = [];
+		try {
+			lanAddresses = Object.values(os.networkInterfaces())
+				.flatMap((ifs) => ifs ?? [])
+				.filter((i) => i.family === "IPv4" && !i.internal)
+				.map((i) => i.address);
+		} catch { /* network interfaces are best-effort */ }
+		return { ...widgetState, lanAddresses };
+	});
 	/**
 	 * Find a free port for this profile and persist it. Exposed as a button so a
 	 * user can re-pick deterministically instead of waiting for a restart probe;

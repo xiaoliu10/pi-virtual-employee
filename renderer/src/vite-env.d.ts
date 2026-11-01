@@ -28,6 +28,8 @@ export interface RendererApi {
 		expose: "loopback" | "lan";
 		error?: string;
 		reassignedFrom?: number;
+		/** This machine's LAN IPv4 addresses — for building embed snippets. */
+		lanAddresses?: string[];
 	}>;
 	/** Pick + persist a free widget port for THIS profile. */
 	allocateWidgetPort(): Promise<{ port: number; changed: boolean; reason?: string }>;
