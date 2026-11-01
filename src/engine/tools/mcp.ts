@@ -62,6 +62,10 @@ interface ServerConn {
 	inflight: number;
 	/** Stable per-client identity used in the change signature. */
 	id: number;
+	/** Set once this connection is dropped; the retire loop stops waiting. */
+	retiring?: boolean;
+	/** Guards close() against a second call from the retire continuation or dispose. */
+	closed?: boolean;
 }
 
 /** Bound on how long a retired connection may linger waiting for in-flight
@@ -105,6 +109,10 @@ export class McpManager {
 	private lastSignature = "";
 	private refreshInFlight: Promise<{ changed: boolean; report: McpRefreshReport[] }> | undefined;
 	private disposed = false;
+	/** Connections dropped from the cache that may still be draining in-flight
+	 * calls. dispose() must close these too, or a quit can finish while an old
+	 * stdio client is still open (review P1). */
+	private retired = new Set<ServerConn>();
 
 	constructor(private readonly deps: McpManagerDeps = {}) {}
 
@@ -225,13 +233,27 @@ export class McpManager {
 	 * failed turn. The wait is bounded so a hung server cannot pin a process.
 	 */
 	private async retire(conn: ServerConn): Promise<void> {
-		const deadline = Date.now() + RETIRE_GRACE_MS;
-		while (conn.inflight > 0 && Date.now() < deadline) {
-			await sleep(50);
+		conn.retiring = true;
+		this.retired.add(conn);
+		try {
+			const deadline = Date.now() + RETIRE_GRACE_MS;
+			while (conn.inflight > 0 && !conn.closed && Date.now() < deadline) {
+				await sleep(50);
+			}
+			if (conn.inflight > 0 && !conn.closed) {
+				console.warn(`[mcp] ${conn.config.name}: 关闭连接时仍有 ${conn.inflight} 个调用在途（已等待 ${RETIRE_GRACE_MS / 1000} 秒上限）`);
+			}
+			await this.closeOnce(conn);
+		} finally {
+			this.retired.delete(conn);
 		}
-		if (conn.inflight > 0) {
-			console.warn(`[mcp] ${conn.config.name}: 关闭连接时仍有 ${conn.inflight} 个调用在途（已等待 ${RETIRE_GRACE_MS / 1000} 秒上限）`);
-		}
+	}
+
+	/** Close a connection exactly once (retire and dispose can both reach it). */
+	private async closeOnce(conn: ServerConn): Promise<void> {
+		if (conn.closed) return;
+		conn.closed = true;
+		conn.retiring = false;
 		await conn.client.close().catch(() => { /* best-effort teardown */ });
 	}
 
@@ -241,10 +263,12 @@ export class McpManager {
 		// products; then wait it out so nothing is abandoned outside the cache.
 		this.disposed = true;
 		await this.refreshInFlight?.catch(() => {});
-		const closing = [...this.cache.values()].map((conn) =>
-			conn.client.close().catch(() => { /* best-effort teardown */ }),
-		);
+		// Immediate close of both sets: an app quit must not wait out a retire
+		// grace period, and a retired connection is invisible to the cache.
+		const all = [...this.cache.values(), ...this.retired];
+		const closing = all.map((conn) => this.closeOnce(conn));
 		this.cache.clear();
+		this.retired.clear();
 		this.lastSignature = "";
 		await Promise.allSettled(closing);
 	}

@@ -38,9 +38,9 @@ function grab(name) {
 
 const ifaceAt = lines.findIndex((l) => l.startsWith("interface McpRowDraft"));
 const decl = lines.slice(ifaceAt, ifaceAt + 14).join("\n");
-const helpers = [decl, ...["encodeKeyValueLines", "parseKeyValueLines", "parseArgsJson", "serverToRow", "rowToServer"].map(grab)].join("\n\n");
+const helpers = [decl, ...["encodeKeyValueLines", "parseKeyValueLines", "parseArgsJson", "validateRow", "serverToRow", "rowToServer"].map(grab)].join("\n\n");
 const probe = `${helpers}
-export { parseArgsJson, parseKeyValueLines, encodeKeyValueLines, serverToRow, rowToServer };`;
+export { parseArgsJson, parseKeyValueLines, encodeKeyValueLines, validateRow, serverToRow, rowToServer };`;
 
 const workDir = join(root, "node_modules/.mcp-editor-test");
 mkdirSync(workDir, { recursive: true });
@@ -54,7 +54,7 @@ await build({
 	packages: "external",
 	logLevel: "silent",
 });
-const { parseArgsJson, parseKeyValueLines, encodeKeyValueLines, serverToRow, rowToServer } = await import(pathToFileURL(join(workDir, "helpers.mjs")).href);
+const { parseArgsJson, parseKeyValueLines, encodeKeyValueLines, validateRow, serverToRow, rowToServer } = await import(pathToFileURL(join(workDir, "helpers.mjs")).href);
 
 test("args round-trip is lossless (spaces, quotes, apostrophes, empty, Windows paths)", () => {
 	const nasty = ["-y", "C:\\Program Files\\x\\server.js", "it's", 'say "hi"', "", "a\\b"];
@@ -112,4 +112,28 @@ test("malformed env/header lines are reported (so save can refuse)", () => {
 	const bad = parseKeyValueLines("NO_SEPARATOR\n=orphan", "=");
 	assert.equal(bad.errors.length, 2, "both the missing separator and the missing key are reported");
 	assert.deepEqual(bad.values, {});
+});
+
+test("validateRow catches what the probe used to test silently-mangled", () => {
+	// "test connection" used to call rowToServer() directly, which drops invalid
+	// args — so a green result certified a configuration nobody had entered.
+	assert.ok(validateRow(serverToRow({ name: "s", command: "node" })).length === 0, "a complete row is valid");
+	const bad = serverToRow({ name: "s", command: "node" });
+	bad.argsRaw = "[broken";
+	assert.match(validateRow(bad).join("|"), /参数必须是 JSON 字符串数组/);
+
+	bad.argsRaw = "";
+	bad.envRaw = "NO_SEPARATOR";
+	assert.match(validateRow(bad).join("|"), /env/);
+
+	const noCommand = serverToRow({ name: "s" });
+	assert.match(validateRow(noCommand).join("|"), /缺少可执行文件/);
+
+	const http = serverToRow({ name: "h", url: "https://x/mcp" });
+	http.url = "";
+	assert.equal(http.transport, "http");
+	assert.match(validateRow(http).join("|"), /缺少 URL/);
+
+	const badName = serverToRow({ name: "bad name" });
+	assert.match(validateRow(badName).join("|"), /名称只能用字母/);
 });

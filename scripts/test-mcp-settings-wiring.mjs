@@ -96,3 +96,26 @@ test("quitting waits for the MCP teardown instead of racing the process exit", (
 	assert.match(hook, /Promise\.race\(/, "the teardown is bounded so a hung server cannot block quitting");
 	assert.match(hook, /app\.quit\(\)/, "the deferred quit is re-issued after cleanup");
 });
+
+test("an external MCP config push never overwrites unsaved editor rows", () => {
+	const page = readFileSync(join(root, "renderer/src/pages/SettingsPage.tsx"), "utf8");
+	// MCP rows live outside `draft`, so the draft-adoption guard does not cover
+	// them: re-seeding unconditionally threw away edits in progress (review P2).
+	const at = page.indexOf("const mcpSeed = persistedSeed(config);");
+	assert.ok(at > 0, "the reseed effect exists");
+	const effect = page.slice(at, at + 900);
+	assert.match(effect, /if \(mcpDirtyRef\.current\) return;/, "dirty rows are preserved");
+	assert.match(effect, /mcpSeedRef\.current === mcpSeed/, "an unchanged list does not re-seed");
+	// The save path must mark the rows clean, or the editor stays permanently dirty.
+	const saveAt = page.indexOf("await onChange(merged.config);");
+	assert.ok(saveAt > 0, "the save path exists");
+	assert.match(page.slice(saveAt, saveAt + 400), /mcpSeedRef\.current = persistedSeed\(merged\.config\)/, "saving marks the rows clean");
+});
+
+test("the connection probe validates the row and pins its result to what it tested", () => {
+	const page = readFileSync(join(root, "renderer/src/pages/SettingsPage.tsx"), "utf8");
+	assert.match(page, /const problems = validateRow\(row\);/, "the probe validates before IPC (it used to drop malformed args)");
+	assert.match(page, /const fingerprint = rowFingerprint\(row\);/, "the probe records the tested configuration");
+	assert.match(page, /prev\[row\.uid\]\?\.fingerprint !== fingerprint/, "a result is dropped when the row no longer matches");
+	assert.match(page, /seq !== probeSeq\.current/, "an older response cannot overwrite a newer one");
+});

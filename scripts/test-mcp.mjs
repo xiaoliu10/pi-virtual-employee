@@ -312,6 +312,32 @@ test("retire actually makes progress while a call is in flight (no deadlock in t
 	await manager.dispose();
 });
 
+test("dispose closes connections already being retired (quit must not leave children)", async () => {
+	// A retired connection is gone from the cache, so a cache-only dispose
+	// finished while the old stdio client was still open (review P1).
+	let releaseCall;
+	const closed = [];
+	const manager = new McpManager({
+		connect: async () => ({
+			transport: {},
+			async listTools() { return { tools: [{ name: "slow" }] }; },
+			callTool() { return new Promise((resolve) => { releaseCall = () => resolve({ content: [{ type: "text", text: "ok" }] }); }); },
+			async close() { closed.push("c"); },
+		}),
+	});
+	await manager.refresh({ all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "x", command: "a" }] } } }) });
+	void manager.tools()[0].execute("t1", {});
+	for (let i = 0; i < 20 && typeof releaseCall !== "function"; i += 1) await Promise.resolve();
+	await manager.refresh({ all: () => ({ capabilities: { mcp: { enabled: true, servers: [] } } }) });
+	assert.deepEqual(closed, [], "still draining: the in-flight call has not settled");
+
+	await manager.dispose();
+	assert.deepEqual(closed, ["c"], "dispose closes the retired connection too");
+	releaseCall();
+	await new Promise((r) => setTimeout(r, 120));
+	assert.deepEqual(closed, ["c"], "closing is idempotent: the retire continuation cannot close it twice");
+});
+
 /** Fake MCP client: canned listTools + scripted callTool results. */
 function fakeClient({ tools, result, error }) {
 	const client = {

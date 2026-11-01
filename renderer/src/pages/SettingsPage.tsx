@@ -147,6 +147,28 @@ function serverToRow(server: { name: string; command?: string; args?: string[]; 
 	};
 }
 
+/**
+ * Validate ONE editor row. Shared by save and "test connection": the probe used
+ * to call rowToServer() directly, which silently drops malformed args/env lines
+ * and would then test a DIFFERENT configuration than the one on screen (review).
+ */
+function validateRow(row: McpRowDraft): string[] {
+	const label = row.name.trim() || "(未命名)";
+	const problems: string[] = [];
+	if (!row.name.trim()) problems.push("服务器名为空");
+	else if (!/^[A-Za-z0-9_-]+$/.test(row.name.trim())) problems.push(`${label}: 名称只能用字母/数字/_/-`);
+	if (row.transport === "stdio") {
+		if (!row.command.trim()) problems.push(`${label}: 缺少可执行文件（stdio 传输）`);
+		const args = parseArgsJson(row.argsRaw);
+		if (!args.ok) problems.push(`${label}: ${args.reason}`);
+		for (const err of parseKeyValueLines(row.envRaw, "=").errors) problems.push(`${label} env ${err}`);
+	} else {
+		if (!row.url.trim()) problems.push(`${label}: 缺少 URL（HTTP 传输）`);
+		for (const err of parseKeyValueLines(row.headersRaw, ":").errors) problems.push(`${label} headers ${err}`);
+	}
+	return problems;
+}
+
 /** Convert an editable row into the persisted server config (parse on commit). */
 function rowToServer(row: McpRowDraft): { name: string; enabled: boolean } & Record<string, unknown> {
 	const out: Record<string, unknown> = { name: row.name.trim(), enabled: row.enabled };
@@ -513,16 +535,32 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 	/** MCP editor rows: raw-text drafts keyed by stable uid (index keys misattribute
 	 * probe results after a delete). Initialized once from the loaded config. */
 	const [mcpRows, setMcpRows] = useState<McpRowDraft[] | null>(null);
-	const [mcpTesting, setMcpTesting] = useState<Record<string, { busy?: boolean; ok?: boolean; error?: string; tools?: string[] }>>({});
+	/** Probe results keyed by row uid. `fingerprint` is the configuration that was
+	 * tested; a result is dropped as soon as the row no longer matches it, so a
+	 * green "连接成功" can never certify a config nobody tested (review P2). */
+	const [mcpTesting, setMcpTesting] = useState<Record<string, { busy?: boolean; ok?: boolean; error?: string; tools?: string[]; fingerprint?: string }>>({});
+	const probeSeq = useRef(0);
+	/** Identity of a row's current configuration — any edit changes this string. */
+	const rowFingerprint = (row: McpRowDraft): string => JSON.stringify([row.name, row.transport, row.command, row.cwd, row.argsRaw, row.envRaw, row.url, row.headersRaw, row.timeoutSecRaw]);
 	// Re-seed the rows when the persisted server list changes underneath us (an
 	// IM-side manage_settings edit, an import, or the config push after our own
-	// save). Without this the editor keeps showing the list it loaded on mount and
-	// the next save would write that stale list back (review P2).
-	const mcpSeed = JSON.stringify((config?.capabilities.mcp.servers ?? []).map((s) => serverToRow(s)).map(({ uid: _uid, ...rest }) => rest));
+	// save) — but ONLY while the user has no unsaved MCP edits. MCP rows live
+	// outside `draft`, so the draft-adoption guard above does not protect them;
+	// unconditionally re-seeding silently threw away edits in progress (review P2).
+	const persistedSeed = (value: AppConfig | null): string =>
+		JSON.stringify((value?.capabilities.mcp.servers ?? []).map((s) => serverToRow(s)).map(({ uid: _uid, ...rest }) => rest));
+	const mcpSeed = persistedSeed(config);
+	/** Seed the rows were last loaded from / saved to. */
 	const mcpSeedRef = useRef<string | null>(null);
+	/** True while the rows differ from what was last published. */
+	const mcpDirtyRef = useRef(false);
+	const mcpDirty = mcpRows !== null && mcpSeedRef.current !== null && JSON.stringify(mcpRows.map(({ uid: _uid, ...rest }) => rest)) !== mcpSeedRef.current;
+	mcpDirtyRef.current = mcpDirty;
 	useEffect(() => {
 		if (!config) return;
 		if (mcpSeedRef.current === mcpSeed) return;
+		// Keep unsaved edits: adopt the incoming list only when the editor is clean.
+		if (mcpDirtyRef.current) return;
 		mcpSeedRef.current = mcpSeed;
 		setMcpRows((config.capabilities.mcp.servers ?? []).map((s) => serverToRow(s)));
 		// Probe results belong to the previous rows.
@@ -683,28 +721,15 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 	 */
 	const withMcpRows = (base: AppConfig): { ok: true; config: AppConfig } | { ok: false; reason: string } => {
 		const rows = mcpRows ?? [];
-		const problems: string[] = [];
-		for (const row of rows) {
-			const label = row.name || "(未命名)";
-			if (row.transport === "stdio") {
-				const args = parseArgsJson(row.argsRaw);
-				if (!args.ok) problems.push(`${label}: ${args.reason}`);
-				if (!row.command.trim()) problems.push(`${label}: 缺少可执行文件（stdio 传输）`);
-				for (const err of parseKeyValueLines(row.envRaw, "=").errors) problems.push(`${label} env ${err}`);
-			} else {
-				if (!row.url.trim()) problems.push(`${label}: 缺少 URL（HTTP 传输）`);
-				for (const err of parseKeyValueLines(row.headersRaw, ":").errors) problems.push(`${label} headers ${err}`);
-			}
-		}
-		const servers = rows.map(rowToServer);
+		const problems: string[] = rows.flatMap(validateRow);
 		const seen = new Set<string>();
-		for (const server of servers) {
-			const name = server.name.trim();
-			if (!name) { problems.push("有服务器未填名称"); continue; }
-			if (!/^[A-Za-z0-9_-]+$/.test(name)) problems.push(`${name}: 名称只能用字母/数字/_/-`);
+		for (const row of rows) {
+			const name = row.name.trim();
+			if (!name) continue;
 			if (seen.has(name)) problems.push(`${name}: 服务器名重复`);
 			seen.add(name);
 		}
+		const servers = rows.map(rowToServer);
 		if (problems.length) return { ok: false, reason: `MCP 服务器配置有误，未保存：\n· ${[...new Set(problems)].join("\n· ")}` };
 		return {
 			ok: true,
@@ -720,6 +745,9 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 			const merged = withMcpRows(draft);
 			if (!merged.ok) { setError(merged.reason); return; }
 			await onChange(merged.config);
+			// The rows now match what is persisted: mark them clean so a later
+			// external refresh is adopted again.
+			mcpSeedRef.current = persistedSeed(merged.config);
 			onClose();
 		} catch (reason) {
 			setError(reason instanceof Error ? reason.message : String(reason));
@@ -1406,14 +1434,34 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 																<button type="button"
 																	disabled={mcpTesting[row.uid]?.busy === true}
 																	onClick={async () => {
-																		setMcpTesting((prev) => ({ ...prev, [row.uid]: { busy: true } }));
+																		// Validate first: rowToServer() drops malformed args/env
+																		// lines, so probing without this tests a different config.
+																		const problems = validateRow(row);
+																		if (problems.length) {
+																			setMcpTesting((prev) => ({ ...prev, [row.uid]: { busy: false, ok: false, error: problems.join("；") } }));
+																			return;
+																		}
+																		const fingerprint = rowFingerprint(row);
+																		const seq = (probeSeq.current += 1);
+																		setMcpTesting((prev) => ({ ...prev, [row.uid]: { busy: true, fingerprint } }));
 																		try {
 																			const r = await api.testMcpServer(rowToServer(row));
-																			setMcpTesting((prev) => ({ ...prev, [row.uid]: { busy: false, ok: r.ok, error: r.error, tools: r.tools } }));
-																		} catch { setMcpTesting((prev) => ({ ...prev, [row.uid]: { busy: false, ok: false, error: "测试请求失败" } })); }
+																			// Apply only if this is still the newest request AND the row
+																			// still holds the configuration that was tested.
+																			setMcpTesting((prev) => {
+																				if (seq !== probeSeq.current) return prev;
+																				if (prev[row.uid]?.fingerprint !== fingerprint) return prev;
+																				return { ...prev, [row.uid]: { busy: false, ok: r.ok, error: r.error, tools: r.tools, fingerprint } };
+																			});
+																		} catch {
+																			setMcpTesting((prev) => {
+																				if (seq !== probeSeq.current) return prev;
+																				return { ...prev, [row.uid]: { busy: false, ok: false, error: "测试请求失败", fingerprint } };
+																			});
+																		}
 																	}}
 																	className="rounded-lg border border-sky-300 px-2.5 py-1 text-xs text-sky-700 hover:bg-sky-50 disabled:opacity-50">测试连接</button>
-																{mcpTesting[row.uid] && (
+																{mcpTesting[row.uid] && mcpTesting[row.uid].fingerprint === rowFingerprint(row) && (
 																	<span className="min-w-0 flex-1 truncate text-xs text-slate-500" title={mcpTesting[row.uid].error ?? (mcpTesting[row.uid].tools ?? []).join("、")}>
 																		{mcpTesting[row.uid].busy ? "连接中…" : mcpTesting[row.uid].ok ? `连接成功，${mcpTesting[row.uid].tools?.length ?? 0} 个工具：${(mcpTesting[row.uid].tools ?? []).slice(0, 6).join("、")}${(mcpTesting[row.uid].tools?.length ?? 0) > 6 ? " …" : ""}` : `失败：${mcpTesting[row.uid].error}`}
 																	</span>
