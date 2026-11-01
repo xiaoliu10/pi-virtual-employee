@@ -351,7 +351,7 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 	 * each keep their own port; before this, a collision only produced one WARN in
 	 * main.log while the settings page still claimed the widget was enabled.
 	 */
-	const [widgetStatus, setWidgetStatus] = useState<{ running: boolean; starting?: boolean; port: number; error?: string; reassignedFrom?: number; lanAddresses?: string[] } | null>(null);
+	const [widgetStatus, setWidgetStatus] = useState<{ running: boolean; starting?: boolean; port: number; expose?: "loopback" | "lan"; error?: string; reassignedFrom?: number; lanAddresses?: string[] } | null>(null);
 	const [widgetBusy, setWidgetBusy] = useState(false);
 	const [copied, setCopied] = useState(false);
 	useEffect(() => {
@@ -1274,12 +1274,20 @@ X-VE-Secret: <接入密钥>
 																	</span>
 																	<button type="button"
 																		onClick={() => {
-																			// The integrator aims at a REAL address: LAN IP when
-																			// exposing to the network, loopback for same-host proxies.
-																			const host = draft.widget.expose === "lan"
+																			// Everything here must describe the LISTENER as it runs,
+																			// not the unsaved draft: expose mode and token take effect
+																			// on save+restart, so a snippet built from the draft can
+																			// point at an address nothing is serving / a token the
+																			// service would reject (Copilot review).
+																			const expose = widgetStatus.expose ?? draft.widget.expose;
+																			const host = expose === "lan"
 																				? (widgetStatus.lanAddresses?.[0] ?? "<本机局域网IP>")
 																				: "127.0.0.1";
-																			const snippet = `<script src="http://${host}:${widgetStatus.port}/widget.js" data-token="${draft.widget.token}" data-ticket="<由业务后端调用 /api/widget/session 换取>"></script>`;
+																			// HTML attribute escaping: the token is a user-editable
+																			// string, and a quote would truncate data-token / an
+																			// entity would decode differently.
+																			const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+																			const snippet = `<script src="http://${host}:${widgetStatus.port}/widget.js" data-token="${esc((config ?? draft).widget.token)}" data-ticket="<由业务后端调用 /api/widget/session 换取>"></script>`;
 																			void navigator.clipboard.writeText(snippet);
 																			setCopied(true);
 																			setTimeout(() => setCopied(false), 1600);
