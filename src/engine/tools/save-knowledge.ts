@@ -3,7 +3,7 @@ import { Type } from "@earendil-works/pi-ai";
 import type { KnowledgeService } from "../../knowledge/knowledge-service.js";
 import { deriveMemoryContext, ownerForScope, type MemoryScope } from "../../knowledge/memory-scope.js";
 import { CONFLICT_HINT_TEMPLATE, findTitleConflict, looksShortLived, memoryPhrasingHint } from "../../knowledge/memory-write.js";
-import { isLocalConversation, resolveRole, type Role } from "../../security/permissions.js";
+import {ROLE_RANK, isLocalConversation, resolveRole, type Role} from "../../security/permissions.js";
 import type { ConfigStore } from "../../db/config-store.js";
 import type { InboundActor } from "../../im/types.js";
 
@@ -157,7 +157,8 @@ export function createRememberTool(deps: {
 				const role: Role = local ? "admin" : (actor?.channel === "widget"
 					? (actor.verifiedRole && ["admin", "operator", "viewer"].includes(actor.verifiedRole) ? actor.verifiedRole : "viewer")
 					: resolveRole(deps.config, actor?.senderId));
-				const isAdmin = (): boolean => role === "admin";
+				// owner >= admin: profile-scope memory must stay writable for owner.
+				const isAdmin = (): boolean => ROLE_RANK[role] >= ROLE_RANK.admin;
 				const isAtLeastOperator = (): boolean => role !== "viewer";
 
 				// Resolve the effective scope.

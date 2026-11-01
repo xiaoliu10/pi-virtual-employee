@@ -13,7 +13,7 @@ import { Type } from "@earendil-works/pi-ai";
 import type { SchedulerService } from "../../scheduler/scheduler-service.js";
 import type { ConfigStore } from "../../db/config-store.js";
 import { maskId, isExplicitConfirmation, isSchedulerActor, requireConfirmedAdmin, type ActorContext } from "./admin.js";
-import { resolveRole } from "../../security/permissions.js";
+import {ROLE_RANK, resolveRole} from "../../security/permissions.js";
 
 function fmtTime(ms: number | null): string {
 	return ms ? new Date(ms).toLocaleString("zh-CN", { hour12: false }) : "—";
@@ -157,7 +157,7 @@ export function createSchedulerTools(
 								type: "text" as const,
 								text: (() => {
 									const role = creatorRole ?? "viewer";
-									const scope = role === "admin"
+									const scope = ROLE_RANK[role] >= ROLE_RANK.admin
 										? "完整命令、系统设置与其它管理工具"
 										: role === "operator"
 											? "浏览器、文件系统、文档、定时任务、白名单内的命令"
@@ -403,7 +403,7 @@ export function createSchedulerTools(
 			const actor = resolveActor?.(conversationId);
 			const role = actor && config ? resolveRole(config, actor.senderId) : "viewer";
 			const isCreator = !!actor?.senderId && actor.senderId === task.created_by;
-			if (role !== "admin" && !isCreator) {
+			if (ROLE_RANK[role] < ROLE_RANK.admin && !isCreator) {
 				return {
 					content: [{ type: "text", text: "⛔ 续跑自主任务需要管理员或任务创建人。" }],
 					details: { ok: false, refused: true },
