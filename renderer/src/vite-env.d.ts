@@ -33,6 +33,8 @@ export interface RendererApi {
 	}>;
 	/** Pick + persist a free widget port for THIS profile. */
 	allocateWidgetPort(): Promise<{ port: number; changed: boolean; reason?: string }>;
+	/** Connect to one MCP server and list its tools. */
+	testMcpServer(server: unknown): Promise<{ ok: boolean; error?: string; tools: string[] }>;
 	onWidgetStatusChanged(cb: (s: { enabled: boolean; running: boolean; starting?: boolean; port: number; expose: "loopback" | "lan"; error?: string; reassignedFrom?: number }) => void): () => void;
 	manageComputer(action: "status" | "install" | "connect" | "disconnect"): Promise<import("../../src/shared/computer").ComputerStatus>;
 	pickComputerDriver(): Promise<string | null>;

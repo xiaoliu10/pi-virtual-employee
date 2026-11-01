@@ -79,6 +79,38 @@ test("normalizeMcpServer rejects bad entries with precise reasons", () => {
 	assert.equal(normalizeMcpServer({ name: "ok", command: "x" }).ok, true);
 });
 
+test("refresh closes connections it drops (config change, disable, remove); dispose closes the rest", async () => {
+	const closed = [];
+	const makeClient = (tag) => ({
+		transport: {},
+		async listTools() { return { tools: [{ name: "t" }] }; },
+		async callTool() { return { content: [{ type: "text", text: "x" }] }; },
+		async close() { closed.push(tag); },
+	});
+	let made = 0;
+	const manager = new McpManager({ connect: async () => { made += 1; return makeClient(`c${made}`); } });
+	const configFor = (servers) => ({ all: () => ({ capabilities: { mcp: { enabled: true, servers } } }) });
+
+	await manager.refresh(configFor([{ name: "a", command: "a" }, { name: "b", command: "b" }]));
+	assert.deepEqual(closed, [], "fresh connections stay open across a no-op refresh");
+
+	// a's config changes → its OLD client must be closed (the new one replaces it)
+	await manager.refresh(configFor([{ name: "a", command: "a2" }, { name: "b", command: "b" }]));
+	assert.deepEqual(closed, ["c1"], "config-changed replacement closes the stale stdio client");
+
+	// b disabled → its client must be closed (c2 — b's client from the FIRST refresh;
+	// c3 was a's replacement client made during the config-change step above)
+	await manager.refresh(configFor([{ name: "a", command: "a2" }, { name: "b", command: "b", enabled: false }]));
+	assert.deepEqual(closed, ["c1", "c2"], "disabled servers close their stdio client");
+
+	// a removed → its client must be closed
+	await manager.refresh(configFor([]));
+	assert.deepEqual(closed, ["c1", "c2", "c3"], "removed servers close their stdio client");
+
+	await manager.dispose();
+	assert.equal(manager.tools().length, 0, "dispose empties the cache");
+});
+
 /** Fake MCP client: canned listTools + scripted callTool results. */
 function fakeClient({ tools, result, error }) {
 	const client = {

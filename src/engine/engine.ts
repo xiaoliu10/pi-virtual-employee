@@ -376,6 +376,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 	/** MCP connector (external servers' tools bridged as native tools). */
 	private mcpManager!: McpManager;
+
+	/** Close every MCP connection (stdio transports own child processes). */
+	async disposeMcp(): Promise<void> {
+		await this.mcpManager.dispose();
+	}
 	/** Work items (autonomous work phase 2). Set by main after construction; absent → work tools off. */
 	workItems?: WorkItemStore;
 	/** Main-process bridge for work items: fire a window now / push to a conversation. */

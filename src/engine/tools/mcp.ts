@@ -153,8 +153,27 @@ export class McpManager {
 			.join("|");
 		const changed = signature !== this.lastSignature;
 		this.lastSignature = signature;
+		// Close everything the new cache dropped: a config-changed replacement
+		// (nextCache holds a NEW client for the same name) and servers that were
+		// disabled or removed. stdio transports own a child process — skipping this
+		// leaks one process per refresh (review B1/B2).
+		for (const [name, oldConn] of this.cache) {
+			const kept = nextCache.get(name);
+			if (kept && kept.client === oldConn.client) continue;
+			oldConn.client.close().catch(() => { /* best-effort teardown */ });
+		}
 		this.cache = nextCache;
 		return { changed, report };
+	}
+
+	/** Close every live connection (app quit / capability disabled). */
+	async dispose(): Promise<void> {
+		const closing = [...this.cache.values()].map((conn) =>
+			conn.client.close().catch(() => { /* best-effort teardown */ }),
+		);
+		this.cache.clear();
+		this.lastSignature = "";
+		await Promise.allSettled(closing);
 	}
 
 	private async connect(server: McpServerConfig): Promise<Client> {
