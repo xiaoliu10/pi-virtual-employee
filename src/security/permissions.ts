@@ -131,6 +131,21 @@ export function isAdmin(config: ConfigStore, senderId: string | undefined | null
 }
 
 /**
+ * Role that counts for a one-shot authorization decision (「确认授权」).
+ *
+ * Widget tickets participate: a ticketed admin confirming in the embedded
+ * assistant is the same act of authority as an IM admin replying. Extracted
+ * so the rank comparison has one testable home (owner >= admin must pass).
+ */
+export function effectiveAuthorizationRole(actor: { senderId: string; channel?: string; verifiedRole?: "viewer" | "operator" | "admin" } | undefined, config: ConfigStore): Role {
+	if (actor?.channel === "widget") {
+		const verified = actor.verifiedRole;
+		return verified && ROLE_RANK[verified] <= ROLE_RANK.admin ? verified : "viewer";
+	}
+	return resolveRole(config, actor?.senderId ?? null);
+}
+
+/**
  * Effective role for an actor, honouring a widget ticket's verified role.
  *
  * A handful of tools guard THEMSELVES (shell/managed settings/…) instead of
