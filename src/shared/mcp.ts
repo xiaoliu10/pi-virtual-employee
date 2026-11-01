@@ -102,3 +102,13 @@ export function normalizeMcpServers(raw: unknown, env: NodeJS.ProcessEnv = proce
 	}
 	return { servers, errors };
 }
+
+/**
+ * Strip this server's exact `mcp__<server>__` prefix from a bridged tool name.
+ * Server names may contain underscores, so a generic pattern cannot do this —
+ * derive the prefix from the name itself (P3: `mcp__my_server__t` must strip).
+ */
+export function stripMcpToolPrefix(serverName: string, bridgedName: string): string {
+	const prefix = `mcp__${serverName}__`;
+	return bridgedName.startsWith(prefix) ? bridgedName.slice(prefix.length) : bridgedName;
+}

@@ -10,6 +10,92 @@ import { SkillsSection } from "../components/SkillsSection";
 import { ComputerSection } from "../components/ComputerSection";
 import { MAX_TIMEOUT_SEC, normalizeTimeoutSec } from "../../../src/shared/timeouts";
 
+/** One editable MCP server row in the settings page. Raw text fields hold
+ * EXACTLY what the user typed; parsing happens only on save / test (P1: parsing
+ * on every keystroke deleted the first character of a new line). */
+interface McpRowDraft {
+	uid: string;
+	name: string;
+	transport: "stdio" | "http";
+	command: string;
+	argsRaw: string;
+	envRaw: string;
+	url: string;
+	headersRaw: string;
+	timeoutSecRaw: string;
+	enabled: boolean;
+}
+
+/** Parse `KEY=VALUE` (or `Key: value`) lines; skips blanks and malformed lines. */
+function parseKeyValueLines(raw: string, sep: "=" | ":"): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const line of raw.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		const at = trimmed.indexOf(sep);
+		if (at <= 0) continue;
+		const key = trimmed.slice(0, at).trim();
+		const value = trimmed.slice(at + 1).trim();
+		if (key) out[key] = value;
+	}
+	return out;
+}
+
+/** Whitespace-split with `"double"` and `'single'` quoting (paths with spaces). */
+function parseArgsRaw(raw: string): string[] {
+	const out: string[] = [];
+	let cur = "";
+	let quote: '"' | "'" | null = null;
+	let started = false;
+	for (const ch of raw) {
+		if (quote) {
+			if (ch === quote) quote = null;
+			else cur += ch;
+		} else if (ch === '"' || ch === "'") {
+			quote = ch;
+			started = true;
+		} else if (ch === " " || ch === "\t") {
+			if (cur || started) { out.push(cur); cur = ""; started = false; }
+		} else cur += ch;
+	}
+	if (cur || started) out.push(cur);
+	return out;
+}
+
+function serverToRow(server: { name: string; command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string>; timeoutSec?: number; enabled?: boolean }, index: number): McpRowDraft {
+	return {
+		uid: `mcp-${Date.now().toString(36)}-${index}`,
+		name: server.name ?? "",
+		transport: server.command ? "stdio" : server.url ? "http" : "stdio",
+		command: server.command ?? "",
+		argsRaw: (server.args ?? []).map((a) => (a.includes(" ") || a.includes('"')) ? `'${a.replaceAll("'", "\'")}'` : a).join(" "),
+		envRaw: Object.entries(server.env ?? {}).map(([k, v]) => `${k}=${v}`).join("\n"),
+		url: server.url ?? "",
+		headersRaw: Object.entries(server.headers ?? {}).map(([k, v]) => `${k}: ${v}`).join("\n"),
+		timeoutSecRaw: server.timeoutSec != null ? String(server.timeoutSec) : "",
+		enabled: server.enabled !== false,
+	};
+}
+
+/** Convert an editable row into the persisted server config (parse on commit). */
+function rowToServer(row: McpRowDraft): { name: string; enabled: boolean } & Record<string, unknown> {
+	const out: Record<string, unknown> = { name: row.name.trim(), enabled: row.enabled };
+	const timeout = Math.floor(Number(row.timeoutSecRaw));
+	if (Number.isFinite(timeout) && timeout > 0) out.timeoutSec = timeout;
+	if (row.transport === "http") {
+		if (row.url.trim()) out.url = row.url.trim();
+		const headers = parseKeyValueLines(row.headersRaw, ":");
+		if (Object.keys(headers).length) out.headers = headers;
+	} else {
+		if (row.command.trim()) out.command = row.command.trim();
+		const args = parseArgsRaw(row.argsRaw);
+		if (args.length) out.args = args;
+		const env = parseKeyValueLines(row.envRaw, "=");
+		if (Object.keys(env).length) out.env = env;
+	}
+	return out as { name: string; enabled: boolean } & Record<string, unknown>;
+}
+
 interface SettingsPageProps {
 	config: AppConfig | null;
 	onChange: (patch: Partial<AppConfig>) => Promise<void>;
@@ -353,8 +439,15 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 	 */
 	const [widgetStatus, setWidgetStatus] = useState<{ running: boolean; starting?: boolean; port: number; expose?: "loopback" | "lan"; error?: string; reassignedFrom?: number; lanAddresses?: string[] } | null>(null);
 	const [widgetBusy, setWidgetBusy] = useState(false);
-	/** Per-server MCP probe state for the settings page. */
-	const [mcpTesting, setMcpTesting] = useState<Record<number, { busy?: boolean; ok?: boolean; error?: string; tools?: string[] }>>({});
+	/** MCP editor rows: raw-text drafts keyed by stable uid (index keys misattribute
+	 * probe results after a delete). Initialized once from the loaded config. */
+	const [mcpRows, setMcpRows] = useState<McpRowDraft[] | null>(null);
+	const [mcpTesting, setMcpTesting] = useState<Record<string, { busy?: boolean; ok?: boolean; error?: string; tools?: string[] }>>({});
+	useEffect(() => {
+		if (!mcpRows && config) {
+			setMcpRows((config.capabilities.mcp.servers ?? []).map(serverToRow));
+		}
+	}, [config, mcpRows]);
 	const [copied, setCopied] = useState(false);
 	useEffect(() => {
 		let alive = true;
@@ -499,12 +592,19 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 		onClose();
 	};
 
+	/** Commit the MCP editor rows into the draft right before any onChange call
+	 * (the real save AND report-section preflight both persist the draft). */
+	const withMcpRows = (base: AppConfig): AppConfig => {
+		const rows = mcpRows ?? [];
+		return { ...base, capabilities: { ...base.capabilities, mcp: { enabled: base.capabilities.mcp.enabled, servers: rows.map(rowToServer) } } };
+	};
+
 	const save = async () => {
 		if (!draft) return;
 		setSaving(true);
 		setError(null);
 		try {
-			await onChange(draft);
+			await onChange(withMcpRows(draft));
 			onClose();
 		} catch (reason) {
 			setError(reason instanceof Error ? reason.message : String(reason));
@@ -1145,55 +1245,66 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 											<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
 												<div className="text-sm font-medium text-slate-800">MCP 服务器（外部工具）</div>
 												<div className="mt-1 text-xs leading-relaxed text-slate-400">
-													接入 Model Context Protocol 服务器，把外部工具（数据库查询、浏览器自动化、内部系统 API……）挂进员工工具箱。工具以 mcp__服务器名__工具名 注入对话，与内置工具不冲突。保存后自动重连，工具面有变化会重建会话。
+													接入 Model Context Protocol 服务器，把外部工具（数据库查询、浏览器自动化、内部系统 API……）挂进员工工具箱。工具以 mcp__服务器名__工具名 注入对话，与内置工具不冲突。保存后自动重连，工具面有变化会重建会话。env 与 headers 支持 ${'{ENV}'} 形式的环境变量引用。
 												</div>
 												<div className="mt-3 space-y-3">
 													<label className="flex cursor-pointer items-center justify-between rounded-xl border border-sky-200 bg-sky-50/50 px-4 py-3">
 														<div><div className="text-sm font-medium text-slate-800">启用 MCP 服务器</div><div className="mt-0.5 text-xs text-sky-700/70">关闭时不连接任何服务器，已挂载的外部工具从对话中移除（保存即生效）。</div></div>
 														<input type="checkbox" checked={draft.capabilities.mcp.enabled} onChange={(e) => setDraft((v) => v ? { ...v, capabilities: { ...v.capabilities, mcp: { ...v.capabilities.mcp, enabled: e.target.checked } } } : v)} className="h-5 w-5 accent-sky-500" />
 													</label>
-													{(draft.capabilities.mcp.servers ?? []).map((server, idx) => (
-														<div key={idx} className="rounded-xl border border-slate-200 px-4 py-3">
+													{(mcpRows ?? []).map((row, idx) => (
+														<div key={row.uid} className="rounded-xl border border-slate-200 px-4 py-3">
 															<div className="flex items-center justify-between gap-2">
-																<input value={server.name} onChange={(e) => setDraft((v) => v ? { ...v, capabilities: { ...v.capabilities, mcp: { ...v.capabilities.mcp, servers: v.capabilities.mcp.servers.map((s, i) => i === idx ? { ...s, name: e.target.value.replace(/[^A-Za-z0-9_-]/g, "") } : s) } } } : v)} placeholder="服务器名（字母数字_-）" className="w-40 rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
-																<div className="flex items-center gap-2">
-																	<label className="flex items-center gap-1 text-xs text-slate-500"><input type="checkbox" checked={server.enabled !== false} onChange={(e) => setDraft((v) => v ? { ...v, capabilities: { ...v.capabilities, mcp: { ...v.capabilities.mcp, servers: v.capabilities.mcp.servers.map((s, i) => i === idx ? { ...s, enabled: e.target.checked } : s) } } } : v)} className="h-4 w-4 accent-sky-500" />启用</label>
-																	<button type="button" onClick={() => setDraft((v) => v ? { ...v, capabilities: { ...v.capabilities, mcp: { ...v.capabilities.mcp, servers: v.capabilities.mcp.servers.filter((_, i) => i !== idx) } } } : v)} className="rounded-lg px-2 py-1 text-xs text-rose-600 hover:bg-rose-50">删除</button>
+																<input value={row.name} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, name: e.target.value.replace(/[^A-Za-z0-9_-]/g, "") } : r))} placeholder="服务器名（字母数字_-）" className="w-44 rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																<div className="flex items-center gap-3">
+																	<div className="flex overflow-hidden rounded-lg border border-slate-300 text-xs">
+																		<button type="button" onClick={() => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, transport: "stdio" } : r))} className={`px-2 py-1 ${row.transport === "stdio" ? "bg-sky-600 text-white" : "bg-white text-slate-500 hover:bg-slate-50"}`}>stdio</button>
+																		<button type="button" onClick={() => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, transport: "http" } : r))} className={`px-2 py-1 ${row.transport === "http" ? "bg-sky-600 text-white" : "bg-white text-slate-500 hover:bg-slate-50"}`}>HTTP</button>
+																	</div>
+																	<label className="flex items-center gap-1 text-xs text-slate-500"><input type="checkbox" checked={row.enabled} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, enabled: e.target.checked } : r))} className="h-4 w-4 accent-sky-500" />启用</label>
+																	<button type="button" onClick={() => { setMcpRows((rows) => (rows ?? []).filter((r) => r.uid !== row.uid)); setMcpTesting((prev) => { const next = { ...prev }; delete next[row.uid]; return next; }); }} className="rounded-lg px-2 py-1 text-xs text-rose-600 hover:bg-rose-50">删除</button>
 																</div>
 															</div>
-															<div className="mt-2 grid grid-cols-2 gap-2">
-																{server.url !== undefined || !server.command ? (
-																	<input value={server.url ?? ""} onChange={(e) => setDraft((v) => v ? { ...v, capabilities: { ...v.capabilities, mcp: { ...v.capabilities.mcp, servers: v.capabilities.mcp.servers.map((s, i) => i === idx ? { ...s, url: e.target.value } : s) } } } : v)} placeholder="HTTP 传输：https://mcp.example.com/mcp" className="rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
-																) : (
-																	<input value={server.command ?? ""} onChange={(e) => setDraft((v) => v ? { ...v, capabilities: { ...v.capabilities, mcp: { ...v.capabilities.mcp, servers: v.capabilities.mcp.servers.map((s, i) => i === idx ? { ...s, command: e.target.value } : s) } } } : v)} placeholder="stdio 传输：可执行文件路径" className="rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
-																)}
-																<input value={(server.args ?? []).join(" ")} onChange={(e) => setDraft((v) => v ? { ...v, capabilities: { ...v.capabilities, mcp: { ...v.capabilities.mcp, servers: v.capabilities.mcp.servers.map((s, i) => i === idx ? { ...s, args: e.target.value.split(" ").filter(Boolean) } : s) } } } : v)} placeholder="参数（空格分隔）" className="rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
-															</div>
-															<div className="mt-2 grid grid-cols-2 gap-2">
-																<textarea rows={2} value={Object.entries(server.env ?? {}).map(([k, val]) => `${k}=${val}`).join("\n")} onChange={(e) => setDraft((v) => v ? { ...v, capabilities: { ...v.capabilities, mcp: { ...v.capabilities.mcp, servers: v.capabilities.mcp.servers.map((s, i) => i === idx ? { ...s, env: Object.fromEntries(e.target.value.split("\n").filter(Boolean).map((line) => { const eq = line.indexOf("="); return eq > 0 ? [line.slice(0, eq), line.slice(eq + 1)] : null; }).filter((pair): pair is [string, string] => pair !== null)) } : s) } } } : v)} placeholder="env（每行 KEY=值，支持 ${ENV} 形式的环境变量引用）" className="rounded-lg border border-slate-300 px-2 py-1 font-mono text-[11px] outline-none focus:border-sky-400" />
-																<textarea rows={2} value={Object.entries(server.headers ?? {}).map(([k, val]) => `${k}: ${val}`).join("\n")} onChange={(e) => setDraft((v) => v ? { ...v, capabilities: { ...v.capabilities, mcp: { ...v.capabilities.mcp, servers: v.capabilities.mcp.servers.map((s, i) => i === idx ? { ...s, headers: Object.fromEntries(e.target.value.split("\n").filter(Boolean).map((line) => { const colon = line.indexOf(":"); return colon > 0 ? [line.slice(0, colon).trim(), line.slice(colon + 1).trim()] : null; }).filter((pair): pair is [string, string] => pair !== null)) } : s) } } } : v)} placeholder="headers（每行 Key: 值，如 Authorization: Bearer …）" className="rounded-lg border border-slate-300 px-2 py-1 font-mono text-[11px] outline-none focus:border-sky-400" />
-															</div>
+															{row.transport === "stdio" ? (
+																<div className="mt-2 space-y-2">
+																	<div className="grid grid-cols-[1fr_auto] gap-2">
+																		<input value={row.command} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, command: e.target.value } : r))} placeholder="stdio 传输：可执行文件（如 node / npx / uvx）" className="rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																		<input value={row.timeoutSecRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, timeoutSecRaw: e.target.value.replace(/[^0-9]/g, "") } : r))} placeholder="超时秒" className="w-24 rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																	</div>
+																	<input value={row.argsRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, argsRaw: e.target.value } : r))} placeholder="参数（空格分隔，含空格的参数用引号包裹）" className="w-full rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																	<textarea rows={2} value={row.envRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, envRaw: e.target.value } : r))} placeholder="env（每行 KEY=值，保存/测试时解析）" className="w-full rounded-lg border border-slate-300 px-2 py-1 font-mono text-[11px] outline-none focus:border-sky-400" />
+																</div>
+															) : (
+																<div className="mt-2 space-y-2">
+																	<div className="grid grid-cols-[1fr_auto] gap-2">
+																		<input value={row.url} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, url: e.target.value } : r))} placeholder="HTTP 传输：https://mcp.example.com/mcp" className="rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																		<input value={row.timeoutSecRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, timeoutSecRaw: e.target.value.replace(/[^0-9]/g, "") } : r))} placeholder="超时秒" className="w-24 rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																	</div>
+																	<textarea rows={2} value={row.headersRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, headersRaw: e.target.value } : r))} placeholder="headers（每行 Key: 值，如 Authorization: Bearer …）" className="w-full rounded-lg border border-slate-300 px-2 py-1 font-mono text-[11px] outline-none focus:border-sky-400" />
+																</div>
+															)}
 															<div className="mt-2 flex items-center gap-2">
 																<button type="button"
 																	onClick={async () => {
-																		setMcpTesting((prev) => ({ ...prev, [idx]: { busy: true } }));
+																		setMcpTesting((prev) => ({ ...prev, [row.uid]: { busy: true } }));
 																		try {
-																			const r = await api.testMcpServer(server);
-																			setMcpTesting((prev) => ({ ...prev, [idx]: { busy: false, ok: r.ok, error: r.error, tools: r.tools } }));
-																		} catch { setMcpTesting((prev) => ({ ...prev, [idx]: { busy: false, ok: false, error: "测试请求失败" } })); }
+																			const r = await api.testMcpServer(rowToServer(row));
+																			setMcpTesting((prev) => ({ ...prev, [row.uid]: { busy: false, ok: r.ok, error: r.error, tools: r.tools } }));
+																		} catch { setMcpTesting((prev) => ({ ...prev, [row.uid]: { busy: false, ok: false, error: "测试请求失败" } })); }
 																	}}
 																	className="rounded-lg border border-sky-300 px-2.5 py-1 text-xs text-sky-700 hover:bg-sky-50">测试连接</button>
-																{mcpTesting[idx] && (
-																	<span className="text-xs text-slate-500">
-																		{mcpTesting[idx].busy ? "连接中…" : mcpTesting[idx].ok ? `连接成功，${mcpTesting[idx].tools?.length ?? 0} 个工具：${(mcpTesting[idx].tools ?? []).slice(0, 6).join("、")}${(mcpTesting[idx].tools?.length ?? 0) > 6 ? " …" : ""}` : `失败：${mcpTesting[idx].error}`}
+																{mcpTesting[row.uid] && (
+																	<span className="min-w-0 flex-1 truncate text-xs text-slate-500" title={mcpTesting[row.uid].error ?? (mcpTesting[row.uid].tools ?? []).join("、")}>
+																		{mcpTesting[row.uid].busy ? "连接中…" : mcpTesting[row.uid].ok ? `连接成功，${mcpTesting[row.uid].tools?.length ?? 0} 个工具：${(mcpTesting[row.uid].tools ?? []).slice(0, 6).join("、")}${(mcpTesting[row.uid].tools?.length ?? 0) > 6 ? " …" : ""}` : `失败：${mcpTesting[row.uid].error}`}
 																	</span>
 																)}
 															</div>
 														</div>
 													))}
-													<button type="button" onClick={() => setDraft((v) => v ? { ...v, capabilities: { ...v.capabilities, mcp: { ...v.capabilities.mcp, servers: [...(v.capabilities.mcp.servers ?? []), { name: `server-${(v.capabilities.mcp.servers?.length ?? 0) + 1}`, enabled: true } as never] } } } : v)} className="rounded-lg border border-dashed border-slate-300 px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-50">+ 添加服务器</button>
+													<button type="button" onClick={() => setMcpRows((rows) => [...(rows ?? []), serverToRow({ name: `server-${(rows?.length ?? 0) + 1}` }, rows?.length ?? 0)])} className="rounded-lg border border-dashed border-slate-300 px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-50">+ 添加服务器</button>
 												</div>
 											</div>
+
 
 											<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
 												<div className="text-sm font-medium text-slate-800">助理小组件（嵌入业务系统）</div>

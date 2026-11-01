@@ -17,7 +17,7 @@ const bundle = join(workDir, "mcp.mjs");
 await build({
 	stdin: {
 		contents: `
-			export { normalizeMcpServer, normalizeMcpServers, interpolateEnv } from "./src/shared/mcp.ts";
+			export { normalizeMcpServer, normalizeMcpServers, interpolateEnv, stripMcpToolPrefix } from "./src/shared/mcp.ts";
 			export { McpManager } from "./src/engine/tools/mcp.ts";
 		`,
 		resolveDir: root,
@@ -29,7 +29,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { normalizeMcpServer, normalizeMcpServers, interpolateEnv, McpManager } = await import(pathToFileURL(bundle).href);
+const { normalizeMcpServer, normalizeMcpServers, interpolateEnv, stripMcpToolPrefix, McpManager } = await import(pathToFileURL(bundle).href);
 
 test("standard mcpServers record form normalizes with env interpolation", () => {
 	const env = { GITHUB_TOKEN: "tok-123", MISSING: undefined };
@@ -109,6 +109,60 @@ test("refresh closes connections it drops (config change, disable, remove); disp
 
 	await manager.dispose();
 	assert.equal(manager.tools().length, 0, "dispose empties the cache");
+});
+
+test("a client whose listTools fails is closed, not leaked", async () => {
+	const closed = [];
+	const manager = new McpManager({
+		connect: async () => ({
+			transport: {},
+			async listTools() { throw new Error("list failed"); },
+			async callTool() { return { content: [] }; },
+			async close() { closed.push("probe"); },
+		}),
+	});
+	const config = { all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "x", command: "x" }] } } }) };
+	const { report } = await manager.refresh(config);
+	assert.equal(report[0].ok, false);
+	assert.match(report[0].error, /list failed/);
+	await manager.dispose();
+	assert.deepEqual(closed, ["probe"], "discovery-failed transport must still be closed");
+});
+
+test("dispose during an in-flight refresh wins: late connections are closed, not cached", async () => {
+	let releaseConnect;
+	const closed = [];
+	const manager = new McpManager({
+		connect: () => new Promise((resolve) => { releaseConnect = resolve; }).then(() => ({
+			transport: {},
+			async listTools() { return { tools: [{ name: "t" }] }; },
+			async callTool() { return { content: [] }; },
+			async close() { closed.push("late"); },
+		})),
+	});
+	const config = { all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "x", command: "x" }] } } }) };
+	const refreshing = manager.refresh(config);
+	assert.equal(typeof releaseConnect, "function", "refresh must be parked inside connect()");
+	const disposing = manager.dispose();
+	// Dispose has flagged itself; only NOW let the parked connect resolve, so the
+	// refresh is guaranteed to finish while the manager is already disposed.
+	const settled = refreshing.then((result) => result);
+	await Promise.resolve();
+	releaseConnect();
+	const refreshed = await settled;
+	await disposing;
+	assert.equal(manager.tools().length, 0, "dispose must win over the in-flight refresh");
+	assert.deepEqual(closed, ["late"], "the refresh must close what it built after dispose started");
+	// Only the refresh's own self-check can produce this: dispose() already
+	// awaited refreshInFlight, so its own clear() runs after — without the
+	// self-check the run would report changed:true and publish a stale cache.
+	assert.equal(refreshed.changed, false, "a refresh invalidated by dispose reports no change");
+});
+
+test("stripMcpToolPrefix removes the exact server prefix (underscores included)", () => {
+	assert.equal(stripMcpToolPrefix("my_server", "mcp__my_server__t"), "t");
+	assert.equal(stripMcpToolPrefix("a", "mcp__a__t"), "t");
+	assert.equal(stripMcpToolPrefix("a", "unrelated"), "unrelated", "non-matching names pass through");
 });
 
 /** Fake MCP client: canned listTools + scripted callTool results. */

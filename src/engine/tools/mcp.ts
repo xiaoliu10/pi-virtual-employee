@@ -80,6 +80,7 @@ export class McpManager {
 	private cache = new Map<string, ServerConn>();
 	private lastSignature = "";
 	private refreshInFlight: Promise<{ changed: boolean; report: McpRefreshReport[] }> | undefined;
+	private disposed = false;
 
 	constructor(private readonly deps: McpManagerDeps = {}) {}
 
@@ -106,6 +107,7 @@ export class McpManager {
 	 * sessions when something actually moved). */
 	refresh(config: ConfigStore): Promise<{ changed: boolean; report: McpRefreshReport[] }> {
 		if (this.refreshInFlight) return this.refreshInFlight;
+		this.disposed = false;
 		this.refreshInFlight = this.runRefresh(config).finally(() => {
 			this.refreshInFlight = undefined;
 		});
@@ -118,6 +120,7 @@ export class McpManager {
 		const enabled = mcpConfig?.enabled === true ? servers.filter((s) => s.enabled !== false) : [];
 		const report: McpRefreshReport[] = errors.map((error) => ({ name: "(配置)", ok: false, tools: 0, error }));
 		const nextCache = new Map<string, ServerConn>();
+		const pendingClose: Promise<unknown>[] = [];
 
 		for (const server of enabled) {
 			const cacheKey = JSON.stringify(server);
@@ -130,11 +133,19 @@ export class McpManager {
 					continue;
 				}
 				const client = await this.connect(server);
-				const listed = await this.withTimeout(
-					client.listTools(),
-					(server.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000,
-					`${server.name}: listTools 超时`,
-				);
+				let listed: Awaited<ReturnType<Client["listTools"]>>;
+				try {
+					listed = await this.withTimeout(
+						client.listTools(),
+						(server.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000,
+						`${server.name}: listTools 超时`,
+					);
+				} catch (err) {
+					// The transport is live but discovery failed — without this close
+					// the stdio child process leaks (never enters any cache).
+					pendingClose.push(client.close().catch(() => {}));
+					throw err;
+				}
 				const tools = (listed.tools ?? []).map((t: { name: string; description?: string; inputSchema?: object }) => ({
 					name: t.name,
 					description: t.description,
@@ -162,12 +173,24 @@ export class McpManager {
 			if (kept && kept.client === oldConn.client) continue;
 			oldConn.client.close().catch(() => { /* best-effort teardown */ });
 		}
+		await Promise.allSettled(pendingClose);
+		// A dispose() that started while this refresh was in flight wins: close
+		// what this run produced instead of publishing a cache nobody will clear.
+		if (this.disposed) {
+			const late = [...nextCache.values()].map((conn) => conn.client.close().catch(() => {}));
+			await Promise.allSettled(late);
+			return { changed: false, report };
+		}
 		this.cache = nextCache;
 		return { changed, report };
 	}
 
 	/** Close every live connection (app quit / capability disabled). */
 	async dispose(): Promise<void> {
+		// Flag FIRST so a refresh still in flight sees it and closes its own
+		// products; then wait it out so nothing is abandoned outside the cache.
+		this.disposed = true;
+		await this.refreshInFlight?.catch(() => {});
 		const closing = [...this.cache.values()].map((conn) =>
 			conn.client.close().catch(() => { /* best-effort teardown */ }),
 		);

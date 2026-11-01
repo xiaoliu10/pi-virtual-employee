@@ -1485,7 +1485,7 @@ ${tailForProgress(decision.text)}`;
 	 */
 	ipcMain.handle("mcp:test", async (_e, server: unknown) => {
 		const { createMcpManager } = await import("../src/engine/tools/mcp.js");
-		const { normalizeMcpServer } = await import("../src/shared/mcp.js");
+		const { normalizeMcpServer, stripMcpToolPrefix } = await import("../src/shared/mcp.js");
 		const normalized = normalizeMcpServer(server);
 		if (!normalized.ok) return { ok: false as const, error: normalized.reason, tools: [] };
 		const manager = createMcpManager();
@@ -1494,7 +1494,9 @@ ${tailForProgress(decision.text)}`;
 				all: () => ({ capabilities: { mcp: { enabled: true, servers: [server] } } }),
 			} as never);
 			const entry = report.find((r) => r.name === normalized.value.name);
-			const tools = entry?.ok ? manager.tools().map((tool) => tool.name.replace(/^mcp__[^_]+__/, "")) : [];
+			const tools = entry?.ok
+				? manager.tools().map((tool) => stripMcpToolPrefix(normalized.value.name, tool.name))
+				: [];
 			return { ok: entry?.ok ?? false, error: entry?.error, tools };
 		} finally {
 			await manager.dispose();
