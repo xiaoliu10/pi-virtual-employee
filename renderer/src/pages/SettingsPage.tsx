@@ -351,8 +351,9 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 	 * each keep their own port; before this, a collision only produced one WARN in
 	 * main.log while the settings page still claimed the widget was enabled.
 	 */
-	const [widgetStatus, setWidgetStatus] = useState<{ running: boolean; starting?: boolean; port: number; error?: string; reassignedFrom?: number } | null>(null);
+	const [widgetStatus, setWidgetStatus] = useState<{ running: boolean; starting?: boolean; port: number; expose?: "loopback" | "lan"; error?: string; reassignedFrom?: number; lanAddresses?: string[] } | null>(null);
 	const [widgetBusy, setWidgetBusy] = useState(false);
+	const [copied, setCopied] = useState(false);
 	useEffect(() => {
 		let alive = true;
 		const load = () => api.getWidgetStatus().then((s) => { if (alive) setWidgetStatus(s); }).catch(() => {});
@@ -1266,10 +1267,35 @@ X-VE-Secret: <接入密钥>
 																	<span className="font-medium">正在启动…</span>探测并绑定端口，稍后自动刷新。
 																</>
 															) : widgetStatus.running ? (
-																<>
-																	<span className="font-medium">服务运行中</span>：{draft.widget.expose === "lan" ? "0.0.0.0" : "127.0.0.1"}:{widgetStatus.port}
-																	{widgetStatus.reassignedFrom ? `（原端口 ${widgetStatus.reassignedFrom} 被占用，已自动改用 ${widgetStatus.port} 并记住）` : ""}
-																</>
+																<div className="flex flex-wrap items-center gap-2">
+																	<span>
+																		<span className="font-medium">服务运行中</span>：{draft.widget.expose === "lan" ? "0.0.0.0" : "127.0.0.1"}:{widgetStatus.port}
+																		{widgetStatus.reassignedFrom ? `（原端口 ${widgetStatus.reassignedFrom} 被占用，已自动改用 ${widgetStatus.port} 并记住）` : ""}
+																	</span>
+																	<button type="button"
+																		onClick={() => {
+																			// Everything here must describe the LISTENER as it runs,
+																			// not the unsaved draft: expose mode and token take effect
+																			// on save+restart, so a snippet built from the draft can
+																			// point at an address nothing is serving / a token the
+																			// service would reject (Copilot review).
+																			const expose = widgetStatus.expose ?? draft.widget.expose;
+																			const host = expose === "lan"
+																				? (widgetStatus.lanAddresses?.[0] ?? "<本机局域网IP>")
+																				: "127.0.0.1";
+																			// HTML attribute escaping: the token is a user-editable
+																			// string, and a quote would truncate data-token / an
+																			// entity would decode differently.
+																			const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+																			const snippet = `<script src="http://${host}:${widgetStatus.port}/widget.js" data-token="${esc((config ?? draft).widget.token)}" data-ticket="<由业务后端调用 /api/widget/session 换取>"></script>`;
+																			void navigator.clipboard.writeText(snippet);
+																			setCopied(true);
+																			setTimeout(() => setCopied(false), 1600);
+																		}}
+																		className="shrink-0 rounded-lg border border-emerald-300 bg-white px-2.5 py-1 text-[11px] text-emerald-700 hover:bg-emerald-50">
+																		{copied ? "已复制 ✓" : "复制接入代码"}
+																	</button>
+																</div>
 															) : widgetStatus.error ? (
 																<>
 																	<span className="font-medium">服务未启动</span>：{widgetStatus.error}

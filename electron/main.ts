@@ -6,6 +6,7 @@
  * streams chat through it), the IM adapter manager, and autostart. All
  * GUI-facing state (config, tasks, autostart) flows over IPC.
  */
+import os from "node:os";
 import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from "electron";
 import { mkdir, readFile, writeFile, copyFile, readdir, rm } from "node:fs/promises";
 import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
@@ -1281,7 +1282,18 @@ ${tailForProgress(decision.text)}`;
 	/** Push the widget state to an open settings page (startup completes off-screen). */
 	const publishWidgetState = () => {
 		const wc = mainWindow?.webContents;
-		if (wc && !wc.isDestroyed()) wc.send("widget:statusChanged", widgetState);
+		if (wc && !wc.isDestroyed()) wc.send("widget:statusChanged", withLanAddresses(widgetState));
+	};
+	/** Status plus LAN addresses, shared by pull and push so neither view goes stale. */
+	const withLanAddresses = (state: typeof widgetState) => {
+		let lanAddresses: string[] = [];
+		try {
+			lanAddresses = Object.values(os.networkInterfaces())
+				.flatMap((ifs) => ifs ?? [])
+				.filter((i) => i.family === "IPv4" && !i.internal)
+				.map((i) => i.address);
+		} catch { /* best-effort */ }
+		return { ...state, lanAddresses };
 	};
 	const startWidget = async () => {
 		const w = config.all().widget;
@@ -1459,7 +1471,7 @@ ${tailForProgress(decision.text)}`;
 	 * reason when it did not, so a port collision with another profile is visible
 	 * instead of sitting in main.log.
 	 */
-	ipcMain.handle("widget:status", () => widgetState);
+	ipcMain.handle("widget:status", () => withLanAddresses(widgetState));
 	/**
 	 * Find a free port for this profile and persist it. Exposed as a button so a
 	 * user can re-pick deterministically instead of waiting for a restart probe;
