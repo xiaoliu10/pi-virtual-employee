@@ -32,6 +32,12 @@ const DEFAULT_TIMEOUT_SEC = 60;
 
 const mcpToolName = (server: string, tool: string): string => `mcp__${server}__${tool}`;
 
+let clientSeq = 0;
+const nextClientId = (): number => {
+	clientSeq += 1;
+	return clientSeq;
+};
+
 interface McpToolInfo {
 	name: string;
 	description?: string;
@@ -42,7 +48,17 @@ interface ServerConn {
 	config: McpServerConfig;
 	client: Client;
 	tools: McpToolInfo[];
+	/** In-flight tool calls. A connection being retired waits for these to settle
+	 * so a config change cannot kill a call another conversation is mid-way
+	 * through (markConfigChanged only promises that turns finish). */
+	inflight: number;
+	/** Stable per-client identity used in the change signature. */
+	id: number;
 }
+
+/** Bound on how long a retired connection may linger waiting for in-flight
+ * calls; a hung server must not keep a process alive forever. */
+const RETIRE_GRACE_MS = 30_000;
 
 type McpContentBlock = { type: "text"; text: string } | { type: "image" | "audio"; mimeType?: string; data?: string } | { type: string; [k: string]: unknown };
 
@@ -153,15 +169,20 @@ export class McpManager {
 					description: t.description,
 					inputSchema: t.inputSchema,
 				}));
-				nextCache.set(server.name, { config: server, client, tools });
+				nextCache.set(server.name, { config: server, client, tools, inflight: 0, id: nextClientId() });
 				report.push({ name: server.name, ok: true, tools: tools.length });
 			} catch (err) {
 				report.push({ name: server.name, ok: false, tools: 0, error: err instanceof Error ? err.message : String(err) });
 			}
 		}
 
+		// Include the CLIENT identity, not just tool names: replacing a connection
+		// whose tool surface is identical still invalidates every live session,
+		// because those sessions captured the OLD client (which we are about to
+		// close). A name-only signature reported changed:false and left them
+		// calling a closed transport (review).
 		const signature = [...nextCache.values()]
-			.map((conn) => `${conn.config.name}:${conn.tools.map((t) => t.name).join(",")}`)
+			.map((conn) => `${conn.config.name}#${conn.id}:${conn.tools.map((t) => t.name).join(",")}`)
 			.sort()
 			.join("|");
 		const changed = signature !== this.lastSignature;
@@ -173,7 +194,7 @@ export class McpManager {
 		for (const [name, oldConn] of this.cache) {
 			const kept = nextCache.get(name);
 			if (kept && kept.client === oldConn.client) continue;
-			oldConn.client.close().catch(() => { /* best-effort teardown */ });
+			void this.retire(oldConn);
 		}
 		await Promise.allSettled(pendingClose);
 		// A dispose() that started while this refresh was in flight wins: close
@@ -185,6 +206,25 @@ export class McpManager {
 		}
 		this.cache = nextCache;
 		return { changed, report };
+	}
+
+	/**
+	 * Close a dropped connection once its in-flight calls settle.
+	 *
+	 * Closing immediately would abort a tool call another conversation is
+	 * executing right now — markConfigChanged deliberately lets in-flight turns
+	 * finish, and a stdio child killed mid-request turns that promise into a
+	 * failed turn. The wait is bounded so a hung server cannot pin a process.
+	 */
+	private async retire(conn: ServerConn): Promise<void> {
+		const deadline = Date.now() + RETIRE_GRACE_MS;
+		while (conn.inflight > 0 && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 50).unref?.() ?? setTimeout(resolve, 50));
+		}
+		if (conn.inflight > 0) {
+			console.warn(`[mcp] ${conn.config.name}: 关闭连接时仍有 ${conn.inflight} 个调用在途（已等待 ${RETIRE_GRACE_MS / 1000} 秒上限）`);
+		}
+		await conn.client.close().catch(() => { /* best-effort teardown */ });
 	}
 
 	/** Close every live connection (app quit / capability disabled). */
@@ -254,6 +294,7 @@ export class McpManager {
 				if (conn.client.transport === undefined) {
 					return refuse(`MCP 服务器 ${serverName} 已断开连接，本次无法执行。请管理员检查该服务器是否在线。`);
 				}
+				conn.inflight += 1;
 				try {
 					const result = (await Promise.race([
 						conn.client.callTool({ name: tool.name, arguments: (params ?? {}) as Record<string, unknown> }),
@@ -268,6 +309,8 @@ export class McpManager {
 					};
 				} catch (err) {
 					return refuse(`⚠️ MCP ${serverName}/${tool.name} 调用失败：${err instanceof Error ? err.message : String(err)}`);
+				} finally {
+					conn.inflight -= 1;
 				}
 			},
 		};

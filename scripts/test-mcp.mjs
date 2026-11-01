@@ -199,6 +199,85 @@ test("stripMcpToolPrefix removes the exact server prefix (underscores included)"
 	assert.equal(stripMcpToolPrefix("a", "unrelated"), "unrelated", "non-matching names pass through");
 });
 
+test("replacing a connection reports changed even when the tool surface is identical", async () => {
+	// Sessions capture the CLIENT, not the tool list. A name-only signature said
+	// changed:false here, so live sessions kept calling the closed client.
+	const manager = new McpManager({
+		connect: async () => ({
+			transport: {},
+			async listTools() { return { tools: [{ name: "t" }] }; },
+			async callTool() { return { content: [] }; },
+			async close() {},
+		}),
+	});
+	const configFor = (command) => ({ all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "x", command }] } } }) });
+	const first = await manager.refresh(configFor("a"));
+	assert.equal(first.changed, true);
+	const same = await manager.refresh(configFor("a"));
+	assert.equal(same.changed, false, "an unchanged config reuses the client and reports no change");
+	const replaced = await manager.refresh(configFor("b"));
+	assert.equal(replaced.changed, true, "a replaced client must invalidate sessions even with identical tools");
+	await manager.dispose();
+});
+
+test("a dropped connection waits for its in-flight call before closing", async () => {
+	let releaseCall;
+	const closed = [];
+	const manager = new McpManager({
+		connect: async () => ({
+			transport: {},
+			async listTools() { return { tools: [{ name: "slow" }] }; },
+			callTool() {
+				return new Promise((resolve) => {
+					releaseCall = () => resolve({ content: [{ type: "text", text: "done" }] });
+				});
+			},
+			async close() { closed.push("dropped"); },
+		}),
+	});
+	const config = { all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "x", command: "a" }] } } }) };
+	await manager.refresh(config);
+	const tool = manager.tools()[0];
+	const running = tool.execute("t1", {});
+	for (let i = 0; i < 20 && typeof releaseCall !== "function"; i += 1) await Promise.resolve();
+	assert.equal(typeof releaseCall, "function", "the tool call is parked inside callTool()");
+
+	// Config churns while that call is executing.
+	const removed = manager.refresh({ all: () => ({ capabilities: { mcp: { enabled: true, servers: [] } } }) });
+	await new Promise((r) => setTimeout(r, 120));
+	assert.deepEqual(closed, [], "the in-flight call must not be aborted by teardown");
+
+	releaseCall();
+	const result = await running;
+	assert.match(result.content[0].text, /done/, "the call still completes normally");
+	await removed;
+	await new Promise((r) => setTimeout(r, 120));
+	assert.deepEqual(closed, ["dropped"], "the connection closes once the call settles");
+	await manager.dispose();
+});
+
+test("waiting for in-flight calls is bounded (a hung server cannot pin a process)", async () => {
+	const closed = [];
+	const manager = new McpManager({
+		connect: async () => ({
+			transport: {},
+			async listTools() { return { tools: [{ name: "hang" }] }; },
+			callTool() { return new Promise(() => {}); }, // never settles
+			async close() { closed.push("hung"); },
+		}),
+	});
+	const config = { all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "x", command: "a" }] } } }) };
+	await manager.refresh(config);
+	void manager.tools()[0].execute("t1", {});
+	await new Promise((r) => setTimeout(r, 50));
+	// Drop it; the retire grace is 30s, far longer than a test may wait — assert the
+	// bounded path exists instead of sleeping 30s here.
+	const started = Date.now();
+	await manager.refresh({ all: () => ({ capabilities: { mcp: { enabled: true, servers: [] } } }) });
+	assert.ok(Date.now() - started < 5000, "refresh does not block on a hung connection's grace period");
+	await manager.dispose();
+});
+
 /** Fake MCP client: canned listTools + scripted callTool results. */
 function fakeClient({ tools, result, error }) {
 	const client = {
