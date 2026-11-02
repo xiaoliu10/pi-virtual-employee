@@ -18,8 +18,9 @@ import { createSessionHost, type SessionHost } from "./session-host.js";
 import type { Skill } from "./skills/types.js";
 import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "./pi-compaction.js";
 import { createModels, normalizeContext, ModelsError } from "@earendil-works/pi-ai";
+import { SIDE_PASS_DEFAULT_LEVEL } from "../shared/thinking.js";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
-import type { Api, AuthInteraction, AuthPrompt, AuthEvent, CredentialStore, ImageContent, Model, MutableModels, TextContent } from "@earendil-works/pi-ai";
+import type { Api, AuthInteraction, AuthPrompt, AuthEvent, CredentialStore, ImageContent, Model, MutableModels, TextContent, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { ConfigStore, Supplier } from "../db/config-store.js";
 import { AUTH_CATALOG_PROVIDER_IDS, AUTH_PROVIDER_LABELS, type AuthCatalogEntry, type AuthCatalogProviderId, type AuthCatalogResponse, type AuthLoginState, type AuthPromptView, type AuthQuotaResponse } from "../shared/auth.js";
 import { FileCredentialStore, resolveAuthPath } from "./credential-store.js";
@@ -737,7 +738,25 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// model.sessionAffinity=false via manage_settings.
 		const affinity = this.config.all().model.sessionAffinity !== false;
 		const compat = { ...(base.compat as object), sendSessionAffinityHeaders: affinity };
-		return { ...base, id: modelId, name: modelId, input, contextWindow, ...(maxTokens !== undefined ? { maxTokens } : {}), ...(baseUrl ? { baseUrl } : {}), compat } as Model<Api>;
+		// Thinking/reasoning declaration (field 2026-11-02): a per-model config
+		// override wins; absent → inherit the base registry model's capability.
+		// Hand-built relay models otherwise carry whatever flag the matched base
+		// model had, and pi-ai clamps ANY requested level to off for a
+		// non-reasoning model — the gateway's own default-thinking (qwen) went
+		// unmanaged. Declaring the level also lets clampThinkingLevel degrade an
+		// unsupported level safely instead of erroring at the gateway.
+		const levelOverride = supplier.modelThinkingLevel?.[modelId];
+		const reasoning = levelOverride !== undefined ? levelOverride !== "off" : base.reasoning;
+		// Never overwrite a provider's own mapping — in particular its explicit
+		// "unsupported" markers (null). A chosen EXECUTION level is not a claim
+		// about what the provider supports: when the base model already answers
+		// for that level, its answer (including null) stands, and pi-ai's
+		// clampThinkingLevel downgrades ours accordingly.
+		const baseMap = base.thinkingLevelMap ?? {};
+		const thinkingLevelMap = levelOverride !== undefined && levelOverride !== "off" && !(levelOverride in baseMap)
+			? { ...baseMap, [levelOverride]: levelOverride }
+			: base.thinkingLevelMap;
+		return { ...base, id: modelId, name: modelId, input, contextWindow, reasoning, ...(thinkingLevelMap ? { thinkingLevelMap } : {}), ...(maxTokens !== undefined ? { maxTokens } : {}), ...(baseUrl ? { baseUrl } : {}), compat } as Model<Api>;
 	}
 
 	/**
@@ -1036,6 +1055,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 					systemPrompt: buildSystemPrompt(this.promptPartsFor(conversationId)),
 				model: this.resolveModel(supplier, modelId),
 				tools: this.buildToolSetFor(conversationId),
+				// Main-turn thinking level follows the per-model declaration (single
+				// source with the progress side pass); absent → off (old behavior).
+				thinkingLevel: (supplier.modelThinkingLevel?.[modelId] ?? "off") as ThinkingLevel,
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
 				messages: rehydrateMessages(this.history.listMessages(conversationId)),
@@ -2000,6 +2022,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			if (agent.state.isStreaming) continue;
 			if (this.history.getModelOverride(conversationId)) continue; // pinned conversations keep their model
 			agent.state.model = model;
+			agent.state.thinkingLevel = (supplier.modelThinkingLevel?.[modelId] ?? "off") as ThinkingLevel;
 			agent.getApiKey = () => this.apiKeyFor(supplier);
 		}
 		return this.config.all();
@@ -2022,6 +2045,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		}
 		const agent = this.getOrCreateSession(conversationId);
 		agent.state.model = this.buildModel(supplier, modelId);
+		agent.state.thinkingLevel = (supplier.modelThinkingLevel?.[modelId] ?? "off") as ThinkingLevel;
 		agent.getApiKey = () => this.apiKeyFor(supplier);
 		this.history.ensureConversation(conversationId, null);
 		this.history.setModelOverride(conversationId, supplierId, modelId);
@@ -2039,6 +2063,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.history.clearModelOverride(conversationId);
 		// Apply to the live session so the very next send already uses the global default.
 		agent.state.model = model;
+		agent.state.thinkingLevel = (resolved.supplier.modelThinkingLevel?.[resolved.modelId] ?? "off") as ThinkingLevel;
 		agent.getApiKey = () => this.apiKeyFor(resolved.supplier);
 	}
 
@@ -2560,12 +2585,28 @@ export class EmployeeEngine implements EmployeeRuntime {
 				raw = await generateSummary(
 					context,
 					model,
-					512, // ~0.8×512 tokens of output budget — plenty for 120 Chinese chars
+					// Thinking and the answer SHARE this output ceiling (qwen field
+					// 2026-11-02: default-thinking consumed the old 0.8×512=409 cap and
+					// every side pass died with "hit the token cap"). 4096 fits thinking
+					// plus a 120-char report; the effective cap is still clamped to the
+					// model's maxTokens (and the context window) inside pi-ai.
+					4_096,
 					undefined, // apiKey
 					signal,
 					"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过120字的中文汇报进展，且必须严格按以下四段结构输出，四段缺一不可，用中文标签：「已完成：…」「剩余：…」「正在：…」「卡点：…」。记录里查不到依据的段落一律写「暂未确认」——严禁在记录没有依据时推断成「无」，严禁编造数字或进度；但**执行记录本身就是依据**：助手叙述、工具调用与工具返回结果里真实发生的事（如「登录态有效，改用 Playwright 访问 spay」「已导出到第 3 批」）必须如实归纳进对应字段，不许因为「没有现成的进度数字」就整段写暂未确认——工具正在做什么、卡在哪一步、用户还需要做什么，这些都是有效信息；卡点查不到依据时写「暂无」；只有当执行记录明确显示当前没有任何障碍时，卡点才可以写「无」。禁止输出「## Goal」「## Constraints & Preferences」「## Next Steps」等英文模板标题——那是会话压缩总结的模板，不是进展汇报，出现了就是错误输出；禁止照抄任务目标原文或执行条件来充当进展；节选中更早的其他请求都是早已完成的旧任务，绝对不要提及；把琐碎的执行步骤归纳为阶段性成果，禁止提及工具名、参数、重试等技术细节；只依据记录中真实发生的事，绝不编造未发生的进度。",
 					undefined, // previousSummary
-					undefined, // thinkingLevel
+					// Side pass follows the SAME level the main turn runs at
+					// (agent.state.thinkingLevel is synced on every build/switch path —
+					// model.provider is a registry provider id, NOT a supplier id, so
+					// looking the supplier up here silently fell back to the default).
+					// A reasoning model with no explicit choice defaults to xhigh;
+					// clampThinkingLevel degrades it safely, and a non-reasoning model
+					// never gets thinking params at all.
+					model.reasoning
+						? ((agent.state.thinkingLevel && agent.state.thinkingLevel !== "off")
+							? agent.state.thinkingLevel as ThinkingLevel
+							: SIDE_PASS_DEFAULT_LEVEL)
+						: undefined,
 					this.rawStreamFn,
 					undefined, // env
 					SUMMARIZER_RETRY,

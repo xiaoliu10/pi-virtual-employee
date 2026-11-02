@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import type { DB } from "./sqlite.js";
 import { AUTH_CATALOG_PROVIDER_IDS } from "../shared/auth.js";
 import { normalizeTimeoutSec } from "../shared/timeouts.js";
+import { normalizeModelThinkingLevel, MODEL_THINKING_LEVELS } from "../shared/thinking.js";
 import { normalizeMcpServers, type McpServerConfig } from "../shared/mcp.js";
 import { DEFAULT_COMPUTER_CONFIG, normalizeComputerConfig, type ComputerConfig } from "../shared/computer.js";
 
@@ -80,6 +81,15 @@ export interface Supplier {
 	 * base model's cap, which can silently truncate long answers/reports.
 	 */
 	modelMaxTokens?: Record<string, number>;
+	/**
+	 * Per-model thinking/reasoning declaration. Key = modelId, value = the pi
+	 * thinking level this model should run at ("off" = not a reasoning model).
+	 * Absent → inherit the base registry model's reasoning capability. This is
+	 * the SINGLE source for both the main turn and the progress side pass
+	 * (field 2026-11-02: qwen's gateway default-thinking consumed the side
+	 * pass's 409-token output budget, so no progress note ever pushed).
+	 */
+	modelThinkingLevel?: Record<string, string>;
 	/**
 	 * Account-login provider (pi-ai registry + shared auth.json). When set, this
 	 * supplier's models resolve from the provider's registered catalog and
@@ -783,6 +793,7 @@ export function newSupplier(partial: Partial<Supplier> = {}): Supplier {
 		modelImage: normalizedModelImage(partial.modelImage),
 		modelContextWindow: normalizedModelContextWindow(partial.modelContextWindow),
 		modelMaxTokens: normalizedModelContextWindow(partial.modelMaxTokens),
+		modelThinkingLevel: normalizedModelThinkingLevel(partial.modelThinkingLevel),
 		authProvider,
 	};
 }
@@ -803,6 +814,16 @@ function normalizedModelContextWindow(value: unknown): Record<string, number> | 
 	const out: Record<string, number> = {};
 	for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
 		if (typeof v === "number" && Number.isFinite(v) && v > 0) out[k] = Math.floor(v);
+	}
+	return Object.keys(out).length ? out : undefined;
+}
+
+/** Coerce an untrusted per-model thinking-level map into `{ modelId: level }`; drop junk. */
+function normalizedModelThinkingLevel(value: unknown): Record<string, string> | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const out: Record<string, string> = {};
+	for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+		if (typeof v === "string" && (MODEL_THINKING_LEVELS as readonly string[]).includes(v)) out[k] = v;
 	}
 	return Object.keys(out).length ? out : undefined;
 }
@@ -830,6 +851,7 @@ export function normalizeModelConfig(value: unknown): ModelConfig {
 				modelImage: normalizedModelImage(entry.modelImage),
 				modelContextWindow: normalizedModelContextWindow(entry.modelContextWindow),
 				modelMaxTokens: normalizedModelContextWindow(entry.modelMaxTokens),
+				modelThinkingLevel: normalizedModelThinkingLevel(entry.modelThinkingLevel),
 				authProvider: normalizedAuthProvider(entry.authProvider),
 			}))
 		: [];
