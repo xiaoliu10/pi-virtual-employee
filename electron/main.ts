@@ -28,7 +28,7 @@ import { ComputerService } from "../src/computer/computer-service.js";
 import { ScheduledTaskStore, type ScheduledTaskRow } from "../src/db/scheduled-task-store.js";
 import { WorkItemStore } from "../src/db/work-item-store.js";
 import { WorkService, buildWorkLearning } from "../src/scheduler/work-service.js";
-import { isDeclaredAdmin } from "../src/security/permissions.js";
+import { isAdmin, isDeclaredAdmin } from "../src/security/permissions.js";
 import { SchedulerService, shouldPushScheduledResult, annotateLatePush } from "../src/scheduler/scheduler-service.js";
 import { normalizeProgressIntervalMin } from "../src/scheduler/progress-notify.js";
 import {
@@ -601,7 +601,7 @@ async function main(): Promise<void> {
 		// Credential egress gate (field 2026-10-20): only a 1:1 recipient who is an
 		// admin RIGHT NOW may receive credential-bearing text. Read live from
 		// config so a revoked admin stops being exempt on the next message.
-		isAdminRecipient: (staffId) => isDeclaredAdmin(config, staffId),
+		isAdminRecipient: (staffId) => isAdmin(config, staffId),
 	});
 	// /restart command hook: relaunch the same binary with the same args.
 	im.setOnRestart(() => {

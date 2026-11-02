@@ -98,13 +98,13 @@ test("owner escapes the operator allowlist (superset, not demotion)", async (t) 
 const bundle2 = join(dir, "o2.mjs");
 await build({
 	stdin: { contents: `
-		export { effectiveAuthorizationRole, isDeclaredAdmin } from "./src/security/permissions.ts";
+		export { effectiveAuthorizationRole, isDeclaredAdmin, isAdmin } from "./src/security/permissions.ts";
 		export { createRememberTool } from "./src/engine/tools/save-knowledge.ts";
 		export { createSchedulerTools } from "./src/engine/tools/scheduler.ts";
 	`, resolveDir: root, loader: "ts" },
 	outfile: bundle2, bundle: true, platform: "node", format: "esm", packages: "external",
 });
-const { effectiveAuthorizationRole, isDeclaredAdmin, createRememberTool, createSchedulerTools } = await import(pathToFileURL(bundle2).href);
+const { effectiveAuthorizationRole, isDeclaredAdmin, isAdmin, createRememberTool, createSchedulerTools } = await import(pathToFileURL(bundle2).href);
 
 function dbWithRoles(t) {
 	const db = new DatabaseSync(":memory:");
@@ -237,4 +237,24 @@ test("wiring: the work service isAdmin gate uses the shared declared-admin autho
 	const block = mainSrc.slice(at, at + 1200);
 	assert.match(block, /isAdmin:\s*\(senderId\)\s*=>\s*isDeclaredAdmin\(config,\s*senderId\)/, "work gate delegates to isDeclaredAdmin (owner-tolerant)");
 	assert.ok(!block.includes('resolveRole(config, senderId) === "admin"'), "no owner-rejecting literal comparison remains");
+});
+
+test("wiring: credential egress still uses isAdmin (honours defaultRole); only unattended work is strict", (t) => {
+	// The report service's 1:1 credential gate is a LIVE message decision — a
+	// verified sender whose defaultRole is admin IS an admin and must receive
+	// credentials. Only the unattended-work gate is strict (a removed confirmer
+	// must not be resurrected by a permissive defaultRole). Review regression:
+	// I briefly pointed isAdminRecipient at isDeclaredAdmin too.
+	const mainSrc = readFileSync(join(root, "electron", "main.ts"), "utf8");
+	const recvAt = mainSrc.indexOf("isAdminRecipient:");
+	assert.ok(recvAt > 0);
+	const recvBlock = mainSrc.slice(recvAt, recvAt + 160);
+	assert.match(recvBlock, /isAdminRecipient:\s*\(staffId\)\s*=>\s*isAdmin\(config,\s*staffId\)/, "egress recipient uses the live isAdmin, not the strict declared check");
+	// And a permissive defaultRole must actually make an unlisted verified sender an admin here.
+	const db = new DatabaseSync(":memory:");
+	db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+	const relaxed = new ConfigStore(db);
+	relaxed.replaceAll({ security: { defaultRole: "admin" } });
+	assert.equal(isAdmin(relaxed, "any-verified-sender"), true, "defaultRole=admin makes a live 1:1 sender an admin");
+	db.close();
 });
