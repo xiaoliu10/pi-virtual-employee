@@ -19,3 +19,44 @@ export const SIDE_PASS_DEFAULT_LEVEL = "xhigh";
 export function normalizeModelThinkingLevel(value: unknown): string | undefined {
 	return typeof value === "string" && (MODEL_THINKING_LEVELS as readonly string[]).includes(value) ? value : undefined;
 }
+
+/** Minimal model-capability shape the declaration may adjust. */
+export interface ThinkingCapabilityBase {
+	reasoning: boolean;
+	thinkingLevelMap?: Record<string, string | null> | undefined;
+}
+
+/**
+ * Apply a per-model thinking declaration to a model's capability.
+ *
+ * Semantics differ by supplier kind (review rounds 2+3, resolved):
+ * - **Relay/alias suppliers** (hand-entered baseUrl, no authProvider): the
+ *   borrowed base model's capability describes a DIFFERENT upstream, so the
+ *   declaration is the only truthful source — it supplies the capability
+ *   (`reasoning: true` even for "off", so the provider's disable param can be
+ *   emitted) plus a guarded map entry that never overwrites an existing
+ *   marker, in particular `null` = unsupported.
+ * - **Account-login suppliers** (pi-ai registry): the registry model IS the
+ *   real model, its capability is authoritative — the declaration only sets
+ *   the requested level and must not rewrite capability.
+ *
+ * Returns the fields to merge onto the model (undefined map = keep base's).
+ */
+export function applyThinkingDeclaration(
+	base: ThinkingCapabilityBase,
+	declared: string | undefined,
+	isRelay: boolean,
+): { reasoning: boolean; thinkingLevelMap?: Record<string, string | null> } {
+	if (!isRelay || declared === undefined) {
+		return { reasoning: base.reasoning, thinkingLevelMap: base.thinkingLevelMap ?? undefined };
+	}
+	// The declaration engages thinking management: capability stays ON even for
+	// "off", because off is expressed BY the request (enable_thinking:false /
+	// no effort), not by pretending the model cannot think.
+	const baseMap = base.thinkingLevelMap ?? {};
+	const thinkingLevelMap =
+		declared !== "off" && !(declared in baseMap)
+			? { ...baseMap, [declared]: declared }
+			: base.thinkingLevelMap ?? undefined;
+	return { reasoning: true, thinkingLevelMap };
+}

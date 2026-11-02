@@ -18,7 +18,7 @@ import { createSessionHost, type SessionHost } from "./session-host.js";
 import type { Skill } from "./skills/types.js";
 import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "./pi-compaction.js";
 import { createModels, normalizeContext, ModelsError } from "@earendil-works/pi-ai";
-import { SIDE_PASS_DEFAULT_LEVEL } from "../shared/thinking.js";
+import { SIDE_PASS_DEFAULT_LEVEL, applyThinkingDeclaration } from "../shared/thinking.js";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { Api, AuthInteraction, AuthPrompt, AuthEvent, CredentialStore, ImageContent, Model, MutableModels, TextContent, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { ConfigStore, Supplier } from "../db/config-store.js";
@@ -753,17 +753,14 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// model.sessionAffinity=false via manage_settings.
 		const affinity = this.config.all().model.sessionAffinity !== false;
 		const compat = { ...(base.compat as object), sendSessionAffinityHeaders: affinity };
-		// Thinking declaration (field 2026-11-02, corrected by review round 2):
-		// modelThinkingLevel is the REQUESTED execution level, NOT a capability
-		// claim. model.reasoning stays the base model's own capability — flipping
-		// it off made pi-ai drop the explicit disable param (qwen's
-		// enable_thinking:false), so a default-thinking gateway kept thinking
-		// despite the user selecting off; and injecting [level]: level into the
-		// map erased real "unsupported" markers (xhigh:null), defeating the
-		// automatic downgrade. Capability comes from the model; the level rides
-		// on the request (agent.state / options.reasoning) and pi-ai's
-		// clampThinkingLevel degrades anything the model can't do.
-		return { ...base, id: modelId, name: modelId, input, contextWindow, ...(maxTokens !== undefined ? { maxTokens } : {}), ...(baseUrl ? { baseUrl } : {}), compat } as Model<Api>;
+		// Thinking declaration (field 2026-11-02; semantics per review rounds 2+3):
+		// for RELAY suppliers the borrowed base capability describes a different
+		// upstream, so the declaration supplies it; for account-login suppliers the
+		// registry capability is authoritative and the declaration only sets the
+		// requested level (agent.state.thinkingLevel / durable bridge options).
+		const isRelay = !supplier.authProvider && baseUrl.length > 0;
+		const cap = applyThinkingDeclaration(base, supplier.modelThinkingLevel?.[modelId], isRelay);
+		return { ...base, id: modelId, name: modelId, input, contextWindow, reasoning: cap.reasoning, ...(cap.thinkingLevelMap ? { thinkingLevelMap: cap.thinkingLevelMap } : {}), ...(maxTokens !== undefined ? { maxTokens } : {}), ...(baseUrl ? { baseUrl } : {}), compat } as Model<Api>;
 	}
 
 	/**
@@ -831,6 +828,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/** Resolve (supplier, modelId) for a conversation: override or global default. */
+	/** The per-model declared thinking level for the conversation's current model. */
+	private declaredThinkingLevel(modelId: string, conversationId?: string): string | undefined {
+		if (conversationId === undefined) return undefined;
+		return this.resolveForConversation(conversationId).supplier.modelThinkingLevel?.[modelId];
+	}
+
 	private resolveForConversation(
 		conversationId: string,
 	): { supplier: Supplier; modelId: string } {
@@ -2606,17 +2609,17 @@ export class EmployeeEngine implements EmployeeRuntime {
 					undefined, // previousSummary
 					// Side pass follows the SAME level the main turn runs at
 					// (agent.state.thinkingLevel is synced on every build/switch path).
-					// "off" is forwarded explicitly so the provider emits its disable
-					// param (qwen enable_thinking:false) instead of inheriting a
-					// default-thinking gateway; undefined (no declared level and legacy
-					// off) keeps the historical no-param behavior; a reasoning model with
-					// an explicit non-off level defaults UP to xhigh only when the model
-					// gives no level at all — never asserted as a capability.
-					(conversationId !== undefined && this.resolveForConversation(conversationId).supplier.modelThinkingLevel?.[agent.state.model.id] === "off")
-						? "off" as ThinkingLevel
-						: ((agent.state.thinkingLevel && agent.state.thinkingLevel !== "off"
-							? agent.state.thinkingLevel
-							: (agent.state.model.reasoning ? SIDE_PASS_DEFAULT_LEVEL : undefined)) as ThinkingLevel | undefined),
+					// "off" needs no special forwarding: generateSummary strips it
+					// (pi-compaction excludes off from completionOptions.reasoning), and
+					// for a declared-thinking relay model.reasoning stays true, so the
+					// qwen format still emits enable_thinking:false from the undefined
+					// effort. A reasoning model with no level at all defaults up to
+					// xhigh; a non-reasoning model sends nothing.
+					(agent.state.thinkingLevel && agent.state.thinkingLevel !== "off"
+						? (agent.state.thinkingLevel as ThinkingLevel)
+						: (this.declaredThinkingLevel(agent.state.model.id, conversationId) === "off"
+							? undefined // declared off: no level; qwen-format still emits enable_thinking:false
+							: agent.state.model.reasoning ? SIDE_PASS_DEFAULT_LEVEL : undefined)),
 					this.rawStreamFn,
 					undefined, // env
 					SUMMARIZER_RETRY,

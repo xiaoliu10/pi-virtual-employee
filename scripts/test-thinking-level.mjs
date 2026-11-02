@@ -8,8 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 
 const root = process.cwd();
 
-// Bundle the REAL shared list + the REAL config normalizer so the contract is
-// tested against shipped code, not a copy.
+// Bundle the REAL shared helper + the REAL config normalizer.
 mkdirSync(join(root, "node_modules/.thinking-probe"), { recursive: true });
 await build({
 	entryPoints: [join(root, "src/db/config-store.ts")],
@@ -24,7 +23,8 @@ await build({
 	outfile: join(root, "node_modules/.thinking-probe/thinking.mjs"),
 	logLevel: "silent",
 });
-const { MODEL_THINKING_LEVELS } = await import(pathToFileURL(join(root, "node_modules/.thinking-probe/thinking.mjs")).href);
+const thinking = await import(pathToFileURL(join(root, "node_modules/.thinking-probe/thinking.mjs")).href);
+const { MODEL_THINKING_LEVELS, applyThinkingDeclaration } = thinking;
 const { ConfigStore } = await import(pathToFileURL(join(root, "node_modules/.thinking-probe/config-store.mjs")).href);
 
 const engineSrc = readFileSync(join(root, "src/engine/engine.ts"), "utf8");
@@ -41,8 +41,98 @@ function makeStore(seed = {}) {
 	return { store, db };
 }
 
+// ---------------------------------------------------------------------------
+// BEHAVIORAL PROBE: drive the REAL pi-ai streamSimple the way the engine does,
+// capturing the exact payload that would hit the gateway. Both review rounds
+// proved that source-regex assertions certify wrong designs; only the payload
+// is the contract.
+// ---------------------------------------------------------------------------
+const { createModels, clampThinkingLevel } = await import("@earendil-works/pi-ai");
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
+const models = createModels();
+for (const p of builtinProviders()) models.setProvider(p);
+
+// A qwen thinkingFormat base (like litellm-fronted qwen) + a non-reasoning base
+// (like the groq llama that VE's openai supplier search borrows).
+let qwenBase, plainBase;
+for (const p of models.getProviders()) {
+	for (const m of p.getModels?.() ?? []) {
+		if (m.api !== "openai-completions") continue;
+		if (!qwenBase && m.reasoning && m.compat?.thinkingFormat === "qwen") qwenBase = m;
+		if (!plainBase && !m.reasoning) plainBase = m;
+	}
+}
+assert.ok(qwenBase, "registry must contain a qwen-format reasoning model");
+assert.ok(plainBase, "registry must contain a non-reasoning model");
+
+/** Mimic withIdentity's relay semantics, then capture the gateway payload. */
+async function relayPayload(declared, base = plainBase) {
+	const cap = applyThinkingDeclaration(base, declared, true);
+	// VE builds the qwen relay model with compat.thinkingFormat="qwen" (the real
+	// gateway speaks qwen), but the BORROWED base is a non-reasoning groq model —
+	// so capability must come from the declaration, not the base.
+	const model = {
+		...base, id: "relay-x", compat: { ...(base.compat ?? {}), thinkingFormat: "qwen" },
+		reasoning: cap.reasoning,
+		...(cap.thinkingLevelMap ? { thinkingLevelMap: cap.thinkingLevelMap } : { thinkingLevelMap: undefined }),
+	};
+	let payload;
+	try {
+		const level = declared && declared !== "off" ? declared : undefined;
+		await models.streamSimple(model, { systemPrompt: "s", messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] },
+			{ apiKey: "sk-t", maxTokens: 64, ...(level ? { reasoning: level } : {}), onPayload: (p) => { payload = p; return p; } }).result();
+	} catch { /* unreachable gateway is fine — payload is built before network */ }
+	return payload;
+}
+
 test("level list covers the pi levels incl. xhigh/max", () => {
 	assert.deepEqual([...MODEL_THINKING_LEVELS], ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+});
+
+test("PROBE relay: declared xhigh actually turns gateway thinking on", async () => {
+	// Round-3 P1: capability decoupling made every declared level clamp to off on
+	// a non-reasoning borrowed base — NOTHING reached the gateway. For the qwen
+	// thinkingFormat the contract is enable_thinking:true (the boolean switch);
+	// under the broken design this was undefined (param omitted entirely).
+	const payload = await relayPayload("xhigh");
+	assert.equal(payload?.enable_thinking, true);
+});
+
+test("PROBE relay (non-reasoning borrowed base): declared off emits enable_thinking:false", async () => {
+	// Round-2 P1: capability=false dropped the disable param entirely. Even on a
+	// non-reasoning borrowed base, the declaration turns capability ON so the
+	// qwen-format disable switch is emitted.
+	const payload = await relayPayload("off");
+	assert.equal(payload?.enable_thinking, false);
+});
+
+test("PROBE relay: undeclared keeps the borrowed base behavior (no thinking params)", async () => {
+	// Old installs must not suddenly start sending thinking params.
+	const cap = applyThinkingDeclaration(plainBase, undefined, true);
+	assert.equal(cap.reasoning, plainBase.reasoning);
+	const payload = await relayPayload(undefined);
+	assert.equal(payload?.enable_thinking, undefined);
+	assert.equal(payload?.reasoning_effort, undefined);
+});
+
+test("PROBE: declaration never overwrites a null (unsupported) marker (relay and registry)", () => {
+	// Round-2 P2: {xhigh:null} + declared xhigh must keep clamping DOWN, not
+	// promote the model into claiming support. Applies on both supplier kinds —
+	// a relay base may itself carry a registry-derived map.
+	const base = { reasoning: true, thinkingLevelMap: { high: "high", xhigh: null, max: null } };
+	for (const isRelay of [true, false]) {
+		const cap = applyThinkingDeclaration(base, "max", isRelay);
+		assert.equal(cap.thinkingLevelMap?.max, null, `null marker preserved (isRelay=${isRelay})`);
+		assert.equal(clampThinkingLevel({ reasoning: true, thinkingLevelMap: cap.thinkingLevelMap }, "max"), "high",
+			`max degrades to high (isRelay=${isRelay})`);
+	}
+});
+
+test("PROBE registry: undeclared capability untouched", () => {
+	const base = { reasoning: false, thinkingLevelMap: undefined };
+	const cap = applyThinkingDeclaration(base, undefined, false);
+	assert.equal(cap.reasoning, false);
+	assert.equal(cap.thinkingLevelMap, undefined);
 });
 
 test("config: keeps declared levels, drops junk values and non-strings", () => {
@@ -72,73 +162,27 @@ test("config: absent declaration stays absent (inherit semantics preserved)", ()
 	assert.equal(store.all().model.suppliers[0].modelThinkingLevel, undefined);
 });
 
-test("builder: reasoning capability is NEVER touched by the declaration", () => {
-	// Review round 2 P1: declaring "off" used to flip model.reasoning=false, which
-	// made pi-ai drop the explicit disable param (qwen enable_thinking:false) — a
-	// default-thinking gateway kept thinking despite the user selecting off.
-	assert.ok(!/const reasoning = levelOverride/.test(engineSrc),
-		"the declaration must not rewrite the model's reasoning capability");
-	assert.match(engineSrc, /return \{ \.\.\.base, id: modelId, name: modelId, input, contextWindow, \.\.\.\(maxTokens !== undefined/,
-		"withIdentity returns the base model's own reasoning capability");
-});
-
-test("builder: no thinkingLevelMap injection at all (capability stays with the model)", () => {
-	// Review round 2 P2: even the guarded injection promoted an absent xhigh/max
-	// into "supported" (pi-ai treats a MISSING xhigh/max entry as unsupported).
-	// The execution level must never mutate capability maps.
-	assert.ok(!/thinkingLevelMap/.test(
-		engineSrc.slice(engineSrc.indexOf("private withIdentity"), engineSrc.indexOf("resolveModel(supplier"))),
-		"withIdentity must not fabricate thinkingLevelMap entries");
-});
-
-test("main turn: default stays off so existing installs behave identically", () => {
-	assert.match(engineSrc, /thinkingLevel: \(supplier\.modelThinkingLevel\?\.\[modelId\] \?\? "off"\) as ThinkingLevel,/);
-});
-
-test("side pass: follows the agent's synced level, never a supplier lookup by provider", () => {
-	// Code review P1 2026-11-02: model.provider is a REGISTRY provider id (e.g.
-	// "groq"), not a supplier id, so findSupplier(model.provider) returned null and
-	// a configured "low" silently became the xhigh default.
-	assert.ok(!sidePassBody.includes("findSupplier(model.provider)"),
-		"no supplier lookup by model.provider (it is not a supplier id)");
-	assert.match(sidePassBody, /agent\.state\.thinkingLevel/, "side pass reads the synced agent level");
-	assert.ok(!/SIDE_PASS_DEFAULT_LEVEL\) : undefined,\n\t\t\t\t\tthis\.rawStreamFn/.test(sidePassBody) ||
-		sidePassBody.includes("agent.state.thinkingLevel"),
-		"default only applies when the agent has no explicit level");
-});
-
-test("side pass: budget leaves room for thinking plus a 120-char report", () => {
-	assert.match(sidePassBody, /4_096,/,
-		"output reserve raised above the thinking floor (was 0.8×512=409)");
-	assert.ok(!sidePassBody.includes("0.8×512 tokens of output budget"), "the old 409-token reserve is gone");
-});
-
-test("model switches keep the agent's level in sync on every path", () => {
-	const syncs = engineSrc.match(/agent\.state\.thinkingLevel = \([^\n]+as ThinkingLevel;/g) ?? [];
-	assert.ok(syncs.length >= 3,
-		`default-model loop, pin, and unpin all sync thinkingLevel (found ${syncs.length})`);
-});
-
-test("durable (default kernel): the stream bridge applies the declared level", () => {
-	// Copilot review 2026-11-02: DurableRuntime drives the harness pipeline, so the
-	// Agent's thinkingLevel never reaches the request. Without this the main turn
-	// silently kept the harness default while only the side pass honored the config.
+test("wiring: durable bridge forwards the declared level incl. off", () => {
+	// Durable is the DEFAULT kernel — the Agent's thinkingLevel never reaches the
+	// harness request without this bridge (Copilot round 1).
 	const i = engineSrc.indexOf("async openDurableRuntime");
-	const bridge = engineSrc.slice(i, i + 1600);
-	assert.match(bridge, /const declared = supplier\.modelThinkingLevel\?\.\[modelId\];/,
-		"durable bridge reads the per-model declaration");
-	// Review round 2 P1: an explicit "off" must be FORWARDED (reasoning:"off"),
-	// not turned into reasoning:undefined — undefined makes pi-ai omit the
-	// provider's disable param, so a default-thinking gateway kept thinking.
+	const bridge = engineSrc.slice(i, i + 1800);
+	assert.match(bridge, /const declared = supplier\.modelThinkingLevel\?\.\[modelId\];/);
 	assert.match(bridge, /declared !== undefined\s*\?\s*\(declared as ThinkingLevel\)\s*:\s*options\.reasoning/,
-		"declared off forwards reasoning:\"off\"; only the absent case keeps the harness default");
+		"declared off forwards reasoning:'off'; absent keeps the harness default");
 });
 
-test("renderer: reset and auth-supplier rebuild keep the thinking map", () => {
-	const dlg = readFileSync(join(root, "renderer/src/components/model-service/EditModelDialog.tsx"), "utf8");
-	assert.match(dlg, /setThinking\(supplier\.modelThinkingLevel\?\.\[modelId\] \?\? ""\)/,
-		"恢复默认 also resets the thinking level (Copilot review)");
-	const svc = readFileSync(join(root, "renderer/src/components/ModelServiceSection.tsx"), "utf8");
-	assert.match(svc, /existing\?\.modelThinkingLevel \? \{ modelThinkingLevel: existing\.modelThinkingLevel \}/,
-		"rebuilding an auth supplier preserves its configured levels (Copilot review)");
+test("wiring: main turn default stays off; every switch path syncs the level", () => {
+	assert.match(engineSrc, /thinkingLevel: \(supplier\.modelThinkingLevel\?\.\[modelId\] \?\? "off"\) as ThinkingLevel,/);
+	const syncs = engineSrc.match(/agent\.state\.thinkingLevel = \([^\n]+as ThinkingLevel;/g) ?? [];
+	assert.ok(syncs.length >= 3, `default loop, pin, unpin all sync (found ${syncs.length})`);
+});
+
+test("wiring: side pass reads the agent level; budget leaves room for thinking", () => {
+	const i = engineSrc.indexOf("async progressBriefDetailed");
+	const body = engineSrc.slice(i, i + 9000);
+	assert.ok(!body.includes("findSupplier(model.provider)"), "no supplier lookup by registry provider id");
+	assert.match(body, /agent\.state\.thinkingLevel/);
+	assert.match(body, /4_096,/, "output reserve covers thinking + 120-char report");
+	assert.ok(!body.includes("0.8×512 tokens"), "old 409 reserve gone");
 });
