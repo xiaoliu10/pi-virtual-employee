@@ -82,10 +82,18 @@ export function SupplierDetailPane(props: SupplierDetailPaneProps) {
 		const imageMap = patch.image === undefined
 			? supplier.modelImage
 			: nextModelImage(supplier.modelImage, modelId, patch.image);
+		const levelMap = (() => {
+			if (patch.thinking === undefined) return supplier.modelThinkingLevel;
+			const next = { ...(supplier.modelThinkingLevel ?? {}) };
+			if (!patch.thinking) delete next[modelId];
+			else next[modelId] = patch.thinking;
+			return Object.keys(next).length ? next : undefined;
+		})();
 		props.onUpdate({
 			modelContextWindow: mergeTokens(supplier.modelContextWindow, patch.contextWindow),
 			modelMaxTokens: mergeTokens(supplier.modelMaxTokens, patch.maxTokens),
 			modelImage: imageMap,
+			modelThinkingLevel: levelMap,
 		});
 	};
 

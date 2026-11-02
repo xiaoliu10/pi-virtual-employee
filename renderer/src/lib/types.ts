@@ -30,6 +30,10 @@ export interface Supplier {
 	modelContextWindow?: Record<string, number>;
 	/** Per-model max output tokens override (absent → inherit base). */
 	modelMaxTokens?: Record<string, number>;
+	/** Per-model thinking/reasoning level declaration (pi level: off…max;
+	 *  absent → inherit base registry capability). Single source for the main
+	 *  turn and the progress side pass (mirrors src/db/config-store.ts). */
+	modelThinkingLevel?: Record<string, string>;
 	/** Account-login supplier (pi-ai registry + shared auth.json). When set, the
  *  supplier's models resolve from the provider's registered catalog and
  *  authenticate via the stored credential (OAuth refresh included) —

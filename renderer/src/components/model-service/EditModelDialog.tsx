@@ -20,7 +20,10 @@ export interface ModelOverridePatch {
 	contextWindow?: string;
 	maxTokens?: string;
 	image?: "inherit" | boolean;
+	thinking?: string;
 }
+
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 interface EditModelDialogProps {
 	supplier: Supplier;
@@ -44,10 +47,11 @@ export function EditModelDialog(props: EditModelDialogProps) {
 	const [contextWindow, setContextWindow] = useState(String(supplier.modelContextWindow?.[modelId] ?? ""));
 	const [maxTokens, setMaxTokens] = useState(String(supplier.modelMaxTokens?.[modelId] ?? ""));
 	const [image, setImage] = useState<"inherit" | boolean>(supplier.modelImage?.[modelId] ?? "inherit");
+	const [thinking, setThinking] = useState(supplier.modelThinkingLevel?.[modelId] ?? "");
 	const [advanced, setAdvanced] = useState(false);
 
 	const save = () => {
-		props.onApply(modelId, { contextWindow, maxTokens, image });
+		props.onApply(modelId, { contextWindow, maxTokens, image, thinking });
 		props.onClose();
 	};
 
@@ -77,6 +81,13 @@ export function EditModelDialog(props: EditModelDialogProps) {
 							最大输出 Token <span className="ml-1 cursor-help text-[#a1a1a6]" title="单次回复的最大输出长度（tokens）。该值同时占用上下文窗口（输入+输出≤窗口），配大了会挤掉可用输入甚至被网关直接拒绝。未填写时应用会先向网关查询（litellm /model/info），查不到才回退默认 32768。">?</span>
 						</span>
 						<input type="number" min={0} value={maxTokens} onChange={(e) => setMaxTokens(e.target.value)} className={inputCls} placeholder="留空 = 先查网关，查不到默认 32K" />
+					</label>
+					<label className="block">
+						<span className="mb-2 block text-sm font-medium text-slate-800">思考档位（推理模型）</span>
+						<select value={thinking} onChange={(e) => setThinking(e.target.value)} className={inputCls}>
+							<option value="">继承模型默认</option>
+							{THINKING_LEVELS.map((lv) => <option key={lv} value={lv}>{lv === "off" ? "off（非推理）" : lv}</option>)}
+						</select>
 					</label>
 
 					<div>
@@ -112,6 +123,7 @@ export function EditModelDialog(props: EditModelDialogProps) {
 							setContextWindow(String(supplier.modelContextWindow?.[modelId] ?? ""));
 							setMaxTokens(String(supplier.modelMaxTokens?.[modelId] ?? ""));
 							setImage(supplier.modelImage?.[modelId] ?? "inherit");
+							setThinking(supplier.modelThinkingLevel?.[modelId] ?? "");
 						}}
 						className="rounded-xl px-4 py-2.5 text-sm font-medium text-slate-500 hover:bg-slate-100"
 					>
