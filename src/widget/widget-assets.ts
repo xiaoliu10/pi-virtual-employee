@@ -61,7 +61,7 @@ input, textarea { font-family: inherit; }
 .think-b { padding:8px 10px; font-size:12px; color:#4e5969; white-space:pre-wrap; word-break:break-word; max-height:220px; overflow-y:auto; background:#fafbfc; }
 .think-b.hidden { display:none; }
 .msg.streaming::after { content:"▍"; color:#4f6ef7; animation:ve-blink 1s step-start infinite; }
-@keyframes ve-blink { 50% { opacity:0; }
+@keyframes ve-blink { 50% { opacity:0; } }
 `;
 
 /**

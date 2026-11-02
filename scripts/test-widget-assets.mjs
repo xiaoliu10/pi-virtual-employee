@@ -11,7 +11,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { build } from "esbuild";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -44,6 +44,93 @@ function assertParses(label, html, { inline }) {
 	assert.doesNotThrow(() => new Function(code), `${label}: client JS parses as real JavaScript`);
 	return code;
 }
+
+/**
+ * Extract every CSS text the loader/page can inject and parse it with a real
+ * CSS parser.
+ *
+ * Field failure (v0.2.179–v0.2.182, P0): `SHARED_CSS` ended with
+ * `@keyframes ve-blink { 50% { opacity:0; }` — one brace short. The browser
+ * threw away the WHOLE stylesheet, so `.launcher { position:absolute; ... }`
+ * never applied, the floating button rendered off-viewport, and every embedding
+ * business system lost its entry point. The JS gate above could not catch it
+ * (CSS is just a string to JS), and nothing executed the CSS.
+ */
+/**
+ * The loader's stylesheet is assembled in TypeScript from TWO pieces that the
+ * browser concatenates into ONE sheet: the module-level `SHARED_CSS` constant
+ * (inlined via JSON.stringify) plus a template literal inside the loader. A
+ * syntax error in either half makes the browser discard everything that follows
+ * — including `.launcher { position:absolute }` — so the entry point renders
+ * off-viewport. Field P0 (v0.2.179–v0.2.182) was exactly this: SHARED_CSS ended
+ * one brace short in `@keyframes ve-blink`.
+ *
+ * Parsing the served bytes with a real CSS parser is the only gate that catches
+ * it: the JS gate treats CSS as an opaque string, and nothing executed the CSS.
+ */
+/**
+ * The served loader builds its stylesheet as `var css = "<SHARED_CSS literal>" + `
+ * <template half>`;` — ONE sheet to the browser, assembled from two JS string
+ * pieces. A syntax error in either piece (or at their seam) makes the browser
+ * discard everything after it, including `.launcher { position:absolute }`, so
+ * the floating button renders off-viewport and the embedder has no entry point.
+ * Field P0 (v0.2.179–v0.2.182): SHARED_CSS ended one brace short in
+ * `@keyframes ve-blink`. The JS gate cannot see this — CSS is an opaque string.
+ *
+ * This reconstructs the sheet from the ACTUAL served bytes: run the css
+ * expression the loader evaluates, then parse the result with a real CSS parser.
+ */
+async function servedStylesheet(html) {
+	const postcss = (await import("postcss")).default;
+	const at = html.indexOf("var css = ");
+	assert.ok(at > 0, "the loader assigns var css");
+	// Take the whole statement: everything up to the first `;` that ENDS the
+	// assignment (the template half itself contains no `;`-at-line-end before it).
+	const rest = html.slice(at + "var css = ".length);
+	// The expression is "<JSON string literal>" + `<template>` ; — scan quote-aware
+	// instead of looking for ";\n" (CSS declarations contain that too).
+	let i = 0;
+	let quote = null;
+	for (; i < rest.length; i += 1) {
+		const ch = rest[i];
+		if (quote) {
+			if (ch === "\\") { i += 1; continue; }
+			if (ch === quote) quote = null;
+			continue;
+		}
+		if (ch === '"' || ch === "'" || ch === "`") { quote = ch; continue; }
+		if (ch === ";") break;
+	}
+	assert.ok(i < rest.length, "the css assignment terminates");
+	const expr = rest.slice(0, i);
+	// Evaluate it exactly as the browser would (no network, no side effects).
+	const css = new Function(`return (${expr});`)();
+	assert.equal(typeof css, "string", "the css expression yields a string");
+	assert.ok(css.length > 500, "the stylesheet is not empty");
+	return { postcss, css };
+}
+
+test("the stylesheet the loader actually evaluates is valid CSS", async () => {
+	const { postcss, css } = await servedStylesheet(renderWidgetLoader());
+	assert.doesNotThrow(
+		() => postcss.parse(css),
+		"an unclosed block makes the browser drop the ENTIRE sheet — every rule after it dies",
+	);
+	// The keyframes that broke is present and closed.
+	assert.ok(css.includes("@keyframes ve-blink"), "blink keyframes survive");
+	assert.ok(/@keyframes[^{]*\{[\s\S]*\}\s*\}?\s*$/.test(css.replace(/\s+$/, "") + "", "@keyframes blocks are balanced")
+		|| css.includes("@keyframes ve-blink { 50% { opacity:0; } }"), "@keyframes ve-blink is closed");
+});
+
+test("the evaluated stylesheet carries the launcher positioning rule", async () => {
+	const { postcss, css } = await servedStylesheet(renderWidgetLoader());
+	let position = null;
+	postcss.parse(css).walkRules((rule) => {
+		if (!/(^|,)\s*\.launcher\s*$/.test(rule.selector.trim())) return;
+		rule.walkDecls("position", (decl) => { position = decl.value; });
+	});
+	assert.equal(position, "absolute", "without this the button renders off-viewport (field P0)");
+});
 
 test("the loader script served to browsers is valid JavaScript", () => {
 	const js = assertParses("loader", renderWidgetLoader(), { inline: false });
