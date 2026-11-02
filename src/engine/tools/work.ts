@@ -4,7 +4,7 @@ import { Type } from "@earendil-works/pi-ai";
 import type { WorkItemStore } from "../../db/work-item-store.js";
 import type { ConfigStore } from "../../db/config-store.js";
 import { isExplicitConfirmation, type ActorContext } from "./admin.js";
-import { isOwner, resolveRole } from "../../security/permissions.js";
+import { isDeclaredAdmin, isOwner } from "../../security/permissions.js";
 import { parseNextCheck } from "../../scheduler/work.js";
 
 function fmtTime(ms: number | null): string {
@@ -40,14 +40,6 @@ function verifiedIMActor(actor: ActorContext, conversationId: string): actor is 
 }
 
 /** Defaults never grant unattended work authority; a named admin must still be admin live. */
-function currentAdmin(config: ConfigStore, senderId: string): boolean {
-	const security = config.all().security;
-	const declared = security.adminStaffIds.includes(senderId) ||
-		security.people?.some((person) => person.staffId === senderId && person.role === "admin");
-	// owner is a strict superset of admin: accepting only "admin" here would make
-	// granting owner REMOVE ordinary task-management powers.
-	return resolveRole(config, senderId) === "owner" || (!!declared && resolveRole(config, senderId) === "admin");
-}
 
 function failure(reason: string) {
 	return {
@@ -109,7 +101,7 @@ export function createWorkTools(deps: {
 		if (!verifiedIMActor(actor, conversationId)) {
 			return failure("自主任务管理需要来源 IM 单聊或群聊中经过平台验证的发送者身份；定时任务和无身份会话不能确认或恢复工作。");
 		}
-		if (!currentAdmin(config, actor.senderId)) return failure("此操作需要当前管理员权限，创建人或默认角色不能代替管理员授权。");
+		if (!isDeclaredAdmin(config, actor.senderId)) return failure("此操作需要当前管理员权限，创建人或默认角色不能代替管理员授权。");
 		// 管理员完全访问模式：确认创建口令也一并豁免（管理员身份即授权）。
 		if (needConfirmation && config.all().security.adminFullAccess !== true && (typeof actor.text !== "string" || !isExplicitConfirmation(actor.text))) {
 			return failure("请管理员在任务来源会话的当前消息中明确确认（如「确认创建」）。");
@@ -139,7 +131,7 @@ export function createWorkTools(deps: {
 			}
 			const item = workItems.get(itemId);
 			if (!item || item.status !== "working" || !item.created_by || actor.senderId !== item.created_by ||
-				!currentAdmin(config, item.created_by)) {
+				!isDeclaredAdmin(config, item.created_by)) {
 				return failure("只能记录当前正在执行的自主任务，且调度身份必须匹配仍有管理员权限的创建人。");
 			}
 			if (!["set_conditions", "add_lesson", "set_progress"].includes(p.action)) return failure("未知的笔记操作。");
@@ -251,7 +243,7 @@ export function createWorkTools(deps: {
 			// 2026-10-04, a paused group-owned item was undiagnosable from a DM
 			// because list/get couldn't see it. Mutations stay source-scoped and
 			// admin-gated below.
-			const admin = currentAdmin(config, actor.senderId);
+			const admin = isDeclaredAdmin(config, actor.senderId);
 			const scoped = admin ? workItems.list() : workItems.list().filter((item) => item.origin_conversation === conversationId);
 			if (p.action === "list") {
 				const items = scoped.slice(0, 30);

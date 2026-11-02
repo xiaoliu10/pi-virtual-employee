@@ -28,7 +28,7 @@ import { ComputerService } from "../src/computer/computer-service.js";
 import { ScheduledTaskStore, type ScheduledTaskRow } from "../src/db/scheduled-task-store.js";
 import { WorkItemStore } from "../src/db/work-item-store.js";
 import { WorkService, buildWorkLearning } from "../src/scheduler/work-service.js";
-import { isAdmin, resolveRole } from "../src/security/permissions.js";
+import { isAdmin, isDeclaredAdmin } from "../src/security/permissions.js";
 import { SchedulerService, shouldPushScheduledResult, annotateLatePush } from "../src/scheduler/scheduler-service.js";
 import { normalizeProgressIntervalMin } from "../src/scheduler/progress-notify.js";
 import {
@@ -944,12 +944,14 @@ ${tailForProgress(decision.text)}`;
 	 */
 	const workService = new WorkService({
 		store: workItemStore,
-		isAdmin: (senderId) => {
-			const security = config.all().security;
-			// A permissive defaultRole must not resurrect a removed confirmer.
-			const declared = security.adminStaffIds.includes(senderId) || security.people?.some((p) => p.staffId === senderId && p.role === "admin");
-			return !!declared && resolveRole(config, senderId) === "admin";
-		},
+		// One authority for "is this sender an admin/owner": isAdmin() already
+		// treats owner as a strict superset of admin. The previous inline copy
+		// compared === "admin", so a task CREATED BY AN OWNER passed creation
+		// (work.ts accepts owner) but failed this check at the start of EVERY work
+		// window → it was instantly parked back into waiting_human: resume
+		// succeeded in chat, then the next window re-parked it, and the client kept
+		// showing "待人工恢复" (v0.2.182 missed this seventh owner-gate site).
+		isAdmin: (senderId) => isDeclaredAdmin(config, senderId),
 		open: (item, convId) => {
 			history.ensureConversation(convId, `🧭 ${item.title}`);
 			return engine.getOrCreateSession(convId);

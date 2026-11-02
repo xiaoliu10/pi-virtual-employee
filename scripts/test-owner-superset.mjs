@@ -12,7 +12,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { build } from "esbuild";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -98,13 +98,13 @@ test("owner escapes the operator allowlist (superset, not demotion)", async (t) 
 const bundle2 = join(dir, "o2.mjs");
 await build({
 	stdin: { contents: `
-		export { effectiveAuthorizationRole } from "./src/security/permissions.ts";
+		export { effectiveAuthorizationRole, isDeclaredAdmin, isAdmin } from "./src/security/permissions.ts";
 		export { createRememberTool } from "./src/engine/tools/save-knowledge.ts";
 		export { createSchedulerTools } from "./src/engine/tools/scheduler.ts";
 	`, resolveDir: root, loader: "ts" },
 	outfile: bundle2, bundle: true, platform: "node", format: "esm", packages: "external",
 });
-const { effectiveAuthorizationRole, createRememberTool, createSchedulerTools } = await import(pathToFileURL(bundle2).href);
+const { effectiveAuthorizationRole, isDeclaredAdmin, isAdmin, createRememberTool, createSchedulerTools } = await import(pathToFileURL(bundle2).href);
 
 function dbWithRoles(t) {
 	const db = new DatabaseSync(":memory:");
@@ -206,4 +206,55 @@ test("scheduler CREATE describes an owner's unattended identity as admin-tier sc
 	// a display of the very demotion this fix removes.
 	assert.ok(text.includes("完整命令"), "owner's unattended identity reads as admin-tier scope");
 	assert.ok(!text.includes("仅对话与知识库"), "no viewer-tier wording for owner");
+});
+
+test("isDeclaredAdmin accepts an explicitly-declared OWNER (field: work windows re-parked owner tasks)", (t) => {
+	const config = dbWithRoles(t);
+	assert.equal(isDeclaredAdmin(config, "the-owner"), true, "a named owner is admin-tier for unattended work");
+	assert.equal(isDeclaredAdmin(config, "an-admin"), true, "a declared admin passes");
+	assert.equal(isDeclaredAdmin(config, "op-user"), false, "an operator does not pass");
+	assert.equal(isDeclaredAdmin(config, "someone-else"), false, "an undeclared id is not resurrected by defaultRole");
+});
+
+test("a permissive defaultRole does not resurrect a removed confirmer", (t) => {
+	const db = new DatabaseSync(":memory:");
+	db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+	const config = new ConfigStore(db);
+	t.after(() => db.close());
+	config.replaceAll({ security: { defaultRole: "admin", adminStaffIds: ["still-admin"] } });
+	assert.equal(isDeclaredAdmin(config, "still-admin"), true, "a listed confirmer still passes");
+	assert.equal(isDeclaredAdmin(config, "anyone-at-all"), false, "defaultRole=admin must NOT make everyone an unattended admin");
+});
+
+test("wiring: the work service isAdmin gate uses the shared declared-admin authority, not === admin", (t) => {
+	// The field bug lived in electron/main.ts's WorkService isAdmin closure, a
+	// SEPARATE inline copy of the work.ts gate. It compared resolveRole === "admin",
+	// so owner-created work parked into waiting_human at every window. Pin that the
+	// closure delegates to the shared authority (which accepts owner).
+	const mainSrc = readFileSync(join(root, "electron", "main.ts"), "utf8");
+	const at = mainSrc.indexOf("new WorkService(");
+	assert.ok(at > 0, "WorkService is constructed in main.ts");
+	const block = mainSrc.slice(at, at + 1200);
+	assert.match(block, /isAdmin:\s*\(senderId\)\s*=>\s*isDeclaredAdmin\(config,\s*senderId\)/, "work gate delegates to isDeclaredAdmin (owner-tolerant)");
+	assert.ok(!block.includes('resolveRole(config, senderId) === "admin"'), "no owner-rejecting literal comparison remains");
+});
+
+test("wiring: credential egress still uses isAdmin (honours defaultRole); only unattended work is strict", (t) => {
+	// The report service's 1:1 credential gate is a LIVE message decision — a
+	// verified sender whose defaultRole is admin IS an admin and must receive
+	// credentials. Only the unattended-work gate is strict (a removed confirmer
+	// must not be resurrected by a permissive defaultRole). Review regression:
+	// I briefly pointed isAdminRecipient at isDeclaredAdmin too.
+	const mainSrc = readFileSync(join(root, "electron", "main.ts"), "utf8");
+	const recvAt = mainSrc.indexOf("isAdminRecipient:");
+	assert.ok(recvAt > 0);
+	const recvBlock = mainSrc.slice(recvAt, recvAt + 160);
+	assert.match(recvBlock, /isAdminRecipient:\s*\(staffId\)\s*=>\s*isAdmin\(config,\s*staffId\)/, "egress recipient uses the live isAdmin, not the strict declared check");
+	// And a permissive defaultRole must actually make an unlisted verified sender an admin here.
+	const db = new DatabaseSync(":memory:");
+	db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+	const relaxed = new ConfigStore(db);
+	relaxed.replaceAll({ security: { defaultRole: "admin" } });
+	assert.equal(isAdmin(relaxed, "any-verified-sender"), true, "defaultRole=admin makes a live 1:1 sender an admin");
+	db.close();
 });

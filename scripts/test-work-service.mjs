@@ -321,6 +321,23 @@ test("missing/revoked confirming identity waits before session/tool execution", 
 	}
 });
 
+test("an owner-created task runs its window (the work service gate accepts owner, v0.2.183)", async t => {
+	// Field bug: a task CREATED BY AN OWNER passed the work tool's gate (work.ts
+	// accepts owner) but failed the work service's inline gate (it compared
+	// resolveRole === "admin"), so every window parked the task straight back
+	// into waiting_human. Resume succeeded in chat, then the next window
+	// re-parked it, and the client stayed on "待人工恢复" forever.
+	let opened = 0;
+	const isOwnerOrAdmin = id => id === "the-owner" || id === "admin";
+	const h = fixture(t, {
+		options: { isAdmin: isOwnerOrAdmin, open: () => { opened += 1; return { abort() {} }; } },
+	});
+	const item = h.create("queued", { createdBy: "the-owner" });
+	h.service.start(); await flush();
+	assert.equal(opened, 1, "an owner-created task opens its window, not parked");
+	assert.equal(h.store.get(item.id).status, "done", "it runs to completion instead of waiting_human");
+});
+
 test("revocation after a turn forbids the next send and persists human block", async t => {
 	const h = fixture(t, { send: h => { h.admin = false; return { reply: "下一轮开始操作" }; } });
 	const item = h.create(); h.service.start(); await flush();
