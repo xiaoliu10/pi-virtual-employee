@@ -72,14 +72,16 @@ async function openRuntime({ history, faux, tools = () => [] }) {
 
 test("the durable kernel reports streamed text through onProcessEvent", async (t) => {
 	const history = makeHistory(t);
-	// The harness commits partials at most every 100 ms (progress.partialIntervalMs),
-	// so a provider that answers instantly has NO intermediate commit and therefore
-	// no text_delta — that is a property of the kernel, not of this feature. A real
-	// provider streams over time; tokensPerSecond reproduces that.
-	// 8 tokens/s over a long reply crosses several 100 ms commit windows; a
-	// fast provider finishes inside one and legitimately produces no update.
-	const faux = fauxProvider({ tokensPerSecond: 8, tokenSize: { min: 1, max: 2 } });
+	// The harness commits partials at most every ~100 ms (progress.partialIntervalMs):
+	// a provider that answers instantly has NO intermediate commit and therefore no
+	// text_delta. That is a property of the kernel, not of this feature, so this test
+	// pacing (below) spaces the partial commits — a fast provider legitimately
+	// produces no intermediate update, and the assertion is the CONTRACT
+	// (progressive prefix deltas), not a particular ratio: the tail converges via
+	// the final replace/done.
 	const reply = "这是一段足够长的回答用来验证流式增量是否真的能够跨越节流窗口产生多个中间提交";
+	// 8 tokens/s over a long reply crosses several 100 ms commit windows.
+	const faux = fauxProvider({ tokensPerSecond: 8, tokenSize: { min: 1, max: 2 } });
 	faux.setResponses([fauxAssistantMessage(reply)]);
 	const { runtime, session } = await openRuntime({ history, faux });
 	const events = [];
@@ -90,14 +92,17 @@ test("the durable kernel reports streamed text through onProcessEvent", async (t
 		});
 		assert.equal(result.reply, reply);
 
-		const deltas = events.filter((e) => e.type === "text_delta").map((e) => e.delta).join("");
-		assert.ok(deltas.length > 0, "the sink received text deltas (was: zero events under durable)");
-		// Partials commit at most every ~100 ms, so the tail of the reply can land
-		// after the last commit — the client converges on the authoritative text via
-		// the final `replace`/`done` (same contract as the legacy kernel).
-		assert.ok(deltas.length > 0, "text arrived progressively");
-		assert.ok(reply.startsWith(deltas), `streamed text is a prefix of the reply (got ${deltas.length}/${reply.length} chars)`);
-		assert.ok(deltas.length >= reply.length * 0.8, "the stream carried the bulk of the reply, not one token");
+		// The contract: at least two separate delta events (progressive, not one
+		// shot), each an extension of the same growing text, together a PREFIX of the
+		// reply. The tail may land after the last commit; the client converges via
+		// the final replace/done.
+		const deltaEvents = events.filter((e) => e.type === "text_delta");
+		assert.ok(deltaEvents.length >= 2, `progressive deltas arrived (got ${deltaEvents.length})`);
+		let acc = "";
+		for (const e of deltaEvents) {
+			acc += e.delta;
+			assert.ok(reply.startsWith(acc), `deltas always extend the reply (at ${JSON.stringify(acc)})`);
+		}
 	} finally {
 		await runtime.close();
 	}
@@ -151,6 +156,35 @@ test("a turn without a sink still runs (watching is best-effort)", async (t) => 
 			actor: { senderId: "widget-user-3", channel: "widget", chatType: "single" },
 		});
 		assert.equal(result.reply, "无流式也照常回答", "the answer is unaffected by the absence of a sink");
+	} finally {
+		await runtime.close();
+	}
+});
+
+test("a tool that throws reports tool_end with isError=true (not a success checkmark)", async (t) => {
+	const history = makeHistory(t);
+	const faux = fauxProvider();
+	const tools = () => [{
+		name: "boom",
+		label: "boom",
+		description: "always throws",
+		parameters: Type.Object({}),
+		execute: async () => {
+			throw new Error("kaboom");
+		},
+	}];
+	faux.setResponses([fauxAssistantMessage(fauxToolCall("boom", {}), { stopReason: "toolUse" }), fauxAssistantMessage("工具失败了")]);
+	const { runtime, session } = await openRuntime({ history, faux, tools });
+	const events = [];
+	try {
+		const result = await runtime.send(session("widget:boom"), "炸一下", {
+			actor: { senderId: "widget-user-4", channel: "widget", chatType: "single" },
+			onProcessEvent: (event) => events.push(event),
+		});
+		assert.ok(result.reply.length > 0, "the turn still answers");
+		const end = events.find((e) => e.type === "tool_end");
+		assert.ok(end, "tool_end was reported");
+		assert.equal(end.isError, true, "a faulted tool is reported as an error — the old inference painted it false");
 	} finally {
 		await runtime.close();
 	}

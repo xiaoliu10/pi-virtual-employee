@@ -247,10 +247,13 @@ export class DurableRuntime {
 		// consumer (the widget's SSE) serves both. Failure here must never affect
 		// the turn: it only costs progressive rendering.
 		const stopWatching = ctx?.onProcessEvent ? await this.watchProcess(conv.id, ctx.onProcessEvent) : undefined;
-		this.opts.history.ensureConversation(id, text.slice(0, 40));
-		this.opts.history.appendMessage(id, "user", text);
-		ctx?.onPersist?.(id);
 		try {
+			// Inside the try so ANY failure after the watch was created still reaches
+			// the teardown below — a history write or onPersist callback that throws
+			// must not leave the watcher attached to the turn's sink (review).
+			this.opts.history.ensureConversation(id, text.slice(0, 40));
+			this.opts.history.appendMessage(id, "user", text);
+			ctx?.onPersist?.(id);
 			const content = ctx?.images?.length ? [{ type: "text" as const, text }, ...ctx.images.map((image) => ({ type: "image" as const, ...image }))] : text;
 			const submission = await conv.submit({ type: "input", content, requestId: `ve:${conv.id}` }, context);
 			const outcome = await submission.wait(context);
@@ -284,6 +287,23 @@ export class DurableRuntime {
 			: { reply: EMPTY_ANSWER_REPLY, error: "durable empty answer" };
 	}
 	/**
+	 * Did this tool call end as a failure?
+	 *
+	 * The obvious reading (`no entry and no result`) is WRONG here: VE's tools
+	 * catch their own throws and RETURN `{ isError: true }` (ve-tools.ts), so a
+	 * faulted tool still produces a result entry — the old check therefore painted
+	 * every failure as a success checkmark (review). The authoritative flag is on
+	 * the persisted toolResult message (`entry.model[0].isError`), with the
+	 * missing-entry case kept for a call that was orphaned or never ran.
+	 */
+	private static endedAsError(event: { entry?: { model?: readonly unknown[] }; result?: { isError?: boolean } }): boolean {
+		if (event.result?.isError === true) return true;
+		if (event.entry === undefined) return true; // orphaned / faulted without a result
+		const message = (event.entry.model ?? [])[0] as { role?: string; isError?: boolean } | undefined;
+		return message?.isError === true;
+	}
+
+	/**
 	 * Translate the harness event stream of ONE conversation into TurnProcessEvents.
 	 *
 	 * `message_update.changes` carries the in-flight assistant message's
@@ -314,8 +334,7 @@ export class DurableRuntime {
 								type: "tool_end",
 								toolName: event.toolName,
 								toolCallId: event.toolCallId,
-								// A call with no result entry faulted or was orphaned.
-								isError: event.entry === undefined && event.result === undefined,
+								isError: DurableRuntime.endedAsError(event),
 								durationMs: began === undefined ? undefined : Date.now() - began,
 							});
 						}

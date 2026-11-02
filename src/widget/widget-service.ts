@@ -26,7 +26,7 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { gateOutboundText } from "../im/credential-egress.js";
+import { gateOutboundText, streamingHoldbackLength } from "../im/credential-egress.js";
 import type { AgentEvent } from "@earendil-works/pi-agent-core";
 import type { EmployeeRuntime, TurnProcessEvent } from "../engine/engine.js";
 import { renderWidgetPage, renderWidgetLoader, type LauncherLook } from "./widget-assets.js";
@@ -455,13 +455,28 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 						return {
 							push: (incoming: string): void => {
 								full += incoming;
-								const safe = gateOutboundText(full, "restricted");
+								// Bytes already sent can never be taken back, so the tail that
+								// could still BECOME a credential is withheld until it is
+								// decidable (review: `密码：8392017` passed the per-increment
+								// gate and the next delta completed the password — the first
+								// seven digits were already rendered by then).
+								const holdback = streamingHoldbackLength(full);
+								const decidable = holdback > 0 ? full.slice(0, full.length - holdback) : full;
+								const safe = gateOutboundText(decidable, "restricted");
 								if (safe === sent) return;
 								if (safe.startsWith(sent)) {
 									sse({ type: eventType, text: safe.slice(sent.length) });
 								} else {
 									sse({ type: eventType === "delta" ? "replace" : "thinking_replace", text: safe });
 								}
+								sent = safe;
+							},
+							/** Release whatever the holdback still owes at the end of the turn. */
+							flush: (): void => {
+								const safe = gateOutboundText(full, "restricted");
+								if (safe === sent) return;
+								if (safe.startsWith(sent)) sse({ type: eventType, text: safe.slice(sent.length) });
+								else sse({ type: eventType === "delta" ? "replace" : "thinking_replace", text: safe });
 								sent = safe;
 							},
 							get sentText() {
@@ -517,6 +532,10 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 							});
 						}
 						const { reply, error } = await deps.runtime.send(agent, message, { actor, onProcessEvent: applyEvent });
+						// Release anything the holdback still owed (the turn is over, so no
+						// further delta can complete a credential).
+						textChannel.flush();
+						thinkingChannel.flush();
 						if (error) {
 							sse({ type: "error", message: error });
 						} else {

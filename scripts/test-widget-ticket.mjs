@@ -594,3 +594,37 @@ test("durable kernel streams through the sink even though subscribe sees nothing
 	assert.equal(types[types.length - 1], "done");
 	assert.equal(runtime.subscribedCount(), 0, "no subscribe was needed (durable provides nothing there)");
 });
+
+test("a credential split across deltas never leaks its prefix (streaming holdback)", async (t) => {
+	// Review (2026-11-02): gating each increment in isolation let `密码：8392017`
+	// through — no pattern matches a bare digit run — and the NEXT delta `4`
+	// completed the password. Those seven digits were already rendered, and a
+	// later `replace` cannot retract bytes a client has seen.
+	const runtime = makeStreamingRuntime({
+		finalReply: "已按安全规定隐藏",
+		script: [
+			{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "好的，" } },
+			{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "密码：" } },
+			{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "8392017" } },
+			{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "4" } },
+			{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "。请收好" } },
+		],
+	});
+	const { base, session, server } = await start({ runtime });
+	t.after(() => { server.closeAllConnections?.(); server.close(); });
+	const tk = await session("u1", "viewer");
+
+	const res = await fetch(base + "/api/widget/chat", {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}`, "x-ve-ticket": tk, accept: "text/event-stream", origin: "https://oa.example.com" },
+		body: JSON.stringify({ message: "密码是多少" }),
+	});
+	const events = await readSse(res);
+	for (const event of events) {
+		const text = typeof event.text === "string" ? event.text : "";
+		assert.ok(!/8392017/.test(text), `a partial password must never be sent (saw ${JSON.stringify(text)})`);
+		assert.ok(!/83920174/.test(text), "nor the complete one");
+	}
+	// And the visible text still arrives.
+	assert.ok(events.some((e) => e.type === "delta" && e.text.includes("好的")), "safe text still streams");
+});
