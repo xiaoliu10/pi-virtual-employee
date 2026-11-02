@@ -491,11 +491,15 @@ export class EmployeeEngine implements EmployeeRuntime {
 				// review 2026-11-02). Apply the per-model declared level explicitly —
 				// otherwise a configured low/high changed only the side pass and the
 				// main turn silently kept whatever the harness defaults to.
+				// An explicit level — INCLUDING "off" — must be forwarded: pi-ai needs
+				// a non-undefined reasoning to emit the provider's disable param
+				// (qwen enable_thinking:false). Absent declaration = harness default.
 				const declared = supplier.modelThinkingLevel?.[modelId];
-				const level = declared !== undefined ? declared : (model.reasoning && options.reasoning ? options.reasoning : undefined);
-				const reasoning = level && level !== "off" ? (level as ThinkingLevel) : undefined;
+				const reasoning = declared !== undefined
+					? (declared as ThinkingLevel)
+					: options.reasoning;
 				return this.makeStreamFn(id)(model, normalizeContext({ messages }), {
-					...options, ...(reasoning ? { reasoning } : { reasoning: undefined }), sessionId: id, apiKey: this.apiKeyFor(supplier),
+					...options, reasoning, sessionId: id, apiKey: this.apiKeyFor(supplier),
 				});
 			},
 			withActor: async (id, ctx, text, run) => {
@@ -749,25 +753,17 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// model.sessionAffinity=false via manage_settings.
 		const affinity = this.config.all().model.sessionAffinity !== false;
 		const compat = { ...(base.compat as object), sendSessionAffinityHeaders: affinity };
-		// Thinking/reasoning declaration (field 2026-11-02): a per-model config
-		// override wins; absent → inherit the base registry model's capability.
-		// Hand-built relay models otherwise carry whatever flag the matched base
-		// model had, and pi-ai clamps ANY requested level to off for a
-		// non-reasoning model — the gateway's own default-thinking (qwen) went
-		// unmanaged. Declaring the level also lets clampThinkingLevel degrade an
-		// unsupported level safely instead of erroring at the gateway.
-		const levelOverride = supplier.modelThinkingLevel?.[modelId];
-		const reasoning = levelOverride !== undefined ? levelOverride !== "off" : base.reasoning;
-		// Never overwrite a provider's own mapping — in particular its explicit
-		// "unsupported" markers (null). A chosen EXECUTION level is not a claim
-		// about what the provider supports: when the base model already answers
-		// for that level, its answer (including null) stands, and pi-ai's
-		// clampThinkingLevel downgrades ours accordingly.
-		const baseMap = base.thinkingLevelMap ?? {};
-		const thinkingLevelMap = levelOverride !== undefined && levelOverride !== "off" && !(levelOverride in baseMap)
-			? { ...baseMap, [levelOverride]: levelOverride }
-			: base.thinkingLevelMap;
-		return { ...base, id: modelId, name: modelId, input, contextWindow, reasoning, ...(thinkingLevelMap ? { thinkingLevelMap } : {}), ...(maxTokens !== undefined ? { maxTokens } : {}), ...(baseUrl ? { baseUrl } : {}), compat } as Model<Api>;
+		// Thinking declaration (field 2026-11-02, corrected by review round 2):
+		// modelThinkingLevel is the REQUESTED execution level, NOT a capability
+		// claim. model.reasoning stays the base model's own capability — flipping
+		// it off made pi-ai drop the explicit disable param (qwen's
+		// enable_thinking:false), so a default-thinking gateway kept thinking
+		// despite the user selecting off; and injecting [level]: level into the
+		// map erased real "unsupported" markers (xhigh:null), defeating the
+		// automatic downgrade. Capability comes from the model; the level rides
+		// on the request (agent.state / options.reasoning) and pi-ai's
+		// clampThinkingLevel degrades anything the model can't do.
+		return { ...base, id: modelId, name: modelId, input, contextWindow, ...(maxTokens !== undefined ? { maxTokens } : {}), ...(baseUrl ? { baseUrl } : {}), compat } as Model<Api>;
 	}
 
 	/**
@@ -1068,6 +1064,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 				tools: this.buildToolSetFor(conversationId),
 				// Main-turn thinking level follows the per-model declaration (single
 				// source with the progress side pass); absent → off (old behavior).
+				// Declared "off" is forwarded EXPLICITLY (provider disable param);
+				// absent declaration keeps the historical default.
 				thinkingLevel: (supplier.modelThinkingLevel?.[modelId] ?? "off") as ThinkingLevel,
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
@@ -2607,17 +2605,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 					"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过120字的中文汇报进展，且必须严格按以下四段结构输出，四段缺一不可，用中文标签：「已完成：…」「剩余：…」「正在：…」「卡点：…」。记录里查不到依据的段落一律写「暂未确认」——严禁在记录没有依据时推断成「无」，严禁编造数字或进度；但**执行记录本身就是依据**：助手叙述、工具调用与工具返回结果里真实发生的事（如「登录态有效，改用 Playwright 访问 spay」「已导出到第 3 批」）必须如实归纳进对应字段，不许因为「没有现成的进度数字」就整段写暂未确认——工具正在做什么、卡在哪一步、用户还需要做什么，这些都是有效信息；卡点查不到依据时写「暂无」；只有当执行记录明确显示当前没有任何障碍时，卡点才可以写「无」。禁止输出「## Goal」「## Constraints & Preferences」「## Next Steps」等英文模板标题——那是会话压缩总结的模板，不是进展汇报，出现了就是错误输出；禁止照抄任务目标原文或执行条件来充当进展；节选中更早的其他请求都是早已完成的旧任务，绝对不要提及；把琐碎的执行步骤归纳为阶段性成果，禁止提及工具名、参数、重试等技术细节；只依据记录中真实发生的事，绝不编造未发生的进度。",
 					undefined, // previousSummary
 					// Side pass follows the SAME level the main turn runs at
-					// (agent.state.thinkingLevel is synced on every build/switch path —
-					// model.provider is a registry provider id, NOT a supplier id, so
-					// looking the supplier up here silently fell back to the default).
-					// A reasoning model with no explicit choice defaults to xhigh;
-					// clampThinkingLevel degrades it safely, and a non-reasoning model
-					// never gets thinking params at all.
-					model.reasoning
-						? ((agent.state.thinkingLevel && agent.state.thinkingLevel !== "off")
-							? agent.state.thinkingLevel as ThinkingLevel
-							: SIDE_PASS_DEFAULT_LEVEL)
-						: undefined,
+					// (agent.state.thinkingLevel is synced on every build/switch path).
+					// "off" is forwarded explicitly so the provider emits its disable
+					// param (qwen enable_thinking:false) instead of inheriting a
+					// default-thinking gateway; undefined (no declared level and legacy
+					// off) keeps the historical no-param behavior; a reasoning model with
+					// an explicit non-off level defaults UP to xhigh only when the model
+					// gives no level at all — never asserted as a capability.
+					(conversationId !== undefined && this.resolveForConversation(conversationId).supplier.modelThinkingLevel?.[agent.state.model.id] === "off")
+						? "off" as ThinkingLevel
+						: ((agent.state.thinkingLevel && agent.state.thinkingLevel !== "off"
+							? agent.state.thinkingLevel
+							: (agent.state.model.reasoning ? SIDE_PASS_DEFAULT_LEVEL : undefined)) as ThinkingLevel | undefined),
 					this.rawStreamFn,
 					undefined, // env
 					SUMMARIZER_RETRY,

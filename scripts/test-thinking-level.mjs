@@ -72,20 +72,23 @@ test("config: absent declaration stays absent (inherit semantics preserved)", ()
 	assert.equal(store.all().model.suppliers[0].modelThinkingLevel, undefined);
 });
 
-test("builder: an absent declaration leaves the base reasoning capability untouched", () => {
-	// reasoning flag: declared off/none → false; undeclared → inherit base.
-	assert.match(engineSrc, /const reasoning = levelOverride !== undefined \? levelOverride !== "off" : base\.reasoning;/,
-		"undeclared models inherit the base registry capability (no behavioral change)");
+test("builder: reasoning capability is NEVER touched by the declaration", () => {
+	// Review round 2 P1: declaring "off" used to flip model.reasoning=false, which
+	// made pi-ai drop the explicit disable param (qwen enable_thinking:false) — a
+	// default-thinking gateway kept thinking despite the user selecting off.
+	assert.ok(!/const reasoning = levelOverride/.test(engineSrc),
+		"the declaration must not rewrite the model's reasoning capability");
+	assert.match(engineSrc, /return \{ \.\.\.base, id: modelId, name: modelId, input, contextWindow, \.\.\.\(maxTokens !== undefined/,
+		"withIdentity returns the base model's own reasoning capability");
 });
 
-test("builder: a declared level never overwrites the provider's own mapping (null=unsupported survives)", () => {
-	// Code review P1 2026-11-02: writing `[level]: level` unconditionally erased
-	// an explicit `xhigh: null` marker and made pi-ai clamp emit xhigh anyway,
-	// defeating the promised downgrade.
-	assert.match(engineSrc, /!\(levelOverride in baseMap\)/,
-		"declared execution level must not claim provider support the base model denies");
-	assert.match(engineSrc, /!\(levelOverride in baseMap\)[\s\S]{0,80}\[levelOverride\]: levelOverride/,
-		"the self-mapping is guarded by the base-map check");
+test("builder: no thinkingLevelMap injection at all (capability stays with the model)", () => {
+	// Review round 2 P2: even the guarded injection promoted an absent xhigh/max
+	// into "supported" (pi-ai treats a MISSING xhigh/max entry as unsupported).
+	// The execution level must never mutate capability maps.
+	assert.ok(!/thinkingLevelMap/.test(
+		engineSrc.slice(engineSrc.indexOf("private withIdentity"), engineSrc.indexOf("resolveModel(supplier"))),
+		"withIdentity must not fabricate thinkingLevelMap entries");
 });
 
 test("main turn: default stays off so existing installs behave identically", () => {
@@ -124,8 +127,11 @@ test("durable (default kernel): the stream bridge applies the declared level", (
 	const bridge = engineSrc.slice(i, i + 1600);
 	assert.match(bridge, /const declared = supplier\.modelThinkingLevel\?\.\[modelId\];/,
 		"durable bridge reads the per-model declaration");
-	assert.match(bridge, /reasoning: undefined/,
-		"an off/undeclared level must not inherit a stale reasoning option");
+	// Review round 2 P1: an explicit "off" must be FORWARDED (reasoning:"off"),
+	// not turned into reasoning:undefined — undefined makes pi-ai omit the
+	// provider's disable param, so a default-thinking gateway kept thinking.
+	assert.match(bridge, /declared !== undefined\s*\?\s*\(declared as ThinkingLevel\)\s*:\s*options\.reasoning/,
+		"declared off forwards reasoning:\"off\"; only the absent case keeps the harness default");
 });
 
 test("renderer: reset and auth-supplier rebuild keep the thinking map", () => {
