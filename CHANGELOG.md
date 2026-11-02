@@ -4,6 +4,24 @@
 
 开源前的内部迭代细节不在此逐一罗列（完整历史见 git log）；以下从开源基线版本开始记录。
 
+## v0.2.184 — work gates accept owner, progress notes finally push, per-model thinking levels
+
+### English
+
+**Owner-created autonomous work no longer bounces back to "awaiting human" (P0)**: the WorkService window gate — a separate inline check in `electron/main.ts`, not the `work.ts` gate fixed in v0.2.182 — still compared `resolveRole === "admin"` literally, so an owner-created work item passed creation, then EVERY execution window judged "admin identity missing" and wrote itself back to `waiting_human`. The field loop was: admin resumes → "re-queued" → next window bounced again. Both gates now share one authority, `isDeclaredAdmin()` (explicit declaration + rank ≥ admin), preserving the rule that a permissive `defaultRole` cannot resurrect a removed confirmer — while credential egress keeps the live `isAdmin()` (honours `defaultRole`) after a review catch.
+
+**Autonomous-task progress notes actually push again**: every side-pass summary died with `Summarization failed: generation hit the token cap` — the 512-token reserve (409 after pi-ai's 0.8 factor) is SHARED by thinking and the answer, and default-thinking qwen consumed the whole budget on a 120-char report. The output reserve is now 4096 (still clamped by the model's max tokens), and thinking level is configurable per model.
+
+**Per-model thinking levels (设置 → 模型 → 思考档位)**: each model can declare a pi thinking level (`off/minimal/low/medium/high/xhigh/max`). Capability semantics differ by supplier kind — relay (hand-entered baseUrl) suppliers take the declaration as the capability truth (the borrowed base model describes a different upstream); account-login suppliers keep the registry model's capability and the declaration only sets the requested level. `off` strips to "no level" (the literal form forces thinking ON on Anthropic-API models and can produce `max_tokens: null`); pi-ai's `clampThinkingLevel` degrades unsupported levels automatically; undeclared models behave exactly as before. Verified by payload-level probes (real `streamSimple` + `onPayload`) across four independent review rounds.
+
+### 中文
+
+**owner 创建的自主任务不再反复打回「待人工恢复」（P0）**：WorkService 的窗口开工门禁是 `electron/main.ts` 里另一段内联判断（不是 v0.2.182 修过的 `work.ts` 那处），仍按 `resolveRole === "admin"` 字面比较——owner 创建的任务创建成功，但**每个执行窗口**都被判「管理员身份缺失」写回 `waiting_human`。现场循环：管理员恢复 → 「已重新入队」→ 下个窗口又被打回。两处门禁现收敛到同一权威 `isDeclaredAdmin()`（显式声明 + rank ≥ admin），保留「permissive defaultRole 不能复活已移除确认人」的防护；凭据外发经 review 提醒仍用实时的 `isAdmin()`（尊重 `defaultRole`）。
+
+**自主任务进度汇报恢复推送**：旁路总结全部死于 `generation hit the token cap`——512 token 预留（pi-ai 折算 409）由思考与正文**共享**，默认开思考的 qwen 在一段 120 字汇报上就能吃满预算。输出预留提到 4096（仍受模型 max tokens 钳制），且思考档位可按模型配置。
+
+**每模型思考档位（设置 → 模型 → 思考档位）**：每个模型可声明 pi 思考档位（`off/minimal/low/medium/high/xhigh/max`）。能力语义按供应商类型分叉——中继型（手填 baseUrl）以声明为能力真源（借来的基底模型描述的是另一个上游）；账号登录型保持 registry 模型能力、声明只设请求档位。`off` 剥离为「无档位」（字面 off 在 anthropic API 模型上会强制开启思考、甚至产生 `max_tokens: null`）；不支持的档位由 pi-ai `clampThinkingLevel` 自动降级；未声明的模型行为与之前完全一致。经四轮独立 review 的 payload 级探针（真实 `streamSimple` + `onPayload`）验证。
+
 ## v0.2.183 — MCP settings UI, durable streaming for widgets, and a P0 widget CSS fix
 
 ### English
