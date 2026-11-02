@@ -94,6 +94,7 @@ export function ModelServiceSection({ model, onUpdate }: Props) {
 			...(existing?.modelImage ? { modelImage: existing.modelImage } : {}),
 			...(existing?.modelContextWindow ? { modelContextWindow: existing.modelContextWindow } : {}),
 			...(existing?.modelMaxTokens ? { modelMaxTokens: existing.modelMaxTokens } : {}),
+			...(existing?.modelThinkingLevel ? { modelThinkingLevel: existing.modelThinkingLevel } : {}),
 			authProvider: entry.provider,
 		};
 		const suppliers = existing

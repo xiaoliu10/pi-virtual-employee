@@ -485,7 +485,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 			tools: (id) => this.buildToolSetFor(id),
 			stream: (id, options, messages) => {
 				const { supplier, modelId } = this.resolveForConversation(id);
-				return this.makeStreamFn(id)(this.resolveModel(supplier, modelId), normalizeContext({ messages }), { ...options, sessionId: id, apiKey: this.apiKeyFor(supplier) });
+				const model = this.resolveModel(supplier, modelId);
+				// Durable is the DEFAULT kernel and drives the harness pipeline, so the
+				// Agent's own thinkingLevel never reaches the request here (Copilot
+				// review 2026-11-02). Apply the per-model declared level explicitly —
+				// otherwise a configured low/high changed only the side pass and the
+				// main turn silently kept whatever the harness defaults to.
+				const declared = supplier.modelThinkingLevel?.[modelId];
+				const level = declared !== undefined ? declared : (model.reasoning && options.reasoning ? options.reasoning : undefined);
+				const reasoning = level && level !== "off" ? (level as ThinkingLevel) : undefined;
+				return this.makeStreamFn(id)(model, normalizeContext({ messages }), {
+					...options, ...(reasoning ? { reasoning } : { reasoning: undefined }), sessionId: id, apiKey: this.apiKeyFor(supplier),
+				});
 			},
 			withActor: async (id, ctx, text, run) => {
 				if (ctx.actor) this.turnActor.set(id, { ...ctx.actor, text });

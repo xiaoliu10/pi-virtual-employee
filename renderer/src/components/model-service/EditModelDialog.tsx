@@ -123,6 +123,7 @@ export function EditModelDialog(props: EditModelDialogProps) {
 							setContextWindow(String(supplier.modelContextWindow?.[modelId] ?? ""));
 							setMaxTokens(String(supplier.modelMaxTokens?.[modelId] ?? ""));
 							setImage(supplier.modelImage?.[modelId] ?? "inherit");
+							setThinking(supplier.modelThinkingLevel?.[modelId] ?? "");
 						}}
 						className="rounded-xl px-4 py-2.5 text-sm font-medium text-slate-500 hover:bg-slate-100"
 					>

@@ -115,3 +115,24 @@ test("model switches keep the agent's level in sync on every path", () => {
 	assert.ok(syncs.length >= 3,
 		`default-model loop, pin, and unpin all sync thinkingLevel (found ${syncs.length})`);
 });
+
+test("durable (default kernel): the stream bridge applies the declared level", () => {
+	// Copilot review 2026-11-02: DurableRuntime drives the harness pipeline, so the
+	// Agent's thinkingLevel never reaches the request. Without this the main turn
+	// silently kept the harness default while only the side pass honored the config.
+	const i = engineSrc.indexOf("async openDurableRuntime");
+	const bridge = engineSrc.slice(i, i + 1600);
+	assert.match(bridge, /const declared = supplier\.modelThinkingLevel\?\.\[modelId\];/,
+		"durable bridge reads the per-model declaration");
+	assert.match(bridge, /reasoning: undefined/,
+		"an off/undeclared level must not inherit a stale reasoning option");
+});
+
+test("renderer: reset and auth-supplier rebuild keep the thinking map", () => {
+	const dlg = readFileSync(join(root, "renderer/src/components/model-service/EditModelDialog.tsx"), "utf8");
+	assert.match(dlg, /setThinking\(supplier\.modelThinkingLevel\?\.\[modelId\] \?\? ""\)/,
+		"恢复默认 also resets the thinking level (Copilot review)");
+	const svc = readFileSync(join(root, "renderer/src/components/ModelServiceSection.tsx"), "utf8");
+	assert.match(svc, /existing\?\.modelThinkingLevel \? \{ modelThinkingLevel: existing\.modelThinkingLevel \}/,
+		"rebuilding an auth supplier preserves its configured levels (Copilot review)");
+});
