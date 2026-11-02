@@ -356,6 +356,28 @@ test("CORS preflight allows the X-VE-Ticket header (review P0-2)", async (t) => 
 // ── SSE process streaming (v0.2.179): the widget shows thinking/tools/text live ──
 
 /** A runtime stub whose agent emits scripted events around the reply. */
+/**
+ * A durable-style runtime: `agent.subscribe` delivers NOTHING (the durable kernel
+ * never calls agent.prompt) and `streamsProcessEvents` is false. Process events
+ * arrive only through the `SendCtx.onProcessEvent` sink.
+ */
+function makeDurableRuntime(options) {
+	const events = options.script;
+	let subscribed = 0;
+	return {
+		streamsProcessEvents: false,
+		isReadOnlyConversation: () => false,
+		getOrCreateSession: () => ({
+			subscribe: () => { subscribed += 1; return () => {}; },
+		}),
+		subscribedCount: () => subscribed,
+		send: async (_agent, _message, ctx) => {
+			for (const event of events) ctx.onProcessEvent?.(event);
+			return { reply: options.finalReply ?? "done" };
+		},
+	};
+}
+
 function makeStreamingRuntime(options) {
 	const events = Array.isArray(options) ? options : options.script;
 	const listeners = new Set();
@@ -470,13 +492,14 @@ test("streaming chat without a ticket is refused before the stream starts", asyn
 
 // ── durable-kernel fallback (review P0-3): no process events → honest JSON ──
 
-test("a runtime without process events serves JSON even when the client asks for SSE", async (t) => {
-	// The durable kernel never drives agent.subscribe (review probe: 0 events
-	// across a full turn), so an SSE stream there would be meta→done with a
-	// silent hole. The runtime declares its capability and the widget falls
-	// back to the JSON path the client already renders.
-	const runtime = makeStreamingRuntime({ script: [], finalReply: "durable 回复" });
-	runtime.streamsProcessEvents = false;
+test("streamsProcessEvents=false no longer forces a JSON fallback", async (t) => {
+	// This used to assert the opposite: the durable kernel drives nothing on
+	// agent.subscribe, so an SSE stream would have been meta→done with a silent
+	// hole and the widget fell back to JSON (users then stared at an empty bubble
+	// for the entire generation). The runtime now reports process events through
+	// SendCtx.onProcessEvent, so `streamsProcessEvents` only answers the legacy
+	// subscribe question — it must NOT disable streaming.
+	const runtime = makeDurableRuntime({ script: [{ type: "text_delta", delta: "分段" }], finalReply: "分段到达" });
 	const { base, session, server } = await start({ runtime });
 	t.after(() => { server.closeAllConnections?.(); server.close(); });
 	const tk = await session("u1", "viewer");
@@ -487,9 +510,10 @@ test("a runtime without process events serves JSON even when the client asks for
 		body: JSON.stringify({ message: "hi" }),
 	});
 	assert.equal(res.status, 200);
-	assert.match(res.headers.get("content-type") ?? "", /application\/json/, "JSON fallback, not an empty stream");
-	const data = await res.json();
-	assert.equal(data.reply, "durable 回复");
+	assert.match(res.headers.get("content-type") ?? "", /text\/event-stream/, "still a stream, not JSON");
+	const events = await readSse(res);
+	assert.ok(events.some((e) => e.type === "delta" && e.text === "分段"), "the sink's delta reached the client");
+	assert.equal(events.at(-1).type, "done");
 });
 
 test("a runtime WITH process events streams SSE as before", async (t) => {
@@ -531,4 +555,42 @@ test("a throwing subscribe must not wedge inFlight (round-2 heartbeat probe A)",
 	const tk2 = await session("u1", "viewer");
 	const second = await post("/api/widget/chat", { message: "again" }, { "x-ve-ticket": tk2, origin: "https://oa.example.com", accept: "text/event-stream" });
 	assert.notEqual(second.status, 429, "the conversation must NOT be wedged as busy forever");
+});
+
+test("durable kernel streams through the sink even though subscribe sees nothing", async (t) => {
+	// Field report: v0.2.167+ defaults to durable, where agent.subscribe observes
+	// zero events, so the widget fell back to JSON and users stared at an empty
+	// bubble for the whole generation. The sink must carry the same process events.
+	const runtime = makeDurableRuntime({
+		finalReply: "订单 A 已发货。",
+		script: [
+			{ type: "thinking_delta", delta: "用户问发货，" },
+			{ type: "tool_start", toolName: "order_lookup", toolCallId: "c1" },
+			{ type: "tool_end", toolName: "order_lookup", toolCallId: "c1", isError: false, durationMs: 130 },
+			{ type: "text_delta", delta: "订单 A " },
+			{ type: "text_delta", delta: "已发货。" },
+		],
+	});
+	const { base, session, server } = await start({ runtime });
+	t.after(() => { server.closeAllConnections?.(); server.close(); });
+	const tk = await session("u1", "viewer");
+
+	const res = await fetch(base + "/api/widget/chat", {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}`, "x-ve-ticket": tk, accept: "text/event-stream", origin: "https://oa.example.com" },
+		body: JSON.stringify({ message: "A 发货了吗" }),
+	});
+	assert.equal(res.status, 200);
+	assert.match(res.headers.get("content-type") ?? "", /text\/event-stream/, "durable answers with SSE, not JSON");
+
+	const events = await readSse(res);
+	const types = events.map((e) => e.type);
+	assert.equal(types[0], "meta");
+	assert.deepEqual(
+		types.slice(1, -1),
+		["thinking_delta", "tool_start", "tool_end", "delta", "delta"],
+		"the sink's events reach the client in order",
+	);
+	assert.equal(types[types.length - 1], "done");
+	assert.equal(runtime.subscribedCount(), 0, "no subscribe was needed (durable provides nothing there)");
 });

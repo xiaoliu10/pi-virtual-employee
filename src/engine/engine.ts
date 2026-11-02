@@ -88,6 +88,14 @@ export type ImageSender = (filePath: string) => Promise<{ ok: boolean; url?: str
  * robotCode/conversationId; channels that can't (console/HTTP) omit it, and the
  * tool degrades to an archived-path notice.
  */
+/** The subset of process events any kernel can report live. Mirrors the widget's
+ * SSE vocabulary so one consumer serves both kernels. */
+export type TurnProcessEvent =
+	| { type: "text_delta"; delta: string }
+	| { type: "thinking_delta"; delta: string }
+	| { type: "tool_start"; toolName: string; toolCallId: string }
+	| { type: "tool_end"; toolName: string; toolCallId: string; isError?: boolean; durationMs?: number };
+
 export interface SendCtx {
 	sendFile?: FileSender;
 	/** Inline image sender for the send_image tool (IM channels that support it). */
@@ -104,6 +112,13 @@ export interface SendCtx {
 	conversationName?: string;
 	/** Called right after a message is persisted, so the UI can reload this conversation live. */
 	onPersist?: (conversationId: string) => void;
+	/**
+	 * Live process events for THIS turn (thinking deltas, streamed text, tool
+	 * calls). The durable kernel never drives `agent.subscribe`, so callers that
+	 * want progressive output pass a sink instead of subscribing; the runtime
+	 * translates its harness events into this shape. Legacy kernel ignores it.
+	 */
+	onProcessEvent?: (event: TurnProcessEvent) => void;
 	/**
 	 * Evaluation run: the turn is answered but NOT persisted and NOT recorded in
 	 * telemetry. Keeps prompt experiments out of the transcript, the sidebar and —
@@ -133,11 +148,13 @@ export interface EmployeeRuntime {
 	/**
 	 * Whether `agent.subscribe` receives live process events (text/thinking
 	 * deltas, tool executions) during `send`. Legacy/pi-session kernels drive the
-	 * Agent directly, so it does. The durable kernel (the DEFAULT since v0.2.167)
-	 * drives the harness's own pipeline and never calls agent.prompt, so agent
-	 * subscriptions observe NOTHING — measured in review: 0 events across a full
-	 * durable turn. SSE consumers (the widget) must fall back to JSON when this
-	 * is false instead of streaming an empty channel.
+	 * Agent directly, so it does. The durable kernel drives the harness pipeline
+	 * and never calls agent.prompt, so agent subscriptions observe NOTHING
+	 * (measured: 0 events across a full durable turn).
+	 *
+	 * Durable still reports its process events — pass `SendCtx.onProcessEvent`.
+	 * Progressive consumers (the widget) should use that sink; `agent.subscribe`
+	 * is the legacy-channel answer and is false under durable.
 	 */
 	readonly streamsProcessEvents?: boolean;
 }
@@ -544,7 +561,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 		return c.model.defaultModelId || this.availableModels()[0]?.modelId || "unknown";
 	}
 
-	/** Only the legacy kernel drives the Agent (and thus its subscribers) live. */
+	/** `agent.subscribe` is live only on the legacy kernel; durable reports its
+	 * process events through `SendCtx.onProcessEvent` instead. */
 	get streamsProcessEvents(): boolean {
 		return this.opts.kernel !== "durable";
 	}

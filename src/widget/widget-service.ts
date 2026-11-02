@@ -28,7 +28,7 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { gateOutboundText } from "../im/credential-egress.js";
 import type { AgentEvent } from "@earendil-works/pi-agent-core";
-import type { EmployeeRuntime } from "../engine/engine.js";
+import type { EmployeeRuntime, TurnProcessEvent } from "../engine/engine.js";
 import { renderWidgetPage, renderWidgetLoader, type LauncherLook } from "./widget-assets.js";
 import { TicketStore, secretMatches, widgetConversationKey, type WidgetRole } from "./widget-ticket.js";
 
@@ -403,13 +403,14 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 			// at a frozen bubble, which the field called out as unusable. With
 			// Accept: text/event-stream we forward the same process events the
 			// desktop console shows: thinking, tool calls, and streaming text.
-			const wantsStream =
-				(req.headers.accept ?? "").includes("text/event-stream") &&
-				// The durable kernel (the DEFAULT) never drives agent.subscribe, so an
-				// SSE stream would carry only meta→done — silently no process events
-				// (review P0-3). Fall back to the JSON path there; the client renders
-				// its "thinking…" placeholder either way.
-				deps.runtime.streamsProcessEvents !== false;
+			// SSE is always available. The durable kernel (the DEFAULT) does not drive
+			// `agent.subscribe`, so subscribing there yielded meta→done with no
+			// process events and the widget used to fall back to JSON — the user then
+			// stared at an empty bubble for the whole generation (field report). The
+			// runtime now REPORTS its process events through `SendCtx.onProcessEvent`
+			// on both kernels, so streaming works regardless of which one is active.
+			const wantsStream = (req.headers.accept ?? "").includes("text/event-stream");
+			const subscribeLive = deps.runtime.streamsProcessEvents !== false;
 			const actor = {
 				senderId: `widget-user-${ticket.conversationKey}`,
 				channel: "widget" as const,
@@ -478,27 +479,44 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 					// wedge inFlight (review round 2, heartbeat probe A).
 					let unsubscribe: () => void = () => {};
 					try {
-						unsubscribe = agent.subscribe((event: AgentEvent) => {
+						// One sink for both kernels: the runtime translates its live
+						// events into this shape (durable: harness events; legacy: the
+						// Agent's own events). Subscribing is kept ONLY for a legacy
+						// runtime that ignores the sink, so no kernel loses streaming.
+						const applyEvent = (event: TurnProcessEvent) => {
 							switch (event.type) {
-								case "message_update": {
-									// The delta event carries exactly the new bytes — no need to
-									// diff the message snapshot.
-									const a = event.assistantMessageEvent;
-									if (a.type === "text_delta") pushText(a.delta);
-									else if (a.type === "thinking_delta") pushThinking(a.delta);
+								case "text_delta":
+									pushText(event.delta);
 									break;
-								}
-								case "tool_execution_start":
+								case "thinking_delta":
+									pushThinking(event.delta);
+									break;
+								case "tool_start":
 									sse({ type: "tool_start", toolName: event.toolName, toolCallId: event.toolCallId });
 									break;
-								case "tool_execution_end":
+								case "tool_end":
 									sse({ type: "tool_end", toolName: event.toolName, toolCallId: event.toolCallId, isError: event.isError === true, durationMs: event.durationMs });
 									break;
 								default:
 									break;
 							}
-						});
-						const { reply, error } = await deps.runtime.send(agent, message, { actor });
+						};
+						if (subscribeLive) {
+							unsubscribe = agent.subscribe((event: AgentEvent) => {
+								if (event.type === "message_update") {
+									// The delta event carries exactly the new bytes — no need to
+									// diff the message snapshot.
+									const a = event.assistantMessageEvent;
+									if (a.type === "text_delta") applyEvent({ type: "text_delta", delta: a.delta });
+									else if (a.type === "thinking_delta") applyEvent({ type: "thinking_delta", delta: a.delta });
+								} else if (event.type === "tool_execution_start") {
+									applyEvent({ type: "tool_start", toolName: event.toolName, toolCallId: event.toolCallId });
+								} else if (event.type === "tool_execution_end") {
+									applyEvent({ type: "tool_end", toolName: event.toolName, toolCallId: event.toolCallId, isError: event.isError === true, durationMs: event.durationMs });
+								}
+							});
+						}
+						const { reply, error } = await deps.runtime.send(agent, message, { actor, onProcessEvent: applyEvent });
 						if (error) {
 							sse({ type: "error", message: error });
 						} else {
