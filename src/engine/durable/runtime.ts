@@ -1,9 +1,9 @@
 /** Durable execution owned by VE; UI history is a projection of the transcript. */
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createModels, createProvider, createAssistantMessageEventStream, type Model, type Api, type Message, type AssistantMessage, type SimpleStreamOptions } from "@earendil-works/pi-ai";
-import { defineDoc, ProviderDoc, type Conversation, type ConversationId, type Cursor, type ToolRegistration } from "@earendil-works/pi-durable";
+import { defineDoc, ProviderDoc, watchEvents, type Conversation, type ConversationId, type Cursor, type ToolRegistration } from "@earendil-works/pi-durable";
 import type { Agent, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
-import type { SendCtx, SendResult } from "../engine.js";
+import type { SendCtx, SendResult, TurnProcessEvent } from "../engine.js";
 import type { HistoryStore } from "../../db/history-store.js";
 import { openDurableHost, type DurableHost } from "./harness-host.js";
 import { toDurableTool } from "./ve-tools.js";
@@ -240,10 +240,20 @@ export class DurableRuntime {
 		this.providerRoutes.set(provider.sessionId, conv.id);
 		this.liveContexts.set(conv.id, ctx ?? {});
 		this.track(conv, id);
-		this.opts.history.ensureConversation(id, text.slice(0, 40));
-		this.opts.history.appendMessage(id, "user", text);
-		ctx?.onPersist?.(id);
+		// Live process events for this turn. The durable kernel drives the harness
+		// pipeline, so `agent.subscribe` observes nothing (measured: 0 events over a
+		// full durable turn) — the harness publishes its own event stream instead,
+		// which we translate into the same vocabulary the legacy kernel emits so one
+		// consumer (the widget's SSE) serves both. Failure here must never affect
+		// the turn: it only costs progressive rendering.
+		const stopWatching = ctx?.onProcessEvent ? await this.watchProcess(conv.id, ctx.onProcessEvent) : undefined;
 		try {
+			// Inside the try so ANY failure after the watch was created still reaches
+			// the teardown below — a history write or onPersist callback that throws
+			// must not leave the watcher attached to the turn's sink (review).
+			this.opts.history.ensureConversation(id, text.slice(0, 40));
+			this.opts.history.appendMessage(id, "user", text);
+			ctx?.onPersist?.(id);
 			const content = ctx?.images?.length ? [{ type: "text" as const, text }, ...ctx.images.map((image) => ({ type: "image" as const, ...image }))] : text;
 			const submission = await conv.submit({ type: "input", content, requestId: `ve:${conv.id}` }, context);
 			const outcome = await submission.wait(context);
@@ -251,7 +261,11 @@ export class DurableRuntime {
 			await this.project(conv, result);
 			ctx?.onPersist?.(id);
 			return result;
-		} finally { this.liveContexts.delete(conv.id); this.untrack(conv, id); }
+		} finally {
+			await stopWatching?.();
+			this.liveContexts.delete(conv.id);
+			this.untrack(conv, id);
+		}
 	}
 	/**
 	 * Read a finished run's answer. A submission that reaches `done` can still
@@ -272,6 +286,71 @@ export class DurableRuntime {
 			? { reply: "执行已暂停，请检查恢复状态。", error: "durable submission unanswered" }
 			: { reply: EMPTY_ANSWER_REPLY, error: "durable empty answer" };
 	}
+	/**
+	 * Did this tool call end as a failure?
+	 *
+	 * The obvious reading (`no entry and no result`) is WRONG here: VE's tools
+	 * catch their own throws and RETURN `{ isError: true }` (ve-tools.ts), so a
+	 * faulted tool still produces a result entry — the old check therefore painted
+	 * every failure as a success checkmark (review). The authoritative flag is on
+	 * the persisted toolResult message (`entry.model[0].isError`), with the
+	 * missing-entry case kept for a call that was orphaned or never ran.
+	 */
+	private static endedAsError(event: { entry?: { model?: readonly unknown[] }; result?: { isError?: boolean } }): boolean {
+		if (event.result?.isError === true) return true;
+		if (event.entry === undefined) return true; // orphaned / faulted without a result
+		const message = (event.entry.model ?? [])[0] as { role?: string; isError?: boolean } | undefined;
+		return message?.isError === true;
+	}
+
+	/**
+	 * Translate the harness event stream of ONE conversation into TurnProcessEvents.
+	 *
+	 * `message_update.changes` carries the in-flight assistant message's
+	 * increments (`text_delta` / `thinking_delta`), and tool events carry start and
+	 * end with their call id — enough for the widget's progressive rendering.
+	 * Text is NOT deduplicated here: the widget's outbound credential gate already
+	 * accumulates and decides what to send.
+	 */
+	private async watchProcess(conversationId: ConversationId, emit: (event: TurnProcessEvent) => void): Promise<() => Promise<void>> {
+		try {
+			const stream = await watchEvents(this.host.harness, conversationId, context);
+			const startedAt = new Map<string, number>();
+			stream.start(async (events) => {
+				for (const event of events) {
+					try {
+						if (event.type === "message_update") {
+							for (const change of event.changes) {
+								if (change.type === "text_delta") emit({ type: "text_delta", delta: change.delta });
+								else if (change.type === "thinking_delta") emit({ type: "thinking_delta", delta: change.delta });
+							}
+						} else if (event.type === "tool_execution_start") {
+							startedAt.set(event.toolCallId, Date.now());
+							emit({ type: "tool_start", toolName: event.toolName, toolCallId: event.toolCallId });
+						} else if (event.type === "tool_execution_end") {
+							const began = startedAt.get(event.toolCallId);
+							startedAt.delete(event.toolCallId);
+							emit({
+								type: "tool_end",
+								toolName: event.toolName,
+								toolCallId: event.toolCallId,
+								isError: DurableRuntime.endedAsError(event),
+								durationMs: began === undefined ? undefined : Date.now() - began,
+							});
+						}
+					} catch (err) {
+						console.warn("[durable] process event failed:", err instanceof Error ? err.message : err);
+					}
+				}
+			});
+			return async () => { await stream.stop().catch(() => {}); };
+		} catch (err) {
+			// Watching is best-effort: a turn must still run and answer without it.
+			console.warn(`[durable] process watch unavailable for ${conversationId}:`, err instanceof Error ? err.message : err);
+			return async () => {};
+		}
+	}
+
 	private async project(conv: Conversation, result: SendResult): Promise<void> {
 		const route = this.routes.get(conv.id)!;
 		if (route.projected) return;

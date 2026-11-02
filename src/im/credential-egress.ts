@@ -312,6 +312,73 @@ function redactUrlCredentialParams(text: string): string {
 		inPresigned(offset, match.length) ? match : `${prefix}***`);
 }
 
+/**
+ * Length of the tail of `text` that must NOT be sent yet: it could still grow into
+ * a credential once more deltas arrive.
+ *
+ * Streaming split the gate open: `gateOutboundText` judges a STRING, and each
+ * increment was gated in isolation, so `密码：8392017` passed (no pattern matches a
+ * bare seven-digit number) and the next delta `4` completed the password — the
+ * first seven digits were already on the wire and a later `replace` cannot
+ * retract bytes a client has rendered (review, 2026-11-02). Holding back a
+ * bounded tail until it is decidably safe is the only way to stream and still
+ * withhold.
+ *
+ * The window is the longest prefix that the patterns could still extend: any
+ * dangling quote, quote-opened value, partial scheme or half-typed keyword. It is
+ * deliberately generous — a few withheld characters delay text, leaked bytes
+ * cannot be undone.
+ */
+export function streamingHoldbackLength(text: string): number {
+	if (!text) return 0;
+	// Look at the tail only: a credential pattern never spans more than this.
+	const window = 200;
+	const tail = text.slice(-window);
+	const base = text.length - tail.length;
+
+	let hold = 0;
+	const holdFrom = (index: number): void => {
+		if (index < 0) return;
+		const length = text.length - (base + index);
+		if (length > hold) hold = length;
+	};
+
+	// 1) An unterminated quote may still become a quoted secret value.
+	const lastQuote = Math.max(tail.lastIndexOf('"'), tail.lastIndexOf("'"));
+	if (lastQuote >= 0) {
+		const quote = tail[lastQuote];
+		const closed = tail.indexOf(quote, lastQuote + 1) >= 0;
+		if (!closed) holdFrom(lastQuote);
+	}
+
+	// 2) A pending key/value assignment or JSON field whose value may still grow.
+	//    `PASSWORD=abc123` is not a credential until 6+ chars follow the sigil, so
+	//    the shorter prefix passes the gate — hold the whole tail of the line.
+	const assign = /(?:PASSWORD|PASSWD|PWD|SECRET|TOKEN|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CLIENT_?SECRET)\s*=\s*["']?[^\s"']*$/i.exec(tail);
+	if (assign) holdFrom(assign.index);
+	const jsonField = /"(?:password|passwd|pwd|secret|token|api_?key|apikey|access_?key|client_?secret|secret_?key)"\s*:\s*"?[^"]*$/i.exec(tail);
+	if (jsonField) holdFrom(jsonField.index);
+
+	// 3) A URL still being written: a scheme, or userinfo without '@' yet.
+	const urlLike = /[a-z][a-z0-9+.-]*:\/\/[^\s]*$/i.exec(tail);
+	if (urlLike) {
+		const candidate = urlLike[0];
+		if (!candidate.includes("@") || /[?&][^\s&"']*$/.test(candidate)) holdFrom(urlLike.index);
+	}
+
+	// 4) A token prefix that the patterns may still match (sk-, ghp_, xox, eyJ…).
+	const tokenPrefix = /\b(?:sk-\w*|gh[pousr]_\w*|xox[abpsr]-[\w-]*|eyJ[\w-]*(?:\.[\w-]*){0,2}|Bearer\s+[\w.~+/-]*)$/.exec(tail);
+	if (tokenPrefix) holdFrom(tokenPrefix.index);
+
+	// 5) A bare digit run: `密码：83920174` matches no pattern as a whole, but a
+	//    LONG digit run following a password-ish label is exactly what the field
+	//    leaked. Hold digits while the label is still in view.
+	const labelRun = /(?:密码|口令|password|passwd|pwd|secret|token)[^\w]{0,3}([\dA-Za-z]{1,64})$/i.exec(tail);
+	if (labelRun) holdFrom(labelRun.index);
+
+	return Math.min(hold, text.length);
+}
+
 export function gateOutboundText(text: string, audience: CredentialAudience): string {
 	if (audience === "admin-single") return text;
 	const redacted = redactUrlCredentialParams(text);
