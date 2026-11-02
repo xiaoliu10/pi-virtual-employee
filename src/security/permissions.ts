@@ -131,6 +131,28 @@ export function isAdmin(config: ConfigStore, senderId: string | undefined | null
 }
 
 /**
+ * True when the sender is an EXPLICITLY DECLARED admin or owner — a person named
+ * in `adminStaffIds` / `ownerStaffIds` / `people[]` — and still holds that rank.
+ *
+ * This is stricter than `isAdmin()`: it deliberately does NOT honor
+ * `defaultRole`. A permissive default role must not resurrect a confirmer whose
+ * entry was removed, and a work/scheduled task created by an admin must stop
+ * running unattended the moment that admin is demoted. Owner counts because it
+ * is a strict superset of admin (v0.2.183: the work service had its own inline
+ * copy that compared === "admin", so owner-created tasks were parked into
+ * waiting_human at the start of every window).
+ */
+export function isDeclaredAdmin(config: ConfigStore, senderId: string | undefined | null): boolean {
+	if (!senderId) return false;
+	const security = config.all().security;
+	const declared =
+		security.adminStaffIds.includes(senderId) ||
+		Array.isArray(security.ownerStaffIds) && security.ownerStaffIds.includes(senderId) ||
+		security.people?.some((person) => person.staffId === senderId && (person.role === "admin" || person.role === "owner"));
+	return !!declared && ROLE_RANK[resolveRole(config, senderId)] >= ROLE_RANK.admin;
+}
+
+/**
  * Role that counts for a one-shot authorization decision (「确认授权」).
  *
  * Widget tickets participate: a ticketed admin confirming in the embedded
