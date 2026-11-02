@@ -168,8 +168,12 @@ test("wiring: durable bridge forwards the declared level incl. off", () => {
 	const i = engineSrc.indexOf("async openDurableRuntime");
 	const bridge = engineSrc.slice(i, i + 1800);
 	assert.match(bridge, /const declared = supplier\.modelThinkingLevel\?\.\[modelId\];/);
-	assert.match(bridge, /declared !== undefined\s*\?\s*\(declared as ThinkingLevel\)\s*:\s*options\.reasoning/,
-		"declared off forwards reasoning:'off'; absent keeps the harness default");
+	// Review round 4 P1 (probed): a literal "off" is truthy — anthropic-messages
+	// models FORCE thinking on (adaptive→effort high, non-adaptive→max_tokens:null),
+	// qwen off:null maps clamp to minimal→enable_thinking:true. "off" must strip to
+	// undefined, which yields each provider's real disable shape.
+	assert.match(bridge, /declared !== undefined && declared !== "off"\s*\?\s*\(declared as ThinkingLevel\)\s*:\s*undefined/,
+		"declared off strips to reasoning:undefined (never a literal off payload)");
 });
 
 test("wiring: main turn default stays off; every switch path syncs the level", () => {

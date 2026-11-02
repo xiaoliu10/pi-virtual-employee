@@ -491,13 +491,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 				// review 2026-11-02). Apply the per-model declared level explicitly —
 				// otherwise a configured low/high changed only the side pass and the
 				// main turn silently kept whatever the harness defaults to.
-				// An explicit level — INCLUDING "off" — must be forwarded: pi-ai needs
-				// a non-undefined reasoning to emit the provider's disable param
-				// (qwen enable_thinking:false). Absent declaration = harness default.
+				// Declared "off" maps to undefined — the SAME stripping the legacy
+				// path does (pi-agent-core agent-loop drops "off"; generateSummary
+				// too). undefined is what makes pi-ai emit each provider's real
+				// disable shape (anthropic thinkingEnabled:false / qwen
+				// enable_thinking:false); a literal "off" is TRUTHY and on
+				// anthropic-messages models FORCES thinking on (adaptive models
+				// default to effort "high", non-adaptive produce max_tokens:null —
+				// review round 4, probed). Absent declaration = harness default.
 				const declared = supplier.modelThinkingLevel?.[modelId];
-				const reasoning = declared !== undefined
+				const reasoning = declared !== undefined && declared !== "off"
 					? (declared as ThinkingLevel)
-					: options.reasoning;
+					: undefined;
 				return this.makeStreamFn(id)(model, normalizeContext({ messages }), {
 					...options, reasoning, sessionId: id, apiKey: this.apiKeyFor(supplier),
 				});
@@ -827,13 +832,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 			: ["anthropic"];
 	}
 
-	/** Resolve (supplier, modelId) for a conversation: override or global default. */
 	/** The per-model declared thinking level for the conversation's current model. */
 	private declaredThinkingLevel(modelId: string, conversationId?: string): string | undefined {
 		if (conversationId === undefined) return undefined;
 		return this.resolveForConversation(conversationId).supplier.modelThinkingLevel?.[modelId];
 	}
 
+	/** Resolve (supplier, modelId) for a conversation: override or global default. */
 	private resolveForConversation(
 		conversationId: string,
 	): { supplier: Supplier; modelId: string } {
