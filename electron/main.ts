@@ -516,6 +516,22 @@ async function main(): Promise<void> {
 		shellAuditLogPath: path.join(userData, "logs", "shell-audit.log"),
 		proposalsDir,
 	}, { timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000, kernel });
+	// stdio MCP transports own child processes — disconnect them on quit
+	// (best-effort: will-quit cannot await, fire and forget).
+	// Electron's will-quit cannot await, and the process dies with the event loop:
+	// a fire-and-forget dispose() can lose the race and leave stdio children alive
+	// (review P1). Delay the quit once, with a hard bound, so the cleanup finishes.
+	let mcpQuitGuard = false;
+	app.on("will-quit", (event) => {
+		if (mcpQuitGuard) return;
+		event.preventDefault();
+		mcpQuitGuard = true;
+		const bounded = Promise.race([
+			engine.disposeMcp().catch(() => {}),
+			new Promise((resolve) => setTimeout(resolve, 3000)),
+		]);
+		void bounded.finally(() => app.quit());
+	});
 	engine.setComputerService(computer);
 	// Run telemetry: the employee's own record of how its turns went (my_stats tool;
 	// later, the input to a self-improvement proposal loop). Pruned at startup,
@@ -1472,6 +1488,41 @@ ${tailForProgress(decision.text)}`;
 	 * instead of sitting in main.log.
 	 */
 	ipcMain.handle("widget:status", () => withLanAddresses(widgetState));
+
+	/**
+	 * Connect to ONE MCP server and report its tools — the settings page's
+	 * "test connection" button. Runs outside the engine's manager so a probe
+	 * never pollutes the live tool cache; the probe's own transport is closed.
+	 */
+	ipcMain.handle("mcp:test", async (_e, server: unknown) => {
+		const { createMcpManager } = await import("../src/engine/tools/mcp.js");
+		const { normalizeMcpServer, stripMcpToolPrefix } = await import("../src/shared/mcp.js");
+		// Validate the row as the user typed it (references preserved), then probe
+		// with real resolution — a probe must behave like the live connection.
+		const normalized = normalizeMcpServer(server, null);
+		if (!normalized.ok) return { ok: false as const, error: normalized.reason, tools: [] };
+		const manager = createMcpManager();
+		try {
+			const { report } = await manager.refresh({
+				// A per-server switch that is off must not make the probe fail with no
+				// reason: refresh() filters disabled entries, so the report would have
+				// no matching row (review). The probe connects regardless — testing a
+				// disabled row is exactly how you decide whether to enable it.
+				all: () => ({
+					capabilities: {
+						mcp: { enabled: true, servers: [{ ...(server as Record<string, unknown>), enabled: true }] },
+					},
+				}),
+			} as never);
+			const entry = report.find((r) => r.name === normalized.value.name);
+			const tools = entry?.ok
+				? manager.tools().map((tool) => stripMcpToolPrefix(normalized.value.name, tool.name))
+				: [];
+			return { ok: entry?.ok ?? false, error: entry?.error, tools };
+		} finally {
+			await manager.dispose();
+		}
+	});
 	/**
 	 * Find a free port for this profile and persist it. Exposed as a button so a
 	 * user can re-pick deterministically instead of waiting for a restart probe;
@@ -1518,6 +1569,11 @@ ${tailForProgress(decision.text)}`;
 		await im.sync().catch((err) => console.error("[im] sync failed", err));
 		engine.setRequestTimeoutMs((updated.general.requestTimeoutMin || 0) * 60_000);
 		await engine.invalidate(); // prompt/skill/tool composition may have changed
+		// The MCP server list lives in the same patch: connect/disconnect NOW
+		// instead of waiting for a restart, or the settings page's "保存后自动
+		// 重连" promise is false and a successful 测试连接 misleads (review P1).
+		// change-gated internally, so a non-MCP save stays a cheap no-op.
+		await engine.refreshMcpTools();
 		return updated;
 	});
 

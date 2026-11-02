@@ -17,7 +17,7 @@ const bundle = join(workDir, "mcp.mjs");
 await build({
 	stdin: {
 		contents: `
-			export { normalizeMcpServer, normalizeMcpServers, interpolateEnv } from "./src/shared/mcp.ts";
+			export { normalizeMcpServer, normalizeMcpServers, interpolateEnv, stripMcpToolPrefix } from "./src/shared/mcp.ts";
 			export { McpManager } from "./src/engine/tools/mcp.ts";
 		`,
 		resolveDir: root,
@@ -29,7 +29,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { normalizeMcpServer, normalizeMcpServers, interpolateEnv, McpManager } = await import(pathToFileURL(bundle).href);
+const { normalizeMcpServer, normalizeMcpServers, interpolateEnv, stripMcpToolPrefix, McpManager } = await import(pathToFileURL(bundle).href);
 
 test("standard mcpServers record form normalizes with env interpolation", () => {
 	const env = { GITHUB_TOKEN: "tok-123", MISSING: undefined };
@@ -77,6 +77,265 @@ test("normalizeMcpServer rejects bad entries with precise reasons", () => {
 	assert.match(normalizeMcpServer({ command: "x" }).reason, /name 非法/);
 	assert.match(normalizeMcpServer({ name: "ok-name" }).reason, /缺少 command/);
 	assert.equal(normalizeMcpServer({ name: "ok", command: "x" }).ok, true);
+});
+
+test("refresh closes connections it drops (config change, disable, remove); dispose closes the rest", async () => {
+	const closed = [];
+	const makeClient = (tag) => ({
+		transport: {},
+		async listTools() { return { tools: [{ name: "t" }] }; },
+		async callTool() { return { content: [{ type: "text", text: "x" }] }; },
+		async close() { closed.push(tag); },
+	});
+	let made = 0;
+	const manager = new McpManager({ connect: async () => { made += 1; return makeClient(`c${made}`); } });
+	const configFor = (servers) => ({ all: () => ({ capabilities: { mcp: { enabled: true, servers } } }) });
+
+	await manager.refresh(configFor([{ name: "a", command: "a" }, { name: "b", command: "b" }]));
+	assert.deepEqual(closed, [], "fresh connections stay open across a no-op refresh");
+
+	// a's config changes → its OLD client must be closed (the new one replaces it)
+	await manager.refresh(configFor([{ name: "a", command: "a2" }, { name: "b", command: "b" }]));
+	assert.deepEqual(closed, ["c1"], "config-changed replacement closes the stale stdio client");
+
+	// b disabled → its client must be closed (c2 — b's client from the FIRST refresh;
+	// c3 was a's replacement client made during the config-change step above)
+	await manager.refresh(configFor([{ name: "a", command: "a2" }, { name: "b", command: "b", enabled: false }]));
+	assert.deepEqual(closed, ["c1", "c2"], "disabled servers close their stdio client");
+
+	// a removed → its client must be closed
+	await manager.refresh(configFor([]));
+	assert.deepEqual(closed, ["c1", "c2", "c3"], "removed servers close their stdio client");
+
+	await manager.dispose();
+	assert.equal(manager.tools().length, 0, "dispose empties the cache");
+});
+
+test("a client whose listTools fails is closed, not leaked", async () => {
+	const closed = [];
+	const manager = new McpManager({
+		connect: async () => ({
+			transport: {},
+			async listTools() { throw new Error("list failed"); },
+			async callTool() { return { content: [] }; },
+			async close() { closed.push("probe"); },
+		}),
+	});
+	const config = { all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "x", command: "x" }] } } }) };
+	const { report } = await manager.refresh(config);
+	assert.equal(report[0].ok, false);
+	assert.match(report[0].error, /list failed/);
+	await manager.dispose();
+	assert.deepEqual(closed, ["probe"], "discovery-failed transport must still be closed");
+});
+
+test("dispose during an in-flight refresh wins: late connections are closed, not cached", async () => {
+	let releaseConnect;
+	const closed = [];
+	const manager = new McpManager({
+		connect: () => new Promise((resolve) => { releaseConnect = resolve; }).then(() => ({
+			transport: {},
+			async listTools() { return { tools: [{ name: "t" }] }; },
+			async callTool() { return { content: [] }; },
+			async close() { closed.push("late"); },
+		})),
+	});
+	const config = { all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "x", command: "x" }] } } }) };
+	const refreshing = manager.refresh(config);
+	assert.equal(typeof releaseConnect, "function", "refresh must be parked inside connect()");
+	const disposing = manager.dispose();
+	// Dispose has flagged itself; only NOW let the parked connect resolve, so the
+	// refresh is guaranteed to finish while the manager is already disposed.
+	const settled = refreshing.then((result) => result);
+	await Promise.resolve();
+	releaseConnect();
+	const refreshed = await settled;
+	await disposing;
+	assert.equal(manager.tools().length, 0, "dispose must win over the in-flight refresh");
+	assert.deepEqual(closed, ["late"], "the refresh must close what it built after dispose started");
+	// Only the refresh's own self-check can produce this: dispose() already
+	// awaited refreshInFlight, so its own clear() runs after — without the
+	// self-check the run would report changed:true and publish a stale cache.
+	assert.equal(refreshed.changed, false, "a refresh invalidated by dispose reports no change");
+});
+
+test("persisted config keeps ${ENV} references; connections resolve them at connect time", async () => {
+	// normalizeMcpServers(raw, null) is the PERSIST path: no interpolation, so a
+	// secret is never frozen into the config DB (review P2).
+	const persisted = normalizeMcpServers([{ name: "s", url: "https://x/mcp", headers: { Authorization: "Bearer ${TOK}" } }], null);
+	assert.equal(persisted.servers[0].headers.Authorization, "Bearer ${TOK}", "reference survives persistence");
+
+	// The manager resolves references right before connecting.
+	process.env.MCP_TEST_TOK = "secret-1";
+	const seen = [];
+	const manager = new McpManager({
+		connect: async (server) => {
+			seen.push(server.headers?.Authorization);
+			return { transport: {}, async listTools() { return { tools: [] }; }, async callTool() { return { content: [] }; }, async close() {} };
+		},
+	});
+	const config = { all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "s", url: "https://x/mcp", headers: { Authorization: "Bearer ${MCP_TEST_TOK}" } }] } } }) };
+	await manager.refresh(config);
+	await manager.dispose();
+	assert.deepEqual(seen, ["Bearer secret-1"], "connection sees the resolved value");
+
+	// Rotating the env var takes effect on the next refresh without re-saving.
+	process.env.MCP_TEST_TOK = "secret-2";
+	const manager2 = new McpManager({
+		connect: async (server) => {
+			seen.push(server.headers?.Authorization);
+			return { transport: {}, async listTools() { return { tools: [] }; }, async callTool() { return { content: [] }; }, async close() {} };
+		},
+	});
+	await manager2.refresh(config);
+	await manager2.dispose();
+	assert.equal(seen.at(-1), "Bearer secret-2", "rotation needs no re-save");
+	delete process.env.MCP_TEST_TOK;
+});
+
+test("stripMcpToolPrefix removes the exact server prefix (underscores included)", () => {
+	assert.equal(stripMcpToolPrefix("my_server", "mcp__my_server__t"), "t");
+	assert.equal(stripMcpToolPrefix("a", "mcp__a__t"), "t");
+	assert.equal(stripMcpToolPrefix("a", "unrelated"), "unrelated", "non-matching names pass through");
+});
+
+test("replacing a connection reports changed even when the tool surface is identical", async () => {
+	// Sessions capture the CLIENT, not the tool list. A name-only signature said
+	// changed:false here, so live sessions kept calling the closed client.
+	const manager = new McpManager({
+		connect: async () => ({
+			transport: {},
+			async listTools() { return { tools: [{ name: "t" }] }; },
+			async callTool() { return { content: [] }; },
+			async close() {},
+		}),
+	});
+	const configFor = (command) => ({ all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "x", command }] } } }) });
+	const first = await manager.refresh(configFor("a"));
+	assert.equal(first.changed, true);
+	const same = await manager.refresh(configFor("a"));
+	assert.equal(same.changed, false, "an unchanged config reuses the client and reports no change");
+	const replaced = await manager.refresh(configFor("b"));
+	assert.equal(replaced.changed, true, "a replaced client must invalidate sessions even with identical tools");
+	await manager.dispose();
+});
+
+test("a dropped connection waits for its in-flight call before closing", async () => {
+	let releaseCall;
+	const closed = [];
+	const manager = new McpManager({
+		connect: async () => ({
+			transport: {},
+			async listTools() { return { tools: [{ name: "slow" }] }; },
+			callTool() {
+				return new Promise((resolve) => {
+					releaseCall = () => resolve({ content: [{ type: "text", text: "done" }] });
+				});
+			},
+			async close() { closed.push("dropped"); },
+		}),
+	});
+	const config = { all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "x", command: "a" }] } } }) };
+	await manager.refresh(config);
+	const tool = manager.tools()[0];
+	const running = tool.execute("t1", {});
+	for (let i = 0; i < 20 && typeof releaseCall !== "function"; i += 1) await Promise.resolve();
+	assert.equal(typeof releaseCall, "function", "the tool call is parked inside callTool()");
+
+	// Config churns while that call is executing.
+	const removed = manager.refresh({ all: () => ({ capabilities: { mcp: { enabled: true, servers: [] } } }) });
+	await new Promise((r) => setTimeout(r, 120));
+	assert.deepEqual(closed, [], "the in-flight call must not be aborted by teardown");
+
+	releaseCall();
+	const result = await running;
+	assert.match(result.content[0].text, /done/, "the call still completes normally");
+	await removed;
+	await new Promise((r) => setTimeout(r, 120));
+	assert.deepEqual(closed, ["dropped"], "the connection closes once the call settles");
+	await manager.dispose();
+});
+
+test("waiting for in-flight calls is bounded (a hung server cannot pin a process)", async () => {
+	const closed = [];
+	const manager = new McpManager({
+		connect: async () => ({
+			transport: {},
+			async listTools() { return { tools: [{ name: "hang" }] }; },
+			callTool() { return new Promise(() => {}); }, // never settles
+			async close() { closed.push("hung"); },
+		}),
+	});
+	const config = { all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "x", command: "a" }] } } }) };
+	await manager.refresh(config);
+	void manager.tools()[0].execute("t1", {});
+	await new Promise((r) => setTimeout(r, 50));
+	// Drop it; the retire grace is 30s, far longer than a test may wait — assert the
+	// bounded path exists instead of sleeping 30s here.
+	const started = Date.now();
+	await manager.refresh({ all: () => ({ capabilities: { mcp: { enabled: true, servers: [] } } }) });
+	assert.ok(Date.now() - started < 5000, "refresh does not block on a hung connection's grace period");
+	await manager.dispose();
+});
+
+test("retire actually makes progress while a call is in flight (no deadlock in the wait loop)", async () => {
+	// Regression for a hang: the wait used `setTimeout(...).unref() ?? setTimeout(...)`,
+	// and unref() returns the Timeout — so `??` never fired and the resolve callback
+	// was dropped. The connection was then NEVER closed and its child process
+	// outlived the app. The only way to catch that is to assert the close happens.
+	let releaseCall;
+	const closed = [];
+	const manager = new McpManager({
+		connect: async () => ({
+			transport: {},
+			async listTools() { return { tools: [{ name: "slow" }] }; },
+			callTool() {
+				return new Promise((resolve) => { releaseCall = () => resolve({ content: [{ type: "text", text: "ok" }] }); });
+			},
+			async close() { closed.push("retired"); },
+		}),
+	});
+	await manager.refresh({ all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "x", command: "a" }] } } }) });
+	const running = manager.tools()[0].execute("t1", {});
+	for (let i = 0; i < 20 && typeof releaseCall !== "function"; i += 1) await Promise.resolve();
+	// Drop the server while the call is parked, then settle it.
+	const dropped = manager.refresh({ all: () => ({ capabilities: { mcp: { enabled: true, servers: [] } } }) });
+	await new Promise((r) => setTimeout(r, 60));
+	assert.deepEqual(closed, [], "still waiting: the call has not settled");
+	releaseCall();
+	await running;
+	await dropped;
+	// The retire loop must OBSERVE the settled call within a couple of poll ticks.
+	const deadline = Date.now() + 3000;
+	while (closed.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+	assert.deepEqual(closed, ["retired"], "the retired connection is closed once the call settles (a hanging wait loop would leave this empty)");
+	await manager.dispose();
+});
+
+test("dispose closes connections already being retired (quit must not leave children)", async () => {
+	// A retired connection is gone from the cache, so a cache-only dispose
+	// finished while the old stdio client was still open (review P1).
+	let releaseCall;
+	const closed = [];
+	const manager = new McpManager({
+		connect: async () => ({
+			transport: {},
+			async listTools() { return { tools: [{ name: "slow" }] }; },
+			callTool() { return new Promise((resolve) => { releaseCall = () => resolve({ content: [{ type: "text", text: "ok" }] }); }); },
+			async close() { closed.push("c"); },
+		}),
+	});
+	await manager.refresh({ all: () => ({ capabilities: { mcp: { enabled: true, servers: [{ name: "x", command: "a" }] } } }) });
+	void manager.tools()[0].execute("t1", {});
+	for (let i = 0; i < 20 && typeof releaseCall !== "function"; i += 1) await Promise.resolve();
+	await manager.refresh({ all: () => ({ capabilities: { mcp: { enabled: true, servers: [] } } }) });
+	assert.deepEqual(closed, [], "still draining: the in-flight call has not settled");
+
+	await manager.dispose();
+	assert.deepEqual(closed, ["c"], "dispose closes the retired connection too");
+	releaseCall();
+	await new Promise((r) => setTimeout(r, 120));
+	assert.deepEqual(closed, ["c"], "closing is idempotent: the retire continuation cannot close it twice");
 });
 
 /** Fake MCP client: canned listTools + scripted callTool results. */

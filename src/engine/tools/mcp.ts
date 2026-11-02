@@ -32,6 +32,20 @@ const DEFAULT_TIMEOUT_SEC = 60;
 
 const mcpToolName = (server: string, tool: string): string => `mcp__${server}__${tool}`;
 
+/** Wait `ms` with an unref'd timer, so a pending retire never keeps the process
+ * alive on its own (a quit must not wait for a 30s grace period). */
+const sleep = (ms: number): Promise<void> =>
+	new Promise((resolve) => {
+		const timer = setTimeout(resolve, ms);
+		timer.unref?.();
+	});
+
+let clientSeq = 0;
+const nextClientId = (): number => {
+	clientSeq += 1;
+	return clientSeq;
+};
+
 interface McpToolInfo {
 	name: string;
 	description?: string;
@@ -42,7 +56,21 @@ interface ServerConn {
 	config: McpServerConfig;
 	client: Client;
 	tools: McpToolInfo[];
+	/** In-flight tool calls. A connection being retired waits for these to settle
+	 * so a config change cannot kill a call another conversation is mid-way
+	 * through (markConfigChanged only promises that turns finish). */
+	inflight: number;
+	/** Stable per-client identity used in the change signature. */
+	id: number;
+	/** Set once this connection is dropped; the retire loop stops waiting. */
+	retiring?: boolean;
+	/** Guards close() against a second call from the retire continuation or dispose. */
+	closed?: boolean;
 }
+
+/** Bound on how long a retired connection may linger waiting for in-flight
+ * calls; a hung server must not keep a process alive forever. */
+const RETIRE_GRACE_MS = 30_000;
 
 type McpContentBlock = { type: "text"; text: string } | { type: "image" | "audio"; mimeType?: string; data?: string } | { type: string; [k: string]: unknown };
 
@@ -80,6 +108,11 @@ export class McpManager {
 	private cache = new Map<string, ServerConn>();
 	private lastSignature = "";
 	private refreshInFlight: Promise<{ changed: boolean; report: McpRefreshReport[] }> | undefined;
+	private disposed = false;
+	/** Connections dropped from the cache that may still be draining in-flight
+	 * calls. dispose() must close these too, or a quit can finish while an old
+	 * stdio client is still open (review P1). */
+	private retired = new Set<ServerConn>();
 
 	constructor(private readonly deps: McpManagerDeps = {}) {}
 
@@ -106,6 +139,7 @@ export class McpManager {
 	 * sessions when something actually moved). */
 	refresh(config: ConfigStore): Promise<{ changed: boolean; report: McpRefreshReport[] }> {
 		if (this.refreshInFlight) return this.refreshInFlight;
+		this.disposed = false;
 		this.refreshInFlight = this.runRefresh(config).finally(() => {
 			this.refreshInFlight = undefined;
 		});
@@ -114,10 +148,13 @@ export class McpManager {
 
 	private async runRefresh(config: ConfigStore): Promise<{ changed: boolean; report: McpRefreshReport[] }> {
 		const mcpConfig = config.all().capabilities?.mcp;
-		const { servers, errors } = normalizeMcpServers(mcpConfig?.servers);
+		// Config stores `${ENV}` references verbatim; resolve them HERE, at connect
+		// time, so rotating an env var needs no re-save (review: persisted plaintext).
+		const { servers, errors } = normalizeMcpServers(mcpConfig?.servers, process.env);
 		const enabled = mcpConfig?.enabled === true ? servers.filter((s) => s.enabled !== false) : [];
 		const report: McpRefreshReport[] = errors.map((error) => ({ name: "(配置)", ok: false, tools: 0, error }));
 		const nextCache = new Map<string, ServerConn>();
+		const pendingClose: Promise<unknown>[] = [];
 
 		for (const server of enabled) {
 			const cacheKey = JSON.stringify(server);
@@ -130,31 +167,110 @@ export class McpManager {
 					continue;
 				}
 				const client = await this.connect(server);
-				const listed = await this.withTimeout(
-					client.listTools(),
-					(server.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000,
-					`${server.name}: listTools 超时`,
-				);
+				let listed: Awaited<ReturnType<Client["listTools"]>>;
+				try {
+					listed = await this.withTimeout(
+						client.listTools(),
+						(server.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000,
+						`${server.name}: listTools 超时`,
+					);
+				} catch (err) {
+					// The transport is live but discovery failed — without this close
+					// the stdio child process leaks (never enters any cache).
+					pendingClose.push(client.close().catch(() => {}));
+					throw err;
+				}
 				const tools = (listed.tools ?? []).map((t: { name: string; description?: string; inputSchema?: object }) => ({
 					name: t.name,
 					description: t.description,
 					inputSchema: t.inputSchema,
 				}));
-				nextCache.set(server.name, { config: server, client, tools });
+				nextCache.set(server.name, { config: server, client, tools, inflight: 0, id: nextClientId() });
 				report.push({ name: server.name, ok: true, tools: tools.length });
 			} catch (err) {
 				report.push({ name: server.name, ok: false, tools: 0, error: err instanceof Error ? err.message : String(err) });
 			}
 		}
 
+		// Include the CLIENT identity, not just tool names: replacing a connection
+		// whose tool surface is identical still invalidates every live session,
+		// because those sessions captured the OLD client (which we are about to
+		// close). A name-only signature reported changed:false and left them
+		// calling a closed transport (review).
 		const signature = [...nextCache.values()]
-			.map((conn) => `${conn.config.name}:${conn.tools.map((t) => t.name).join(",")}`)
+			.map((conn) => `${conn.config.name}#${conn.id}:${conn.tools.map((t) => t.name).join(",")}`)
 			.sort()
 			.join("|");
 		const changed = signature !== this.lastSignature;
 		this.lastSignature = signature;
+		// Close everything the new cache dropped: a config-changed replacement
+		// (nextCache holds a NEW client for the same name) and servers that were
+		// disabled or removed. stdio transports own a child process — skipping this
+		// leaks one process per refresh (review B1/B2).
+		for (const [name, oldConn] of this.cache) {
+			const kept = nextCache.get(name);
+			if (kept && kept.client === oldConn.client) continue;
+			void this.retire(oldConn);
+		}
+		await Promise.allSettled(pendingClose);
+		// A dispose() that started while this refresh was in flight wins: close
+		// what this run produced instead of publishing a cache nobody will clear.
+		if (this.disposed) {
+			const late = [...nextCache.values()].map((conn) => conn.client.close().catch(() => {}));
+			await Promise.allSettled(late);
+			return { changed: false, report };
+		}
 		this.cache = nextCache;
 		return { changed, report };
+	}
+
+	/**
+	 * Close a dropped connection once its in-flight calls settle.
+	 *
+	 * Closing immediately would abort a tool call another conversation is
+	 * executing right now — markConfigChanged deliberately lets in-flight turns
+	 * finish, and a stdio child killed mid-request turns that promise into a
+	 * failed turn. The wait is bounded so a hung server cannot pin a process.
+	 */
+	private async retire(conn: ServerConn): Promise<void> {
+		conn.retiring = true;
+		this.retired.add(conn);
+		try {
+			const deadline = Date.now() + RETIRE_GRACE_MS;
+			while (conn.inflight > 0 && !conn.closed && Date.now() < deadline) {
+				await sleep(50);
+			}
+			if (conn.inflight > 0 && !conn.closed) {
+				console.warn(`[mcp] ${conn.config.name}: 关闭连接时仍有 ${conn.inflight} 个调用在途（已等待 ${RETIRE_GRACE_MS / 1000} 秒上限）`);
+			}
+			await this.closeOnce(conn);
+		} finally {
+			this.retired.delete(conn);
+		}
+	}
+
+	/** Close a connection exactly once (retire and dispose can both reach it). */
+	private async closeOnce(conn: ServerConn): Promise<void> {
+		if (conn.closed) return;
+		conn.closed = true;
+		conn.retiring = false;
+		await conn.client.close().catch(() => { /* best-effort teardown */ });
+	}
+
+	/** Close every live connection (app quit / capability disabled). */
+	async dispose(): Promise<void> {
+		// Flag FIRST so a refresh still in flight sees it and closes its own
+		// products; then wait it out so nothing is abandoned outside the cache.
+		this.disposed = true;
+		await this.refreshInFlight?.catch(() => {});
+		// Immediate close of both sets: an app quit must not wait out a retire
+		// grace period, and a retired connection is invisible to the cache.
+		const all = [...this.cache.values(), ...this.retired];
+		const closing = all.map((conn) => this.closeOnce(conn));
+		this.cache.clear();
+		this.retired.clear();
+		this.lastSignature = "";
+		await Promise.allSettled(closing);
 	}
 
 	private async connect(server: McpServerConfig): Promise<Client> {
@@ -210,6 +326,7 @@ export class McpManager {
 				if (conn.client.transport === undefined) {
 					return refuse(`MCP 服务器 ${serverName} 已断开连接，本次无法执行。请管理员检查该服务器是否在线。`);
 				}
+				conn.inflight += 1;
 				try {
 					const result = (await Promise.race([
 						conn.client.callTool({ name: tool.name, arguments: (params ?? {}) as Record<string, unknown> }),
@@ -224,6 +341,8 @@ export class McpManager {
 					};
 				} catch (err) {
 					return refuse(`⚠️ MCP ${serverName}/${tool.name} 调用失败：${err instanceof Error ? err.message : String(err)}`);
+				} finally {
+					conn.inflight -= 1;
 				}
 			},
 		};

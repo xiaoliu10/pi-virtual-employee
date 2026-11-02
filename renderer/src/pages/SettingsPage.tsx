@@ -10,6 +10,185 @@ import { SkillsSection } from "../components/SkillsSection";
 import { ComputerSection } from "../components/ComputerSection";
 import { MAX_TIMEOUT_SEC, normalizeTimeoutSec } from "../../../src/shared/timeouts";
 
+/** One editable MCP server row in the settings page. Raw text fields hold
+ * EXACTLY what the user typed; parsing happens only on save / test (P1: parsing
+ * on every keystroke deleted the first character of a new line). */
+interface McpRowDraft {
+	uid: string;
+	name: string;
+	transport: "stdio" | "http";
+	command: string;
+	cwd: string;
+	argsRaw: string;
+	envRaw: string;
+	url: string;
+	headersRaw: string;
+	timeoutSecRaw: string;
+	enabled: boolean;
+}
+
+/**
+ * Encode a key/value map for the env/headers textareas.
+ *
+ * Values round-trip EXACTLY: a value that contains a newline, or has leading /
+ * trailing spaces, is written as a JSON string literal (`KEY="..."`); plain
+ * values stay human-readable. Without this a multiline PEM credential was split
+ * into separate entries and indentation was silently stripped on save (review).
+ */
+function encodeKeyValueLines(entries: Record<string, string>, sep: "=" | ":"): string {
+	const joiner = sep === "=" ? "=" : ": ";
+	return Object.entries(entries)
+		.map(([key, value]) => {
+			// Only values that a plain single line cannot represent are quoted:
+			// newlines (split into separate entries) and leading/trailing spaces
+			// (trimmed away by the reader). Interior spaces and the separator are
+			// preserved by the first-occurrence split, so they stay readable.
+			// A value that itself starts with a quote would be misread as an encoded
+			// literal — quote it so the encoding is unambiguous.
+			const needsJson = value.includes("\n") || value.includes("\r") || value !== value.trim() || value.startsWith('"');
+			const rendered = needsJson ? JSON.stringify(value) : value;
+			return `${key}${joiner}${rendered}`;
+		})
+		.join("\n");
+}
+
+/**
+ * Parse `KEY=VALUE` (or `Key: value`) lines; skips blanks and malformed lines.
+ * A value wrapped in double quotes is read as a JSON string literal, so values
+ * encoded by `encodeKeyValueLines` come back byte-identical. It returns the
+ * malformed lines so callers can REFUSE to save instead of dropping secrets.
+ */
+function parseKeyValueLines(raw: string, sep: "=" | ":"): { values: Record<string, string>; errors: string[] } {
+	const values: Record<string, string> = {};
+	const errors: string[] = [];
+	const lines = raw.split("\n");
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		const at = line.search(sep === "=" ? /=/ : /:/);
+		if (at <= 0) {
+			errors.push(`无法解析：${line.slice(0, 40)}`);
+			continue;
+		}
+		const key = line.slice(0, at).trim();
+		let value = line.slice(at + 1);
+		if (sep === ":") value = value.replace(/^\s+/, "");
+		if (value.startsWith('"')) {
+			try {
+				const parsed: unknown = JSON.parse(value);
+				if (typeof parsed !== "string") throw new Error("not a string");
+				value = parsed;
+			} catch {
+				errors.push(`${key}: 引号包裹的值不是合法字符串`);
+				continue;
+			}
+		}
+		if (!key) {
+			errors.push(`缺少键名：${line.slice(0, 40)}`);
+			continue;
+		}
+		values[key] = value;
+	}
+	return { values, errors };
+}
+
+/** Whitespace-split with `"double"` and `'single'` quoting (paths with spaces). */
+/** Parse the args editor: a JSON string array. Empty input means "no args". */
+function parseArgsJson(raw: string): { ok: true; args: string[] } | { ok: false; reason: string } {
+	const trimmed = raw.trim();
+	if (!trimmed) return { ok: true, args: [] };
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(trimmed);
+	} catch {
+		return { ok: false, reason: "参数必须是 JSON 字符串数组，例如 [\"-y\", \"my server.js\"]" };
+	}
+	if (!Array.isArray(parsed) || parsed.some((a) => typeof a !== "string")) {
+		return { ok: false, reason: "参数必须是 JSON 字符串数组（每一项都要加引号）" };
+	}
+	return { ok: true, args: parsed as string[] };
+}
+
+function parseArgsRaw(raw: string): string[] {
+	const out: string[] = [];
+	let cur = "";
+	let quote: '"' | "'" | null = null;
+	let started = false;
+	for (const ch of raw) {
+		if (quote) {
+			if (ch === quote) quote = null;
+			else cur += ch;
+		} else if (ch === '"' || ch === "'") {
+			quote = ch;
+			started = true;
+		} else if (ch === " " || ch === "\t") {
+			if (cur || started) { out.push(cur); cur = ""; started = false; }
+		} else cur += ch;
+	}
+	if (cur || started) out.push(cur);
+	return out;
+}
+
+function serverToRow(server: { name: string; command?: string; args?: string[]; env?: Record<string, string>; cwd?: string; url?: string; headers?: Record<string, string>; timeoutSec?: number; enabled?: boolean }): McpRowDraft {
+	return {
+		uid: crypto.randomUUID(),
+		name: server.name ?? "",
+		transport: server.command ? "stdio" : server.url ? "http" : "stdio",
+		command: server.command ?? "",
+		cwd: server.cwd ?? "",
+		// JSON array preserves every arg exactly (spaces, quotes, apostrophes,
+		// Windows paths). The old space-joined form round-tripped corrupted
+		// because the parser had no escape handling (review P3).
+		argsRaw: (server.args ?? []).length ? JSON.stringify(server.args) : "",
+		envRaw: encodeKeyValueLines(server.env ?? {}, "="),
+		url: server.url ?? "",
+		headersRaw: encodeKeyValueLines(server.headers ?? {}, ":"),
+		timeoutSecRaw: server.timeoutSec != null ? String(server.timeoutSec) : "",
+		enabled: server.enabled !== false,
+	};
+}
+
+/**
+ * Validate ONE editor row. Shared by save and "test connection": the probe used
+ * to call rowToServer() directly, which silently drops malformed args/env lines
+ * and would then test a DIFFERENT configuration than the one on screen (review).
+ */
+function validateRow(row: McpRowDraft): string[] {
+	const label = row.name.trim() || "(未命名)";
+	const problems: string[] = [];
+	if (!row.name.trim()) problems.push("服务器名为空");
+	else if (!/^[A-Za-z0-9_-]+$/.test(row.name.trim())) problems.push(`${label}: 名称只能用字母/数字/_/-`);
+	if (row.transport === "stdio") {
+		if (!row.command.trim()) problems.push(`${label}: 缺少可执行文件（stdio 传输）`);
+		const args = parseArgsJson(row.argsRaw);
+		if (!args.ok) problems.push(`${label}: ${args.reason}`);
+		for (const err of parseKeyValueLines(row.envRaw, "=").errors) problems.push(`${label} env ${err}`);
+	} else {
+		if (!row.url.trim()) problems.push(`${label}: 缺少 URL（HTTP 传输）`);
+		for (const err of parseKeyValueLines(row.headersRaw, ":").errors) problems.push(`${label} headers ${err}`);
+	}
+	return problems;
+}
+
+/** Convert an editable row into the persisted server config (parse on commit). */
+function rowToServer(row: McpRowDraft): { name: string; enabled: boolean } & Record<string, unknown> {
+	const out: Record<string, unknown> = { name: row.name.trim(), enabled: row.enabled };
+	const timeout = Math.floor(Number(row.timeoutSecRaw));
+	if (Number.isFinite(timeout) && timeout > 0) out.timeoutSec = timeout;
+	if (row.transport === "http") {
+		if (row.url.trim()) out.url = row.url.trim();
+		const headers = parseKeyValueLines(row.headersRaw, ":");
+		if (Object.keys(headers.values).length) out.headers = headers.values;
+	} else {
+		if (row.command.trim()) out.command = row.command.trim();
+		if (row.cwd.trim()) out.cwd = row.cwd.trim();
+		const parsedArgs = parseArgsJson(row.argsRaw);
+		if (parsedArgs.ok && parsedArgs.args.length) out.args = parsedArgs.args;
+		const env = parseKeyValueLines(row.envRaw, "=");
+		if (Object.keys(env.values).length) out.env = env.values;
+	}
+	return out as { name: string; enabled: boolean } & Record<string, unknown>;
+}
+
 interface SettingsPageProps {
 	config: AppConfig | null;
 	onChange: (patch: Partial<AppConfig>) => Promise<void>;
@@ -353,6 +532,40 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 	 */
 	const [widgetStatus, setWidgetStatus] = useState<{ running: boolean; starting?: boolean; port: number; expose?: "loopback" | "lan"; error?: string; reassignedFrom?: number; lanAddresses?: string[] } | null>(null);
 	const [widgetBusy, setWidgetBusy] = useState(false);
+	/** MCP editor rows: raw-text drafts keyed by stable uid (index keys misattribute
+	 * probe results after a delete). Initialized once from the loaded config. */
+	const [mcpRows, setMcpRows] = useState<McpRowDraft[] | null>(null);
+	/** Probe results keyed by row uid. `fingerprint` is the configuration that was
+	 * tested; a result is dropped as soon as the row no longer matches it, so a
+	 * green "连接成功" can never certify a config nobody tested (review P2). */
+	const [mcpTesting, setMcpTesting] = useState<Record<string, { busy?: boolean; ok?: boolean; error?: string; tools?: string[]; fingerprint?: string }>>({});
+	const probeSeq = useRef(0);
+	/** Identity of a row's current configuration — any edit changes this string. */
+	const rowFingerprint = (row: McpRowDraft): string => JSON.stringify([row.name, row.transport, row.command, row.cwd, row.argsRaw, row.envRaw, row.url, row.headersRaw, row.timeoutSecRaw]);
+	// Re-seed the rows when the persisted server list changes underneath us (an
+	// IM-side manage_settings edit, an import, or the config push after our own
+	// save) — but ONLY while the user has no unsaved MCP edits. MCP rows live
+	// outside `draft`, so the draft-adoption guard above does not protect them;
+	// unconditionally re-seeding silently threw away edits in progress (review P2).
+	const persistedSeed = (value: AppConfig | null): string =>
+		JSON.stringify((value?.capabilities.mcp.servers ?? []).map((s) => serverToRow(s)).map(({ uid: _uid, ...rest }) => rest));
+	const mcpSeed = persistedSeed(config);
+	/** Seed the rows were last loaded from / saved to. */
+	const mcpSeedRef = useRef<string | null>(null);
+	/** True while the rows differ from what was last published. */
+	const mcpDirtyRef = useRef(false);
+	const mcpDirty = mcpRows !== null && mcpSeedRef.current !== null && JSON.stringify(mcpRows.map(({ uid: _uid, ...rest }) => rest)) !== mcpSeedRef.current;
+	mcpDirtyRef.current = mcpDirty;
+	useEffect(() => {
+		if (!config) return;
+		if (mcpSeedRef.current === mcpSeed) return;
+		// Keep unsaved edits: adopt the incoming list only when the editor is clean.
+		if (mcpDirtyRef.current) return;
+		mcpSeedRef.current = mcpSeed;
+		setMcpRows((config.capabilities.mcp.servers ?? []).map((s) => serverToRow(s)));
+		// Probe results belong to the previous rows.
+		setMcpTesting({});
+	}, [config, mcpSeed]);
 	const [copied, setCopied] = useState(false);
 	useEffect(() => {
 		let alive = true;
@@ -497,12 +710,44 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 		onClose();
 	};
 
+	/**
+	 * Commit the MCP editor rows into the draft right before any onChange call
+	 * (the real save AND report-section preflight both persist the draft).
+	 *
+	 * Rows are validated FIRST: config-store's normalizeMcpServers silently
+	 * DROPS entries it cannot parse (missing command/url, bad name, duplicates),
+	 * so without this the page would show a row that vanishes on reload (review
+	 * P2). Return the problem instead of persisting a half-saved list.
+	 */
+	const withMcpRows = (base: AppConfig): { ok: true; config: AppConfig } | { ok: false; reason: string } => {
+		const rows = mcpRows ?? [];
+		const problems: string[] = rows.flatMap(validateRow);
+		const seen = new Set<string>();
+		for (const row of rows) {
+			const name = row.name.trim();
+			if (!name) continue;
+			if (seen.has(name)) problems.push(`${name}: 服务器名重复`);
+			seen.add(name);
+		}
+		const servers = rows.map(rowToServer);
+		if (problems.length) return { ok: false, reason: `MCP 服务器配置有误，未保存：\n· ${[...new Set(problems)].join("\n· ")}` };
+		return {
+			ok: true,
+			config: { ...base, capabilities: { ...base.capabilities, mcp: { enabled: base.capabilities.mcp.enabled, servers } } },
+		};
+	};
+
 	const save = async () => {
 		if (!draft) return;
 		setSaving(true);
 		setError(null);
 		try {
-			await onChange(draft);
+			const merged = withMcpRows(draft);
+			if (!merged.ok) { setError(merged.reason); return; }
+			await onChange(merged.config);
+			// The rows now match what is persisted: mark them clean so a later
+			// external refresh is adopted again.
+			mcpSeedRef.current = persistedSeed(merged.config);
 			onClose();
 		} catch (reason) {
 			setError(reason instanceof Error ? reason.message : String(reason));
@@ -567,7 +812,10 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 												reports={draft.reports}
 												onUpdate={(reports) => setReports(reports)}
 												onBeforeTest={async () => {
-													if (draft) await onChange(draft);
+													if (!draft) return;
+													const merged = withMcpRows(draft);
+													if (!merged.ok) throw new Error(merged.reason);
+													await onChange(merged.config);
 												}}
 											/>
 										)}
@@ -1139,6 +1387,92 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 													</div>
 												</div>
 											</div>
+
+											<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
+												<div className="text-sm font-medium text-slate-800">MCP 服务器（外部工具）</div>
+												<div className="mt-1 text-xs leading-relaxed text-slate-400">
+													接入 Model Context Protocol 服务器，把外部工具（数据库查询、浏览器自动化、内部系统 API……）挂进员工工具箱。工具以 mcp__服务器名__工具名 注入对话，与内置工具不冲突。保存后自动重连，工具面有变化会重建会话。env 与 headers 支持 ${'{ENV}'} 形式的环境变量引用。
+												</div>
+												<div className="mt-3 space-y-3">
+													<label className="flex cursor-pointer items-center justify-between rounded-xl border border-sky-200 bg-sky-50/50 px-4 py-3">
+														<div><div className="text-sm font-medium text-slate-800">启用 MCP 服务器</div><div className="mt-0.5 text-xs text-sky-700/70">关闭时不连接任何服务器，已挂载的外部工具从对话中移除（保存即生效）。</div></div>
+														<input type="checkbox" checked={draft.capabilities.mcp.enabled} onChange={(e) => setDraft((v) => v ? { ...v, capabilities: { ...v.capabilities, mcp: { ...v.capabilities.mcp, enabled: e.target.checked } } } : v)} className="h-5 w-5 accent-sky-500" />
+													</label>
+													{(mcpRows ?? []).map((row, idx) => (
+														<div key={row.uid} className="rounded-xl border border-slate-200 px-4 py-3">
+															<div className="flex items-center justify-between gap-2">
+																<input value={row.name} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, name: e.target.value.replace(/[^A-Za-z0-9_-]/g, "") } : r))} placeholder="服务器名（字母数字_-）" className="w-44 rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																<div className="flex items-center gap-3">
+																	<div className="flex overflow-hidden rounded-lg border border-slate-300 text-xs">
+																		<button type="button" onClick={() => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, transport: "stdio" } : r))} className={`px-2 py-1 ${row.transport === "stdio" ? "bg-sky-600 text-white" : "bg-white text-slate-500 hover:bg-slate-50"}`}>stdio</button>
+																		<button type="button" onClick={() => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, transport: "http" } : r))} className={`px-2 py-1 ${row.transport === "http" ? "bg-sky-600 text-white" : "bg-white text-slate-500 hover:bg-slate-50"}`}>HTTP</button>
+																	</div>
+																	<label className="flex items-center gap-1 text-xs text-slate-500"><input type="checkbox" checked={row.enabled} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, enabled: e.target.checked } : r))} className="h-4 w-4 accent-sky-500" />启用</label>
+																	<button type="button" onClick={() => { setMcpRows((rows) => (rows ?? []).filter((r) => r.uid !== row.uid)); setMcpTesting((prev) => { const next = { ...prev }; delete next[row.uid]; return next; }); }} className="rounded-lg px-2 py-1 text-xs text-rose-600 hover:bg-rose-50">删除</button>
+																</div>
+															</div>
+															{row.transport === "stdio" ? (
+																<div className="mt-2 space-y-2">
+																	<div className="grid grid-cols-[1fr_auto] gap-2">
+																		<input value={row.command} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, command: e.target.value } : r))} placeholder="stdio 传输：可执行文件（如 node / npx / uvx）" className="rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																		<input value={row.timeoutSecRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, timeoutSecRaw: e.target.value.replace(/[^0-9]/g, "") } : r))} placeholder="超时秒" className="w-24 rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																	</div>
+																	<input value={row.argsRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, argsRaw: e.target.value } : r))} placeholder={'参数 JSON 数组，如 ["-y", "server.js"]'} className="w-full rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																	<input value={row.cwd} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, cwd: e.target.value } : r))} placeholder="工作目录（可选，留空用应用当前目录）" className="w-full rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																	<textarea rows={2} value={row.envRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, envRaw: e.target.value } : r))} placeholder="env（每行 KEY=值，保存/测试时解析）" className="w-full rounded-lg border border-slate-300 px-2 py-1 font-mono text-[11px] outline-none focus:border-sky-400" />
+																</div>
+															) : (
+																<div className="mt-2 space-y-2">
+																	<div className="grid grid-cols-[1fr_auto] gap-2">
+																		<input value={row.url} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, url: e.target.value } : r))} placeholder="HTTP 传输：https://mcp.example.com/mcp" className="rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																		<input value={row.timeoutSecRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, timeoutSecRaw: e.target.value.replace(/[^0-9]/g, "") } : r))} placeholder="超时秒" className="w-24 rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																	</div>
+																	<textarea rows={2} value={row.headersRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, headersRaw: e.target.value } : r))} placeholder="headers（每行 Key: 值，如 Authorization: Bearer …）" className="w-full rounded-lg border border-slate-300 px-2 py-1 font-mono text-[11px] outline-none focus:border-sky-400" />
+																</div>
+															)}
+															<div className="mt-2 flex items-center gap-2">
+																<button type="button"
+																	disabled={mcpTesting[row.uid]?.busy === true}
+																	onClick={async () => {
+																		// Validate first: rowToServer() drops malformed args/env
+																		// lines, so probing without this tests a different config.
+																		const problems = validateRow(row);
+																		if (problems.length) {
+																			setMcpTesting((prev) => ({ ...prev, [row.uid]: { busy: false, ok: false, error: problems.join("；") } }));
+																			return;
+																		}
+																		const fingerprint = rowFingerprint(row);
+																		const seq = (probeSeq.current += 1);
+																		setMcpTesting((prev) => ({ ...prev, [row.uid]: { busy: true, fingerprint } }));
+																		try {
+																			const r = await api.testMcpServer(rowToServer(row));
+																			// Apply only if this is still the newest request AND the row
+																			// still holds the configuration that was tested.
+																			setMcpTesting((prev) => {
+																				if (seq !== probeSeq.current) return prev;
+																				if (prev[row.uid]?.fingerprint !== fingerprint) return prev;
+																				return { ...prev, [row.uid]: { busy: false, ok: r.ok, error: r.error, tools: r.tools, fingerprint } };
+																			});
+																		} catch {
+																			setMcpTesting((prev) => {
+																				if (seq !== probeSeq.current) return prev;
+																				return { ...prev, [row.uid]: { busy: false, ok: false, error: "测试请求失败", fingerprint } };
+																			});
+																		}
+																	}}
+																	className="rounded-lg border border-sky-300 px-2.5 py-1 text-xs text-sky-700 hover:bg-sky-50 disabled:opacity-50">测试连接</button>
+																{mcpTesting[row.uid] && mcpTesting[row.uid].fingerprint === rowFingerprint(row) && (
+																	<span className="min-w-0 flex-1 truncate text-xs text-slate-500" title={mcpTesting[row.uid].error ?? (mcpTesting[row.uid].tools ?? []).join("、")}>
+																		{mcpTesting[row.uid].busy ? "连接中…" : mcpTesting[row.uid].ok ? `连接成功，${mcpTesting[row.uid].tools?.length ?? 0} 个工具：${(mcpTesting[row.uid].tools ?? []).slice(0, 6).join("、")}${(mcpTesting[row.uid].tools?.length ?? 0) > 6 ? " …" : ""}` : `失败：${mcpTesting[row.uid].error}`}
+																	</span>
+																)}
+															</div>
+														</div>
+													))}
+													<button type="button" onClick={() => setMcpRows((rows) => [...(rows ?? []), serverToRow({ name: `server-${(rows?.length ?? 0) + 1}` })])} className="rounded-lg border border-dashed border-slate-300 px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-50">+ 添加服务器</button>
+												</div>
+											</div>
+
 
 											<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
 												<div className="text-sm font-medium text-slate-800">助理小组件（嵌入业务系统）</div>

@@ -161,6 +161,20 @@ export interface AppConfig {
 	capabilities: {
 		shell: { enabled: boolean; allowedCommands: string[]; timeoutSec: number; backgroundTimeoutSec: number; pollTimeoutSec: number };
 		autonomousMining: { enabled: boolean; intervalHours: number };
+		mcp: {
+			enabled: boolean;
+			servers: Array<{
+				name: string;
+				command?: string;
+				args?: string[];
+				env?: Record<string, string>;
+				cwd?: string;
+				url?: string;
+				headers?: Record<string, string>;
+				timeoutSec?: number;
+				enabled?: boolean;
+			}>;
+		};
 	};
 	widget: {
 		enabled: boolean;
