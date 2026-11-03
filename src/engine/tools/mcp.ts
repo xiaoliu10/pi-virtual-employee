@@ -19,7 +19,7 @@
  *    server's timeoutSec (default 60).
  */
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import type { Schema } from "@earendil-works/pi-schema";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -321,7 +321,9 @@ export class McpManager {
 			name: fullName,
 			label: `MCP ${serverName}/${tool.name}`,
 			description: `[MCP:${serverName}] ${tool.description ?? tool.name}`,
-			parameters: Type.Unsafe(inputSchema as unknown as Parameters<typeof Type.Unsafe>[0]),
+			// An MCP server ships its own JSON Schema; pi-schema accepts a raw JSON
+			// Schema object (open shape) so it passes through unchanged.
+			parameters: inputSchema as unknown as Schema,
 			async execute(_toolCallId, params) {
 				if (conn.client.transport === undefined) {
 					return refuse(`MCP 服务器 ${serverName} 已断开连接，本次无法执行。请管理员检查该服务器是否在线。`);

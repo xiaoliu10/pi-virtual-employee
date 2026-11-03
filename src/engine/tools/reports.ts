@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { obj, opt, str } from "@earendil-works/pi-schema";
 import type { ReportService } from "../../reports/report-service.js";
 
 /**
@@ -32,13 +32,13 @@ export function createSaveReportTool(reportService: ReportService, conversationI
 		label: "保存到产物中心",
 		description:
 			"把当前对话中生成的任意内容（一首诗、一段总结、一份分析、一个文档等）保存到「产物中心」，并返回一个可分享的访问链接（发布到配置的 Gitee 仓库或阿里云 OSS）。用于：用户要求『给我一个链接/文件地址』、『保存这份报告』、『生成并发布』等场景。内容用 Markdown 书写，标题简明。返回结果里会含 url 字段——把它告诉用户即可。",
-		parameters: Type.Object({
-			title: Type.String({ description: "产物标题，简明概括（如「八月运营小诗」）" }),
-			content: Type.String({
+		parameters: obj({
+			title: str({ description: "产物标题，简明概括（如「八月运营小诗」）" }),
+			content: str({
 				description: "产物正文，用 Markdown 书写，完整自包含（脱离对话也能看懂）",
 			}),
-			summary: Type.Optional(Type.String({ description: "可选一句话摘要，用于列表预览" })),
-		}),
+			summary: opt(str({ description: "可选一句话摘要，用于列表预览" })),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { title, content, summary } = params as { title: string; content: string; summary?: string };
 			try {

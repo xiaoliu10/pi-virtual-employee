@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { lit, obj, opt, str, union } from "@earendil-works/pi-schema";
 import type { SkillWriter } from "../skills/skill-writer.js";
 
 /**
@@ -21,22 +21,22 @@ export function createSaveToSkillTool(
 			"把一套「何时触发 + 标准执行步骤 + 完成标准 + 注意事项」写成一个新的 SKILL.md 技能。两种触发：① 对话方明确要求「做成技能 / 创建 Skill / 整理成技能 / 更新或修改某个技能」；② 按 pi-auto-research 技能完成自主研究、方案已在本环境验证通过且属于可复用的操作流程——此时可直接固化为技能并在回复中说明（管理员可随时调整或删除）。" +
 			"凡是没有明确提到技能/Skill 的整理请求——例如「整理聊天、整理知识、沉淀经验、总结一下、记下来、以后参考」——一律改用 save_to_knowledge 写入知识库，不要写技能；未经自主研究验证的流程也不要自行写成技能。" +
 			"不要因为内容看起来像流程就自行改存为技能；同一条内容默认只写一个渠道，除非对方明确要求「同时保存到知识库和做成技能」才可两边都写。",
-		parameters: Type.Object({
-			name: Type.String({
+		parameters: obj({
+			name: str({
 				description: "技能名称，中文或小写英文/数字/连字符，如 退款处理、handle-refund",
 			}),
-			description: Type.String({
+			description: str({
 				description: "一句话说明该技能何时被触发（≤1024 字），作为技能的触发依据",
 			}),
-			content: Type.String({
+			content: str({
 				description: "技能正文（Markdown）：适用场景、标准步骤、完成标准、注意事项，需完整可独立理解",
 			}),
-			mode: Type.Optional(
-				Type.Union([Type.Literal("create"), Type.Literal("replace")], {
+			mode: opt(
+				union([lit("create"), lit("replace")], {
 					description: "create=新建（默认；同名已存在时不会覆盖，会返回提示让你向对方确认）。replace=更新/覆盖已存在的同名技能，仅当对方明确要求「更新/修改/覆盖」时使用。",
 				}),
 			),
-		}),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { name, description, content, mode } = params as {
 				name: string;

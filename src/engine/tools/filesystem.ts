@@ -13,7 +13,7 @@
  * No write/modify tools exist: this capability is listing + authorized delete only.
  */
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { arr, bool, obj, opt, str } from "@earendil-works/pi-schema";
 import type { FileSystemService } from "../../filesystem/filesystem-service.js";
 
 function formatSize(bytes: number): string {
@@ -41,10 +41,10 @@ export function createFilesystemTools(filesystem: FileSystemService): AgentTool[
 		label: "文件系统：列目录",
 		description:
 			"列出允许目录内的文件与子目录，返回名称、类型、大小、最近修改时间、最近访问时间。用于查看本地下载目录等、找出「长期未用/体积大/安装包/压缩包」类文件。只能列举 filesystem.allowedDirs 白名单内的目录；白名单外会被拒绝。",
-		parameters: Type.Object({
-			path: Type.String({ description: "要列举的目录路径，如 ~/Downloads（须在允许目录内）" }),
-			recursive: Type.Optional(Type.Boolean({ description: "是否递归子目录（默认否，且有深度上限）" })),
-		}),
+		parameters: obj({
+			path: str({ description: "要列举的目录路径，如 ~/Downloads（须在允许目录内）" }),
+			recursive: opt(bool({ description: "是否递归子目录（默认否，且有深度上限）" })),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { path: dirPath, recursive } = params as { path: string; recursive?: boolean };
 			try {
@@ -72,12 +72,12 @@ export function createFilesystemTools(filesystem: FileSystemService): AgentTool[
 		label: "文件系统：删除文件",
 		description:
 			"删除允许目录内的文件。必须两步：先不带 confirmed（或 confirmed=false）调用，得到拟删清单，把清单明确展示给用户并征得其明确同意；只有在用户明确同意后，才可再次调用并带 confirmed=true 真正删除。未经用户明确授权绝不删除或修改任何文件；仅能删除文件、不能删除目录；白名单外的路径会被拒绝。",
-		parameters: Type.Object({
-			paths: Type.Array(Type.String(), { description: "要删除的文件绝对路径列表" }),
-			confirmed: Type.Optional(
-				Type.Boolean({ description: "仅当用户已明确同意删除时才设为 true；缺省/false 只返回拟删清单、不删除" }),
+		parameters: obj({
+			paths: arr(str(), { description: "要删除的文件绝对路径列表" }),
+			confirmed: opt(
+				bool({ description: "仅当用户已明确同意删除时才设为 true；缺省/false 只返回拟删清单、不删除" }),
 			),
-		}),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { paths, confirmed } = params as { paths: string[]; confirmed?: boolean };
 			if (!Array.isArray(paths) || paths.length === 0) {

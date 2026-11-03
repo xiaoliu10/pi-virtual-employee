@@ -17,7 +17,7 @@
  *    the current message (same gate as all guarded tools).
  */
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { arr, bool, lit, num, obj, opt, str, union } from "@earendil-works/pi-schema";
 import type { ConfigStore } from "../../db/config-store.js";
 import {
 	isExplicitConfirmation,
@@ -216,19 +216,19 @@ export function createManageSettingsTool(deps: SettingsToolDeps): AgentTool {
 			(fullAccess
 				? "注意修改 model 块（供应商/默认模型）有失联风险——配错将无法再通过对话恢复；切换前先核对该模型确在目标供应商 models 列表，核对无误且管理员已明确指示即可直接执行。"
 				: "注意修改 model 块（供应商/默认模型）有失联风险——配错将无法再通过对话恢复，请谨慎核对。"),
-		parameters: Type.Object({
-			action: Type.Union([Type.Literal("list"), Type.Literal("get"), Type.Literal("dump"), Type.Literal("set")], {
+		parameters: obj({
+			action: union([lit("list"), lit("get"), lit("dump"), lit("set")], {
 				description: fullAccess
 					? "list=列出可配置块；get=读单个值；dump=按块列出全部配置项（敏感值自动打码）；set=写配置（完全访问开启，直接执行）"
 					: "list=列出可配置块；get=读单个值；dump=按块列出全部配置项（敏感值自动打码）；set=写配置（需确认）",
 			}),
-			path: Type.Optional(Type.String({ description: "get/set 必填：点分路径，如 general.maxToolSteps、kb.local.topK、im.channels.0.enabled" })),
-			value: Type.Optional(
-				Type.Union([Type.String(), Type.Number(), Type.Boolean(), Type.Array(Type.String()), Type.Object({}, { additionalProperties: true })], {
+			path: opt(str({ description: "get/set 必填：点分路径，如 general.maxToolSteps、kb.local.topK、im.channels.0.enabled" })),
+			value: opt(
+				union([str(), num(), bool(), arr(str()), obj({}, { open: true })], {
 					description: "仅 set 必填：新值（标量、数组或对象；数组整体替换）",
 				}),
 			),
-		}),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { action } = params as { action: "list" | "get" | "dump" | "set"; path?: string; value?: unknown };
 

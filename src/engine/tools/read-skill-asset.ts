@@ -16,7 +16,7 @@
  *     so the context window isn't flooded.
  */
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { obj, str } from "@earendil-works/pi-schema";
 import { lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { SKILL_NAME_PATTERN } from "../skills/skill-parser.js";
@@ -33,14 +33,14 @@ export function createReadSkillAssetTool(userSkillsDir: string): AgentTool {
 		description:
 			"读取某个已导入技能目录下的附属文件（脚本、模板、参考数据等，随该技能的 SKILL.md 一起导入）。用于执行或参考 SKILL.md 中以相对路径引用的文件（如 run.py、templates/tpl.html）。" +
 			"只读，且只能读取该技能自身目录内的文件；路径含 ..、绝对路径、或指向技能目录之外都会被拒绝。读目录则返回其下文件清单（不递归），不返回目录内容正文。",
-		parameters: Type.Object({
-			skill: Type.String({
+		parameters: obj({
+			skill: str({
 				description: "技能名（与技能目录名一致，如 退款处理、handle-refund）",
 			}),
-			path: Type.String({
+			path: str({
 				description: "要读取的文件在该技能目录下的相对路径，如 run.py、templates/tpl.html；留空或为 . 则列出该技能目录根的文件清单",
 			}),
-		}),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { skill, path: rel } = params as { skill: string; path: string };
 			const skillErr = validateName(skill);

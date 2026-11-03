@@ -20,7 +20,7 @@
  *    admin cannot be removed through chat, so the gate can't lock itself out.
  */
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { lit, obj, opt, str, union } from "@earendil-works/pi-schema";
 import type { ConfigStore } from "../../db/config-store.js";
 import type { InboundActor } from "../../im/types.js";
 import { effectiveActorRole, hasAnyAdmin, isAdmin, ROLE_RANK } from "../../security/permissions.js";
@@ -219,14 +219,14 @@ export function createManageAdminTool(deps: AdminToolDeps): AgentTool {
 			"action=claim 在系统尚未设置任何管理员时认领成为首位管理员。" +
 			"安全规则：增删管理员及认领都必须由对方在当前消息中明确说出「确认」（或同义明确肯定语），" +
 			"否则返回待确认信息，你应先向对方复述变更内容征求确认；群聊请求一律拒绝。",
-		parameters: Type.Object({
-			action: Type.Union([Type.Literal("list"), Type.Literal("claim"), Type.Literal("add"), Type.Literal("remove")], {
+		parameters: obj({
+			action: union([lit("list"), lit("claim"), lit("add"), lit("remove")], {
 				description: "list=查看；claim=首位管理员认领（仅在尚无管理员时）；add/remove=增删管理员（仅管理员）",
 			}),
-			staffId: Type.Optional(Type.String({
+			staffId: opt(str({
 				description: "add/remove 时必填：目标用户的平台用户 ID（如钉钉 senderStaffId / staffId）",
 			})),
-		}),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { action, staffId } = params as { action: "list" | "claim" | "add" | "remove"; staffId?: string };
 			const adminIds = deps.config.all().security.adminStaffIds;
@@ -332,11 +332,11 @@ export function createUpdateIdentityTool(deps: AdminToolDeps): AgentTool {
 			"至少传一个字段；只想查看当前值时不要调用本工具（当前值：role/duty/serviceHours 会随工具说明注入，直接告诉对方即可）。" +
 			"安全规则：对方必须在当前消息中明确包含「确认」（或同义明确肯定语）才会执行；群聊一律拒绝；" +
 			"系统未设置管理员时，首位明确确认修改的人将同时成为首位管理员。",
-		parameters: Type.Object({
-			role: Type.Optional(Type.String({ description: "新的员工类型/角色，如「虚拟运维工程师」" })),
-			duty: Type.Optional(Type.String({ description: "新的职责描述" })),
-			serviceHours: Type.Optional(Type.String({ description: "新的服务时间标签，如「7×24h」" })),
-		}),
+		parameters: obj({
+			role: opt(str({ description: "新的员工类型/角色，如「虚拟运维工程师」" })),
+			duty: opt(str({ description: "新的职责描述" })),
+			serviceHours: opt(str({ description: "新的服务时间标签，如「7×24h」" })),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { role, duty, serviceHours } = params as { role?: string; duty?: string; serviceHours?: string };
 			const patch: Record<string, string> = {};

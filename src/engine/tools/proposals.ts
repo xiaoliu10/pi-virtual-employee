@@ -16,7 +16,7 @@
  *    anything: sharing it is a separate, deliberate act (save_report).
  */
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { lit, obj, opt, str, union } from "@earendil-works/pi-schema";
 import type { ProposalStore } from "../proposals.js";
 import type { TelemetryStore } from "../../db/telemetry-store.js";
 import { refuse } from "./admin.js";
@@ -50,19 +50,19 @@ export function createProposeImprovementTool(deps: ProposalToolDeps): AgentTool 
 			"action=resolve：关闭一份提案（id 或问题原文 + reason），关闭后同类问题不再重复上报。\n" +
 			"用法：先 my_stats focus=failures 拿到失败聚类与环比，挑「本窗口新增」或明显恶化的 1–3 项来提；同一个问题重复提交会**追加成第 N 次检测**而不是新建文件。\n" +
 			"本工具只写提案文件，不改代码、不改配置、不改权限，也不对外发布——那是人审议后的事。",
-		parameters: Type.Object({
-			action: Type.Union([Type.Literal("list"), Type.Literal("file"), Type.Literal("resolve")], {
+		parameters: obj({
+			action: union([lit("list"), lit("file"), lit("resolve")], {
 				description: "list=查看；file=新建/追加；resolve=关闭",
 			}),
-			problem: Type.Optional(Type.String({ description: "action=file 必填：一句话问题描述（它同时是提案的唯一标识）" })),
-			impact: Type.Optional(Type.String({ description: "action=file 必填：这个问题造成什么损失/麻烦" })),
-			proposal: Type.Optional(Type.String({ description: "action=file 必填：拟怎么改（写清改哪儿、改成什么）" })),
-			verification: Type.Optional(Type.String({ description: "action=file 必填：怎么验证有效（尽量用可测的指标）" })),
-			evidence: Type.Optional(Type.String({ description: "可选：证据文本；必须来自 my_stats 的真实输出，省略则由本工具自动附加当前统计快照" })),
-			source: Type.Optional(Type.String({ description: "可选：证据来源标注，如 my_stats focus=failures hours=168 scope=all" })),
-			id: Type.Optional(Type.String({ description: "action=resolve 必填：提案 id 或问题原文" })),
-			reason: Type.Optional(Type.String({ description: "action=resolve 必填：关闭理由（采纳并修好了 / 暂不处理的原因）" })),
-		}),
+			problem: opt(str({ description: "action=file 必填：一句话问题描述（它同时是提案的唯一标识）" })),
+			impact: opt(str({ description: "action=file 必填：这个问题造成什么损失/麻烦" })),
+			proposal: opt(str({ description: "action=file 必填：拟怎么改（写清改哪儿、改成什么）" })),
+			verification: opt(str({ description: "action=file 必填：怎么验证有效（尽量用可测的指标）" })),
+			evidence: opt(str({ description: "可选：证据文本；必须来自 my_stats 的真实输出，省略则由本工具自动附加当前统计快照" })),
+			source: opt(str({ description: "可选：证据来源标注，如 my_stats focus=failures hours=168 scope=all" })),
+			id: opt(str({ description: "action=resolve 必填：提案 id 或问题原文" })),
+			reason: opt(str({ description: "action=resolve 必填：关闭理由（采纳并修好了 / 暂不处理的原因）" })),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const p = params as {
 				action: "list" | "file" | "resolve";

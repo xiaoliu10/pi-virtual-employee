@@ -1,7 +1,7 @@
 /** Durable execution owned by VE; UI history is a projection of the transcript. */
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createModels, createProvider, createAssistantMessageEventStream, type Model, type Api, type Message, type AssistantMessage, type SimpleStreamOptions } from "@earendil-works/pi-ai";
-import { defineDoc, ProviderDoc, watchEvents, type Conversation, type ConversationId, type Cursor, type ToolRegistration } from "@earendil-works/pi-durable";
+import { defineDoc, ProviderDoc, type Conversation, type ConversationId, type Cursor, type ToolRegistration } from "@earendil-works/pi-durable";
 import type { Agent, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
 import type { SendCtx, SendResult, TurnProcessEvent } from "../engine.js";
 import type { HistoryStore } from "../../db/history-store.js";
@@ -287,6 +287,26 @@ export class DurableRuntime {
 			: { reply: EMPTY_ANSWER_REPLY, error: "durable empty answer" };
 	}
 	/**
+	 * Did this live tool SLOT end as a failure?
+	 *
+	 * Same trap as `endedAsError` below, in the 1.5.0 view shape: VE's tools catch
+	 * their own throws and RETURN `{ isError: true }`, so a faulted tool still has
+	 * a result ENTRY. The slot itself carries no error flag, so read the entry's
+	 * toolResult message out of the view's transcript window. A done slot with no
+	 * entry was orphaned or never ran — also a failure.
+	 */
+	private static slotEndedAsError(
+		slot: { entry?: unknown },
+		entries: readonly unknown[],
+	): boolean {
+		if (slot.entry === undefined) return true;
+		const entry = entries.find((e) => (e as { id?: unknown }).id === slot.entry) as
+			| { model?: readonly { isError?: boolean }[] }
+			| undefined;
+		return entry?.model?.[0]?.isError === true;
+	}
+
+	/**
 	 * Did this tool call end as a failure?
 	 *
 	 * The obvious reading (`no entry and no result`) is WRONG here: VE's tools
@@ -304,48 +324,93 @@ export class DurableRuntime {
 	}
 
 	/**
-	 * Translate the harness event stream of ONE conversation into TurnProcessEvents.
+	 * Translate ONE conversation's live view into TurnProcessEvents.
 	 *
-	 * `message_update.changes` carries the in-flight assistant message's
-	 * increments (`text_delta` / `thinking_delta`), and tool events carry start and
-	 * end with their call id — enough for the widget's progressive rendering.
-	 * Text is NOT deduplicated here: the widget's outbound credential gate already
-	 * accumulates and decides what to send.
+	 * pi-durable 1.5.0 removed `watchEvents()` (spec §9.4): a renderer renders
+	 * STATE instead of assembling it from an event stream. So we watch the
+	 * conversation view and read the two things the widget needs out of it:
+	 *
+	 *   - `pi.live.generation.message` — the throttled partial of the in-flight
+	 *     answer (persisted at `settings.progress.persistWithinMs`, default 1s);
+	 *   - `pi.live.tools` — one slot per tool call of the current round.
+	 *
+	 * The view hands us CUMULATIVE snapshots, while the widget wants increments
+	 * (`text_delta`), so each callback diffs against what it already emitted. The
+	 * diff is per content INDEX and prefix-based: the provider only ever appends
+	 * to a block, so a shorter value than we remember means the round restarted
+	 * and the accumulated text must reset.
+	 *
+	 * Watching is best-effort: a turn must still run and answer without it.
 	 */
 	private async watchProcess(conversationId: ConversationId, emit: (event: TurnProcessEvent) => void): Promise<() => Promise<void>> {
 		try {
-			const stream = await watchEvents(this.host.harness, conversationId, context);
+			const watch = await this.host.harness.conversation(conversationId, context);
+			if (!watch) return async () => {};
+			const handle = await watch.watch(context);
+			// Per-block already-emitted lengths, plus the tool calls seen so far.
+			const emitted = new Map<number, { text: number; thinking: number }>();
+			const toolState = new Map<string, "running" | "done">();
 			const startedAt = new Map<string, number>();
-			stream.start(async (events) => {
-				for (const event of events) {
-					try {
-						if (event.type === "message_update") {
-							for (const change of event.changes) {
-								if (change.type === "text_delta") emit({ type: "text_delta", delta: change.delta });
-								else if (change.type === "thinking_delta") emit({ type: "thinking_delta", delta: change.delta });
-							}
-						} else if (event.type === "tool_execution_start") {
-							startedAt.set(event.toolCallId, Date.now());
-							emit({ type: "tool_start", toolName: event.toolName, toolCallId: event.toolCallId });
-						} else if (event.type === "tool_execution_end") {
-							const began = startedAt.get(event.toolCallId);
-							startedAt.delete(event.toolCallId);
+
+			handle.start(async (call) => {
+				// Discriminated union: a `failed` frame keeps the watch open with no value.
+				if (call.kind !== "value") return;
+				const value = call.value as { docs: Record<string, unknown>; entries: readonly unknown[] };
+				const entries = value.entries;
+				try {
+					// 1) Streaming answer text / reasoning.
+					const live = value.docs["pi.live"] as
+						| { generation?: { message?: { content?: unknown[] } } }
+						| undefined;
+					const content = (live?.generation?.message?.content ?? []) as {
+						type?: string;
+						text?: string;
+						thinking?: string;
+					}[];
+					content.forEach((block, index) => {
+						const mark = emitted.get(index) ?? { text: 0, thinking: 0 };
+						const kind = block.type === "text" ? "text" : block.type === "thinking" ? "thinking" : undefined;
+						if (!kind) return;
+						const full = (kind === "text" ? block.text : block.thinking) ?? "";
+						// A shorter value than remembered = a new round reused the index.
+						if (full.length < mark[kind]) mark[kind] = 0;
+						const delta = full.slice(mark[kind]);
+						if (delta) {
+							mark[kind] = full.length;
+							emit({ type: kind === "text" ? "text_delta" : "thinking_delta", delta });
+						}
+						emitted.set(index, mark);
+					});
+
+					// 2) Tool calls of the current round.
+					const tools = (live as { tools?: { callId: string; name: string; status: string; durationMs?: number; entry?: unknown }[] })
+						?.tools ?? [];
+					for (const slot of tools) {
+						const seen = toolState.get(slot.callId);
+						if (seen === undefined) {
+							toolState.set(slot.callId, slot.status === "done" ? "done" : "running");
+							startedAt.set(slot.callId, Date.now());
+							emit({ type: "tool_start", toolName: slot.name, toolCallId: slot.callId });
+						}
+						if (slot.status === "done" && toolState.get(slot.callId) !== "done") {
+							toolState.set(slot.callId, "done");
+							const began = startedAt.get(slot.callId);
+							startedAt.delete(slot.callId);
 							emit({
 								type: "tool_end",
-								toolName: event.toolName,
-								toolCallId: event.toolCallId,
-								isError: DurableRuntime.endedAsError(event),
-								durationMs: began === undefined ? undefined : Date.now() - began,
+								toolName: slot.name,
+								toolCallId: slot.callId,
+								isError: DurableRuntime.slotEndedAsError(slot, entries),
+								durationMs: slot.durationMs ?? (began === undefined ? undefined : Date.now() - began),
 							});
 						}
-					} catch (err) {
-						console.warn("[durable] process event failed:", err instanceof Error ? err.message : err);
 					}
+				} catch (err) {
+					console.warn("[durable] process event failed:", err instanceof Error ? err.message : err);
 				}
 			});
-			return async () => { await stream.stop().catch(() => {}); };
+			return async () => { await handle.stop().catch(() => {}); };
 		} catch (err) {
-			// Watching is best-effort: a turn must still run and answer without it.
 			console.warn(`[durable] process watch unavailable for ${conversationId}:`, err instanceof Error ? err.message : err);
 			return async () => {};
 		}

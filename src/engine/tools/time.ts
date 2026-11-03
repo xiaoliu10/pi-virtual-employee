@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { obj } from "@earendil-works/pi-schema";
 
 /** Beijing time (UTC+8), regardless of the host machine's timezone. */
 export const BEIJING_TZ = "Asia/Shanghai";
@@ -51,7 +51,7 @@ export function createCurrentTimeTool(): AgentTool {
 		label: "获取当前时间",
 		description:
 			"获取当前的真实日期与时间（北京时间，UTC+8）。凡是任务里出现「今天/昨天/明天/本周/本月/每日/当前」等时间词，或报告需要写日期标题时，必须先调用本工具取真实时间，禁止凭记忆或训练知识猜测日期。返回日期(YYYY-MM-DD)、时间、星期。",
-		parameters: Type.Object({}),
+		parameters: obj({}, { open: true }),
 		async execute() {
 			const t = beijingNow();
 			const text = `当前北京时间：${t.date} ${t.time}（${t.weekdayName}）。涉及日期的任务请以本时间为准（如「昨天」= ${t.date} 的前一天）。`;

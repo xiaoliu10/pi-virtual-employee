@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { bool, lit, obj, opt, union } from "@earendil-works/pi-schema";
 import type { ConfigStore } from "../../db/config-store.js";
 import { effectiveActorRole, hasAnyAdmin, isAdmin } from "../../security/permissions.js";
 import {
@@ -168,15 +168,15 @@ export function createManageUpdateTool(deps: UpdateToolDeps): AgentTool {
 			"action=set_auto 开启或关闭无人值守自动更新（传 enabled=true/false）。" +
 			"用户说「立刻安装/马上装」而新版本已下载时用 install_now；用户回复「确认更新到最新版」（download_only 模式提示语）也映射为 install_now。" +
 			"update 是异步操作：收到工具结果后先正常回复「已安排更新」，不要声称已经重启完成；install_now 同理，回复后应用随时会重启。",
-		parameters: Type.Object({
-			action: Type.Union(
-				[Type.Literal("status"), Type.Literal("check"), Type.Literal("update"), Type.Literal("install_now"), Type.Literal("set_auto")],
+		parameters: obj({
+			action: union(
+				[lit("status"), lit("check"), lit("update"), lit("install_now"), lit("set_auto")],
 				{ description: "status=查看；check=检查；update=下载并空闲时安装；install_now=立即安装已下载版本；set_auto=开关无人值守自动更新" },
 			),
-			enabled: Type.Optional(Type.Union([Type.Boolean(), Type.Literal("full"), Type.Literal("download_only"), Type.Literal("off")], {
+			enabled: opt(union([bool(), lit("full"), lit("download_only"), lit("off")], {
 				description: "仅 set_auto 必填：true/false 或 \"full\"（完全自动）/ \"download_only\"（仅下载不自动装）/ \"off\"",
 			})),
-		}),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { action, enabled } = params as {
 				action: "status" | "check" | "update" | "install_now" | "set_auto";

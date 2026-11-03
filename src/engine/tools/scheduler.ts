@@ -9,7 +9,7 @@
  * "0 9 * * 1" = every Monday 09:00.
  */
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { bool, num, obj, opt, str } from "@earendil-works/pi-schema";
 import type { SchedulerService } from "../../scheduler/scheduler-service.js";
 import type { ConfigStore } from "../../db/config-store.js";
 import { maskId, isExplicitConfirmation, isSchedulerActor, requireConfirmedAdmin, type ActorContext } from "./admin.js";
@@ -76,15 +76,15 @@ export function createSchedulerTools(
 			"因此：不要向对方索要任何 ID；也不要声称群聊里创建的任务需要另外授权——那是不对的。任务创建本身需要 operator 及以上角色（会受会话门槛约束）。**无人值守回合（定时任务执行中）创建的跟进任务会自动沿用任务链源头管理员的身份**，同样无需补授权（每名管理员名下此类链式任务上限 20 个，防失控）；只有控制台/旧版本创建的遗留任务才需要 authorize_scheduled_task。" +
 			"【术语边界，2026-10-17 现场教训】本工具创建的是**定时任务**（到点执行固定 prompt）。用户说「自主任务」时指的是另一套东西——由 manage_work_items 管理的 work item（员工自己决定观察点与节奏持续跟进，卡住暂停等人，无固定 cron）。用户说「重建自主任务」「自主任务继续」时**必须**用 manage_work_items 的 create/resume，严禁用本工具的 autonomous 参数顶替（那只是「到点后多跑几轮」，仍是定时任务，会让真正的自主任务永远缺失）。" +
 			"凡是「N 分钟/小时后执行」「到 X 点再查/再跟一次」这类**明确了时间**的一次性延迟请求，也必须创建定时任务（cron 写具体时刻，下一个触发点即目标时间），当前回合只确认创建结果并回复触发时间——严禁在回合内 sleep/轮询等到点，回合内长阻塞会卡死会话队列，对方后续消息进不来。【自主任务/定时任务边界铁律（2026-10-17 现场修复）】这两类是**不同的东西，不可互相顶替**：自主任务（需要持续判断、卡住暂停等人的工作）由员工自己提议、管理员确认后创建，它的等待人工恢复机制是「管理员在来源会话直接回复内容即自动继续」；定时任务是到点执行固定 prompt。**当你在处理一个正在等待人工的自主任务卡点（⏸️）时，管理员在会话里提供的答复（验证码、登录信息、参数）是给那个自主任务恢复用的，严禁用 create_scheduled_task 新建任务来「接手」或「重建」它**——那会让原任务永远等待、现场同时跑两份重复工作。正确做法：确认答复内容，告知原自主任务会据此自动恢复。时刻模糊（「之后/回头」）的先报建议时间、对方确认后再建。注意 cron 是循环语义：任务到点执行后仍保留、明年同日还会再触发，一次性任务请在 prompt 末尾写明「任务完成后用 delete_scheduled_task 删除本任务」自我清理；提醒类任务不要开 silent；cron 最小粒度为分钟，秒级延迟无法精确表达。",
-		parameters: Type.Object({
-			title: Type.String({ description: "任务简短标题，如「每日订单早报」" }),
-			prompt: Type.String({ description: "到点要执行的指令，如「查询昨日所有订单状态并汇总异常」" }),
-			cron: Type.String({ description: "5 字段 cron 表达式（本地时间），如 0 9 * * *" }),
-			autonomous: Type.Optional(Type.Boolean({ description: "自主模式：到点后不止执行一轮，而是连续多轮工作直到目标完成、需要人工或时间上限（默认不限制轮数、时长上限 120 分钟）。适合「整理并核对月末报表」这类长目标；单次可完成的任务不要开" })),
-			silent: Type.Optional(Type.Boolean({ description: "静默执行：到点照常执行并记录结果，但完成时不推送回会话（不发送「定时任务完成+报告链接」）。适合保活、巡检、维护类任务——只要跑成功就不需要人知道。出错时仍会推送，静默不等于隐藏失败" })),
-			maxTurns: Type.Optional(Type.Number({ description: "自主模式最大轮数：不传或传 0 = 不限制轮数（默认，仅受时长上限约束）；仅当对方明确要求限制轮数时才传正数（上限 200）" })),
-			maxMinutes: Type.Optional(Type.Number({ description: "自主模式最大时长分钟（默认 120，上限 1440）" })),
-		}),
+		parameters: obj({
+			title: str({ description: "任务简短标题，如「每日订单早报」" }),
+			prompt: str({ description: "到点要执行的指令，如「查询昨日所有订单状态并汇总异常」" }),
+			cron: str({ description: "5 字段 cron 表达式（本地时间），如 0 9 * * *" }),
+			autonomous: opt(bool({ description: "自主模式：到点后不止执行一轮，而是连续多轮工作直到目标完成、需要人工或时间上限（默认不限制轮数、时长上限 120 分钟）。适合「整理并核对月末报表」这类长目标；单次可完成的任务不要开" })),
+			silent: opt(bool({ description: "静默执行：到点照常执行并记录结果，但完成时不推送回会话（不发送「定时任务完成+报告链接」）。适合保活、巡检、维护类任务——只要跑成功就不需要人知道。出错时仍会推送，静默不等于隐藏失败" })),
+			maxTurns: opt(num({ description: "自主模式最大轮数：不传或传 0 = 不限制轮数（默认，仅受时长上限约束）；仅当对方明确要求限制轮数时才传正数（上限 200）" })),
+			maxMinutes: opt(num({ description: "自主模式最大时长分钟（默认 120，上限 1440）" })),
+		}, { open: true }),
 		async execute(_id, params) {
 			const p = params as { title: string; prompt: string; cron: string; autonomous?: boolean; silent?: boolean; maxTurns?: number; maxMinutes?: number };
 			try {
@@ -185,7 +185,7 @@ export function createSchedulerTools(
 			"列出当前所有定时任务及其启用状态、cron、上次与下次执行时间、创建来源，以及**无人值守执行身份**。" +
 			"执行身份＝创建人当前的角色（任务跟随创建人权限）；显示「未记录」的只有控制台/旧版本创建的任务，那些才需要用 authorize_scheduled_task 补授权。创建人被降权时这里会警告。" +
 			"本列表不含 prompt 正文；要看某个任务的执行指令原文用 get_scheduled_task（id 从本列表取）。",
-		parameters: Type.Object({}),
+		parameters: obj({}, { open: true }),
 		async execute() {
 			const rows = scheduler.list();
 			if (rows.length === 0) {
@@ -217,7 +217,7 @@ export function createSchedulerTools(
 		description:
 			"按 id 查看一个定时任务的完整详情，包括 **prompt 执行指令原文**（list_scheduled_tasks 只有标题/cron/时间等元数据，不含 prompt）。" +
 			"修改 prompt（update_scheduled_task）之前必须先看原文，禁止盲改。",
-		parameters: Type.Object({ id: Type.String({ description: "任务 id（来自 list_scheduled_tasks）" }) }),
+		parameters: obj({ id: str({ description: "任务 id（来自 list_scheduled_tasks）" }) }, { open: true }),
 		async execute(_toolCallId, params) {
 			const id = (params as { id: string }).id;
 			const task = scheduler.get(id);
@@ -250,7 +250,7 @@ export function createSchedulerTools(
 		name: "delete_scheduled_task",
 		label: "删除定时任务",
 		description: "按 id 删除一个定时任务。删除前建议先用 list_scheduled_tasks 确认 id。",
-		parameters: Type.Object({ id: Type.String({ description: "任务 id（来自 list）" }) }),
+		parameters: obj({ id: str({ description: "任务 id（来自 list）" }) }, { open: true }),
 		async execute(_id, params) {
 			scheduler.delete((params as { id: string }).id);
 			return { content: [{ type: "text", text: "已删除该定时任务。" }], details: { ok: true } };
@@ -266,10 +266,10 @@ export function createSchedulerTools(
 			"授权动作必须在管理员单聊里做（被授权的任务不受来源限制，群任务也能在此修好），结果推送目标（原群/原单聊）不变，且**无需删除重建**——原 cron、prompt 与执行历史全部保留。" +
 			"传 id 授权单个；传 all=true 一次授权**所有尚未授权的任务**（管理员自己建的任务批量补授权用这个，不必逐个来）。" +
 			"授权后任务以你（当前管理员）的身份执行，每次开跑前实时重新校验：你被移出管理员名单，任务立即失去受控权限。",
-		parameters: Type.Object({
-			id: Type.Optional(Type.String({ description: "要授权的任务 id（来自 list_scheduled_tasks）；用 all=true 时省略" })),
-			all: Type.Optional(Type.Boolean({ description: "true=授权当前所有未授权的任务" })),
-		}),
+		parameters: obj({
+			id: opt(str({ description: "要授权的任务 id（来自 list_scheduled_tasks）；用 all=true 时省略" })),
+			all: opt(bool({ description: "true=授权当前所有未授权的任务" })),
+		}, { open: true }),
 		async execute(_id, params) {
 			const { id, all } = params as { id?: string; all?: boolean };
 			let taskId = (id ?? "").trim();
@@ -356,10 +356,10 @@ export function createSchedulerTools(
 		name: "toggle_scheduled_task",
 		label: "启停定时任务",
 		description: "启用或停用一个定时任务（按 id）。",
-		parameters: Type.Object({
-			id: Type.String({ description: "任务 id（来自 list）" }),
-			enabled: Type.Boolean({ description: "true=启用，false=停用" }),
-		}),
+		parameters: obj({
+			id: str({ description: "任务 id（来自 list）" }),
+			enabled: bool({ description: "true=启用，false=停用" }),
+		}, { open: true }),
 		async execute(_id, params) {
 			const p = params as { id: string; enabled: boolean };
 			scheduler.setEnabled(p.id, p.enabled);
@@ -378,10 +378,10 @@ export function createSchedulerTools(
 			"仅限管理员或任务创建人使用；普通用户要求续跑时说明需要管理员或创建人确认。" +
 			"若是「需要人工」暂停，用户消息里通常已含答案——提醒用户答案会作为下一轮的输入交给任务。" +
 			"没有暂停中的链条时不要调用本工具。",
-		parameters: Type.Object({
-			id: Type.String({ description: "任务 id（来自 list_scheduled_tasks）" }),
-			answer: Type.Optional(Type.String({ description: "对暂停问题的答复（任务因「需要人工」暂停时）；会作为下一轮输入交给任务" })),
-		}),
+		parameters: obj({
+			id: str({ description: "任务 id（来自 list_scheduled_tasks）" }),
+			answer: opt(str({ description: "对暂停问题的答复（任务因「需要人工」暂停时）；会作为下一轮输入交给任务" })),
+		}, { open: true }),
 		async execute(_id, params) {
 			const p = params as { id: string; answer?: string };
 			const task = scheduler.get(p.id);
@@ -429,17 +429,17 @@ export function createSchedulerTools(
 			"不要为了「把结果发到这里」而改绑，也不要因为正在某个会话里编辑任务就传 bindCurrent。" +
 			"只有对方明确要求把推送改绑到当前会话时才传 bindCurrent=true；且改绑一个已有推送目标的任务，必须让对方在当前消息中包含「确认」。" +
 			"改 prompt 前必须先用 get_scheduled_task 读原文（本工具不返回旧值），禁止凭记忆盲改。",
-		parameters: Type.Object({
-			id: Type.String({ description: "任务 id（来自 list_scheduled_tasks）" }),
-			title: Type.Optional(Type.String({ description: "新的任务标题" })),
-			prompt: Type.Optional(Type.String({ description: "新的到点执行指令" })),
-			cron: Type.Optional(Type.String({ description: "新的 5 字段 cron（本地时间），如 0 9 * * *" })),
-			bindCurrent: Type.Optional(Type.Boolean({ description: "true=把推送目标改绑为当前会话。仅当对方明确要求改绑；改绑已有推送目标需当前消息含「确认」" })),
-			autonomous: Type.Optional(Type.Boolean({ description: "开/关自主模式（连续多轮工作直到完成、需要人工或时间上限；默认不限制轮数）" })),
-			silent: Type.Optional(Type.Boolean({ description: "静默执行开关：true=执行并记录但不推送完成通知（出错仍推送）；false=恢复完成推送" })),
-			maxTurns: Type.Optional(Type.Number({ description: "自主模式最大轮数：不传 = 保持原样；传 0 = 改成不限制轮数；仅当对方明确要求限制轮数时才传正数（上限 200）" })),
-			maxMinutes: Type.Optional(Type.Number({ description: "自主模式最大时长分钟（默认 120，上限 1440）" })),
-		}),
+		parameters: obj({
+			id: str({ description: "任务 id（来自 list_scheduled_tasks）" }),
+			title: opt(str({ description: "新的任务标题" })),
+			prompt: opt(str({ description: "新的到点执行指令" })),
+			cron: opt(str({ description: "新的 5 字段 cron（本地时间），如 0 9 * * *" })),
+			bindCurrent: opt(bool({ description: "true=把推送目标改绑为当前会话。仅当对方明确要求改绑；改绑已有推送目标需当前消息含「确认」" })),
+			autonomous: opt(bool({ description: "开/关自主模式（连续多轮工作直到完成、需要人工或时间上限；默认不限制轮数）" })),
+			silent: opt(bool({ description: "静默执行开关：true=执行并记录但不推送完成通知（出错仍推送）；false=恢复完成推送" })),
+			maxTurns: opt(num({ description: "自主模式最大轮数：不传 = 保持原样；传 0 = 改成不限制轮数；仅当对方明确要求限制轮数时才传正数（上限 200）" })),
+			maxMinutes: opt(num({ description: "自主模式最大时长分钟（默认 120，上限 1440）" })),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const p = params as { id: string; title?: string; prompt?: string; cron?: string; bindCurrent?: boolean; autonomous?: boolean; silent?: boolean; maxTurns?: number; maxMinutes?: number };
 			const patch: { title?: string; prompt?: string; cron?: string; conversationId?: string | null; autonomous?: boolean; silent?: boolean; maxTurns?: number | null; maxMinutes?: number | null } = {};
