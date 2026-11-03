@@ -515,6 +515,8 @@ async function main(): Promise<void> {
 		userSkillsDir,
 		shellAuditLogPath: path.join(userData, "logs", "shell-audit.log"),
 		proposalsDir,
+		// run_script writes its parameter files here (script-params/<stem>/params.json).
+		userDataDir: userData,
 	}, { timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000, kernel });
 	// stdio MCP transports own child processes — disconnect them on quit
 	// (best-effort: will-quit cannot await, fire and forget).
