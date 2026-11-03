@@ -66,6 +66,10 @@ interface RuntimeOptions {
 	history: HistoryStore;
 	session(id: string): Agent;
 	tools(id: string): AgentTool<any>[];
+	/** MCP external tools for the CURRENT config, read at open and on every refresh.
+	 *  Optional: a caller with no MCP support (tests, standalone hosts) omits it and
+	 *  the durable host simply carries an empty `ve-mcp` extension. */
+	mcpTools?(id: string): AgentTool<any>[];
 	stream(id: string, options: SimpleStreamOptions, messages: Message[]): ReturnType<StreamFn>;
 	withActor<T>(id: string, ctx: SendCtx, text: string, run: () => Promise<T>): Promise<T>;
 	onRecovered(id: string, result: SendResult, occurrenceId: string): Promise<void>;
@@ -123,7 +127,26 @@ export class DurableRuntime {
 					() => toDurableTool(current).execute(args, api, ctx));
 			},
 		}));
-		runtime.host = await openDurableHost({ userDataDir: opts.userDataDir, profileName: "default", tools: [], models, registrations });
+		// MCP gets its own registration set (its own extension in the registry), so
+		// the surface can be replaced live — see setMcpTools below. The execute
+		// closure re-resolves the CURRENT tool on every call, exactly like the
+		// built-ins, so a reconnect needs no re-registration to keep working.
+		const mcpAt = (id: string): AgentTool<any>[] => opts.mcpTools?.(id) ?? [];
+		const mcpRegistrations: ToolRegistration<any, any>[] = mcpAt("default").map((template) => ({
+			...toDurableTool(template),
+			execute: async (args, api, ctx) => {
+				const route = runtime.routes.get(api.conversationId);
+				if (!route) throw new Error("Missing durable tool identity; execution refused");
+				const current = mcpAt(route.conversationId).find((tool) => tool.name === template.name);
+				if (!current) throw new Error(`Tool ${template.name} is currently disabled`);
+				return opts.withActor(route.conversationId, runtime.actorContext(api.conversationId, route), route.text,
+					() => toDurableTool(current).execute(args, api, ctx));
+			},
+		}));
+		runtime.host = await openDurableHost({
+			userDataDir: opts.userDataDir, profileName: "default", tools: [], models, registrations,
+			mcpRegistrations,
+		});
 		try {
 		// Read-only scans must finish before scheduling starts: tool/model closures
 		// need the restored route, never a fabricated console identity.
@@ -196,6 +219,39 @@ export class DurableRuntime {
 	 * that need "is a turn running?" must ask the kernel instead (v0.2.173).
 	 */
 	isBusyConversation(id: string): boolean { return (this.active.get(id)?.size ?? 0) > 0; }
+
+	/**
+	 * Replace the MCP tool surface on the LIVE host.
+	 *
+	 * Field incident 2026-11-03: MCP tools were baked into the `ve-tools`
+	 * extension's registrations when the host opened, so a server that connected
+	 * afterwards (HTTP connect is always slower than startup) — or reconnected
+	 * after a settings change — was invisible to the model for the rest of the
+	 * process lifetime. `registry.install` replaces the `ve-mcp` extension in
+	 * place and publishes at once; every conversation re-resolves its agent from
+	 * the current snapshot, so the next turn sees the new tools.
+	 *
+	 * No-op before open / after close: the caller (engine) only invokes this when
+	 * it holds a live runtime.
+	 */
+	setMcpTools(tools: AgentTool<any>[]): void {
+		if (this.closing || !this.host) return;
+		try {
+			this.host.setMcpTools(tools.map((template) => ({
+				...toDurableTool(template),
+				execute: async (args, api, ctx) => {
+					const route = this.routes.get(api.conversationId);
+					if (!route) throw new Error("Missing durable tool identity; execution refused");
+					const current = (this.opts.mcpTools?.(route.conversationId) ?? []).find((tool) => tool.name === template.name);
+					if (!current) throw new Error(`Tool ${template.name} is currently disabled`);
+					return this.opts.withActor(route.conversationId, this.actorContext(api.conversationId, route), route.text,
+						() => toDurableTool(current).execute(args, api, ctx));
+				},
+			})));
+		} catch (err) {
+			console.error("[durable] mcp tool surface update failed:", err instanceof Error ? err.message : err);
+		}
+	}
 	abort(id: string): boolean {
 		const set = this.active.get(id);
 		for (const conv of set ?? []) void conv.abort(context).catch((err) => console.error("[durable] abort failed", err));
