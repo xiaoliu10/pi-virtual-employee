@@ -43,7 +43,7 @@ import type { DocumentService, FileSender } from "../documents/document-service.
 import type { FileSystemService } from "../filesystem/filesystem-service.js";
 import type { ReportService } from "../reports/report-service.js";
 import type { DownloadService } from "../downloads/download-service.js";
-import { buildSystemPrompt, buildTools } from "./definition.js";
+import { buildSystemPrompt, buildTools, guardTool } from "./definition.js";
 import type { UpdateOperations } from "./tools/update.js";
 import { hasActiveShellCommands } from "./tools/shell.js";
 import {effectiveAuthorizationRole, ROLE_RANK, checkPermission, isLocalConversation, resolveRole} from "../security/permissions.js";
@@ -51,6 +51,7 @@ import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
 import { createMcpManager, type McpManager } from "./tools/mcp.js";
+import { normalizeMcpServers } from "../shared/mcp.js";
 import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, recentAssistantVisibleTexts, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, substantialAnchorOf, SUMMARIZER_RETRY, taskAnchorOf, truncateToFit, usableContextWindow, turnMemoryPrefix } from "./context.js";
 import { extractProgressFromTexts, formatDeterministicBrief, standardizeProgressReport } from "./progress.js";
 import { fetchModelInfo, resolveEffectiveLimits, type RemoteModelInfo } from "./model-info.js";
@@ -377,6 +378,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 			const { changed, report } = await this.mcpManager.refresh(this.config);
 			if (changed) {
 				console.log(`[engine] mcp tools changed: ${report.map((r) => `${r.name}=${r.ok ? r.tools : `err:${r.error ?? "?"}`}`).join(", ")}`);
+				// Durable kernel: the registry's `ve-mcp` extension is replaced in
+				// place and republished, and every conversation re-resolves its agent
+				// from the CURRENT snapshot — so the model sees the new tools on its
+				// next turn WITHOUT a host reopen. markConfigChanged alone only
+				// rebuilds legacy AgentSessions, which is why durable sessions kept
+				// reporting "no such tool" until restart (field incident 2026-11-03).
+				this.durableRuntime?.setMcpTools(this.mcpToolsFor("default"));
 				this.markConfigChanged();
 			}
 		} catch (err) {
@@ -398,12 +406,129 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** Re-read capabilities.mcp and reconnect (called after a settings save so a
 	 * newly added server is live without an app restart). Marked changed only
 	 * when the tool surface moved, so an unrelated save is a cheap no-op. */
-	async refreshMcpTools(): Promise<void> {
-		await this.refreshMcp();
+	/**
+	 * Connect MCP and report whether every configured server ended up with tools.
+	 *
+	 * A single attempt is not enough at startup: an HTTP/stdio MCP server that is
+	 * still booting (field 2026-11-03: the agent starts ~10s before the server it
+	 * must talk to) fails once and then stays invisible for the whole process
+	 * lifetime. Retry with a bounded exponential backoff, and stop as soon as a
+	 * pass succeeds — the retry budget exists only to cover that startup race.
+	 */
+	/**
+	 * Variant used at STARTUP: one bounded attempt, then hand the rest to the
+	 * background. Opening the durable host waits on this, and the connect timeout
+	 * is the server's own `timeoutSec` (default 60s) — a full retry ladder here
+	 * would stall app startup by minutes when a configured server is down.
+	 *
+	 * The first snapshot must already contain the MCP tools (the registry freezes
+	 * at open), but the LAGGING server is handled by the background retry, whose
+	 * success calls the same live `setMcpTools` path.
+	 */
+	async refreshMcpToolsForStartup(startupBudgetMs = 8_000): Promise<{ ok: boolean; servers: number; connected: number }> {
+		const configured = this.configuredMcpServerCount();
+		if (configured === 0) {
+			await this.refreshMcp();
+			return { ok: true, servers: 0, connected: 0 };
+		}
+		const raced = await Promise.race([
+			this.refreshMcpWithReport(),
+			this.unrefSleep(startupBudgetMs).then(() => null),
+		]);
+		const first = raced ?? { servers: configured, connected: 0 };
+		if (first.servers === 0 || first.connected >= first.servers) {
+			return { ok: true, servers: first.servers, connected: first.connected };
+		}
+		// Not everything connected inside the startup budget: finish in the
+		// background so startup proceeds, and apply the surface live when it lands.
+		void this.finishMcpConnectInBackground();
+		return { ok: false, servers: first.servers, connected: first.connected };
 	}
+
+	/** Number of enabled MCP servers in the current config (0 when MCP is off). */
+	private configuredMcpServerCount(): number {
+		const mcp = this.config.all().capabilities?.mcp;
+		if (mcp?.enabled !== true) return 0;
+		return normalizeMcpServers(mcp.servers, process.env).servers.filter((s) => s.enabled !== false).length;
+	}
+
+	/** Keep retrying the MCP connect in the background (bounded), applying live. */
+	private async finishMcpConnectInBackground(): Promise<void> {
+		for (const delay of [2_000, 5_000, 10_000, 30_000, 60_000]) {
+			await this.unrefSleep(delay);
+			// App is quitting: do not touch the manager (it would reconnect a
+			// transport during shutdown and reset its `disposed` flag).
+			if (this.shuttingDown) return;
+			const last = await this.refreshMcpWithReport();
+			if (last.servers === 0 || last.connected >= last.servers) {
+				console.log(`[engine] mcp connected after background retry: ${last.connected}/${last.servers}`);
+				return;
+			}
+		}
+		console.warn("[engine] mcp still not fully connected after background retries");
+	}
+
+	async refreshMcpTools(): Promise<{ ok: boolean; servers: number; connected: number }> {
+		const configured = this.config.all().capabilities?.mcp?.enabled === true
+			? normalizeMcpServers(this.config.all().capabilities?.mcp?.servers, process.env).servers.filter((s) => s.enabled !== false).length
+			: 0;
+		if (configured === 0) {
+			await this.refreshMcp();
+			return { ok: true, servers: 0, connected: 0 };
+		}
+		// 0 → 2s → 5s → 10s: covers a server that boots after the agent. Stops at
+		// the first fully-connected pass, so a healthy setup pays nothing extra.
+		// 0 → 2s → 5s → 10s: covers a server that boots after the agent. Stops at
+		// the first fully-connected pass, so a healthy setup pays nothing extra.
+		// The waits are unref'd: startup must never be held open by a retry sleep
+		// (a quit during the window would otherwise wait out the timer).
+		const delays = [0, 2_000, 5_000, 10_000];
+		let last = await this.refreshMcpWithReport();
+		for (const delay of delays.slice(1)) {
+			if (last.servers === 0 || last.connected >= last.servers) break;
+			await this.unrefSleep(delay);
+			last = await this.refreshMcpWithReport();
+		}
+		const ok = last.servers === 0 || last.connected >= last.servers;
+		if (!ok) console.warn(`[engine] mcp connect incomplete after retries: ${last.connected}/${last.servers}`);
+		return { ok, servers: last.servers, connected: last.connected };
+	}
+
+	/** Sleep that cannot hold the process open (a quit must not wait for a retry). */
+	private async unrefSleep(ms: number): Promise<void> {
+		await new Promise<void>((resolve) => {
+			const timer = setTimeout(resolve, ms);
+			timer.unref?.();
+		});
+	}
+
+	/** One refresh, returning how many configured servers ended up with tools.
+	 *  MUST go through refreshMcp (not mcpManager.refresh directly): a successful
+	 *  connect that never publishes to the durable registry leaves the tools
+	 *  invisible — the exact bug this file fixes, re-created one layer up. */
+	private async refreshMcpWithReport(): Promise<{ servers: number; connected: number }> {
+		try {
+			const { report } = await this.mcpManager.refresh(this.config);
+			const serverRows = report.filter((r) => r.name !== "(配置)");
+			const servers = Math.max(serverRows.length, 0);
+			const connected = serverRows.filter((r) => r.ok).length;
+			// Publish the CURRENT surface — refresh only reports success; the tools
+			// (and their names) are read from the manager afterwards.
+			this.durableRuntime?.setMcpTools(this.mcpToolsFor("default"));
+			return { servers, connected };
+		} catch {
+			return { servers: 1, connected: 0 };
+		}
+	}
+
+	/** Set when shutdown starts, so background MCP retries stop touching the
+	 *  manager (a retry during quit would reconnect a transport and clear the
+	 *  manager's `disposed` flag). */
+	private shuttingDown = false;
 
 	/** Close every MCP connection (stdio transports own child processes). */
 	async disposeMcp(): Promise<void> {
+		this.shuttingDown = true;
 		await this.mcpManager.dispose();
 	}
 	/** Work items (autonomous work phase 2). Set by main after construction; absent → work tools off. */
@@ -483,6 +608,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			userDataDir, history: this.history,
 			session: (id) => this.getOrCreateSession(id),
 			tools: (id) => this.buildToolSetFor(id),
+			mcpTools: (id) => this.mcpToolsFor(id),
 			stream: (id, options, messages) => {
 				const { supplier, modelId } = this.resolveForConversation(id);
 				const model = this.resolveModel(supplier, modelId);
@@ -2955,9 +3081,45 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * instead of a second, drifting construction. A permission check must not
 	 * depend on which kernel drives the conversation.
 	 */
+	/**
+	 * MCP external tools for one conversation. Deliberately SEPARATE from
+	 * buildToolSetFor: under the durable kernel these are installed as their own
+	 * registry extension (`ve-mcp`) so the surface can be replaced at runtime —
+	 * folding them into `ve-tools` froze them at open time and an MCP server that
+	 * connected later was invisible to the model for the whole process lifetime
+	 * (field incident 2026-11-03).
+	 */
+	mcpToolsFor(conversationId: string): AgentTool<any>[] {
+		const cfg = this.config.all();
+		if (!cfg.capabilities.mcp?.enabled) return [];
+		// MUST go through the SAME RBAC guard as the legacy path. The durable
+		// registry bypasses buildTools entirely, so handing it raw manager tools
+		// would skip `guarded("mcp", ...)` — i.e. checkPermission(config, actor,
+		// conversationId, "mcp") never runs and a viewer (or a turn whose
+		// capability was revoked mid-session) could call MCP tools. That is the
+		// exact guard the environment capability gate exists for (PR #95).
+		// MUST go through the SAME RBAC guard as the legacy path. The durable
+		// registry bypasses buildTools entirely, so handing it raw manager tools
+		// would skip `guarded("mcp", ...)` — i.e. checkPermission(config, actor,
+		// conversationId, "mcp") never runs and a viewer could call MCP tools.
+		// Reuse guardTool instead of copying it: a copy is how the two paths drift.
+		const guardOptions = { config: this.config, conversationId, resolveActor: (cid: string) => this.turnActor.get(cid), onRoleRefusal: (cid: string, info: { capability: string; need: string }) => this.noteAuthorizationNeeded(cid, info) } as unknown as Parameters<typeof guardTool>[2];
+		return this.mcpManager.tools().map((tool) => guardTool("mcp", tool, guardOptions));
+	}
+
 	buildToolSetFor(conversationId: string): AgentTool<any>[] {
 		const cfg = this.config.all();
-		return buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), resolveMemoryContext: (cid) => this.turnMemoryContext.get(cid) ?? deriveMemoryContext(this.turnActor.get(cid), cid), onRoleRefusal: (cid, info) => this.noteAuthorizationNeeded(cid, info), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules), mcp: { enabled: cfg.capabilities.mcp?.enabled ?? false, tools: this.mcpManager.tools() }, work: this.workItems ? { items: this.workItems, fireItem: (id) => this.workBridge?.fireItem(id) ?? false, mine: (opts) => this.mineRecentWork({ ...opts, sinceTs: Date.now() - 24 * 60 * 60_000, sourceConversationId: inferConversationOrigin(conversationId) === "im" ? conversationId : undefined }) } : undefined });
+		return buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), resolveMemoryContext: (cid) => this.turnMemoryContext.get(cid) ?? deriveMemoryContext(this.turnActor.get(cid), cid), onRoleRefusal: (cid, info) => this.noteAuthorizationNeeded(cid, info), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules), mcp: this.opts.kernel === "durable"
+					// Under durable the MCP surface lives in its OWN registry
+					// extension (`ve-mcp`) so it can be replaced live — passing it here
+					// as well would register every MCP tool twice (the harness
+					// composes one tool map by name, so the duplicate is masked until
+					// the surface changes and the frozen copy wins).
+					? { enabled: false, tools: [] }
+					// Legacy/pi-session sessions take their tools ONLY from this set, so
+					// MCP must be included here for those kernels.
+					: { enabled: cfg.capabilities.mcp?.enabled ?? false, tools: this.mcpManager.tools() },
+			work: this.workItems ? { items: this.workItems, fireItem: (id) => this.workBridge?.fireItem(id) ?? false, mine: (opts) => this.mineRecentWork({ ...opts, sinceTs: Date.now() - 24 * 60 * 60_000, sourceConversationId: inferConversationOrigin(conversationId) === "im" ? conversationId : undefined }) } : undefined });
 	}
 
 	isIdle(): boolean {
