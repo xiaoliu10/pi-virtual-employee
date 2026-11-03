@@ -303,7 +303,14 @@ export class DurableRuntime {
 		const entry = entries.find((e) => (e as { id?: unknown }).id === slot.entry) as
 			| { model?: readonly { isError?: boolean }[] }
 			| undefined;
-		return entry?.model?.[0]?.isError === true;
+		// The result entry is appended in the same commit the slot turns `done`,
+		// so it is inside the view window (default 50) when we look. If it is not
+		// there anyway — a window scrolled by a burst, or an adapter that trims —
+		// we cannot tell success from failure, and the widget shows a checkmark for
+		// a thrown tool when we guess true (the exact bug this method documents).
+		// Refusing to claim success is the safe direction.
+		if (entry === undefined) return true;
+		return entry.model?.[0]?.isError === true;
 	}
 
 	/**
@@ -337,8 +344,8 @@ export class DurableRuntime {
 	 * The view hands us CUMULATIVE snapshots, while the widget wants increments
 	 * (`text_delta`), so each callback diffs against what it already emitted. The
 	 * diff is per content INDEX and prefix-based: the provider only ever appends
-	 * to a block, so a shorter value than we remember means the round restarted
-	 * and the accumulated text must reset.
+	 * to a block. A shorter value than we remember resets that block, and a new
+	 * GENERATION resets every block — a second answer is not a longer first one.
 	 *
 	 * Watching is best-effort: a turn must still run and answer without it.
 	 */
@@ -351,6 +358,14 @@ export class DurableRuntime {
 			const emitted = new Map<number, { text: number; thinking: number }>();
 			const toolState = new Map<string, "running" | "done">();
 			const startedAt = new Map<string, number>();
+			// Identity of the generation the offsets belong to. `attempt` alone is
+			// not enough (a later run starts at attempt 1 again), so pair it with
+			// the tool-round marker: a new round or a new run resets BOTH maps.
+			// Without this, a second answer whose text happened to be longer than
+			// the first (or, for equal length, ANY second answer) emitted only the
+			// tail — measured: "abc" then "12345" produced "abc" + "45", losing
+			// "123" (review P1).
+			let generationKey = "";
 
 			handle.start(async (call) => {
 				// Discriminated union: a `failed` frame keeps the watch open with no value.
@@ -360,8 +375,14 @@ export class DurableRuntime {
 				try {
 					// 1) Streaming answer text / reasoning.
 					const live = value.docs["pi.live"] as
-						| { generation?: { message?: { content?: unknown[] } } }
+						| { generation?: { attempt?: number; message?: { content?: unknown[] } }; tools?: unknown[] }
 						| undefined;
+					// A new generation (or a re-armed attempt) invalidates every offset.
+					const key = `${live?.generation?.attempt ?? 0}:${live?.tools?.length ?? 0}`;
+					if (key !== generationKey) {
+						generationKey = key;
+						emitted.clear();
+					}
 					const content = (live?.generation?.message?.content ?? []) as {
 						type?: string;
 						text?: string;
@@ -388,11 +409,16 @@ export class DurableRuntime {
 					for (const slot of tools) {
 						const seen = toolState.get(slot.callId);
 						if (seen === undefined) {
-							toolState.set(slot.callId, slot.status === "done" ? "done" : "running");
+							// Always start as "running", even when the FIRST snapshot
+							// already shows it done (a fast tool between two throttled
+							// commits): marking it done here made the completion check
+							// below false, so that call never emitted tool_end and the
+							// widget kept its spinner (review P2).
+							toolState.set(slot.callId, "running");
 							startedAt.set(slot.callId, Date.now());
 							emit({ type: "tool_start", toolName: slot.name, toolCallId: slot.callId });
 						}
-						if (slot.status === "done" && toolState.get(slot.callId) !== "done") {
+						if (slot.status === "done" && toolState.get(slot.callId) === "running") {
 							toolState.set(slot.callId, "done");
 							const began = startedAt.get(slot.callId);
 							startedAt.delete(slot.callId);

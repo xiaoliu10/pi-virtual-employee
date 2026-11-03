@@ -45,7 +45,7 @@ export function createComputerTools(deps: ComputerToolDeps): AgentTool<any>[] {
 		parameters: obj({
 			action: union(COMPUTER_ACTIONS.map(v => lit(v))),
 			arguments: opt(obj({}, { open: true, description: "Cua 工具参数。例如窗口状态 {pid:123,window_id:456}；点击再加 element_token；输入再加 text；按键再加 key。list_apps 可省略。" })),
-		}),
+		}, { open: true }),
 		async execute(_id, params, signal) {
 			const authorize = () => {
 				const gate = requireAdminForCommand(deps, { needConfirmation: false });

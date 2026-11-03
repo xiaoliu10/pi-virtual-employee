@@ -189,3 +189,95 @@ test("a tool that throws reports tool_end with isError=true (not a success check
 		await runtime.close();
 	}
 });
+
+// ---- Review P1: a SECOND answer must not be treated as a continuation ----
+
+test("two turns in one conversation each stream their OWN text (review P1)", async (t) => {
+	// The offset map used to survive across generations, so a second answer whose
+	// text was shorter (or the same length) emitted nothing / only a tail.
+	const history = makeHistory(t);
+	const first = "第一轮的回答内容";
+	const second = "第二轮完全不同的回答";
+	const faux = fauxProvider({ tokensPerSecond: 8, tokenSize: { min: 1, max: 2 } });
+	faux.setResponses([fauxAssistantMessage(first), fauxAssistantMessage(second)]);
+	const { runtime, session } = await openRuntime({ history, faux });
+	const perTurn = [];
+	try {
+		for (const text of [first, second]) {
+			const events = [];
+			const result = await runtime.send(session("widget:probe"), "问题", {
+				actor: { senderId: "widget-user-1", channel: "widget", chatType: "single" },
+				onProcessEvent: (event) => events.push(event),
+			});
+			assert.equal(result.reply, text);
+			perTurn.push(events.filter((e) => e.type === "text_delta").map((e) => e.delta).join(""));
+		}
+		// Each turn's delta text must be a prefix of ITS OWN answer — never a tail
+		// of the previous one.
+		assert.ok(first.startsWith(perTurn[0]), `turn 1 deltas belong to turn 1: ${JSON.stringify(perTurn[0])}`);
+		assert.ok(second.startsWith(perTurn[1]), `turn 2 deltas belong to turn 2, got ${JSON.stringify(perTurn[1])}`);
+		assert.ok(perTurn[1].length > 0, "turn 2 must stream something, not be swallowed by stale offsets");
+	} finally {
+		await runtime.close();
+	}
+});
+
+// ---- Direct probes of the watch diffing (deterministic, no timing) ----
+// The real-turn tests above cannot pin these: throttling hides whether a second
+// generation's offsets were reset, and a fast tool may never appear "done" in
+// the first snapshot. These drive watchProcess with an explicit frame sequence.
+
+/** Build a DurableRuntime whose harness watch replays `frames` in order. */
+async function watchFrames(frames) {
+	const { DurableRuntime } = await import(pathToFileURL(join(dir, "runtime.mjs")));
+	const runtime = Object.create(DurableRuntime.prototype);
+	let listener;
+	runtime.host = {
+		harness: {
+			conversation: async () => ({
+				watch: async () => ({
+					start: (fn) => { listener = fn; },
+					stop: async () => {},
+				}),
+			}),
+		},
+	};
+	const events = [];
+	const stop = await runtime.watchProcess(1, (e) => events.push(e));
+	for (const frame of frames) listener(frame);
+	await stop();
+	return events;
+}
+
+const frame = (live) => ({ kind: "value", value: { docs: { "pi.live": live }, entries: live.entries ?? [] }, ops: [], retired: false });
+const gen = (attempt, text) => ({ generation: { attempt, message: { content: [{ type: "text", text }] } }, tools: [] });
+
+test("DIFF: a new generation replays its text from the start (P1)", async () => {
+	const events = await watchFrames([frame(gen(1, "abc")), frame(gen(2, "xyz"))]);
+	const text = events.filter((e) => e.type === "text_delta").map((e) => e.delta).join("");
+	assert.equal(text, "abcxyz", `equal-length second answer must appear in full, got ${JSON.stringify(text)}`);
+});
+
+test("DIFF: a longer second answer is not diffed against the first (P1)", async () => {
+	const events = await watchFrames([frame(gen(1, "abc")), frame(gen(2, "12345"))]);
+	const text = events.filter((e) => e.type === "text_delta").map((e) => e.delta).join("");
+	assert.equal(text, "abc12345", `second answer must not lose its head, got ${JSON.stringify(text)}`);
+});
+
+test("DIFF: a tool done in the very first snapshot still emits tool_end (P2)", async () => {
+	const events = await watchFrames([
+		frame({ tools: [{ callId: "c1", name: "fast", status: "done", entry: 11 }], entries: [{ id: 11, model: [{ isError: false }] }] }),
+	]);
+	const kinds = events.map((e) => e.type);
+	assert.deepEqual(kinds, ["tool_start", "tool_end"], `expected start+end, got ${kinds.join(",")}`);
+	assert.equal(events[1].isError, false);
+});
+
+test("DIFF: a faulted tool reports isError even though it has a result entry (P2)", async () => {
+	const events = await watchFrames([
+		frame({ tools: [{ callId: "c1", name: "boom", status: "running" }] }),
+		frame({ tools: [{ callId: "c1", name: "boom", status: "done", entry: 11 }], entries: [{ id: 11, model: [{ isError: true }] }] }),
+	]);
+	const end = events.find((e) => e.type === "tool_end");
+	assert.equal(end?.isError, true, "a tool that caught its own throw is still an error");
+});
