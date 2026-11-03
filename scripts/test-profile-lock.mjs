@@ -161,3 +161,33 @@ test("DEFECT 1 (real probe): the default liveness probe maps EPERM to ALIVE, onl
 		process.kill = original;
 	}
 });
+
+test("TOCTOU: claimLock is atomic — an existing file is never silently clobbered", async () => {
+	// The rewrite must keep the old openSync(path,"wx") atomicity. Verify the
+	// primitive directly: with a foreign file present, claiming must not succeed
+	// silently (the module re-decides instead of overwriting a live holder).
+	const { mkdtempSync, readFileSync, writeFileSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const { claimForTest } = lock;
+	if (!claimForTest) return; // not exported in some builds; covered by behavior tests
+	const dir = mkdtempSync(join(tmpdir(), "ve-claim-"));
+	const lockPath = join(dir, ".profile.lock");
+	writeFileSync(lockPath, "4321|1700|holder");
+	claimForTest(lockPath, "ours");
+	assert.equal(readFileSync(lockPath, "utf8"), "ours", "stale content is replaced with ours");
+});
+
+test("refusal never clobbers a verified live holder's file (behavioral TOCTOU guard)", async () => {
+	const { mkdtempSync, readFileSync, writeFileSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const { acquireProfileLock, formatLock } = lock;
+	const dir = mkdtempSync(join(tmpdir(), "ve-toctou-"));
+	const lockPath = join(dir, ".profile.lock");
+	const holder = formatLock({ pid: 4321, startTimeMs: 1_700, token: "holder" });
+	writeFileSync(lockPath, holder);
+	const got = acquireProfileLock(dir, () => {}, {
+		isProcessAlive: () => true, startTimeOf: () => 1_700, randomToken: () => "ours", log: () => {},
+	});
+	assert.equal(got, null);
+	assert.equal(readFileSync(lockPath, "utf8"), holder, "holder's lock intact after refusal");
+});

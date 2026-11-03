@@ -128,7 +128,13 @@ mkdirSync(app.getPath("userData"), { recursive: true });
 // App logs live with the profile data (not the packaged app-name dir Electron
 // would pick) — one known place for field diagnostics like im.log.
 app.setPath("logs", path.join(app.getPath("userData"), "logs"));
-profileLock = acquireProfileLock(app.getPath("userData"), () => app.quit(), {
+profileLock = acquireProfileLock(app.getPath("userData"), () => {
+	// Another live instance owns this profile. app.quit() is asynchronous, so the
+	// rest of module init would otherwise keep running and open the SAME SQLite
+	// database — exactly the double-writer failure this lock exists to prevent.
+	// Exit immediately; no cleanup is needed because we never acquired anything.
+	app.exit(0);
+}, {
 	log: (level, msg) => console[level === "INFO" ? "log" : level === "WARN" ? "warn" : "error"](msg),
 });
 app.on("will-quit", () => {

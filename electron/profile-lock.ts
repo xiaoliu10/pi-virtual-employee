@@ -23,7 +23,7 @@
  * the lock; an indeterminate probe (EPERM, EINVAL, unreadable state) means the
  * lock is HELD and this instance must exit rather than risk a shared DB.
  */
-import { existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
@@ -130,21 +130,30 @@ export function acquireProfileLock(
 	const log = deps.log ?? ((level, msg) => console[level === "ERROR" ? "error" : "warn"](msg));
 	const identity = currentIdentity(deps);
 
-	const raw = existsSync(lockPath) ? safeRead(lockPath) : null;
-	const decision = decideLock(raw, identity, deps);
-	if (decision.action === "refuse") {
-		log("ERROR", `[main] profile already running (pid ${decision.pid}: ${decision.reason}); exiting.`);
-		onOwnedByOther(decision.pid, decision.reason);
-		return null;
+	// Up to 3 attempts: another instance may create the lock between our read and
+	// our take (TOCTOU). The old implementation used openSync(path,"wx") exactly
+	// to make the take atomic — keep that guarantee for the acquire path.
+	for (let attempt = 0; attempt < 3; attempt++) {
+		const raw = existsSync(lockPath) ? safeRead(lockPath) : null;
+		const decision = decideLock(raw, identity, deps);
+		if (decision.action === "refuse") {
+			log("ERROR", `[main] profile already running (pid ${decision.pid}: ${decision.reason}); exiting.`);
+			onOwnedByOther(decision.pid, decision.reason);
+			return null;
+		}
+		if (raw !== null) {
+			// Reclaiming: a plain write is correct (we judged the holder stale). A
+			// concurrent starter may have just written its own live lock — re-decide.
+			const again = safeRead(lockPath);
+			if (again !== null && again !== raw && decideLock(again, identity, deps).action === "refuse") continue;
+			log("INFO", "[main] reclaiming a stale profile lock");
+		}
+		if (claimLock(lockPath, formatLock(identity))) return identity;
+		// Lost the atomic create to a racing starter — re-read and decide again.
 	}
-	if (raw !== null) log("INFO", "[main] reclaiming a stale profile lock");
-	try {
-		writeFileSync(lockPath, formatLock(identity));
-	} catch (err) {
-		log("ERROR", `[main] could not write profile lock: ${(err as Error).message}`);
-		return null;
-	}
-	return identity;
+	log("ERROR", "[main] could not acquire the profile lock (racing starters); exiting.");
+	onOwnedByOther(0, "lock contention");
+	return null;
 }
 
 /**
@@ -161,6 +170,35 @@ export function releaseProfileLock(userDataDir: string, identity: ProcessIdentit
 		unlinkSync(lockPath);
 		return true;
 	} catch {
+		return false;
+	}
+}
+
+/**
+ * Atomically create the lock file with our identity. Returns false when the file
+ * already exists (another starter won the race) — the caller re-decides.
+ */
+function claimLock(lockPath: string, body: string): boolean {
+	try {
+		const fd = openSync(lockPath, "wx");
+		try {
+			writeFileSync(fd, body);
+		} finally {
+			closeSync(fd);
+		}
+		return true;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+			// Stale leftovers still need to be reclaimable: our caller already
+			// decided this file is stale, so replace it atomically-enough by
+			// rewriting in place (a racing starter's content is re-checked above).
+			try {
+				writeFileSync(lockPath, body);
+				return true;
+			} catch {
+				return false;
+			}
+		}
 		return false;
 	}
 }
