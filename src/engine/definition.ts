@@ -45,7 +45,8 @@ import { createViewImageTool } from "./tools/view-image.js";
 import { createManageAdminTool, createUpdateIdentityTool, type AdminToolDeps } from "./tools/admin.js";
 import { createManageUpdateTool, type UpdateOperations } from "./tools/update.js";
 import { createManageCapabilitiesTool } from "./tools/capabilities.js";
-import { createRunCommandTool, createManageProcessTool, type ShellToolDeps } from "./tools/shell.js";
+import { createRunCommandTool, createManageProcessTool, executeCommand, type ShellToolDeps } from "./tools/shell.js";
+import { createRunScriptTool } from "./tools/run-script.js";
 import { createManageSettingsTool } from "./tools/settings.js";
 import { orderTool } from "./tools/orders.js";
 import { CAPABILITY_LABEL, checkPermission, permissionRefusal } from "../security/permissions.js";
@@ -112,6 +113,8 @@ export interface ToolSetOptions {
 	playwrightCliPath: () => string;
 	/** Persistent append-only log for run_command authorization/execution events. */
 	shellAuditLogPath?: string;
+	/** Profile user-data dir; `run_script` writes parameter files under it. */
+	userDataDir?: string;
 	/**
 	 * Resolves the current turn's channel file-sender for a conversation (set by
 	 * the engine from the inbound context), or undefined when the channel can't
@@ -358,6 +361,20 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 		auditLogPath: options.shellAuditLogPath,
 	};
 	tools.push(createRunCommandTool(shellDeps), createManageProcessTool(shellDeps));
+	// `run_script`: the same executor, but arguments travel in a JSON file so the
+	// command line carries no user data. This is the fix for Windows argv
+	// re-tokenization / quoting / GBK mangling — see tools/run-script.ts.
+	if (options.userDataDir) {
+		tools.push(createRunScriptTool({
+			...shellDeps,
+			userDataDir: options.userDataDir,
+			runCommand: async (input) => {
+				const result = await executeCommand(shellDeps, input, input.signal);
+				const text = result.content.map((c) => c.text).join("\n");
+				return { text, isError: result.details?.refused === true };
+			},
+		}));
+	}
 	// Full-config read/write for headless deployments — every block the desktop
 	// settings UI exposes, editable from an admin's 1:1 chat (security excluded).
 	tools.push(createManageSettingsTool({

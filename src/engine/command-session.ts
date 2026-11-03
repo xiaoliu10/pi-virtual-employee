@@ -1,6 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { StringDecoder } from "node:string_decoder";
+import { createChunkDecoder } from "./chunk-decoder.js";
 
 const MAX_LOG_BYTES = 256_000;
 const MAX_PAGE_BYTES = 32_000;
@@ -37,7 +37,10 @@ export class CommandSession {
 			});
 		});
 		for (const stream of [child.stdout, child.stderr]) {
-			const decoder = new StringDecoder("utf8");
+			// GBK-aware: Chinese Windows tools write CP936 to a pipe and `chcp 65001`
+			// does not change that (field: every Chinese path came out as mojibake).
+			// See chunk-decoder.ts for why this cannot just be a fixed encoding.
+			const decoder = createChunkDecoder();
 			stream?.on("data", (chunk: Buffer) => this.append(decoder.write(chunk)));
 			stream?.once("end", () => this.append(decoder.end()));
 		}
