@@ -17,6 +17,7 @@ import type { AgentEvent, AgentMessage, FinishTurn, StreamFn } from "@earendil-w
 import { createSessionHost, type SessionHost } from "./session-host.js";
 import type { Skill } from "./skills/types.js";
 import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "./pi-compaction.js";
+import { formatPlanMessage, looksLikeTask, parsePlan, PLAN_PROMPT_HEADER } from "./task-planner.js";
 import { createModels, normalizeContext, ModelsError } from "@earendil-works/pi-ai";
 import { SIDE_PASS_DEFAULT_LEVEL, applyThinkingDeclaration } from "../shared/thinking.js";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
@@ -2950,6 +2951,50 @@ export class EmployeeEngine implements EmployeeRuntime {
 		} catch (err) {
 			console.warn("[engine] progress summary failed:", err instanceof Error ? err.message : err);
 			return await fallback();
+		}
+	}
+
+	/**
+	 * Plan-ahead side pass (user ruling 2026-11-03): for task-shaped messages,
+	 * produce a short numbered plan and hand it back BEFORE execution starts,
+	 * so the chat sees what will happen. Same in-flight/side-call discipline as
+	 * progressBriefDetailed (counted as life, bounded at 60s), and a NULL return
+	 * means "not a task / no usable plan" — planning must NEVER block or delay
+	 * execution by more than the pass itself, and a failure here is silent
+	 * (logged) rather than an error the user sees.
+	 */
+	async planTaskBrief(agent: Agent, message: string, conversationId?: string): Promise<string | null> {
+		if (!looksLikeTask(message)) return null;
+		try {
+			const model = agent.state.model;
+			if (!model) return null;
+			const signal = conversationId ? this.beginSideLlmCall(conversationId, 60_000) : undefined;
+			let raw: string | undefined;
+			try {
+				raw = await generateSummary(
+					[{ role: "user", content: message, timestamp: Date.now() }],
+					model,
+					512,
+					undefined,
+					signal,
+					PLAN_PROMPT_HEADER,
+					undefined,
+					undefined,
+					this.rawStreamFn,
+					undefined,
+					SUMMARIZER_RETRY,
+				);
+			} catch (err) {
+				console.warn(`[engine] task planning skipped (${err instanceof Error ? err.name : typeof err}): ${err instanceof Error ? err.message : String(err)}`.slice(0, 200));
+				return null;
+			} finally {
+				if (conversationId) this.endSideLlmCall(conversationId);
+			}
+			const plan = parsePlan(raw);
+			return plan ? formatPlanMessage(plan) : null;
+		} catch (err) {
+			console.warn("[engine] task planning failed:", err instanceof Error ? err.message : err);
+			return null;
 		}
 	}
 

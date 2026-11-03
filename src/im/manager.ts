@@ -506,9 +506,37 @@ export class IMAdapterManager {
 						: undefined;
 
 					try {
+						// Plan-ahead (user ruling 2026-11-03): for task-shaped messages,
+						// push a short numbered plan to the chat BEFORE execution starts,
+						// then hand the same plan to the turn as context so the agent
+						// honors what was promised. Planning is a bounded side pass (60s);
+						// any failure or NO_PLAN verdict simply skips it — execution is
+						// never blocked by planning, and simple questions never see a plan.
+						let planText: string | undefined;
+						if (this.config.all().general.taskPlanning?.enabled !== false) {
+							try {
+								const plan = await this.engine.planTaskBrief(agent, msg.text, msg.conversationId);
+									if (plan) {
+										planText = plan;
+										const occurrenceId = msg.messageId
+											? chatHeartbeatOccurrenceId(msg.channel ?? "im", msg.messageId, Date.now(), 60_000)
+											: undefined;
+										// Push it. A failed push must NOT block execution: the plan
+										// still goes to the turn — the chat just didn't see it.
+										if (ctx?.onProgress) {
+											await ctx.onProgress(plan, { occurrenceId: occurrenceId || undefined, kind: "task-plan" })
+												.catch((err) => console.warn("[im] task plan push failed:", err instanceof Error ? err.message : err));
+										}
+									}
+							} catch (err) {
+								console.warn("[im] task planning skipped:", err instanceof Error ? err.message : err);
+							}
+						}
 						const result = await this.engine.send(
 							agent,
-							msg.text,
+							planText
+							? `[已向用户确认的执行规划，严格按此执行，完成后逐步对照汇报]\n${planText}\n\n[用户原始指令]\n${msg.text}`
+							: msg.text,
 							{ sendFile: ctx?.sendFile, sendImage: ctx?.sendImage, images: msg.images, actor: msg.actor, conversationName: msg.conversationName, onPersist: (id) => this.onActivity?.(id) },
 						);
 						// Final turn complete — signal the UI to refresh the task list.

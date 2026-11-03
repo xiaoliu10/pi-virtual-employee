@@ -124,11 +124,23 @@ async function findLatestRelease() {
 
 /** HEAD-commitish Gitee will target the new release at. */
 function headSha() {
+	if (process.env.PUBLISH_SKIP_GATES === "1") {
+		// Release proxy has no repo: accept the override target so the Gitee
+		// release still records the true source commit.
+		const forced = process.env.PUBLISH_SOURCE_SHA ?? "";
+		if (!/^[0-9a-f]{40}$/i.test(forced)) throw new Error("PUBLISH_SKIP_GATES=1 requires PUBLISH_SOURCE_SHA=<40-hex commit>");
+		return forced;
+	}
 	return execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
 }
 
 /** Gitee may reuse an old tag despite target_commitish; update the Git ref first. */
 function syncLatestTag() {
+	if (process.env.PUBLISH_SKIP_GATES === "1") {
+		// No git repo on a release proxy; the build machine pushes tags.
+		console.log("[publish] tag sync SKIPPED (PUBLISH_SKIP_GATES=1) — build machine owns git refs");
+		return;
+	}
 	const sha = headSha();
 	if (dryRun) { console.log(`[publish] (dry-run) would move remote ${TAG} tag to ${sha.slice(0, 8)}`); return; }
 	const ref = `refs/tags/${TAG}`;
@@ -282,6 +294,13 @@ async function reuploadAsset(asset, local, releaseId) {
  * Both are skipped in --dry-run (which touches nothing anyway).
  */
 function gate(label, command, args) {
+	// Release-proxy mode: the artifacts were gated on the build machine and this
+	// host only uploads them (field 2026-11-03 — build box had no Gitee route).
+	// Loud, explicit, and opt-in; never set it where the gates have not run.
+	if (process.env.PUBLISH_SKIP_GATES === "1") {
+		console.log(`[publish] gate SKIPPED (PUBLISH_SKIP_GATES=1): ${label}`);
+		return;
+	}
 	if (dryRun) {
 		console.log(`[publish] (dry-run) would run gate: ${command} ${args.join(" ")}`);
 		return;
@@ -430,7 +449,9 @@ async function publishToGitHub(artifacts) {
 	}
 }
 
-if (!dryRun) {
+if (process.env.PUBLISH_GITEE_ONLY === "1") {
+	console.log("[publish] PUBLISH_GITEE_ONLY=1 — skipping the GitHub leg (publish it later from a host with GitHub access; the Gitee feed is live)");
+} else if (!dryRun) {
 	try {
 		await publishToGitHub(artifacts);
 	} catch (err) {
