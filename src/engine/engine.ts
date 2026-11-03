@@ -43,7 +43,7 @@ import type { DocumentService, FileSender } from "../documents/document-service.
 import type { FileSystemService } from "../filesystem/filesystem-service.js";
 import type { ReportService } from "../reports/report-service.js";
 import type { DownloadService } from "../downloads/download-service.js";
-import { buildSystemPrompt, buildTools } from "./definition.js";
+import { buildSystemPrompt, buildTools, guardTool } from "./definition.js";
 import type { UpdateOperations } from "./tools/update.js";
 import { hasActiveShellCommands } from "./tools/shell.js";
 import {effectiveAuthorizationRole, ROLE_RANK, checkPermission, isLocalConversation, resolveRole} from "../security/permissions.js";
@@ -456,6 +456,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 	private async finishMcpConnectInBackground(): Promise<void> {
 		for (const delay of [2_000, 5_000, 10_000, 30_000, 60_000]) {
 			await this.unrefSleep(delay);
+			// App is quitting: do not touch the manager (it would reconnect a
+			// transport during shutdown and reset its `disposed` flag).
+			if (this.shuttingDown) return;
 			const last = await this.refreshMcpWithReport();
 			if (last.servers === 0 || last.connected >= last.servers) {
 				console.log(`[engine] mcp connected after background retry: ${last.connected}/${last.servers}`);
@@ -499,21 +502,33 @@ export class EmployeeEngine implements EmployeeRuntime {
 		});
 	}
 
-	/** One refresh, returning how many configured servers ended up with tools. */
+	/** One refresh, returning how many configured servers ended up with tools.
+	 *  MUST go through refreshMcp (not mcpManager.refresh directly): a successful
+	 *  connect that never publishes to the durable registry leaves the tools
+	 *  invisible — the exact bug this file fixes, re-created one layer up. */
 	private async refreshMcpWithReport(): Promise<{ servers: number; connected: number }> {
 		try {
 			const { report } = await this.mcpManager.refresh(this.config);
 			const serverRows = report.filter((r) => r.name !== "(配置)");
 			const servers = Math.max(serverRows.length, 0);
 			const connected = serverRows.filter((r) => r.ok).length;
+			// Publish the CURRENT surface — refresh only reports success; the tools
+			// (and their names) are read from the manager afterwards.
+			this.durableRuntime?.setMcpTools(this.mcpToolsFor("default"));
 			return { servers, connected };
 		} catch {
 			return { servers: 1, connected: 0 };
 		}
 	}
 
+	/** Set when shutdown starts, so background MCP retries stop touching the
+	 *  manager (a retry during quit would reconnect a transport and clear the
+	 *  manager's `disposed` flag). */
+	private shuttingDown = false;
+
 	/** Close every MCP connection (stdio transports own child processes). */
 	async disposeMcp(): Promise<void> {
+		this.shuttingDown = true;
 		await this.mcpManager.dispose();
 	}
 	/** Work items (autonomous work phase 2). Set by main after construction; absent → work tools off. */
@@ -3074,10 +3089,22 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * connected later was invisible to the model for the whole process lifetime
 	 * (field incident 2026-11-03).
 	 */
-	mcpToolsFor(_conversationId: string): AgentTool<any>[] {
+	mcpToolsFor(conversationId: string): AgentTool<any>[] {
 		const cfg = this.config.all();
 		if (!cfg.capabilities.mcp?.enabled) return [];
-		return this.mcpManager.tools();
+		// MUST go through the SAME RBAC guard as the legacy path. The durable
+		// registry bypasses buildTools entirely, so handing it raw manager tools
+		// would skip `guarded("mcp", ...)` — i.e. checkPermission(config, actor,
+		// conversationId, "mcp") never runs and a viewer (or a turn whose
+		// capability was revoked mid-session) could call MCP tools. That is the
+		// exact guard the environment capability gate exists for (PR #95).
+		// MUST go through the SAME RBAC guard as the legacy path. The durable
+		// registry bypasses buildTools entirely, so handing it raw manager tools
+		// would skip `guarded("mcp", ...)` — i.e. checkPermission(config, actor,
+		// conversationId, "mcp") never runs and a viewer could call MCP tools.
+		// Reuse guardTool instead of copying it: a copy is how the two paths drift.
+		const guardOptions = { config: this.config, conversationId, resolveActor: (cid: string) => this.turnActor.get(cid), onRoleRefusal: (cid: string, info: { capability: string; need: string }) => this.noteAuthorizationNeeded(cid, info) } as unknown as Parameters<typeof guardTool>[2];
+		return this.mcpManager.tools().map((tool) => guardTool("mcp", tool, guardOptions));
 	}
 
 	buildToolSetFor(conversationId: string): AgentTool<any>[] {

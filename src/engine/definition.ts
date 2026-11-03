@@ -177,17 +177,13 @@ export interface ToolSetOptions {
 }
 
 /** Assemble the employee's tools; capability tools are conditional on their config flags. */
-export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
-	const tools: AgentTool<any>[] = [];
-	/**
-	 * Capability guard (RBAC): wraps a tool's execute with a server-side
-	 * permission check against the CURRENT turn's platform-verified actor —
-	 * the model never mediates who may call what, so prompt injection in
-	 * message/web/file content cannot escalate access. The check is per-turn
-	 * (resolveActor reads the live turn actor), so one group conversation
-	 * serves different senders at their own roles.
-	 */
-	const guarded = (capability: string, tool: AgentTool<any>): AgentTool<any> => ({
+/**
+ * Wrap a tool with the RBAC capability gate. Exported so callers that do NOT go
+ * through buildTools (the durable kernel installs MCP as its own registry
+ * extension, bypassing this function) apply the SAME check instead of a copy.
+ */
+export function guardTool(capability: string, tool: AgentTool<any>, options: ToolSetOptions): AgentTool<any> {
+	return {
 		...tool,
 		async execute(toolCallId, params, signal, onUpdate) {
 			const gate = checkPermission(options.config, options.resolveActor(options.conversationId), options.conversationId, capability);
@@ -215,7 +211,20 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 			}
 			return tool.execute(toolCallId, params, signal, onUpdate);
 		},
-	});
+	};
+}
+
+export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
+	const tools: AgentTool<any>[] = [];
+	/**
+	 * Capability guard (RBAC): wraps a tool's execute with a server-side
+	 * permission check against the CURRENT turn's platform-verified actor —
+	 * the model never mediates who may call what, so prompt injection in
+	 * message/web/file content cannot escalate access. The check is per-turn
+	 * (resolveActor reads the live turn actor), so one group conversation
+	 * serves different senders at their own roles.
+	 */
+	const guarded = (capability: string, tool: AgentTool<any>): AgentTool<any> => guardTool(capability, tool, options);
 	const guardAll = (capability: string, list: AgentTool<any>[]): AgentTool<any>[] => list.map((t) => guarded(capability, t));
 
 	if (options.kbEnabled) {

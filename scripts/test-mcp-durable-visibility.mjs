@@ -213,7 +213,7 @@ test("startup variant is BOUNDED even when a server never connects", async () =>
 	const engBundle = join(outDir, "eng-probe.mjs");
 	await build({
 		stdin: {
-			contents: `export { EmployeeEngine as Engine } from "./src/engine/engine.ts";`,
+			contents: `export { EmployeeEngine as Engine } from "./src/engine/engine.ts";\n\t\t\texport { guardTool } from "./src/engine/definition.ts";`,
 			resolveDir: root, loader: "ts",
 		},
 		outfile: engBundle, bundle: true, platform: "node", format: "esm",
@@ -235,4 +235,105 @@ test("startup variant is BOUNDED even when a server never connects", async () =>
 	assert.equal(result.ok, false);
 	assert.equal(result.connected, 0);
 	assert.ok(backgroundStarted, "the lagging server must continue in the background");
+});
+
+// ---- P0: the durable path must NOT bypass the RBAC "mcp" capability gate ----
+test("durable MCP tools carry the SAME RBAC guard as legacy (conversation floor)", async () => {
+	// Handing raw mcpManager.tools() to the durable registry skipped
+	// guardTool("mcp", ...) → checkPermission never ran. mcp's base minimum is
+	// "viewer", so the observable refusal comes from a per-conversation floor
+	// (security.conversations[<cid>].mcp = admin) — the admin's actual lever.
+	const { guardTool } = await import(pathToFileURL(join(outDir, "eng-probe.mjs")).href);
+
+	let executed = 0;
+	const raw = {
+		name: "mcp__etc__query", label: "mcp__etc__query", description: "q",
+		parameters: { type: "object", properties: {} },
+		execute: async () => { executed += 1; return { content: [{ type: "text", text: "ok" }] }; },
+	};
+	const config = { all: () => ({
+		security: { defaultRole: "viewer", adminStaffIds: [], ownerStaffIds: [], people: [], conversations: [{ id: "dt:group:x", floors: { mcp: "admin" } }] },
+		capabilities: { mcp: { enabled: true } },
+	}) };
+	const guarded = guardTool("mcp", raw, {
+		config, conversationId: "dt:group:x",
+		resolveActor: () => ({ senderId: "u1", senderName: "someone" }),
+	});
+
+	const refusal = await guarded.execute("call1", {}, undefined, () => {});
+	assert.equal(executed, 0, "the underlying MCP tool must NOT run below the conversation floor");
+	const text = JSON.stringify(refusal?.content ?? refusal);
+	assert.match(text, /权限|管理员/, `refusal must explain the gate: ${text}`);
+
+	// And an ADMIN passes the same guard and reaches the tool.
+	const adminConfig = { all: () => ({
+		security: { defaultRole: "viewer", adminStaffIds: [], ownerStaffIds: [], people: [{ staffId: "boss", role: "admin" }], conversations: [{ id: "dt:group:x", floors: { mcp: "admin" } }] },
+		capabilities: { mcp: { enabled: true } },
+	}) };
+	const adminGuarded = guardTool("mcp", raw, {
+		config: adminConfig, conversationId: "dt:group:x",
+		resolveActor: () => ({ senderId: "boss", senderName: "boss" }),
+	});
+	await adminGuarded.execute("call2", {}, undefined, () => {});
+	assert.equal(executed, 1, "an admin above the floor must reach the tool");
+});
+
+test("P1: a successful background retry PUBLISHES (else the late server stays invisible)", async () => {
+	// The bug's shape one layer up: refresh reports success but nothing reaches
+	// the durable registry, so "connected" tools are still unseen by the model.
+	const { Engine } = await import(pathToFileURL(join(outDir, "eng-probe.mjs")).href);
+	const engine = Object.create(Engine.prototype);
+	let published = 0;
+	engine.shuttingDown = false;
+	engine.config = { all: () => ({ capabilities: { mcp: { enabled: true } } }) };
+	engine.durableRuntime = { setMcpTools: () => { published += 1; } };
+	engine.mcpToolsFor = () => [tool("mcp__late__go")];
+	engine.mcpManager = { refresh: async () => ({ changed: true, report: [{ name: "late", ok: true, tools: 1 }] }) };
+	engine.unrefSleep = async () => {};
+
+	const result = await engine.finishMcpConnectInBackground();
+	assert.equal(result, undefined);
+	assert.ok(published > 0, "a successful background connect must publish via setMcpTools");
+});
+
+test("P1: background retries stop after shutdown starts", async () => {
+	const { Engine } = await import(pathToFileURL(join(outDir, "eng-probe.mjs")).href);
+	const engine = Object.create(Engine.prototype);
+	let refreshes = 0;
+	engine.shuttingDown = true; // quit already began
+	engine.config = { all: () => ({ capabilities: { mcp: { enabled: true } } }) };
+	engine.durableRuntime = undefined;
+	engine.mcpToolsFor = () => [];
+	engine.mcpManager = { refresh: async () => { refreshes += 1; return { changed: false, report: [] }; } };
+	engine.unrefSleep = async () => {};
+
+	await engine.finishMcpConnectInBackground();
+	assert.equal(refreshes, 0, "a retry must not reconnect transports during shutdown");
+});
+
+test("P1: mcpToolsFor actually APPLIES the guard (not just guardTool in isolation)", async () => {
+	// Without this, deleting the .map(guardTool) call from mcpToolsFor passes every
+	// other test: the isolated guardTool tests prove the guard works, not that the
+	// engine uses it.
+	const { Engine } = await import(pathToFileURL(join(outDir, "eng-probe.mjs")).href);
+	const engine = Object.create(Engine.prototype);
+	const config = { all: () => ({
+		security: { defaultRole: "viewer", adminStaffIds: [], ownerStaffIds: [], people: [], conversations: [{ id: "dt:group:x", floors: { mcp: "admin" } }] },
+		capabilities: { mcp: { enabled: true } },
+	}) };
+	let executed = 0;
+	engine.config = config;
+	engine.turnActor = new Map([["dt:group:x", { senderId: "u1", senderName: "someone" }]]);
+	engine.noteAuthorizationNeeded = () => {};
+	engine.mcpManager = { tools: () => [{
+		name: "mcp__etc__query", label: "q", description: "q",
+		parameters: { type: "object", properties: {} },
+		execute: async () => { executed += 1; return { content: [{ type: "text", text: "ok" }] }; },
+	}] };
+
+	const tools = engine.mcpToolsFor("dt:group:x");
+	assert.equal(tools.length, 1, "the tool surface is still advertised (the guard refuses at call time)");
+	const result = await tools[0].execute("call1", {}, undefined, () => {});
+	assert.equal(executed, 0, "mcpToolsFor MUST wrap tools with the RBAC guard");
+	assert.match(JSON.stringify(result?.content ?? result), /权限|管理员/);
 });
