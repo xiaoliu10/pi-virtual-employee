@@ -9,7 +9,7 @@
  * (by name and on-disk file) and {@link parseSkillFile} to validate the result
  * round-trips through the loader, so what is written is exactly what loads.
  */
-import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { existsSync, lstatSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import type { Skill } from "./types.js";
@@ -27,6 +27,16 @@ export interface SkillUpsertInput {
 	content: string;
 	/** create refuses to overwrite; replace updates an existing same-name skill. */
 	mode?: SkillWriteMode;
+}
+
+/** A support file (script / reference) written inside an existing skill's dir. */
+export interface SkillSupportFileInput {
+	/** Owning skill name (must resolve to an existing user skill). */
+	skill: string;
+	/** Relative path inside the skill dir: `scripts/x.py`, `references/y.md`. */
+	path: string;
+	/** File body. */
+	content: string;
 }
 
 export interface SkillWriteResult {
@@ -143,6 +153,100 @@ export class SkillWriter {
 				? `已更新技能「${name}」（${target}）。新技能对后续新对话生效。`
 				: `已创建技能「${name}」（${target}）。新技能对后续新对话生效。`,
 		};
+	}
+
+	/**
+	 * Write a support file (`scripts/…`, `references/…`, `templates/…`) inside an
+	 * EXISTING user skill. This is how a verified script from a task run becomes
+	 * reusable: the next run reads the skill and invokes the script instead of
+	 * rewriting it.
+	 *
+	 * Guarded like `upsert`: the skill must already exist on disk, the relative
+	 * path must stay inside that skill's directory (no `..`, absolute, symlink),
+	 * and only the three support subdirectories are writable.
+	 */
+	async writeSupportFile(input: SkillSupportFileInput): Promise<SkillWriteResult> {
+		const run = this.chain.then(() => this.writeSupportFileOnce(input));
+		this.chain = run.then(noop, noop);
+		return run;
+	}
+
+	private async writeSupportFileOnce(input: SkillSupportFileInput): Promise<SkillWriteResult> {
+		const name = (input.skill ?? "").trim();
+		const rel = (input.path ?? "").trim().replace(/\\/g, "/");
+		const content = input.content ?? "";
+		if (!name) return reject("", "缺少 skill 名");
+		const nameError = validateName(name);
+		if (nameError) return reject(name, nameError);
+		if (!rel) return reject(name, "缺少 path（如 scripts/run.py）");
+		if (!content.trim()) return reject(name, "文件内容不能为空");
+
+		const top = rel.split("/", 1)[0];
+		if (top !== "scripts" && top !== "references" && top !== "templates") {
+			return reject(name, `只允许写入 scripts/、references/、templates/ 下的附属文件（收到 ${rel}）`);
+		}
+		if (rel.startsWith("/") || rel.split("/").includes("..")) {
+			return reject(name, "path 必须是技能目录内的相对路径");
+		}
+
+		const user = await this.collectAt(this.loader.userDir);
+		const existing = user.skills.find((s) => s.name === name);
+		const skillDir = existing?.filePath ? dirname(existing.filePath) : resolve(this.userSkillsDir, name);
+		const builtin = await this.collectAt(this.loader.builtinDir);
+		if (builtin.skills.some((s) => s.name === name)) {
+			return reject(name, `「${name}」是内置技能，不可写入附属文件`);
+		}
+		if (!existing) return reject(name, `技能「${name}」不存在：请先创建或更新该技能，再添加附属文件`);
+
+		const target = resolve(skillDir, rel);
+		if (!this.assertInsideSkillDir(target, skillDir)) return reject(name, "目标路径越界，写入被拒绝");
+
+		try {
+			await mkdir(dirname(target), { recursive: true });
+			await atomicWriteFile(target, content);
+		} catch (err) {
+			return reject(name, `写入失败：${err instanceof Error ? err.message : String(err)}`);
+		}
+		return {
+			outcome: "created",
+			name,
+			filePath: target,
+			message: `已写入技能「${name}」的附属文件 ${rel}。`,
+		};
+	}
+
+	/** True iff `targetPath` resolves strictly under `skillDir`. */
+	private assertInsideSkillDir(targetPath: string, skillDir: string): boolean {
+		try {
+			const base = resolve(skillDir);
+			const dest = resolve(targetPath);
+			const s = sepFromPath(base);
+			if (dest !== base && !dest.startsWith(base + s)) return false;
+			if (existsSync(dest)) {
+				const st = lstatSync(dest);
+				if (st.isSymbolicLink()) return false;
+			}
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/** Read a skill's SKILL.md body (read-before-write requirement). */
+	async readSkillFile(name: string): Promise<{ ok: boolean; name: string; content?: string; message: string }> {
+		const trimmed = (name ?? "").trim();
+		if (!trimmed) return { ok: false, name: trimmed, message: "缺少技能名" };
+		const user = await this.collectAt(this.loader.userDir);
+		const existing = user.skills.find((s) => s.name === trimmed);
+		if (!existing?.filePath) {
+			return { ok: false, name: trimmed, message: `技能「${trimmed}」不存在（或为内置技能，只读）` };
+		}
+		try {
+			const content = await readFile(existing.filePath, "utf8");
+			return { ok: true, name: trimmed, content, message: `已读取「${trimmed}」` };
+		} catch (err) {
+			return { ok: false, name: trimmed, message: `读取失败：${err instanceof Error ? err.message : String(err)}` };
+		}
 	}
 
 	/** True iff `targetPath` resolves strictly under the user skills directory. */
