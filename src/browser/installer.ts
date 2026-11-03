@@ -60,6 +60,11 @@ function runPlaywrightInstall(
 		};
 		if (host) env.PLAYWRIGHT_DOWNLOAD_HOST = host;
 		else delete env.PLAYWRIGHT_DOWNLOAD_HOST;
+		// Playwright's Chromium-SPECIFIC host vars take precedence over the generic
+		// PLAYWRIGHT_DOWNLOAD_HOST. If a machine exports one (or a stale profile does),
+		// it would defeat the official→mirror fallback. We never set them ourselves,
+		// so strip inherited ones to let the selected host win.
+		delete env.PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST;
 
 		let child;
 		try {
@@ -110,4 +115,39 @@ function runPlaywrightInstall(
 export function revisionFromExecutablePath(executablePath: string): string {
 	const m = /chromium-(\d+)/.exec(executablePath.replace(/\\/g, "/"));
 	return m ? m[1] : "";
+}
+
+/**
+ * Resolve the headless-shell executable that Playwright's default
+ * `launch({headless:true})` uses (a SEPARATE binary from full Chromium).
+ *
+ * Derived from the full-chromium path so it stays in lockstep with the bundled
+ * revision — Playwright installs both under the same cache root as
+ * `chromium_headless_shell-<rev>/…`. Layout per platform is taken from
+ * Playwright's registryDirectory table and is covered by unit tests.
+ *
+ * Returns "" when the platform/shape is unknown (caller then falls back to
+ * checking only the full chromium binary).
+ */
+export function headlessShellPath(chromiumExe: string, platform: NodeJS.Platform = process.platform): string {
+	const norm = chromiumExe.replace(/\\/g, "/");
+	const rev = revisionFromExecutablePath(norm);
+	const idx = norm.lastIndexOf(`/chromium-${rev}/`);
+	if (!rev || idx < 0) return "";
+	const cacheRoot = norm.slice(0, idx);
+	const dir = `${cacheRoot}/chromium_headless_shell-${rev}`;
+	if (platform === "win32") return `${dir}/chrome-headless-shell-win64/chrome-headless-shell.exe`;
+	if (platform === "darwin") {
+		// Both arm64 and x64 live under the same rev dir; pick by the full binary's
+		// arch segment which is already present in chromiumExe.
+		if (/chrome-mac-arm64/.test(norm)) return `${dir}/chrome-headless-shell-mac-arm64/chrome-headless-shell`;
+		if (/chrome-mac-x64/.test(norm) || /chrome-mac/.test(norm)) return `${dir}/chrome-headless-shell-mac-x64/chrome-headless-shell`;
+		return "";
+	}
+	if (platform === "linux") {
+		// Playwright packs the arm64 headless shell as chrome-linux/headless_shell.
+		if (/chrome-linux-arm64/.test(norm) || /arm64/.test(norm)) return `${dir}/chrome-linux/headless_shell`;
+		return `${dir}/chrome-headless-shell-linux64/chrome-headless-shell`;
+	}
+	return "";
 }
