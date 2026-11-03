@@ -33,13 +33,13 @@ const bundle = join(outDir, "b.mjs");
 await build({
 	stdin: {
 		contents: `export { createChunkDecoder, utf8State, isUtf8 } from "./src/engine/chunk-decoder.ts";
-			export { createRunScriptTool, buildCommand, inferRuntime } from "./src/engine/tools/run-script.ts";`,
+			export { createRunScriptTool, buildCommand, inferRuntime, paramDirName } from "./src/engine/tools/run-script.ts";`,
 		resolveDir: root,
 		loader: "ts",
 	},
 	outfile: bundle, bundle: true, platform: "node", format: "esm", packages: "external", logLevel: "silent",
 });
-const { createChunkDecoder, utf8State, createRunScriptTool, buildCommand, inferRuntime } =
+const { createChunkDecoder, utf8State, createRunScriptTool, buildCommand, inferRuntime, paramDirName } =
 	await import(pathToFileURL(bundle).href + `?t=${Date.now()}`);
 
 // Real byte sequences: 「中文」 in GBK and in UTF-8.
@@ -126,7 +126,11 @@ test("run_script writes params.json (UTF-8) and passes ONLY its path", async () 
 
 		// The parameter file exists and round-trips EXACTLY — quotes and spaces
 		// included, which is impossible to guarantee through argv.
-		const file = join(userDataDir, "script-params", "job", "params.json");
+		// The directory carries a hash of the full script path so same-named
+		// scripts in different folders never share a params file.
+		const dirName = paramDirName(script);
+		assert.match(dirName, /^job-[0-9a-f]{8}$/, `param dir must be stem+hash, got ${dirName}`);
+		const file = join(userDataDir, "script-params", dirName, "params.json");
 		const parsed = JSON.parse(readFileSync(file, "utf8"));
 		assert.deepEqual(parsed, { account: "user name with spaces", note: 'he said "hi"', n: 3 });
 
@@ -169,4 +173,56 @@ test("run_script accepts a pre-serialized JSON string but rejects invalid JSON",
 	} finally {
 		rmSync(userDataDir, { recursive: true, force: true });
 	}
+});
+
+test("paramDirName keeps same-named scripts in different folders apart", () => {
+	const a = paramDirName("/work/a/job.py");
+	const b = paramDirName("/work/b/job.py");
+	const winA = paramDirName("C:\\work\\a\\job.py");
+	const winB = paramDirName("C:\\work\\b\\job.py");
+	assert.notEqual(a, b, "different folders must not share a params file");
+	assert.notEqual(winA, winB);
+	// Windows separators must not leak into the name (the lastIndexOf("/") bug).
+	assert.match(winA, /^job-[0-9a-f]{8}$/, `windows path must yield stem+hash, got ${winA}`);
+	assert.ok(!winA.includes("C_"), "the full path must not become the directory name");
+});
+
+test("a script always gets a non-empty, hash-suffixed directory", () => {
+	for (const p of ["/x/a.py", "C:\\x\\a.py", "/x/no-ext", "/x/.hidden"]) {
+		const n = paramDirName(p);
+		assert.match(n, /^[\w.-]+-[0-9a-f]{8}$/, `unexpected dir name for ${p}: ${n}`);
+	}
+});
+
+test("a script path containing shell metacharacters is refused (injection guard)", async () => {
+	// `q()` escapes quotes the cmd way, but cmd treats & | < > ^ % ( ) as syntax
+	// outside quotes and as expansion triggers inside them — quoting alone cannot
+	// make an arbitrary path safe.
+	const tool = createRunScriptTool({
+		userDataDir: tmpdir(),
+		config: {}, resolveActor: () => ({}), onConfigChanged: () => {}, conversationId: "dt:x",
+		runCommand: async () => { throw new Error("must not execute"); },
+	});
+	// POSIX-absolute paths so `isAbsolute` does not reject them first on the
+	// machine running these tests; the metacharacter guard is what must fire.
+	for (const bad of [
+		"/tmp/job.py & calc.exe",
+		"/tmp/job|whoami.py",
+		"/tmp/job>out.py",
+		"/tmp/job%PATH%.py",
+		"/tmp/job^(1).py",
+		"/tmp/job\r\n.py",
+	]) {
+		const r = await tool.execute("c", { script: bad });
+		assert.match(r.content.map((c) => c.text).join(""), /元字符/, `must refuse: ${bad}`);
+	}
+	// A normal path with spaces and Chinese is still fine — those are common.
+	// Use a permissive stub: the point is that the GUARD does not fire.
+	const okTool = createRunScriptTool({
+		userDataDir: mkdtempSync(join(tmpdir(), "ve-run-script-ok-")),
+		config: {}, resolveActor: () => ({}), onConfigChanged: () => {}, conversationId: "dt:x",
+		runCommand: async () => ({ text: "ok" }),
+	});
+	const ok = await okTool.execute("c2", { script: "/tmp/我的 脚本/job.py" });
+	assert.ok(!/元字符/.test(ok.content.map((c) => c.text).join("")), "spaces and CJK must remain allowed");
 });

@@ -26,6 +26,7 @@
  * would not have fixed (it would still receive argv, still re-tokenize, and add
  * path-mapping problems on top).
  */
+import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -94,6 +95,15 @@ export function createRunScriptTool(deps: RunScriptDeps): AgentTool {
 			if (!isAbsolute(script)) {
 				return refuse(`script 必须是绝对路径（收到「${script}」）。相对路径会随工作目录漂移，容易执行到别的文件。`);
 			}
+			// A path destined for a shell command line must contain no shell
+			// metacharacters. `q()` escapes quotes the cmd way (`""`), but cmd also
+			// treats `&`, `|`, `<`, `>`, `^`, `%` and parentheses as syntax OUTSIDE
+			// quotes and as expansion triggers INSIDE them — no amount of quoting
+			// makes an arbitrary path safe, so refuse the characters outright.
+			// (A legitimate script path never contains them.)
+			if (/[&|<>^%()\r\n\t]/.test(script)) {
+				return refuse(`脚本路径含 shell 元字符（& | < > ^ % ( ) 或换行），拒绝执行：${script}`);
+			}
 			const ext = script.slice(script.lastIndexOf(".")).toLowerCase();
 			if (!SCRIPT_EXTENSIONS.includes(ext)) {
 				return refuse(
@@ -116,9 +126,11 @@ export function createRunScriptTool(deps: RunScriptDeps): AgentTool {
 				body = JSON.stringify(input.params ?? {}, null, 2);
 			}
 
-			// One directory per script stem so two scripts never overwrite each
-			// other's parameters; the file name is fixed so it is easy to inspect.
-			const stem = script.slice(script.lastIndexOf("/") + 1, script.lastIndexOf(".") || undefined).replace(/[^\w.-]/g, "_");
+			// One directory per SCRIPT FILE so two same-named scripts in different
+			// folders never overwrite each other's parameters ("a/job.py" vs
+			// "b/job.py" share the stem "job"). The hash suffix distinguishes them;
+			// the readable stem stays so the directory is still easy to inspect.
+			const stem = paramDirName(script);
 			const dir = join(deps.userDataDir, PARAM_DIR, stem);
 			const file = join(dir, "params.json");
 			try {
@@ -151,6 +163,28 @@ export function createRunScriptTool(deps: RunScriptDeps): AgentTool {
 	};
 }
 
+/**
+ * Directory name for a script's parameter file: `<readable stem>-<hash>`.
+ *
+ * The stem alone is not enough — `C:\a\job.py` and `C:\b\job.py` would share
+ * it — so a short hash of the FULL path keeps them apart.
+ *
+ * Uses `path.basename`, not `lastIndexOf("/")`: on Windows the separator is
+ * `\`, so splitting on `/` returned the whole path and every script landed in
+ * one directory named after its full path with the separators replaced.
+ */
+export function paramDirName(script: string): string {
+	// `path.basename` follows the RUNNING platform's separator, so on macOS/Linux
+	// (where this code is developed and tested) a Windows path like
+	// `C:\work\job.py` is treated as one long file name. Split on BOTH
+	// separators so the result is right wherever the path came from.
+	const base = script.split(/[\\/]/).pop() ?? script;
+	const dot = base.lastIndexOf(".");
+	const stem = (dot > 0 ? base.slice(0, dot) : base).replace(/[^\w.-]/g, "_") || "script";
+	const hash = createHash("sha1").update(script).digest("hex").slice(0, 8);
+	return `${stem}-${hash}`;
+}
+
 /** Pick the runtime from the script extension. */
 export function inferRuntime(extension: string): "python" | "powershell" | "node" | "cmd" | "sh" {
 	switch (extension.toLowerCase()) {
@@ -175,6 +209,9 @@ export function inferRuntime(extension: string): "python" | "powershell" | "node
  * spaces); no user data appears here, which is the whole point.
  */
 export function buildCommand(runtime: string, script: string, paramsFile: string): string {
+	// Callers must have rejected shell metacharacters already: `""` is the cmd
+	// convention for an embedded quote, but it is not an escape for the surrounding
+	// syntax characters, so quoting alone does not make a hostile path safe.
 	const q = (p: string) => `"${p.replace(/"/g, '""')}"`;
 	switch (runtime) {
 		case "python":
