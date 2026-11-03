@@ -2321,17 +2321,19 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	async send(agent: Agent, message: string, ctx?: SendCtx): Promise<SendResult> {
-		// NOTE: beginTurn deliberately does NOT run here. `send` is queue
-		// admission: under durable a second message for the same conversation
-		// waits for the running turn, so resetting here would erase the ACTIVE
-		// loop's history (review finding) — i.e. the queued message would give
-		// the runaway a fresh budget. The window is opened at execution start
-		// (beginExecution) and dropped when the turn ends.
+		// NOTE: beginTurn deliberately does NOT run before this branch. Under
+		// durable, `send` is queue admission: a second message for the same
+		// conversation waits for the running turn, so resetting here would erase
+		// the ACTIVE loop's history (review finding) and hand the runaway a fresh
+		// budget. Durable opens/closes the window in its execute() hooks.
+		// Legacy / pi-session have no such queue: `send` IS the execution, so the
+		// window opens here and closes when the turn settles below.
 		if (this.opts.kernel === "durable" && !ctx?.ephemeral) {
 			if (!this.durableRuntime) throw new Error("Durable runtime is unavailable; refusing to replay through legacy");
 			return this.durableRuntime.send(agent, message, ctx);
 		}
 		const conversationId = agent.sessionId ?? "default";
+		this.progress.beginTurn(conversationId);
 
 		const existing = this.history.getConversation(conversationId);
 		this.history.ensureConversation(conversationId, existing?.title ?? deriveTitle(message));
@@ -2431,6 +2433,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 			this.turnUserMessage.delete(conversationId);
 			this.turnMemoryContext.delete(conversationId);
 			this.turnActivity.delete(conversationId);
+			// Legacy / pi-session close their progress window here (durable does it
+			// in execute()'s finally). Keeps idle processes from accumulating state
+			// and stops a later turn from inheriting a stale window.
+			this.progress.endTurn(conversationId);
 			await this.computer?.release(conversationId);
 		}
 
