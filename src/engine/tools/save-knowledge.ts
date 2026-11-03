@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { lit, obj, opt, str, union } from "@earendil-works/pi-schema";
 import type { KnowledgeService } from "../../knowledge/knowledge-service.js";
 import { deriveMemoryContext, ownerForScope, type MemoryScope } from "../../knowledge/memory-scope.js";
 import { CONFLICT_HINT_TEMPLATE, findTitleConflict, looksShortLived, memoryPhrasingHint } from "../../knowledge/memory-write.js";
@@ -18,39 +18,39 @@ export function createSaveToKnowledgeTool(knowledge: KnowledgeService): AgentToo
 		label: "沉淀知识",
 		description:
 			"把对话中产生的可复用知识（解决方案、政策澄清、FAQ、客户偏好、纠错经验等）整理成一条知识库条目保存。标题简明概括主题、内容写清适用条件与步骤，便于后续检索复用；同标题会自动合并。",
-		parameters: Type.Object({
-			title: Type.String({ description: "知识条目标题，简明概括主题（如「7天无理由退货流程」）" }),
-			content: Type.String({
+		parameters: obj({
+			title: str({ description: "知识条目标题，简明概括主题（如「7天无理由退货流程」）" }),
+			content: str({
 				description: "知识正文：适用条件、步骤、注意事项，完整且可脱离上下文独立理解",
 			}),
-			tags: Type.Optional(
-				Type.String({ description: "可选标签，逗号分隔（如「退货,售后」）" }),
+			tags: opt(
+				str({ description: "可选标签，逗号分隔（如「退货,售后」）" }),
 			),
-			entryId: Type.Optional(
-				Type.String({
+			entryId: opt(
+				str({
 					description: "要更新的已有条目 id（从 search_knowledge_base / manage_knowledge_base 的 list 结果获取）。提供时为更新而非新建。",
 				}),
 			),
-			mode: Type.Optional(
-				Type.Union([Type.Literal("replace"), Type.Literal("append")], {
+			mode: opt(
+				union([lit("replace"), lit("append")], {
 					description: "更新已有条目时的语义：replace=覆盖旧内容（用于纠正/修订），append=追加（默认 replace）",
 				}),
 			),
-			source: Type.Optional(
-				Type.Union(
-					[Type.Literal("learned"), Type.Literal("research")],
+			source: opt(
+				union(
+					[lit("learned"), lit("research")],
 					{
 						description: "知识来源：learned=对话中沉淀（默认）；research=联网研究所得（标记为待核实、低置信度，需带 sourceUrl）",
 					},
 				),
 			),
-			sourceUrl: Type.Optional(
-				Type.String({ description: "来源链接（source=\"research\" 时必填，作为出处留存）" }),
+			sourceUrl: opt(
+				str({ description: "来源链接（source=\"research\" 时必填，作为出处留存）" }),
 			),
-			gapQuery: Type.Optional(
-				Type.String({ description: "若本条知识解答了某个知识缺口，传该缺口查询词，沉淀后自动消除该缺口" }),
+			gapQuery: opt(
+				str({ description: "若本条知识解答了某个知识缺口，传该缺口查询词，沉淀后自动消除该缺口" }),
 			),
-		}),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { title, content, tags, entryId, mode, source, sourceUrl, gapQuery } = params as {
 				title: string;
@@ -137,17 +137,17 @@ export function createRememberTool(deps: {
 			"不要用于客观知识（规则/流程/地址 → save_to_knowledge）或操作步骤（→ save_to_skill）。同范围同标题重存会纠正覆盖旧记忆。" +
 			"**正文写成陈述事实，不要写祈使句**（「对方偏好可复制文本框」✓，「始终用可复制文本框」✗——记忆会被后续会话当作命令执行，可能压过对方当时的真实诉求）。" +
 			"**一周内就会过时的事不要写进记忆**（「今天/明天下单」这类），只记长期稳定的部分。",
-		parameters: Type.Object({
-			title: Type.String({ description: "记忆标题，简明点名主题（如「张工偏好：prompt 用可复制文本框交付」）" }),
-			content: Type.String({ description: "记忆正文：一到三句话写清事实与适用语境；纠正时直接写新事实，不要包含已作废的旧说法" }),
-			summary: Type.Optional(Type.String({
+		parameters: obj({
+			title: str({ description: "记忆标题，简明点名主题（如「张工偏好：prompt 用可复制文本框交付」）" }),
+			content: str({ description: "记忆正文：一到三句话写清事实与适用语境；纠正时直接写新事实，不要包含已作废的旧说法" }),
+			summary: opt(str({
 			description: "可选一行索引摘要（≤60字），用于每次会话自动携带；不填则只携带标题",
 			})),
-			scope: Type.Optional(Type.Union(
-				[Type.Literal("person"), Type.Literal("conversation"), Type.Literal("profile")],
+			scope: opt(union(
+				[lit("person"), lit("conversation"), lit("profile")],
 				{ description: "记忆范围：person=仅本人（默认）；conversation=当前群；profile=全配置共享（需管理员）" },
 			)),
-		}),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const p = params as { title: string; content: string; summary?: string; scope?: "person" | "conversation" | "profile" };
 			try {

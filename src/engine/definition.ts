@@ -45,7 +45,9 @@ import { createViewImageTool } from "./tools/view-image.js";
 import { createManageAdminTool, createUpdateIdentityTool, type AdminToolDeps } from "./tools/admin.js";
 import { createManageUpdateTool, type UpdateOperations } from "./tools/update.js";
 import { createManageCapabilitiesTool } from "./tools/capabilities.js";
-import { createRunCommandTool, createManageProcessTool, type ShellToolDeps } from "./tools/shell.js";
+import { createRunCommandTool, createManageProcessTool, executeCommand, type ShellToolDeps } from "./tools/shell.js";
+import { createRunScriptTool } from "./tools/run-script.js";
+import { computeToolFingerprint } from "./progress-watchdog.js";
 import { createManageSettingsTool } from "./tools/settings.js";
 import { orderTool } from "./tools/orders.js";
 import { CAPABILITY_LABEL, checkPermission, permissionRefusal } from "../security/permissions.js";
@@ -112,6 +114,8 @@ export interface ToolSetOptions {
 	playwrightCliPath: () => string;
 	/** Persistent append-only log for run_command authorization/execution events. */
 	shellAuditLogPath?: string;
+	/** Profile user-data dir; `run_script` writes parameter files under it. */
+	userDataDir?: string;
 	/**
 	 * Resolves the current turn's channel file-sender for a conversation (set by
 	 * the engine from the inbound context), or undefined when the channel can't
@@ -145,7 +149,7 @@ export interface ToolSetOptions {
 	 * sees each call exactly once, so the telemetry wrapper lives here rather than
 	 * inside each tool (a newly added tool is then covered by construction).
 	 */
-	onToolEvent?: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string }) => void;
+	onToolEvent?: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string }) => void;
 	/** Telemetry store for the self-inspection tool (my_stats). */
 	telemetry?: TelemetryStore;
 	/** Proposal store (self-improvement loop output: propose_improvement). */
@@ -177,17 +181,13 @@ export interface ToolSetOptions {
 }
 
 /** Assemble the employee's tools; capability tools are conditional on their config flags. */
-export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
-	const tools: AgentTool<any>[] = [];
-	/**
-	 * Capability guard (RBAC): wraps a tool's execute with a server-side
-	 * permission check against the CURRENT turn's platform-verified actor —
-	 * the model never mediates who may call what, so prompt injection in
-	 * message/web/file content cannot escalate access. The check is per-turn
-	 * (resolveActor reads the live turn actor), so one group conversation
-	 * serves different senders at their own roles.
-	 */
-	const guarded = (capability: string, tool: AgentTool<any>): AgentTool<any> => ({
+/**
+ * Wrap a tool with the RBAC capability gate. Exported so callers that do NOT go
+ * through buildTools (the durable kernel installs MCP as its own registry
+ * extension, bypassing this function) apply the SAME check instead of a copy.
+ */
+export function guardTool(capability: string, tool: AgentTool<any>, options: ToolSetOptions): AgentTool<any> {
+	return {
 		...tool,
 		async execute(toolCallId, params, signal, onUpdate) {
 			const gate = checkPermission(options.config, options.resolveActor(options.conversationId), options.conversationId, capability);
@@ -215,7 +215,20 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 			}
 			return tool.execute(toolCallId, params, signal, onUpdate);
 		},
-	});
+	};
+}
+
+export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
+	const tools: AgentTool<any>[] = [];
+	/**
+	 * Capability guard (RBAC): wraps a tool's execute with a server-side
+	 * permission check against the CURRENT turn's platform-verified actor —
+	 * the model never mediates who may call what, so prompt injection in
+	 * message/web/file content cannot escalate access. The check is per-turn
+	 * (resolveActor reads the live turn actor), so one group conversation
+	 * serves different senders at their own roles.
+	 */
+	const guarded = (capability: string, tool: AgentTool<any>): AgentTool<any> => guardTool(capability, tool, options);
 	const guardAll = (capability: string, list: AgentTool<any>[]): AgentTool<any>[] => list.map((t) => guarded(capability, t));
 
 	if (options.kbEnabled) {
@@ -349,6 +362,20 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 		auditLogPath: options.shellAuditLogPath,
 	};
 	tools.push(createRunCommandTool(shellDeps), createManageProcessTool(shellDeps));
+	// `run_script`: the same executor, but arguments travel in a JSON file so the
+	// command line carries no user data. This is the fix for Windows argv
+	// re-tokenization / quoting / GBK mangling — see tools/run-script.ts.
+	if (options.userDataDir) {
+		tools.push(createRunScriptTool({
+			...shellDeps,
+			userDataDir: options.userDataDir,
+			runCommand: async (input) => {
+				const result = await executeCommand(shellDeps, input, input.signal);
+				const text = result.content.map((c) => c.text).join("\n");
+				return { text, isError: result.details?.refused === true };
+			},
+		}));
+	}
 	// Full-config read/write for headless deployments — every block the desktop
 	// settings UI exposes, editable from an admin's 1:1 chat (security excluded).
 	tools.push(createManageSettingsTool({
@@ -407,9 +434,9 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
  * failure is swallowed, so instrumentation can never break a tool.
  * A refusal counts as NOT ok — it is friction the agent should be able to see.
  */
-function withTelemetry(
+export function withTelemetry(
 	tool: AgentTool<any>,
-	onEvent: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string }) => void,
+	onEvent: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string }) => void,
 ): AgentTool<any> {
 	return {
 		...tool,
@@ -419,7 +446,11 @@ function withTelemetry(
 				const result = await tool.execute(toolCallId, params, signal, onUpdate);
 				const details = (result as { details?: { refused?: boolean; capability?: string } } | undefined)?.details;
 				const refused = Boolean(details?.refused);
-				onEvent({ name: tool.name, durationMs: Date.now() - started, ok: !refused, refused, refusedCapability: details?.capability });
+				// Progress fingerprint: the progress watchdog judges repetition by
+				// tool + normalized params + result digest. Computed here — the
+				// OUTERMOST wrapper — so both kernels and every capability feed it.
+				const fingerprint = computeToolFingerprint(tool.name, params, result);
+				onEvent({ name: tool.name, durationMs: Date.now() - started, ok: !refused, refused, refusedCapability: details?.capability, fingerprint });
 				return result;
 			} catch (err) {
 				onEvent({
@@ -427,6 +458,9 @@ function withTelemetry(
 					durationMs: Date.now() - started,
 					ok: false,
 					error: err instanceof Error ? err.message : String(err),
+					// A throwing tool still carries a fingerprint: the same tool with
+					// the same params throwing the same error every round IS a loop.
+					fingerprint: computeToolFingerprint(tool.name, params, err instanceof Error ? err.message : String(err)),
 				});
 				throw err;
 			}

@@ -14,7 +14,7 @@
  * registration; the admin-only rule for the full view is enforced here.
  */
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { lit, num, obj, opt, union } from "@earendil-works/pi-schema";
 import type { ConfigStore } from "../../db/config-store.js";
 import { isAdmin } from "../../security/permissions.js";
 import type { FailureCluster, TelemetrySummary, Trend } from "../../db/telemetry-store.js";
@@ -132,19 +132,19 @@ export function createMyStatsTool(deps: StatsToolDeps): AgentTool {
 			"scope=conversation（默认）只看当前会话；scope=all 看全部会话，仅管理员可用。工具被权限拒绝的次数也在统计里。" +
 			"focus=failures 返回「失败聚类 + 与上一个等长窗口的环比」——聚类与数字由统计代码算出（同类报错会归并成一组），按新增/恶化优先排序，做改进提案时用它。" +
 			"所有数字都来自本地运行记录，据实报告，不要估算或补充记录之外的数据。",
-		parameters: Type.Object({
-			hours: Type.Optional(Type.Number({ description: "统计最近多少小时，默认 24，最大 720（30 天）" })),
-			scope: Type.Optional(
-				Type.Union([Type.Literal("conversation"), Type.Literal("all")], {
+		parameters: obj({
+			hours: opt(num({ description: "统计最近多少小时，默认 24，最大 720（30 天）" })),
+			scope: opt(
+				union([lit("conversation"), lit("all")], {
 					description: "conversation=仅当前会话（默认）；all=全部会话（仅管理员）",
 				}),
 			),
-			focus: Type.Optional(
-				Type.Union([Type.Literal("summary"), Type.Literal("failures")], {
+			focus: opt(
+				union([lit("summary"), lit("failures")], {
 					description: "summary=总体统计（默认）；failures=失败聚类 + 与上一个等长窗口的环比，做改进提案时用这个",
 				}),
 			),
-		}),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { hours, scope, focus } = params as { hours?: number; scope?: "conversation" | "all"; focus?: "summary" | "failures" };
 			const window = Math.min(720, Math.max(1, Math.round(hours ?? 24)));

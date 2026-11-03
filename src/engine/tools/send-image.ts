@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { obj, str } from "@earendil-works/pi-schema";
 
 /** Resolves the current turn's inline-image sender for a conversation. */
 export type ImageSenderResolver = (
@@ -22,9 +22,9 @@ export function createSendImageTool(resolveImageSender: ImageSenderResolver | un
 		description:
 			"把一张本地图片作为内联图片发送到当前对话（对方能直接看到图，而不是文件）。参数 filePath 是图片的绝对路径——例如 browser_screenshot 返回的 savedPath，或 list_downloads 里的图片文件。" +
 			"仅当对方明确要求看图、或任务结果就是截图/图表时使用。若当前渠道不支持发图，会返回提示，此时把图片路径或说明写进文字回复即可。",
-		parameters: Type.Object({
-			filePath: Type.String({ description: "要发送的图片文件的绝对路径（png/jpg/jpeg 等）" }),
-		}),
+		parameters: obj({
+			filePath: str({ description: "要发送的图片文件的绝对路径（png/jpg/jpeg 等）" }),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { filePath } = params as { filePath: string };
 			const sender = resolveImageSender?.(conversationId);

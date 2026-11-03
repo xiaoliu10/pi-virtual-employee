@@ -19,7 +19,7 @@
  *   rollback — undo the most recent apply.
  */
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { bool, lit, obj, opt, str, union } from "@earendil-works/pi-schema";
 import type { ConfigStore } from "../../db/config-store.js";
 import type { CaseKind, PromptLab, VariantScore } from "../../db/prompt-lab.js";
 import { isAdmin } from "../../security/permissions.js";
@@ -68,28 +68,28 @@ export function createPromptLabTool(deps: PromptLabDeps): AgentTool {
 			"action=history / rollback：查看变更历史 / 回滚最近一次变更。\n" +
 			"用法：从 my_stats focus=failures 的失败聚类出发写候选（**候选文本由你写**），run 打分（**分数由实验室算，你自己不得评判或估算通过率**），通过且优于基线才 apply；失败就把用例的失败详情读一遍再改。\n" +
 			"注意：prompt_includes/excludes 类用例测的是红线是否还在（安全、数据真实性、权限身份、定时任务语义等），**关键用例不允许被牺牲**。",
-		parameters: Type.Object({
-			action: Type.Union(
-				[Type.Literal("cases"), Type.Literal("run"), Type.Literal("apply"), Type.Literal("history"), Type.Literal("rollback")],
+		parameters: obj({
+			action: union(
+				[lit("cases"), lit("run"), lit("apply"), lit("history"), lit("rollback")],
 				{ description: "cases=评测用例；run=打分；apply=写回；history/rollback=历史与回滚" },
 			),
-			sub: Type.Optional(
-				Type.Union([Type.Literal("list"), Type.Literal("add"), Type.Literal("enable"), Type.Literal("disable")], {
+			sub: opt(
+				union([lit("list"), lit("add"), lit("enable"), lit("disable")], {
 					description: "action=cases 时的子操作，默认 list",
 				}),
 			),
-			name: Type.Optional(Type.String({ description: "action=cases sub=add：用例名（如「不得索要 ID」）" })),
-			kind: Type.Optional(Type.Union(CASE_KINDS.map((k) => Type.Literal(k)) as never, { description: "用例类型" })),
-			value: Type.Optional(Type.String({ description: "断言值：prompt_* 为要出现/不得出现的文字；reply_* 为正则" })),
-			input: Type.Optional(Type.String({ description: "reply_* 用例必填：要跑的真实输入" })),
-			critical: Type.Optional(Type.Boolean({ description: "是否关键用例（失败即一票否决），默认 false" })),
-			notes: Type.Optional(Type.String({ description: "用例备注：为什么它重要" })),
-			id: Type.Optional(Type.String({ description: "action=cases sub=enable/disable、以及 rollback 的目标 id（或用例名）" })),
-			text: Type.Optional(Type.String({ description: "action=run/apply：候选规则文本（完整的 prompt.rules 正文）" })),
-			rationale: Type.Optional(Type.String({ description: "action=run：这次候选想解决什么（会存档）" })),
-			reason: Type.Optional(Type.String({ description: "action=apply：变更理由（会写入历史）" })),
-			variantId: Type.Optional(Type.String({ description: "action=apply：要生效的候选 id" })),
-		}),
+			name: opt(str({ description: "action=cases sub=add：用例名（如「不得索要 ID」）" })),
+			kind: opt(union(CASE_KINDS.map((k) => lit(k)) as never, { description: "用例类型" })),
+			value: opt(str({ description: "断言值：prompt_* 为要出现/不得出现的文字；reply_* 为正则" })),
+			input: opt(str({ description: "reply_* 用例必填：要跑的真实输入" })),
+			critical: opt(bool({ description: "是否关键用例（失败即一票否决），默认 false" })),
+			notes: opt(str({ description: "用例备注：为什么它重要" })),
+			id: opt(str({ description: "action=cases sub=enable/disable、以及 rollback 的目标 id（或用例名）" })),
+			text: opt(str({ description: "action=run/apply：候选规则文本（完整的 prompt.rules 正文）" })),
+			rationale: opt(str({ description: "action=run：这次候选想解决什么（会存档）" })),
+			reason: opt(str({ description: "action=apply：变更理由（会写入历史）" })),
+			variantId: opt(str({ description: "action=apply：要生效的候选 id" })),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const p = params as {
 				action: "cases" | "run" | "apply" | "history" | "rollback";

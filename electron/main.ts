@@ -515,6 +515,8 @@ async function main(): Promise<void> {
 		userSkillsDir,
 		shellAuditLogPath: path.join(userData, "logs", "shell-audit.log"),
 		proposalsDir,
+		// run_script writes its parameter files here (script-params/<stem>/params.json).
+		userDataDir: userData,
 	}, { timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000, kernel });
 	// stdio MCP transports own child processes — disconnect them on quit
 	// (best-effort: will-quit cannot await, fire and forget).
@@ -1017,6 +1019,14 @@ ${tailForProgress(decision.text)}`;
 	let durableStartupFailed = false;
 	if (kernel === "durable") {
 		try {
+			// Connect MCP BEFORE opening the durable host. The registry's tool list
+			// is frozen at open time, so an MCP server that finishes connecting
+			// afterwards is invisible to the model for the whole process lifetime
+			// (field incident 2026-11-03: log said "mcp tools changed: 12" while
+			// every widget conversation reported no such tool). Later changes are
+			// applied live by refreshMcp → setMcpTools, but the FIRST snapshot must
+			// already contain them. No servers configured = this returns at once.
+			await engine.refreshMcpToolsForStartup();
 			const host = await engine.openDurableRuntime(userData, async (conversationId, result, occurrenceId) => {
 				const wc = mainWindow?.webContents;
 				if (wc && !wc.isDestroyed()) wc.send("im:activity", conversationId);

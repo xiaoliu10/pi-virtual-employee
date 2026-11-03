@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { obj, str } from "@earendil-works/pi-schema";
 
 interface OrderRecord {
 	status: "待发货" | "已发货" | "已签收" | "已取消";
@@ -20,9 +20,9 @@ export const orderTool: AgentTool = {
 	label: "订单查询",
 	description:
 		"根据订单号查询订单状态、物流单号、金额和下单时间。当客户提到订单号或询问订单进度时调用。",
-	parameters: Type.Object({
-		orderId: Type.String({ description: "订单编号,例如 A10001" }),
-	}),
+	parameters: obj({
+		orderId: str({ description: "订单编号,例如 A10001" }),
+	}, { open: true }),
 	async execute(_toolCallId, params) {
 		const { orderId } = params as { orderId: string };
 		const order = ORDERS[orderId];

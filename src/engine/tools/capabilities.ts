@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { arr, bool, lit, obj, opt, str, union } from "@earendil-works/pi-schema";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
@@ -65,30 +65,30 @@ export function createManageCapabilitiesTool(deps: CapabilityToolDeps): AgentToo
 			"reports（报告中心）、downloads（浏览器下载工作区）、shell（受限命令执行）。" +
 			`安全规则：list 需单聊；${confirmRule}，群聊一律拒绝。` +
 			"setup_browser 已装则直接报告已安装；未装则后台下载（约 150MB，需几分钟），用 status 查询进度。下载源由 browser.downloadHost 决定（留空 = 国内默认走 npmmirror 镜像；如需改用 manage_settings 设置 browser.downloadHost）。",
-		parameters: Type.Object({
-			action: Type.Union([Type.Literal("list"), Type.Literal("set"), Type.Literal("setup_browser"), Type.Literal("status")], {
+		parameters: obj({
+			action: union([lit("list"), lit("set"), lit("setup_browser"), lit("status")], {
 				description: "list=查看能力开关；set=开关能力；setup_browser=安装浏览器内核；status=查询浏览器内核安装状态",
 			}),
-			capability: Type.Optional(
-				Type.Union(
+			capability: opt(
+				union(
 					[
-						Type.Literal("browser"),
-						Type.Literal("computer"),
-						Type.Literal("documents"),
-						Type.Literal("filesystem"),
-						Type.Literal("reports"),
-						Type.Literal("downloads"),
-						Type.Literal("shell"),
-						Type.Literal("research"),
+						lit("browser"),
+						lit("computer"),
+						lit("documents"),
+						lit("filesystem"),
+						lit("reports"),
+						lit("downloads"),
+						lit("shell"),
+						lit("research"),
 					],
 					{ description: "仅 set 必填：要开关的能力名" },
 				),
 			),
-			enabled: Type.Optional(Type.Boolean({ description: "仅 set 必填：true=开启，false=关闭" })),
-			allowedCommands: Type.Optional(Type.Array(Type.String(), {
+			enabled: opt(bool({ description: "仅 set 必填：true=开启，false=关闭" })),
+			allowedCommands: opt(arr(str(), {
 				description: "仅 capability=shell 时可选：完整替换可执行文件白名单，如 [\"tasklist\",\"taskkill\",\"powershell\"]；空数组=全部拒绝；*=任意命令（高风险）",
 			})),
-		}),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { action, capability, enabled, allowedCommands } = params as {
 				action: "list" | "set" | "setup_browser" | "status";

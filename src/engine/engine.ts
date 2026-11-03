@@ -43,14 +43,16 @@ import type { DocumentService, FileSender } from "../documents/document-service.
 import type { FileSystemService } from "../filesystem/filesystem-service.js";
 import type { ReportService } from "../reports/report-service.js";
 import type { DownloadService } from "../downloads/download-service.js";
-import { buildSystemPrompt, buildTools } from "./definition.js";
+import { buildSystemPrompt, buildTools, guardTool, withTelemetry } from "./definition.js";
 import type { UpdateOperations } from "./tools/update.js";
 import { hasActiveShellCommands } from "./tools/shell.js";
 import {effectiveAuthorizationRole, ROLE_RANK, checkPermission, isLocalConversation, resolveRole} from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
+import { ProgressWatchdog } from "./progress-watchdog.js";
 import { createMcpManager, type McpManager } from "./tools/mcp.js";
+import { normalizeMcpServers } from "../shared/mcp.js";
 import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, recentAssistantVisibleTexts, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, substantialAnchorOf, SUMMARIZER_RETRY, taskAnchorOf, truncateToFit, usableContextWindow, turnMemoryPrefix } from "./context.js";
 import { extractProgressFromTexts, formatDeterministicBrief, standardizeProgressReport } from "./progress.js";
 import { fetchModelInfo, resolveEffectiveLimits, type RemoteModelInfo } from "./model-info.js";
@@ -343,6 +345,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * in-flight request counts as life even before its first event arrives. */
 	private readonly llmInFlight = new Map<string, number>();
 	private readonly lastLlmCallAt = new Map<string, number>();
+	/** First stream event per in-flight request — a request that has produced
+	 * ANY event is alive however slow; one that never will is the hung case. */
+	private readonly llmFirstByteAt = new Map<string, number>();
+	/** Progress watchdog state (see progress-watchdog.ts). Pure judgement, no I/O. */
+	private readonly progress = new ProgressWatchdog();
 
 	constructor(
 		private readonly config: ConfigStore,
@@ -354,10 +361,20 @@ export class EmployeeEngine implements EmployeeRuntime {
 		private readonly filesystem: FileSystemService,
 		private readonly reportService: ReportService,
 		private readonly downloadService: DownloadService,
-		private readonly paths: { builtinSkillsDir: string; userSkillsDir: string; shellAuditLogPath?: string; proposalsDir?: string },
+		private readonly paths: { builtinSkillsDir: string; userSkillsDir: string; shellAuditLogPath?: string; proposalsDir?: string; userDataDir?: string },
 		options: EngineOptions = {},
 	) {
 		this.opts = { timeoutMs: options.timeoutMs ?? 0, streamFn: options.streamFn, retrySleepFn: options.retrySleepFn, kernel: options.kernel ?? "legacy" };
+		// Configured thresholds MUST reach the watchdog, otherwise every knob in
+		// Settings is dead code and the defaults silently win.
+		const pwCfg = this.config.all().general.progressWatchdog;
+		if (pwCfg) {
+			this.progress.configure({
+				stallWindowMs: pwCfg.stallWindowMs,
+				windowSize: pwCfg.windowSize,
+				softStopAfterWindows: pwCfg.softStopAfterWindows,
+			});
+		}
 		this.credentialStore = options.credentialStore ?? new FileCredentialStore();
 		this.models = createModels({ credentials: this.credentialStore });
 		for (const provider of builtinProviders()) this.models.setProvider(provider);
@@ -377,6 +394,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 			const { changed, report } = await this.mcpManager.refresh(this.config);
 			if (changed) {
 				console.log(`[engine] mcp tools changed: ${report.map((r) => `${r.name}=${r.ok ? r.tools : `err:${r.error ?? "?"}`}`).join(", ")}`);
+				// Durable kernel: the registry's `ve-mcp` extension is replaced in
+				// place and republished, and every conversation re-resolves its agent
+				// from the CURRENT snapshot — so the model sees the new tools on its
+				// next turn WITHOUT a host reopen. markConfigChanged alone only
+				// rebuilds legacy AgentSessions, which is why durable sessions kept
+				// reporting "no such tool" until restart (field incident 2026-11-03).
+				this.durableRuntime?.setMcpTools(this.mcpToolsFor("default"));
 				this.markConfigChanged();
 			}
 		} catch (err) {
@@ -398,12 +422,129 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** Re-read capabilities.mcp and reconnect (called after a settings save so a
 	 * newly added server is live without an app restart). Marked changed only
 	 * when the tool surface moved, so an unrelated save is a cheap no-op. */
-	async refreshMcpTools(): Promise<void> {
-		await this.refreshMcp();
+	/**
+	 * Connect MCP and report whether every configured server ended up with tools.
+	 *
+	 * A single attempt is not enough at startup: an HTTP/stdio MCP server that is
+	 * still booting (field 2026-11-03: the agent starts ~10s before the server it
+	 * must talk to) fails once and then stays invisible for the whole process
+	 * lifetime. Retry with a bounded exponential backoff, and stop as soon as a
+	 * pass succeeds — the retry budget exists only to cover that startup race.
+	 */
+	/**
+	 * Variant used at STARTUP: one bounded attempt, then hand the rest to the
+	 * background. Opening the durable host waits on this, and the connect timeout
+	 * is the server's own `timeoutSec` (default 60s) — a full retry ladder here
+	 * would stall app startup by minutes when a configured server is down.
+	 *
+	 * The first snapshot must already contain the MCP tools (the registry freezes
+	 * at open), but the LAGGING server is handled by the background retry, whose
+	 * success calls the same live `setMcpTools` path.
+	 */
+	async refreshMcpToolsForStartup(startupBudgetMs = 8_000): Promise<{ ok: boolean; servers: number; connected: number }> {
+		const configured = this.configuredMcpServerCount();
+		if (configured === 0) {
+			await this.refreshMcp();
+			return { ok: true, servers: 0, connected: 0 };
+		}
+		const raced = await Promise.race([
+			this.refreshMcpWithReport(),
+			this.unrefSleep(startupBudgetMs).then(() => null),
+		]);
+		const first = raced ?? { servers: configured, connected: 0 };
+		if (first.servers === 0 || first.connected >= first.servers) {
+			return { ok: true, servers: first.servers, connected: first.connected };
+		}
+		// Not everything connected inside the startup budget: finish in the
+		// background so startup proceeds, and apply the surface live when it lands.
+		void this.finishMcpConnectInBackground();
+		return { ok: false, servers: first.servers, connected: first.connected };
 	}
+
+	/** Number of enabled MCP servers in the current config (0 when MCP is off). */
+	private configuredMcpServerCount(): number {
+		const mcp = this.config.all().capabilities?.mcp;
+		if (mcp?.enabled !== true) return 0;
+		return normalizeMcpServers(mcp.servers, process.env).servers.filter((s) => s.enabled !== false).length;
+	}
+
+	/** Keep retrying the MCP connect in the background (bounded), applying live. */
+	private async finishMcpConnectInBackground(): Promise<void> {
+		for (const delay of [2_000, 5_000, 10_000, 30_000, 60_000]) {
+			await this.unrefSleep(delay);
+			// App is quitting: do not touch the manager (it would reconnect a
+			// transport during shutdown and reset its `disposed` flag).
+			if (this.shuttingDown) return;
+			const last = await this.refreshMcpWithReport();
+			if (last.servers === 0 || last.connected >= last.servers) {
+				console.log(`[engine] mcp connected after background retry: ${last.connected}/${last.servers}`);
+				return;
+			}
+		}
+		console.warn("[engine] mcp still not fully connected after background retries");
+	}
+
+	async refreshMcpTools(): Promise<{ ok: boolean; servers: number; connected: number }> {
+		const configured = this.config.all().capabilities?.mcp?.enabled === true
+			? normalizeMcpServers(this.config.all().capabilities?.mcp?.servers, process.env).servers.filter((s) => s.enabled !== false).length
+			: 0;
+		if (configured === 0) {
+			await this.refreshMcp();
+			return { ok: true, servers: 0, connected: 0 };
+		}
+		// 0 → 2s → 5s → 10s: covers a server that boots after the agent. Stops at
+		// the first fully-connected pass, so a healthy setup pays nothing extra.
+		// 0 → 2s → 5s → 10s: covers a server that boots after the agent. Stops at
+		// the first fully-connected pass, so a healthy setup pays nothing extra.
+		// The waits are unref'd: startup must never be held open by a retry sleep
+		// (a quit during the window would otherwise wait out the timer).
+		const delays = [0, 2_000, 5_000, 10_000];
+		let last = await this.refreshMcpWithReport();
+		for (const delay of delays.slice(1)) {
+			if (last.servers === 0 || last.connected >= last.servers) break;
+			await this.unrefSleep(delay);
+			last = await this.refreshMcpWithReport();
+		}
+		const ok = last.servers === 0 || last.connected >= last.servers;
+		if (!ok) console.warn(`[engine] mcp connect incomplete after retries: ${last.connected}/${last.servers}`);
+		return { ok, servers: last.servers, connected: last.connected };
+	}
+
+	/** Sleep that cannot hold the process open (a quit must not wait for a retry). */
+	private async unrefSleep(ms: number): Promise<void> {
+		await new Promise<void>((resolve) => {
+			const timer = setTimeout(resolve, ms);
+			timer.unref?.();
+		});
+	}
+
+	/** One refresh, returning how many configured servers ended up with tools.
+	 *  MUST go through refreshMcp (not mcpManager.refresh directly): a successful
+	 *  connect that never publishes to the durable registry leaves the tools
+	 *  invisible — the exact bug this file fixes, re-created one layer up. */
+	private async refreshMcpWithReport(): Promise<{ servers: number; connected: number }> {
+		try {
+			const { report } = await this.mcpManager.refresh(this.config);
+			const serverRows = report.filter((r) => r.name !== "(配置)");
+			const servers = Math.max(serverRows.length, 0);
+			const connected = serverRows.filter((r) => r.ok).length;
+			// Publish the CURRENT surface — refresh only reports success; the tools
+			// (and their names) are read from the manager afterwards.
+			this.durableRuntime?.setMcpTools(this.mcpToolsFor("default"));
+			return { servers, connected };
+		} catch {
+			return { servers: 1, connected: 0 };
+		}
+	}
+
+	/** Set when shutdown starts, so background MCP retries stop touching the
+	 *  manager (a retry during quit would reconnect a transport and clear the
+	 *  manager's `disposed` flag). */
+	private shuttingDown = false;
 
 	/** Close every MCP connection (stdio transports own child processes). */
 	async disposeMcp(): Promise<void> {
+		this.shuttingDown = true;
 		await this.mcpManager.dispose();
 	}
 	/** Work items (autonomous work phase 2). Set by main after construction; absent → work tools off. */
@@ -451,7 +592,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * "aborted:watchdog" instead of looking like an ordinary empty reply. Called
 	 * by the IM watchdog, /stop, and install_now; harmless when no turn is running.
 	 */
-	markTurnAbort(conversationId: string, reason: "watchdog" | "user" | "restart" | "install_now"): void {
+	markTurnAbort(conversationId: string, reason: "watchdog" | "runaway" | "user" | "restart" | "install_now"): void {
 		if (!this.turnIds.has(conversationId)) return;
 		this.turnAborts.set(conversationId, reason);
 	}
@@ -483,6 +624,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			userDataDir, history: this.history,
 			session: (id) => this.getOrCreateSession(id),
 			tools: (id) => this.buildToolSetFor(id),
+			mcpTools: (id) => this.mcpToolsFor(id),
 			stream: (id, options, messages) => {
 				const { supplier, modelId } = this.resolveForConversation(id);
 				const model = this.resolveModel(supplier, modelId);
@@ -518,6 +660,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 					this.turnSendFile.delete(id); this.turnSendImage.delete(id);
 				}
 			}, onRecovered,
+			// Progress-window lifecycle belongs to the EXECUTION, not the call:
+			// `send` is admission (queued behind the running turn), `execute` is
+			// when work actually starts.
+			onTurnStart: (id) => this.progress.beginTurn(id),
+			onTurnEnd: (id) => this.progress.endTurn(id),
 		});
 		return this.durableRuntime;
 	}
@@ -613,11 +760,97 @@ export class EmployeeEngine implements EmployeeRuntime {
 		return async (model, context, options) => {
 			this.llmInFlight.set(conversationId, (this.llmInFlight.get(conversationId) ?? 0) + 1);
 			this.lastLlmCallAt.set(conversationId, Date.now());
+			this.llmFirstByteAt.delete(conversationId);
 			this.touchActivity(conversationId);
-			try {
-				return await this.rawStreamFn(model, context, options);
-			} finally {
+			// The in-flight credit is released when the stream is SETTLED, not when
+			// the stream object exists. pi-ai's streamSimple resolves SYNCHRONOUSLY
+			// and performs the HTTP request inside its own async IIFE, so a
+			// `finally` around this call released the credit before a single byte
+			// had been requested: llmInFlight stayed 0 for the whole (possibly
+			// infinite) wait and the hung-request cap was structurally inert
+			// (independent review, P0). `release` is idempotent; one of the paths
+			// below always runs exactly once.
+			let released = false;
+			const release = (): void => {
+				if (released) return;
+				released = true;
 				this.llmInFlight.set(conversationId, Math.max(0, (this.llmInFlight.get(conversationId) ?? 1) - 1));
+				this.touchActivity(conversationId);
+			};
+			try {
+				const response = await this.rawStreamFn(model, context, options);
+				// First-byte detector: the stall watchdog exempts an in-flight
+				// request unconditionally (field 2026-09-18 — slow TTFT is alive),
+				// which let a NEVER-responsive request hold the serial queue until
+				// its own timeout (field 2026-11-03: two conversations blocked ~30
+				// min each). The distinction is exactly this: a request that has
+				// produced ANY event is alive; one with zero events after the hung
+				// cap is dead regardless of what its timeout claims. The wrapper
+				// records on the first iteration the consumer performs and
+				// otherwise passes every call through.
+				const rawIterator = (response as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator];
+				if (typeof rawIterator !== "function") {
+					// Not an async-iterable stream (test doubles, exotic providers): we
+					// cannot observe its lifetime, so settle immediately — the
+					// per-request timeout bounds that path, exactly as before.
+					release();
+					return response;
+				}
+				let primed = false;
+				const originalIterator = (rawIterator as (...args: unknown[]) => AsyncIterator<unknown>).bind(response);
+				// Structural assert: the wrapper delegates everything except asyncIterator.
+				const wrapped = Object.create(response) as typeof response & { [Symbol.asyncIterator]: () => AsyncIterator<unknown>; };
+				wrapped[Symbol.asyncIterator] = (() => {
+					const iterator = originalIterator();
+					const iteratorAny = iterator as AsyncIterator<unknown> & {
+						return?: (v?: unknown) => Promise<IteratorResult<unknown>>;
+						throw?: (e?: unknown) => Promise<IteratorResult<unknown>>;
+					};
+					return {
+						next: async (...args: [] | [undefined]) => {
+							// Passthrough: the wrapper only observes the first iteration.
+							let step: IteratorResult<unknown>;
+							try {
+								step = (await iteratorAny.next(...args)) as IteratorResult<unknown>;
+							} catch (error) {
+								release();
+								throw error;
+							}
+							// "First byte" means the FIRST NETWORK EVENT, not the local
+							// `start`. pi-ai pushes `start` synchronously BEFORE the HTTP
+							// request is made (openai-completions.js), so counting it would
+							// mark a never-responsive request as alive on the very first
+							// pull and disable the hung cap exactly when it is needed.
+							// Any real event — text, thinking, tool call, done or error —
+							// is proof of life; `start` is not.
+							const eventType = (step.done ? undefined : (step.value as { type?: string } | undefined)?.type);
+							if (!primed && (step.done || eventType !== "start")) {
+								primed = true;
+								this.llmFirstByteAt.set(conversationId, Date.now());
+							}
+							// Stream finished: the request is over, give the credit back.
+							if (step.done) release();
+							return step;
+						},
+						return: async (value?: unknown) => {
+							// Consumer stopped early (abort, model switch, retry): the
+							// request is over for us, so the credit must go back.
+							try {
+								return (await iteratorAny.return?.(value)) ?? { done: true as const, value: undefined };
+							} finally {
+								release();
+							}
+						},
+						throw: (error?: unknown) => iteratorAny.throw?.(error),
+						[Symbol.asyncIterator]() {
+							return this;
+						},
+					};
+				}) as typeof response[typeof Symbol.asyncIterator];
+				return wrapped;
+			} catch (error) {
+				release();
+				throw error;
 			}
 		};
 	}
@@ -1274,6 +1507,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 			{
 				lastActivityAt: this.turnActivity.get(conversationId),
 				llmInFlight: this.llmInFlight.get(conversationId) ?? 0,
+				llmCallStartedAt: this.lastLlmCallAt.get(conversationId),
+				llmFirstByteAt: this.llmFirstByteAt.get(conversationId),
+				hungRequestCapMs: this.config.all().general.progressWatchdog?.hungRequestCapMs,
 			},
 			Date.now(),
 		);
@@ -2085,11 +2321,19 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	async send(agent: Agent, message: string, ctx?: SendCtx): Promise<SendResult> {
+		// NOTE: beginTurn deliberately does NOT run before this branch. Under
+		// durable, `send` is queue admission: a second message for the same
+		// conversation waits for the running turn, so resetting here would erase
+		// the ACTIVE loop's history (review finding) and hand the runaway a fresh
+		// budget. Durable opens/closes the window in its execute() hooks.
+		// Legacy / pi-session have no such queue: `send` IS the execution, so the
+		// window opens here and closes when the turn settles below.
 		if (this.opts.kernel === "durable" && !ctx?.ephemeral) {
 			if (!this.durableRuntime) throw new Error("Durable runtime is unavailable; refusing to replay through legacy");
 			return this.durableRuntime.send(agent, message, ctx);
 		}
 		const conversationId = agent.sessionId ?? "default";
+		this.progress.beginTurn(conversationId);
 
 		const existing = this.history.getConversation(conversationId);
 		this.history.ensureConversation(conversationId, existing?.title ?? deriveTitle(message));
@@ -2189,6 +2433,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 			this.turnUserMessage.delete(conversationId);
 			this.turnMemoryContext.delete(conversationId);
 			this.turnActivity.delete(conversationId);
+			// Legacy / pi-session close their progress window here (durable does it
+			// in execute()'s finally). Keeps idle processes from accumulating state
+			// and stops a later turn from inheriting a stale window.
+			this.progress.endTurn(conversationId);
 			await this.computer?.release(conversationId);
 		}
 
@@ -2314,15 +2562,52 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** One tool call, linked to the turn that made it. Never throws. */
 	private recordToolTelemetry(
 		conversationId: string,
-		event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string },
+		event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string },
 	): void {
 		this.touchActivity(conversationId); // tool start/end — life, even without telemetry
+		if (event.fingerprint) this.noteToolProgress(conversationId, event.fingerprint);
 		if (!this.telemetry) return;
 		try {
 			this.turnToolCalls.set(conversationId, (this.turnToolCalls.get(conversationId) ?? 0) + 1);
 			this.telemetry.recordTool({ ...event, conversationId, turnId: this.turnIds.get(conversationId) });
 		} catch (err) {
 			console.warn("[engine] telemetry tool write failed:", err instanceof Error ? err.message : err);
+		}
+	}
+
+	/**
+	 * Feed one tool outcome to the progress watchdog and run its escalations.
+	 *
+	 * L1 (nudge): a stalled window closed — log it (observation; a correction
+	 * injection is a later slice). L2 (soft-stop): a second consecutive window
+	 * with no new work — abort the turn through the SAME path the stall
+	 * watchdog uses, with an honest abort reason. Any new fingerprint resets
+	 * the level to zero inside the watchdog, so a task that started moving
+	 * again is never touched.
+	 */
+	private noteToolProgress(conversationId: string, fingerprint: string): void {
+		// Defensive: a watchdog failure must never break the tool call it merely
+		// observes. `general` is optional in some host configs, so the whole
+		// evaluation is wrapped rather than relying on optional chaining alone.
+		let cfg: { enabled?: boolean; stallWindowMs?: number } | undefined;
+		try {
+			cfg = this.config.all()?.general?.progressWatchdog;
+		} catch {
+			return;
+		}
+		if (cfg?.enabled === false) return;
+		let verdict: ReturnType<ProgressWatchdog["touch"]>;
+		try {
+			verdict = this.progress.touch(conversationId, fingerprint);
+		} catch {
+			return; // observing must never become a failure mode
+		}
+		if (verdict === "nudge") {
+			console.warn(`[engine] progress watchdog: no new tool outcome in ${cfg?.stallWindowMs ?? 300_000}ms (L1 nudge) — ${conversationId}`);
+		} else if (verdict === "soft-stop") {
+			console.warn(`[engine] progress watchdog: stalled again after nudge (L2 soft-stop) — ${conversationId} | ${this.turnStallSnapshot(conversationId)}`);
+			this.markTurnAbort(conversationId, "runaway");
+			this.abortSession(conversationId);
 		}
 	}
 
@@ -2955,9 +3240,55 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * instead of a second, drifting construction. A permission check must not
 	 * depend on which kernel drives the conversation.
 	 */
+	/**
+	 * MCP external tools for one conversation. Deliberately SEPARATE from
+	 * buildToolSetFor: under the durable kernel these are installed as their own
+	 * registry extension (`ve-mcp`) so the surface can be replaced at runtime —
+	 * folding them into `ve-tools` froze them at open time and an MCP server that
+	 * connected later was invisible to the model for the whole process lifetime
+	 * (field incident 2026-11-03).
+	 */
+	mcpToolsFor(conversationId: string): AgentTool<any>[] {
+		const cfg = this.config.all();
+		if (!cfg.capabilities.mcp?.enabled) return [];
+		// MUST go through the SAME RBAC guard as the legacy path. The durable
+		// registry bypasses buildTools entirely, so handing it raw manager tools
+		// would skip `guarded("mcp", ...)` — i.e. checkPermission(config, actor,
+		// conversationId, "mcp") never runs and a viewer (or a turn whose
+		// capability was revoked mid-session) could call MCP tools. That is the
+		// exact guard the environment capability gate exists for (PR #95).
+		// MUST go through the SAME RBAC guard as the legacy path. The durable
+		// registry bypasses buildTools entirely, so handing it raw manager tools
+		// would skip `guarded("mcp", ...)` — i.e. checkPermission(config, actor,
+		// conversationId, "mcp") never runs and a viewer could call MCP tools.
+		// Reuse guardTool instead of copying it: a copy is how the two paths drift.
+		const guardOptions = { config: this.config, conversationId, resolveActor: (cid: string) => this.turnActor.get(cid), onRoleRefusal: (cid: string, info: { capability: string; need: string }) => this.noteAuthorizationNeeded(cid, info) } as unknown as Parameters<typeof guardTool>[2];
+		return this.mcpManager.tools().map((tool) => {
+			// RBAC first (a viewer or a mid-session revocation must not reach the
+			// server), THEN telemetry: the durable registry never goes through
+			// buildTools, so without this wrapper an MCP retry loop is invisible to
+			// both the progress watchdog and tool-event telemetry (independent
+			// review: a durable MCP call fired recordToolTelemetry ZERO times).
+			const guarded = guardTool("mcp", tool, guardOptions);
+			return withTelemetry(guarded, (e) => this.recordToolTelemetry(conversationId, e));
+		});
+	}
+
 	buildToolSetFor(conversationId: string): AgentTool<any>[] {
 		const cfg = this.config.all();
-		return buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), resolveMemoryContext: (cid) => this.turnMemoryContext.get(cid) ?? deriveMemoryContext(this.turnActor.get(cid), cid), onRoleRefusal: (cid, info) => this.noteAuthorizationNeeded(cid, info), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules), mcp: { enabled: cfg.capabilities.mcp?.enabled ?? false, tools: this.mcpManager.tools() }, work: this.workItems ? { items: this.workItems, fireItem: (id) => this.workBridge?.fireItem(id) ?? false, mine: (opts) => this.mineRecentWork({ ...opts, sinceTs: Date.now() - 24 * 60 * 60_000, sourceConversationId: inferConversationOrigin(conversationId) === "im" ? conversationId : undefined }) } : undefined });
+
+		return buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), resolveMemoryContext: (cid) => this.turnMemoryContext.get(cid) ?? deriveMemoryContext(this.turnActor.get(cid), cid), onRoleRefusal: (cid, info) => this.noteAuthorizationNeeded(cid, info), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, userDataDir: this.paths.userDataDir, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules), mcp: this.opts.kernel === "durable"
+					// Under durable the MCP surface lives in its OWN registry
+					// extension (`ve-mcp`) so it can be replaced live — passing it here
+					// as well would register every MCP tool twice (the harness
+					// composes one tool map by name, so the duplicate is masked until
+					// the surface changes and the frozen copy wins).
+					? { enabled: false, tools: [] }
+					// Legacy/pi-session sessions take their tools ONLY from this set, so
+					// MCP must be included here for those kernels.
+					: { enabled: cfg.capabilities.mcp?.enabled ?? false, tools: this.mcpManager.tools() },
+			work: this.workItems ? { items: this.workItems, fireItem: (id) => this.workBridge?.fireItem(id) ?? false, mine: (opts) => this.mineRecentWork({ ...opts, sinceTs: Date.now() - 24 * 60 * 60_000, sourceConversationId: inferConversationOrigin(conversationId) === "im" ? conversationId : undefined }) } : undefined });
+
 	}
 
 	isIdle(): boolean {

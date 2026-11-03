@@ -26,7 +26,7 @@
  *    needing elevation fails cleanly instead of silently partial-running.
  */
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { bool, int, lit, obj, opt, str, union } from "@earendil-works/pi-schema";
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -379,32 +379,24 @@ function sessionResult(entry: SessionEntry, offset?: number) {
 }
 
 /**
- * Conversation-side restricted shell tool for headless Windows servers where
- * nobody can open a terminal: inspect processes (tasklist), stop one PID
- * (taskkill), and inspect local system/network state.
+ * Execute one command under the full policy (role gate, allowlist, audit,
+ * session bookkeeping, timeouts).
+ *
+ * Exported because `run_script` must NOT grow its own executor: a second path
+ * would drift from the role gate and the executable allowlist, and the weaker
+ * of the two becomes the way in. `run_script` builds the command line and calls
+ * this.
  */
-export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
-	return {
-		name: "run_command",
-		label: "命令执行（分级）",
-		description:
-			"在部署机器上按角色分级执行 shell 命令（单聊群聊均可，按平台验证的发送者身份与角色授权；operator 需在当前消息明确「确认」，admin 直接执行）。" +
-			"权限分级：viewer 不可执行；operator 只能执行 capabilities.shell.allowedCommands 白名单内的可执行文件（* 表示全部），且串联、管道、重定向、变量展开、脚本扩展名和可执行文件路径均被拒绝，每次只跑一条独立命令；" +
-			"admin 不受白名单与组合语法限制（完整 shell：可用 powershell -Command 管道、重定向、脚本串联等），仅工作目录仍须为不含引号的绝对路径。" +
-			"默认用于运维诊断：tasklist 查看进程、taskkill 按单个 PID 结束进程、systeminfo/whoami/hostname/netstat/ping/ipconfig 查看本机状态。" +
-			"Windows shell 命令已强制 UTF-8 代码页（cmd 内建命令与 powershell 输出正常；tasklist 等 System32 直连命令与 python 管道输出仍可能是 GBK，中文乱码时改用 list_directory 或脚本写文件再读）；含中文/空格的路径必须整体用双引号包住；列目录、查文件元数据优先用 list_directory（原生支持中文路径，无引号转义问题），run_command 留给真正需要执行程序的场景。" +
-			"**同步命令有硬超时（capabilities.shell.timeoutSec，默认 300 秒）**：预计更久一律传 background=true（启动即返回 sessionId，再用 manage_process 的 poll 阻塞等待 / log 增量读 / kill 终止；等待超时只返回当前状态，不杀后台进程）。被超时强杀后不要原样重试同一脚本——要么改后台方式跑，要么先把脚本本身改成分段/增量可续。playwright、数据拉取、大批量文件处理这类几乎必然超过 300 秒，直接 background。后台进程时限用 backgroundTimeoutSec（默认 0=不限制），管理员可用 manage_settings 修改。" +
-			"采集逻辑先写入 .ps1/.py 脚本，命令只用 powershell -File xxx.ps1 或 python xxx.py，参数通过本地文件传递；脚本先输出 observer start 与时间戳，首次 poll/log 检查启动日志，不能把返回 sessionId 当成任务完成。会话由本应用托管，应用退出会终止进程，重启后不可续接；不要再用 nohup 或自制脱管 launcher。" +
-			"powershell/node/npx 等解释器需管理员显式加入白名单（admin 角色无需）；安装 Chromium 请改用 manage_capabilities setup_browser。" +
-			"安全规则：默认关闭；operator 每次执行需在消息中明确包含「确认」/confirm/yes/ok；admin（平台验证身份）发起即授权，直接执行，全部审计留痕。命令以当前应用用户权限运行，不会自动提权。" +
-			"可选 workingDir：命令的工作目录（绝对路径，如 C:\\Users\\me\\project），脚本用相对路径读写数据文件时需要；不影响可执行文件白名单。定时任务无人值守执行时，run_command 以任务创建者身份放行（按该用户当前角色定级），无需消息内含「确认」，但 operator 的白名单校验照常生效。",
-		parameters: Type.Object({
-			command: Type.String({ description: `要执行的命令，如「tasklist /FI "PID eq 19060"」「taskkill /PID 19060 /F」「python scripts/gen_report.py」。跑脚本直接给脚本文件路径，不要用 python -c 内联代码（括号会被拦截）。` }),
-			workingDir: Type.Optional(Type.String({ description: "可选：命令的工作目录绝对路径，如 C:\\Users\\admin\\project。脚本按相对路径找数据文件时必填。" })),
-			background: Type.Optional(Type.Boolean({ description: "true=后台启动并返回 sessionId，再用 manage_process poll/log 跟踪；默认 false=同步等待命令结束。" })),
-		}),
-		async execute(_toolCallId, params, signal) {
-			const { command, workingDir, background = false } = params as { command?: string; workingDir?: string; background?: boolean };
+
+
+export async function executeCommand(
+	deps: ShellToolDeps,
+	input: { command?: string; workingDir?: string; background?: boolean },
+	signal?: AbortSignal,
+): Promise<{ content: { type: "text"; text: string }[]; details: Record<string, unknown> }> {
+	const { command, workingDir, background = false } = input;
+
+
 			if (typeof background !== "boolean") return refuse("background 必须是布尔值。");
 			if (signal?.aborted) return refuse("本次命令执行已取消。");
 			const raw = (command ?? "").trim();
@@ -467,6 +459,39 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 				finally { signal?.removeEventListener("abort", abort); }
 			}
 			return sessionResult(entry);
+}
+
+/**
+ * Conversation-side restricted shell tool for headless Windows servers where
+ * nobody can open a terminal: inspect processes (tasklist), stop one PID
+ * (taskkill), and inspect local system/network state.
+ *
+ * The execute body lives in `executeCommand`, shared with `run_script` — the
+ * tool itself is description + parameters + delegation, nothing else.
+ */
+export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
+	return {
+		name: "run_command",
+		label: "命令执行（分级）",
+		description:
+			"在部署机器上按角色分级执行 shell 命令（单聊群聊均可，按平台验证的发送者身份与角色授权；operator 需在当前消息明确「确认」，admin 直接执行）。" +
+			"权限分级：viewer 不可执行；operator 只能执行 capabilities.shell.allowedCommands 白名单内的可执行文件（* 表示全部），且串联、管道、重定向、变量展开、脚本扩展名和可执行文件路径均被拒绝，每次只跑一条独立命令；" +
+			"admin 不受白名单与组合语法限制（完整 shell：可用 powershell -Command 管道、重定向、脚本串联等），仅工作目录仍须为不含引号的绝对路径。" +
+			"默认用于运维诊断：tasklist 查看进程、taskkill 按单个 PID 结束进程、systeminfo/whoami/hostname/netstat/ping/ipconfig 查看本机状态。" +
+			"**要跑自带脚本且需要传参数时，用 run_script 而不是本工具**：它把参数写成 JSON 文件，命令行里不含任何用户数据，因此不会遇到 cmd 重新分词、引号转义、中文参数乱码这三类问题（这三类问题在 Windows 上极难排查，常见表现为参数被拆开、Cannot find module、中文变问号）。只有在必须拼完整命令行时才用 run_command。" +
+			"Windows shell 命令已强制 UTF-8 代码页（cmd 内建命令与 powershell 输出正常；tasklist 等 System32 直连命令与 python 管道输出仍可能是 GBK，中文乱码时改用 list_directory 或脚本写文件再读）；含中文/空格的路径必须整体用双引号包住；列目录、查文件元数据优先用 list_directory（原生支持中文路径，无引号转义问题），run_command 留给真正需要执行程序的场景。" +
+			"**同步命令有硬超时（capabilities.shell.timeoutSec，默认 300 秒）**：预计更久一律传 background=true（启动即返回 sessionId，再用 manage_process poll/log 阻塞等待 / kill 终止；等待超时只返回当前状态，不杀后台进程）。被超时强杀后不要原样重试同一脚本——要么改后台方式跑，要么先把脚本本身改成分段/增量可续。playwright、数据拉取、大批量文件处理这类几乎必然超过 300 秒，直接 background。后台进程时限用 backgroundTimeoutSec（默认 0=不限制），管理员可用 manage_settings 修改。" +
+			"采集逻辑先写入 .ps1/.py 脚本，命令只用 powershell -File xxx.ps1 或 python xxx.py，参数通过本地文件传递；脚本先输出 observer start 与时间戳，首次 poll/log 检查启动日志，不能把返回 sessionId 当成任务完成。会话由本应用托管，应用退出会终止进程，重启后不可续接；不要再用 nohup 或自制脱管 launcher。" +
+			"powershell/node/npx 等解释器需管理员显式加入白名单（admin 角色无需）；安装 Chromium 请改用 manage_capabilities setup_browser。" +
+			"安全规则：默认关闭；operator 每次执行需在消息中明确包含「确认」/confirm/yes/ok；admin（平台验证身份）发起即授权，直接执行，全部审计留痕。命令以当前应用用户权限运行，不会自动提权。" +
+			"可选 workingDir：命令的工作目录（绝对路径，如 C:\Users\me\project），脚本用相对路径读写数据文件时需要；不影响可执行文件白名单。定时任务无人值守执行时，run_command 以任务创建者身份放行（按该用户当前角色定级），无需消息内含「确认」，但 operator 的白名单校验照常生效。",
+		parameters: obj({
+			command: str({ description: `要执行的命令，如「tasklist /FI "PID eq 19060"」「taskkill /PID 19060 /F」「python scripts/gen_report.py」。跑脚本直接给脚本文件路径，不要用 python -c 内联代码（括号会被拦截）。` }),
+			workingDir: opt(str({ description: "可选：命令的工作目录绝对路径，如 C:\Users\admin\project。脚本按相对路径找数据文件时必填。" })),
+			background: opt(bool({ description: "true=后台启动并返回 sessionId，再用 manage_process poll/log 跟踪；默认 false=同步等待命令结束。" })),
+		}, { open: true }),
+		async execute(_toolCallId, params, signal) {
+			return executeCommand(deps, params as { command?: string; workingDir?: string; background?: boolean }, signal);
 		},
 	};
 }
@@ -488,12 +513,12 @@ export function createManageProcessTool(deps: ShellToolDeps): AgentTool {
 			"poll/log/list 无需重复确认，但每次都校验当前管理员身份，只能访问自己在当前对话启动的命令。定时任务可跟踪自身会话。关闭 shell 开关后仍可查询和终止已有会话。" +
 			"poll 的 waitSec 仅控制此次等待，默认 capabilities.shell.pollTimeoutSec（30 秒），0=立即返回；无论等待超时还是取消等待，都不会终止后台进程。长等待可提高 waitSec（如 840 秒），避免连续短轮询。" +
 			"log/poll 返回 stdout+stderr 与 nextOffset；下次传 offset=nextOffset 只读新增输出。未传 offset 默认显示最新一页，每页最多 32KB，内存保留最近 256KB；完整结果请脚本写文件。先确认 observer start 启动日志，再持续跟踪到退出并核对退出码，不能把 running 当作成功。应用退出会终止进程，重启后会话失效。",
-		parameters: Type.Object({
-			action: Type.Union([Type.Literal("list"), Type.Literal("poll"), Type.Literal("log"), Type.Literal("kill")]),
-			sessionId: Type.Optional(Type.String({ description: "poll/log/kill 必填：run_command 返回的 sessionId。" })),
-			waitSec: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_TIMEOUT_SEC, description: "仅 poll：单次最长等待秒数，默认读配置（30 秒），0=立即返回；不影响命令运行时限。" })),
-			offset: Type.Optional(Type.Integer({ minimum: 0, description: "日志字节游标，传上次 nextOffset 读取增量；0 从保留日志开头读取，省略显示最新一页。" })),
-		}),
+		parameters: obj({
+			action: union([lit("list"), lit("poll"), lit("log"), lit("kill")]),
+			sessionId: opt(str({ description: "poll/log/kill 必填：run_command 返回的 sessionId。" })),
+			waitSec: opt(int({ minimum: 0, maximum: MAX_TIMEOUT_SEC, description: "仅 poll：单次最长等待秒数，默认读配置（30 秒），0=立即返回；不影响命令运行时限。" })),
+			offset: opt(int({ minimum: 0, description: "日志字节游标，传上次 nextOffset 读取增量；0 从保留日志开头读取，省略显示最新一页。" })),
+		}, { open: true }),
 		async execute(_toolCallId, params, signal) {
 			const { action, sessionId, waitSec, offset } = params as { action: string; sessionId?: string; waitSec?: number; offset?: number };
 			if (!["list", "poll", "log", "kill"].includes(action)) return refuse("action 必须是 list/poll/log/kill。");

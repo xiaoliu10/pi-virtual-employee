@@ -1,3 +1,4 @@
+import { num } from "@earendil-works/pi-schema";
 /**
  * Remote model-info lookup: ask the supplier's gateway what a model can REALLY
  * do, instead of trusting a registry value that describes some upstream model

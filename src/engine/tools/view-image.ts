@@ -1,8 +1,8 @@
 import { appendFileSync, mkdirSync } from "node:fs";
+import { obj, str } from "@earendil-works/pi-schema";
 import { readFile, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
 
 const MAX_BYTES = 10 * 1024 * 1024;
 // gif omitted: several OpenAI-compatible relays reject image/gif outright and
@@ -42,9 +42,9 @@ export function createViewImageTool(isVisionModel: () => boolean, auditLogPath?:
 		label: "查看图片",
 		description:
 			"把一张本地图片文件读入你自己的上下文，你会真实看到图像内容并可以分析它（OCR、界面验证、图表读数等）。参数 filePath 是图片的绝对路径——例如截屏/截图工具返回的文件路径。若提示当前模型不支持图像，请让管理员在 设置 → 自定义模型 勾选该模型的「图片」输入或切换视觉模型；不要假装已识别。",
-		parameters: Type.Object({
-			filePath: Type.String({ description: "要查看的图片文件的绝对路径（png/jpg/jpeg/webp/gif）" }),
-		}),
+		parameters: obj({
+			filePath: str({ description: "要查看的图片文件的绝对路径（png/jpg/jpeg/webp/gif）" }),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { filePath } = params as { filePath: string };
 			const clean = String(filePath).trim();

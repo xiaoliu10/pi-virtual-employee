@@ -44,6 +44,16 @@ export interface DurableHostOptions {
 	profileName: string;
 	/** VE tools to expose; adapted by `ve-tools.ts` (replay policy applied there). */
 	tools: AgentTool<any>[];
+	/**
+	 * MCP external tools, installed as their OWN extension (`ve-mcp`) so the tool
+	 * surface can be replaced at runtime. Field incident 2026-11-03: MCP tools
+	 * were folded into the single `ve-tools` extension, whose registrations are
+	 * frozen when the host opens — an MCP server that connects after startup (or
+	 * reconnects after a settings change) was invisible to the model for the
+	 * whole process lifetime, even though the connector log said "tools changed".
+	 */
+	mcpTools?: AgentTool<any>[];
+	mcpRegistrations?: ToolRegistration<any, any>[];
 	models?: Models;
 	registrations?: ToolRegistration<any, any>[];
 	/** Extra durable extensions (plugin host). */
@@ -54,6 +64,17 @@ export interface DurableHostOptions {
 
 export interface DurableHost {
 	harness: Harness;
+	/**
+	 * Replace the MCP tool surface at runtime. `pi-durable`'s registry installs
+	 * an extension IN PLACE when the name matches and publishes at once, and
+	 * every conversation re-resolves its agent from the CURRENT snapshot — so a
+	 * later install is visible to new turns without reopening the host.
+	 */
+	setMcpTools(tools: ToolRegistration<any, any>[]): void;
+	/** Names currently installed in the `ve-mcp` extension — observability for the
+	 * settings UI, main.log diagnostics and tests (the registry itself is private
+	 * to the Harness). */
+	mcpToolNames(): string[];
 	/** Resume any run the previous process left unfinished. Call once after open. */
 	resume(): void;
 	/** Close cleanly; waits for running task code to return. */
@@ -93,8 +114,13 @@ export async function openDurableHost(opts: DurableHostOptions): Promise<Durable
 	const registry = createRegistry();
 
 	const tools: ToolRegistration<any, any>[] = opts.registrations ?? toDurableTools(opts.tools);
+	// MCP lives in its own extension: the registry replaces an installed
+	// extension by NAME in place and publishes synchronously, which is what makes
+	// setMcpTools below a live update instead of a restart.
+	const mcpRegs: ToolRegistration<any, any>[] = opts.mcpRegistrations ?? toDurableTools(opts.mcpTools ?? []);
 	const extensions: Extension[] = [
 		defineExtension({ name: "ve-tools", tools }),
+		defineExtension({ name: "ve-mcp", tools: mcpRegs }),
 		// Rewrite durable's one-line "interrupted" results into an instruction that
 		// tells the model to VERIFY instead of retry (phase 3).
 		createInterruptedToolNotice(),
@@ -112,6 +138,13 @@ export async function openDurableHost(opts: DurableHostOptions): Promise<Durable
 		harness,
 		storage,
 		databasePath,
+		// Hot-update the MCP surface. An empty list is still an install: removing
+		// the last MCP tool must take it out of the model's view too, so a
+		// disabled/unreachable server stops being offered rather than lingering.
+		setMcpTools: (next: ToolRegistration<any, any>[]) => {
+			registry.install(defineExtension({ name: "ve-mcp", tools: next }));
+		},
+		mcpToolNames: () => (registry.snapshot().extension("ve-mcp")?.tools ?? []).map((t) => t.name),
 		resume: () => harness.resume(),
 		close: () => harness.close(BACKGROUND_CONTEXT),
 	};

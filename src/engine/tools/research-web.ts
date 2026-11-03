@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { obj, str } from "@earendil-works/pi-schema";
 import type { KnowledgeService } from "../../knowledge/knowledge-service.js";
 
 /**
@@ -14,9 +14,9 @@ export function createResearchWebTool(knowledge: KnowledgeService): AgentTool {
 		label: "联网研究",
 		description:
 			"知识库未命中时，用搜索引擎查询资料以补充回答。返回若干结果的标题、摘要与来源链接。对其中可复用、可信的结论，应随后调用 save_to_knowledge（source=\"research\"，并带上 sourceUrl）沉淀为知识条目（标记为待核实）。不要把未经验证的网络信息当作官方规则直接断言。",
-		parameters: Type.Object({
-			query: Type.String({ description: "搜索查询词，尽量具体（如「产品X 保修期 多久」）" }),
-		}),
+		parameters: obj({
+			query: str({ description: "搜索查询词，尽量具体（如「产品X 保修期 多久」）" }),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { query } = params as { query: string };
 			const hits = await knowledge.researchWeb(query);
