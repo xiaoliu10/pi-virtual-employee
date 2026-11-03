@@ -16,6 +16,15 @@ import { join } from "node:path";
 import type { ConfigStore } from "../db/config-store.js";
 import { PageOwnership } from "./shared-session.js";
 import { applyConsentChange, deleteSnapshots, ensureSnapshotRoot, sweepSnapshots } from "./real-profile-consent.js";
+import type { BrowserRuntime, RuntimeStatus } from "./runtime.js";
+
+/** Raised when the browser binary is missing and auto-install did not succeed. */
+export class BrowserRuntimeUnavailableError extends Error {
+	constructor(readonly status: RuntimeStatus) {
+		super(status.error || "browser runtime is not installed");
+		this.name = "BrowserRuntimeUnavailableError";
+	}
+}
 
 const NAV_TIMEOUT = 30_000;
 const DOWNLOAD_WAIT_TIMEOUT = 60_000;
@@ -124,6 +133,8 @@ export class BrowserService {
 		/** Persistent store root for this profile (the app's userData). The browser
 		 * profile lives under <profileDir>/browser-profile. Required for login persistence. */
 		private readonly profileDir: string,
+		/** Self-healing Chromium binary manager (missing/old revision → auto-install). */
+		private readonly runtime?: BrowserRuntime,
 	) {}
 
 	/** Inject the download funnel (DownloadService.handleDownload). */
@@ -315,6 +326,10 @@ export class BrowserService {
 	}
 
 	private async launch(): Promise<void> {
+		if (this.runtime) {
+			const status = await this.runtime.ensure();
+			if (status.phase !== "ready") throw new BrowserRuntimeUnavailableError(status);
+		}
 		const { headless } = this.config.all().browser;
 		const profilePath = join(this.profileDir, "browser-profile");
 		await mkdir(profilePath, { recursive: true });

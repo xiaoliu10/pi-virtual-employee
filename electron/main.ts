@@ -28,6 +28,9 @@ import { HistoryStore } from "../src/db/history-store.js";
 import { ContextStore } from "../src/context/store.js";
 import { KnowledgeService } from "../src/knowledge/knowledge-service.js";
 import { BrowserService } from "../src/browser/browser-service.js";
+import { BrowserRuntime, type RuntimeStatus } from "../src/browser/runtime.js";
+import { createInstallRunner, DEFAULT_DOWNLOAD_HOSTS, revisionFromExecutablePath } from "../src/browser/installer.js";
+import { chromium as playwrightChromium } from "playwright";
 import { ComputerService } from "../src/computer/computer-service.js";
 import { ScheduledTaskStore, type ScheduledTaskRow } from "../src/db/scheduled-task-store.js";
 import { WorkItemStore } from "../src/db/work-item-store.js";
@@ -482,7 +485,47 @@ async function main(): Promise<void> {
 	// assembles their context from it; the work service reads the recovery brief.
 	const contextStore = new ContextStore(db);
 	const knowledge = new KnowledgeService(db, config, vecExtension);
-	const browser = new BrowserService(config, userData);
+	// Self-healing browser binary: the bundled Playwright looks for a specific
+	// chromium-<rev> that is NOT shipped in the package. After an app upgrade the
+	// wanted rev changes (field 2026-11-02: 1217 → 1234); this detects that and
+	// installs it automatically using the app's own Electron binary as Node.
+	const playwrightCli = path.join(
+		path.dirname(require.resolve("playwright/package.json")),
+		"cli.js",
+	);
+	const browserExecutablePath = (): string => {
+		try {
+			return playwrightChromium.executablePath();
+		} catch {
+			return "";
+		}
+	};
+	const browserRuntime = new BrowserRuntime({
+		executablePath: browserExecutablePath,
+		exists: (file) => existsSync(file),
+		revision: () => revisionFromExecutablePath(browserExecutablePath()),
+		runner: createInstallRunner({ electronExe: app.getPath("exe"), playwrightCli }),
+		// Read on every ensure so a settings-page change to the download source
+		// applies immediately. A configured host is tried first, then the official
+		// CDN, then the built-in mirror.
+		hosts: () => {
+			const custom = config.all().browser.downloadHost.trim();
+			return custom
+				? [custom, ...DEFAULT_DOWNLOAD_HOSTS]
+				: DEFAULT_DOWNLOAD_HOSTS;
+		},
+	});
+	const publishBrowserRuntime = (status: RuntimeStatus): void => {
+		const wc = mainWindow?.webContents;
+		if (wc && !wc.isDestroyed()) wc.send("browser:runtimeStatusChanged", status);
+	};
+	browserRuntime.onChange(publishBrowserRuntime);
+	const browser = new BrowserService(config, userData, browserRuntime);
+	// Pre-fetch the runtime in the background when browser tools are enabled, so
+	// the first task does not pay the download. Never blocks startup.
+	if (config.all().browser.enabled) {
+		void browserRuntime.ensure().catch(() => { /* status carries the error */ });
+	}
 	const computer = new ComputerService(config, userData);
 	const scheduledTaskStore = new ScheduledTaskStore(db);
 	const scheduler = new SchedulerService(scheduledTaskStore);
@@ -1835,6 +1878,12 @@ ${tailForProgress(decision.text)}`;
 		if (wc && !wc.isDestroyed()) wc.send("config:changed");
 		return { port: alloc.port, changed: alloc.changed, reason: alloc.reason };
 	});
+	ipcMain.handle("browser:runtimeStatus", () => browserRuntime.getStatus());
+	ipcMain.handle("browser:runtimeEnsure", async () => {
+		const status = await browserRuntime.ensure({ force: true });
+		publishBrowserRuntime(status);
+		return status;
+	});
 	ipcMain.handle("config:set", async (_e, patch) => {
 		const updated = config.update(patch);
 		// Push to the renderer: a config written from IM (manage_access /
@@ -1846,6 +1895,9 @@ ${tailForProgress(decision.text)}`;
 			if (wc && !wc.isDestroyed()) wc.send("config:changed");
 		}
 		await computer.syncConfig();
+		if (updated.browser.enabled) {
+			void browserRuntime.ensure().catch(() => { /* status carries the error */ });
+		}
 		// Retention tweaked from the settings page / IM: re-apply immediately so a
 		// shortened window takes effect without waiting for the next launch.
 		pruneOneOffConversations();

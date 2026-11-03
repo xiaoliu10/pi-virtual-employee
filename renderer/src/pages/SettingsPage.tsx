@@ -8,6 +8,7 @@ import { DocumentsSection } from "../components/DocumentsSection";
 import { ReportsSection } from "../components/ReportsSection";
 import { SkillsSection } from "../components/SkillsSection";
 import { ComputerSection } from "../components/ComputerSection";
+import { BrowserRuntimeCard } from "../components/BrowserRuntimeCard";
 import { MAX_TIMEOUT_SEC, normalizeTimeoutSec } from "../../../src/shared/timeouts";
 
 /** One editable MCP server row in the settings page. Raw text fields hold
@@ -1274,9 +1275,10 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 											<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
 												<div className="mb-3">
 													<div className="text-sm font-medium text-slate-800">Computer Use · 浏览器自动化</div>
-													<div className="mt-1 text-xs text-slate-400">开启后员工可用内置浏览器执行网页操作（打开/读取/截图/点击/输入）。需先安装浏览器内核：<code className="rounded bg-slate-100 px-1">npx playwright install chromium</code>。保存后新对话生效。</div>
+													<div className="mt-1 text-xs text-slate-400">开启后员工可用内置浏览器执行网页操作（打开/读取/截图/点击/输入）。浏览器内核由应用自动检查与下载，应用升级后如需新版本也会自动更新，无需手动执行 npx。保存后新对话生效。</div>
 												</div>
 												<div className="space-y-3">
+													<BrowserRuntimeCard />
 													<label className="flex cursor-pointer items-center justify-between rounded-xl border border-slate-200 bg-[#f7f8fa] px-4 py-3">
 														<div><div className="text-sm font-medium text-slate-800">启用浏览器自动化</div><div className="mt-0.5 text-xs text-slate-400">为员工注入浏览器工具。</div></div>
 														<input type="checkbox" checked={draft.browser.enabled} onChange={(e) => setBrowser({ enabled: e.target.checked })} className="h-5 w-5 accent-blue-500" />

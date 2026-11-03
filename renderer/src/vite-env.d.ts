@@ -3,6 +3,18 @@
 import type { AppConfig, ExternalDoc, ExternalProviderConfig, KbGap, KnowledgeDoc, KnowledgeEntry, ModelConfig, ResourceInput, ResourceRow, ScheduledTaskRow, SearchHit, SkillInfo, Supplier, UpdateState, VectorStatus, WorkItemView } from "./lib/types";
 import type { ConversationRow, MessageRow } from "./lib/types";
 
+/** Mirrors src/browser/runtime.ts RuntimeStatus over the IPC bridge. */
+export interface BrowserRuntimeStatusView {
+	phase: "idle" | "checking" | "installing" | "ready" | "error";
+	progress: number;
+	executablePath: string;
+	revision: string;
+	attempt: number;
+	source: string;
+	error: string;
+	checkedAt: number | null;
+}
+
 /** Whitelisted API bridged by electron/preload.ts. Kept in sync manually. */
 export interface RendererApi {
 	getServerPort(): Promise<number>;
@@ -35,6 +47,11 @@ export interface RendererApi {
 	allocateWidgetPort(): Promise<{ port: number; changed: boolean; reason?: string }>;
 	/** Connect to one MCP server and list its tools. */
 	testMcpServer(server: unknown): Promise<{ ok: boolean; error?: string; tools: string[] }>;
+	/** Playwright Chromium binary self-heal state. */
+	getBrowserRuntimeStatus(): Promise<BrowserRuntimeStatusView>;
+	/** Force a (re)check/download of the browser binary. */
+	ensureBrowserRuntime(): Promise<BrowserRuntimeStatusView>;
+	onBrowserRuntimeStatusChanged(cb: (s: BrowserRuntimeStatusView) => void): () => void;
 	onWidgetStatusChanged(cb: (s: { enabled: boolean; running: boolean; starting?: boolean; port: number; expose: "loopback" | "lan"; error?: string; reassignedFrom?: number }) => void): () => void;
 	manageComputer(action: "status" | "install" | "connect" | "disconnect"): Promise<import("../../src/shared/computer").ComputerStatus>;
 	pickComputerDriver(): Promise<string | null>;

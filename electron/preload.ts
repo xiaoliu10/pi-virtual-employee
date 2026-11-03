@@ -22,6 +22,14 @@ const api = {
 		ipcRenderer.on("widget:statusChanged", listener);
 		return () => ipcRenderer.removeListener("widget:statusChanged", listener);
 	},
+	/** Browser binary (Playwright Chromium) self-heal status + manual retry. */
+	getBrowserRuntimeStatus: (): Promise<unknown> => ipcRenderer.invoke("browser:runtimeStatus"),
+	ensureBrowserRuntime: (): Promise<unknown> => ipcRenderer.invoke("browser:runtimeEnsure"),
+	onBrowserRuntimeStatusChanged: (cb: (s: unknown) => void): (() => void) => {
+		const listener = (_e: unknown, s: unknown) => cb(s);
+		ipcRenderer.on("browser:runtimeStatusChanged", listener);
+		return () => ipcRenderer.removeListener("browser:runtimeStatusChanged", listener);
+	},
 	setConfig: (patch: unknown) => ipcRenderer.invoke("config:set", patch),
 	manageComputer: (action: string) => ipcRenderer.invoke("computer:manage", action),
 	pickComputerDriver: () => ipcRenderer.invoke("computer:pickDriver"),
