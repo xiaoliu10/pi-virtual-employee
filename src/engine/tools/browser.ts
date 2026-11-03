@@ -205,7 +205,7 @@ export function createBrowserTools(
 		name: "browser_type",
 		label: "浏览器：输入",
 		description:
-			"向当前页面的输入框填入文本（会先清空该框）。selector 用 CSS 选择器，如 'input[name=\"q\"]'、'#search'。对日期/下拉等复杂组件，优先用 browser_click 点选面板里的选项；若用本工具输入，之后通常要 browser_press_key Enter 提交。",
+			"向当前页面的输入框逐键输入文本（真实键盘事件，会先点中并清空该框）。用真实键盘而非 DOM 赋值，因此 React/Vue 受控组件也认（直接 fill 这类组件会出现框里有字、提交却是空值）。selector 用 CSS 选择器，如 'input[name=\"q\"]'、'#search'。返回的 valueLength 必须等于你传入的字符数；不等说明没填进去（ok:false），此时改用 browser_type_text 逐键输入或先 browser_click 点中再输。对日期/下拉等复杂组件优先 browser_click 点选；输完通常 browser_press_key Enter 提交。",
 		parameters: obj({
 			selector: str({ description: "输入框的 CSS 选择器" }),
 			text: str({ description: "要输入的文本" }),

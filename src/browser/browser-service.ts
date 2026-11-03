@@ -71,6 +71,16 @@ export interface FocusInfo {
 	cls: string;
 }
 
+/**
+ * Decide whether a typed value actually landed. Exported so the contract is
+ * testable without launching Chromium: a readback whose length does not match
+ * what we sent means the framework did not accept the input (the controlled-
+ * component case), and the caller MUST NOT treat it as success.
+ */
+export function evaluateTypeResult(sent: string, readback: string): { ok: boolean; valueLength: number } {
+	return { ok: readback.length === sent.length, valueLength: readback.length };
+}
+
 export class BrowserService {
 	private context: BrowserContext | null = null;
 	/** One page per owner (IM 会话 / 定时任务会话 / 控制台会话)，共享同一个 context，
@@ -321,14 +331,28 @@ export class BrowserService {
 	}
 
 	/**
-	 * 填入后回读真实 value 长度（不回传明文，敏感字段如密码不进上下文），
-	 * 让模型能区分“填成功了”与“受控组件没吃进去”。
+	 * Type text with REAL keyboard events, then read back the actual value length
+	 * (no plaintext — password fields must not enter the context).
+	 *
+	 * Why not page.fill(): fill() is a DOM value assignment. React/Vue controlled
+	 * components derive state from input events the assignment does not fire, so
+	 * the box visually contains the text while the framework state stays empty —
+	 * the form then submits as if nothing was typed (field, repeatedly: login
+	 * forms, SPAs). pressSequentially() dispatches the same keydown/keypress/input
+	 * sequence a human typing would, which every controlled component honours.
+	 *
+	 * The readback is now AUTHORITATIVE: if the value length does not match we
+	 * return ok:false instead of the old hard-coded ok:true (which reported
+	 * success even when fill had silently not taken).
 	 */
 	async type(ownerId: string, selector: string, text: string): Promise<{ ok: boolean; valueLength: number }> {
 		const page = await this.getPage(ownerId);
-		await page.fill(selector, text, { timeout: NAV_TIMEOUT });
+		const locator = page.locator(selector).first();
+		await locator.click({ timeout: NAV_TIMEOUT });
+		await locator.fill("", { timeout: NAV_TIMEOUT }).catch(() => {});
+		await locator.pressSequentially(text, { timeout: NAV_TIMEOUT });
 		const value = await page.inputValue(selector).catch(() => "");
-		return { ok: true, valueLength: value.length };
+		return { ok: value.length === text.length, valueLength: value.length };
 	}
 
 	/** Send a single keyboard key (e.g. "Enter", "Tab", "Escape", "ArrowLeft"). */
