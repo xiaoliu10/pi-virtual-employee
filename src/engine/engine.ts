@@ -2586,9 +2586,22 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * again is never touched.
 	 */
 	private noteToolProgress(conversationId: string, fingerprint: string): void {
-		const cfg = this.config.all().general.progressWatchdog;
+		// Defensive: a watchdog failure must never break the tool call it merely
+		// observes. `general` is optional in some host configs, so the whole
+		// evaluation is wrapped rather than relying on optional chaining alone.
+		let cfg: { enabled?: boolean; stallWindowMs?: number } | undefined;
+		try {
+			cfg = this.config.all()?.general?.progressWatchdog;
+		} catch {
+			return;
+		}
 		if (cfg?.enabled === false) return;
-		const verdict = this.progress.touch(conversationId, fingerprint);
+		let verdict: ReturnType<ProgressWatchdog["touch"]>;
+		try {
+			verdict = this.progress.touch(conversationId, fingerprint);
+		} catch {
+			return; // observing must never become a failure mode
+		}
 		if (verdict === "nudge") {
 			console.warn(`[engine] progress watchdog: no new tool outcome in ${cfg?.stallWindowMs ?? 300_000}ms (L1 nudge) — ${conversationId}`);
 		} else if (verdict === "soft-stop") {
@@ -3250,7 +3263,15 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// conversationId, "mcp") never runs and a viewer could call MCP tools.
 		// Reuse guardTool instead of copying it: a copy is how the two paths drift.
 		const guardOptions = { config: this.config, conversationId, resolveActor: (cid: string) => this.turnActor.get(cid), onRoleRefusal: (cid: string, info: { capability: string; need: string }) => this.noteAuthorizationNeeded(cid, info) } as unknown as Parameters<typeof guardTool>[2];
-		return this.mcpManager.tools().map((tool) => guardTool("mcp", tool, guardOptions));
+		return this.mcpManager.tools().map((tool) => {
+			// RBAC first (a viewer or a mid-session revocation must not reach the
+			// server), THEN telemetry: the durable registry never goes through
+			// buildTools, so without this wrapper an MCP retry loop is invisible to
+			// both the progress watchdog and tool-event telemetry (independent
+			// review: a durable MCP call fired recordToolTelemetry ZERO times).
+			const guarded = guardTool("mcp", tool, guardOptions);
+			return withTelemetry(guarded, (e) => this.recordToolTelemetry(conversationId, e));
+		});
 	}
 
 	buildToolSetFor(conversationId: string): AgentTool<any>[] {

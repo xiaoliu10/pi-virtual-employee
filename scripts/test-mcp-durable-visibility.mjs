@@ -254,6 +254,7 @@ test("durable MCP tools carry the SAME RBAC guard as legacy (conversation floor)
 	const config = { all: () => ({
 		security: { defaultRole: "viewer", adminStaffIds: [], ownerStaffIds: [], people: [], conversations: [{ id: "dt:group:x", floors: { mcp: "admin" } }] },
 		capabilities: { mcp: { enabled: true } },
+		general: {}, // progressWatchdog reads general.progressWatchdog (optional)
 	}) };
 	const guarded = guardTool("mcp", raw, {
 		config, conversationId: "dt:group:x",
@@ -325,6 +326,11 @@ test("P1: mcpToolsFor actually APPLIES the guard (not just guardTool in isolatio
 	engine.config = config;
 	engine.turnActor = new Map([["dt:group:x", { senderId: "u1", senderName: "someone" }]]);
 	engine.noteAuthorizationNeeded = () => {};
+	// The telemetry wrapper (added after the RBAC guard) touches these maps via
+	// recordToolTelemetry → touchActivity. This test builds the engine with
+	// Object.create, so constructor-initialised maps do not exist.
+	engine.turnActivity = new Map();
+	engine.turnActivityLog = new Map();
 	engine.mcpManager = { tools: () => [{
 		name: "mcp__etc__query", label: "q", description: "q",
 		parameters: { type: "object", properties: {} },
