@@ -7,6 +7,7 @@
  * GUI-facing state (config, tasks, autostart) flows over IPC.
  */
 import os from "node:os";
+import { acquireProfileLock, releaseProfileLock, type ProcessIdentity } from "./profile-lock.js";
 import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from "electron";
 import { mkdir, readFile, writeFile, copyFile, readdir, rm } from "node:fs/promises";
 import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
@@ -88,7 +89,6 @@ const isDev = !!process.env.VITE_DEV_SERVER_URL;
  * and redirect BEFORE app.whenReady — everything reading userData depends on it.
  */
 const PROFILE_NAME_RE = /^[A-Za-z0-9_-]+$/;
-const LOCK_FILE = ".profile.lock";
 
 /** Project the Electron updater state to the platform-agnostic tool status. */
 function toUpdateToolStatus(state: UpdateState): UpdateToolStatus {
@@ -116,36 +116,8 @@ function resolveProfile(argv: string[], env: NodeJS.ProcessEnv): string {
 	return name;
 }
 
-/** Acquire an exclusive lock on the profile dir; quit if another live process holds it. */
-function acquireProfileLock(userDataDir: string): void {
-	const lockPath = path.join(userDataDir, LOCK_FILE);
-	const take = () => {
-		const fd = openSync(lockPath, "wx");
-		writeFileSync(fd, String(process.pid));
-	};
-	if (!existsSync(lockPath)) {
-		take();
-		return;
-	}
-	// Stale-lock recovery: if the recorded pid is dead, take over.
-	try {
-		const pid = Number(readFileSync(lockPath, "utf8").trim());
-		if (pid && pid !== process.pid) {
-			process.kill(pid, 0); // throws if the process is gone
-			console.error(`[main] profile already running (pid ${pid}); exiting.`);
-			app.quit();
-			return;
-		}
-	} catch {
-		// pid missing or dead → reclaim
-		try {
-			unlinkSync(lockPath);
-		} catch {
-			/* ignore */
-		}
-	}
-	take();
-}
+/** Profile lock: identity-aware, conservative on indeterminate probes. */
+let profileLock: ProcessIdentity | null = null;
 
 const activeProfile = resolveProfile(process.argv, process.env);
 if (activeProfile !== "default") {
@@ -156,13 +128,13 @@ mkdirSync(app.getPath("userData"), { recursive: true });
 // App logs live with the profile data (not the packaged app-name dir Electron
 // would pick) — one known place for field diagnostics like im.log.
 app.setPath("logs", path.join(app.getPath("userData"), "logs"));
-acquireProfileLock(app.getPath("userData"));
+profileLock = acquireProfileLock(app.getPath("userData"), () => app.quit(), {
+	log: (level, msg) => console[level === "INFO" ? "log" : level === "WARN" ? "warn" : "error"](msg),
+});
 app.on("will-quit", () => {
-	try {
-		unlinkSync(path.join(app.getPath("userData"), LOCK_FILE));
-	} catch {
-		/* ignore */
-	}
+	// Only release OUR lock: an old instance quitting must never delete the lock
+	// its successor wrote (field 2026-11-02).
+	if (profileLock) releaseProfileLock(app.getPath("userData"), profileLock);
 });
 
 let mainWindow: BrowserWindow | null = null;
