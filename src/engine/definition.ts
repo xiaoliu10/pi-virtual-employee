@@ -47,6 +47,7 @@ import { createManageUpdateTool, type UpdateOperations } from "./tools/update.js
 import { createManageCapabilitiesTool } from "./tools/capabilities.js";
 import { createRunCommandTool, createManageProcessTool, executeCommand, type ShellToolDeps } from "./tools/shell.js";
 import { createRunScriptTool } from "./tools/run-script.js";
+import { computeToolFingerprint } from "./progress-watchdog.js";
 import { createManageSettingsTool } from "./tools/settings.js";
 import { orderTool } from "./tools/orders.js";
 import { CAPABILITY_LABEL, checkPermission, permissionRefusal } from "../security/permissions.js";
@@ -148,7 +149,7 @@ export interface ToolSetOptions {
 	 * sees each call exactly once, so the telemetry wrapper lives here rather than
 	 * inside each tool (a newly added tool is then covered by construction).
 	 */
-	onToolEvent?: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string }) => void;
+	onToolEvent?: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string }) => void;
 	/** Telemetry store for the self-inspection tool (my_stats). */
 	telemetry?: TelemetryStore;
 	/** Proposal store (self-improvement loop output: propose_improvement). */
@@ -435,7 +436,7 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
  */
 function withTelemetry(
 	tool: AgentTool<any>,
-	onEvent: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string }) => void,
+	onEvent: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string }) => void,
 ): AgentTool<any> {
 	return {
 		...tool,
@@ -445,7 +446,11 @@ function withTelemetry(
 				const result = await tool.execute(toolCallId, params, signal, onUpdate);
 				const details = (result as { details?: { refused?: boolean; capability?: string } } | undefined)?.details;
 				const refused = Boolean(details?.refused);
-				onEvent({ name: tool.name, durationMs: Date.now() - started, ok: !refused, refused, refusedCapability: details?.capability });
+				// Progress fingerprint: the progress watchdog judges repetition by
+				// tool + normalized params + result digest. Computed here — the
+				// OUTERMOST wrapper — so both kernels and every capability feed it.
+				const fingerprint = computeToolFingerprint(tool.name, params, result);
+				onEvent({ name: tool.name, durationMs: Date.now() - started, ok: !refused, refused, refusedCapability: details?.capability, fingerprint });
 				return result;
 			} catch (err) {
 				onEvent({
@@ -453,6 +458,9 @@ function withTelemetry(
 					durationMs: Date.now() - started,
 					ok: false,
 					error: err instanceof Error ? err.message : String(err),
+					// A throwing tool still carries a fingerprint: the same tool with
+					// the same params throwing the same error every round IS a loop.
+					fingerprint: computeToolFingerprint(tool.name, params, err instanceof Error ? err.message : String(err)),
 				});
 				throw err;
 			}

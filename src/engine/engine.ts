@@ -50,6 +50,7 @@ import {effectiveAuthorizationRole, ROLE_RANK, checkPermission, isLocalConversat
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
+import { ProgressWatchdog } from "./progress-watchdog.js";
 import { createMcpManager, type McpManager } from "./tools/mcp.js";
 import { normalizeMcpServers } from "../shared/mcp.js";
 import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, recentAssistantVisibleTexts, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, substantialAnchorOf, SUMMARIZER_RETRY, taskAnchorOf, truncateToFit, usableContextWindow, turnMemoryPrefix } from "./context.js";
@@ -344,6 +345,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * in-flight request counts as life even before its first event arrives. */
 	private readonly llmInFlight = new Map<string, number>();
 	private readonly lastLlmCallAt = new Map<string, number>();
+	/** First stream event per in-flight request — a request that has produced
+	 * ANY event is alive however slow; one that never will is the hung case. */
+	private readonly llmFirstByteAt = new Map<string, number>();
+	/** Progress watchdog state (see progress-watchdog.ts). Pure judgement, no I/O. */
+	private readonly progress = new ProgressWatchdog();
 
 	constructor(
 		private readonly config: ConfigStore,
@@ -576,7 +582,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * "aborted:watchdog" instead of looking like an ordinary empty reply. Called
 	 * by the IM watchdog, /stop, and install_now; harmless when no turn is running.
 	 */
-	markTurnAbort(conversationId: string, reason: "watchdog" | "user" | "restart" | "install_now"): void {
+	markTurnAbort(conversationId: string, reason: "watchdog" | "runaway" | "user" | "restart" | "install_now"): void {
 		if (!this.turnIds.has(conversationId)) return;
 		this.turnAborts.set(conversationId, reason);
 	}
@@ -739,9 +745,54 @@ export class EmployeeEngine implements EmployeeRuntime {
 		return async (model, context, options) => {
 			this.llmInFlight.set(conversationId, (this.llmInFlight.get(conversationId) ?? 0) + 1);
 			this.lastLlmCallAt.set(conversationId, Date.now());
+			this.llmFirstByteAt.delete(conversationId);
 			this.touchActivity(conversationId);
 			try {
-				return await this.rawStreamFn(model, context, options);
+				const response = await this.rawStreamFn(model, context, options);
+				// First-byte detector: the stall watchdog exempts an in-flight
+				// request unconditionally (field 2026-09-18 — slow TTFT is alive),
+				// which let a NEVER-responsive request hold the serial queue until
+				// its own timeout (field 2026-11-03: two conversations blocked ~30
+				// min each). The distinction is exactly this: a request that has
+				// produced ANY event is alive; one with zero events after the hung
+				// cap is dead regardless of what its timeout claims. The wrapper
+				// records on the first iteration the consumer performs and
+				// otherwise passes every call through.
+				const rawIterator = (response as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator];
+				if (typeof rawIterator !== "function") {
+					// Not an async-iterable stream (test doubles, exotic providers):
+					// pass through untouched; the hung-request cap then relies on the
+					// request timeout for this path, as before.
+					return response;
+				}
+				let primed = false;
+				const originalIterator = (rawIterator as (...args: unknown[]) => AsyncIterator<unknown>).bind(response);
+				// Structural assert: the wrapper delegates everything except asyncIterator.
+				const wrapped = Object.create(response) as typeof response & { [Symbol.asyncIterator]: () => AsyncIterator<unknown>; };
+				wrapped[Symbol.asyncIterator] = (() => {
+					const iterator = originalIterator();
+					const iteratorAny = iterator as AsyncIterator<unknown> & {
+						return?: (v?: unknown) => Promise<IteratorResult<unknown>>;
+						throw?: (e?: unknown) => Promise<IteratorResult<unknown>>;
+					};
+					return {
+						next: async (...args: [] | [undefined]) => {
+							// Passthrough: the wrapper only observes the first iteration.
+							const step = (await iteratorAny.next(...args)) as IteratorResult<unknown>;
+							if (!primed) {
+								primed = true;
+								this.llmFirstByteAt.set(conversationId, Date.now());
+							}
+							return step;
+						},
+						return: (value?: unknown) => iteratorAny.return?.(value),
+						throw: (error?: unknown) => iteratorAny.throw?.(error),
+						[Symbol.asyncIterator]() {
+							return this;
+						},
+					};
+				}) as typeof response[typeof Symbol.asyncIterator];
+				return wrapped;
 			} finally {
 				this.llmInFlight.set(conversationId, Math.max(0, (this.llmInFlight.get(conversationId) ?? 1) - 1));
 			}
@@ -1400,6 +1451,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 			{
 				lastActivityAt: this.turnActivity.get(conversationId),
 				llmInFlight: this.llmInFlight.get(conversationId) ?? 0,
+				llmCallStartedAt: this.lastLlmCallAt.get(conversationId),
+				llmFirstByteAt: this.llmFirstByteAt.get(conversationId),
+				hungRequestCapMs: this.config.all().general.progressWatchdog?.hungRequestCapMs,
 			},
 			Date.now(),
 		);
@@ -2211,6 +2265,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	async send(agent: Agent, message: string, ctx?: SendCtx): Promise<SendResult> {
+		// A new user message opens a fresh progress window: the previous turn's
+		// repetition history must never escalate the next one.
+		if (!ctx?.ephemeral) this.progress.beginTurn(agent.sessionId ?? "default");
 		if (this.opts.kernel === "durable" && !ctx?.ephemeral) {
 			if (!this.durableRuntime) throw new Error("Durable runtime is unavailable; refusing to replay through legacy");
 			return this.durableRuntime.send(agent, message, ctx);
@@ -2440,15 +2497,39 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** One tool call, linked to the turn that made it. Never throws. */
 	private recordToolTelemetry(
 		conversationId: string,
-		event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string },
+		event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string },
 	): void {
 		this.touchActivity(conversationId); // tool start/end — life, even without telemetry
+		if (event.fingerprint) this.noteToolProgress(conversationId, event.fingerprint);
 		if (!this.telemetry) return;
 		try {
 			this.turnToolCalls.set(conversationId, (this.turnToolCalls.get(conversationId) ?? 0) + 1);
 			this.telemetry.recordTool({ ...event, conversationId, turnId: this.turnIds.get(conversationId) });
 		} catch (err) {
 			console.warn("[engine] telemetry tool write failed:", err instanceof Error ? err.message : err);
+		}
+	}
+
+	/**
+	 * Feed one tool outcome to the progress watchdog and run its escalations.
+	 *
+	 * L1 (nudge): a stalled window closed — log it (observation; a correction
+	 * injection is a later slice). L2 (soft-stop): a second consecutive window
+	 * with no new work — abort the turn through the SAME path the stall
+	 * watchdog uses, with an honest abort reason. Any new fingerprint resets
+	 * the level to zero inside the watchdog, so a task that started moving
+	 * again is never touched.
+	 */
+	private noteToolProgress(conversationId: string, fingerprint: string): void {
+		const cfg = this.config.all().general.progressWatchdog;
+		if (cfg?.enabled === false) return;
+		const verdict = this.progress.touch(conversationId, fingerprint);
+		if (verdict === "nudge") {
+			console.warn(`[engine] progress watchdog: no new tool outcome in ${cfg?.stallWindowMs ?? 300_000}ms (L1 nudge) — ${conversationId}`);
+		} else if (verdict === "soft-stop") {
+			console.warn(`[engine] progress watchdog: stalled again after nudge (L2 soft-stop) — ${conversationId} | ${this.turnStallSnapshot(conversationId)}`);
+			this.markTurnAbort(conversationId, "runaway");
+			this.abortSession(conversationId);
 		}
 	}
 

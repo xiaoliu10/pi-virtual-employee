@@ -34,7 +34,18 @@ export interface StallSignals {
 	lastActivityAt?: number;
 	/** Number of LLM requests currently in flight for the turn. */
 	llmInFlight: number;
+	/** When the current in-flight request started (in-flight bookkeeping). */
+	llmCallStartedAt?: number;
+	/** First stream event of the current request; undefined = nothing received. */
+	llmFirstByteAt?: number;
+	/** A request with NO first event after this long is hung (default 10 min). */
+	hungRequestCapMs?: number;
 }
+
+/** Default cap for "in flight but never produced a single event". Well below
+ * typical requestTimeoutMin values (the field box ran 30 min), well above any
+ * plausible time-to-first-token. */
+export const HUNG_REQUEST_CAP_MS = 10 * 60_000;
 
 /**
  * Ms since the turn last showed life — the single definition of "silent" for
@@ -47,7 +58,21 @@ export interface StallSignals {
  * the silence clock resumes from real activity.
  */
 export function computeStallIdleMs(signals: StallSignals, now: number): number {
-	if (signals.llmInFlight > 0) return 0;
+	if (signals.llmInFlight > 0) {
+		// A request that has produced ANY event is alive — exempt unconditionally
+		// (field 2026-09-18: slow-but-real responses must not be killed).
+		if (signals.llmFirstByteAt !== undefined) return 0;
+		// No first event yet: still exempt inside the grace window, but a request
+		// that never produced anything past the cap is HUNG — it would otherwise
+		// hold a serial conversation queue until its own request timeout (field
+		// 2026-11-03: two IM conversations stuck ~30 min behind one dead request
+		// each). Fire now; the abort is the same path a normal stall takes.
+		const cap = signals.hungRequestCapMs ?? HUNG_REQUEST_CAP_MS;
+		if (signals.llmCallStartedAt !== undefined && now - signals.llmCallStartedAt >= cap) {
+			return Number.MAX_SAFE_INTEGER;
+		}
+		return 0;
+	}
 	if (signals.lastActivityAt === undefined) return Number.MAX_SAFE_INTEGER;
 	return now - signals.lastActivityAt;
 }
