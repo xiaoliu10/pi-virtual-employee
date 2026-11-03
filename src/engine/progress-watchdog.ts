@@ -65,6 +65,11 @@ interface ConversationProgressState {
  * Exported for tests: the masking rules are the difference between catching a
  * loop and watching it re-roll its timestamp forever.
  */
+/** Every volatile token class, matched in a single pass (order-free masking). */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const VOLATILE_PATTERN =
+	/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\b\d{13}\b|\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?|\b[0-9a-f]{40}\b/gi;
+
 export function normalizeForFingerprint(value: unknown): string {
 	let s: string;
 	try {
@@ -72,11 +77,16 @@ export function normalizeForFingerprint(value: unknown): string {
 	} catch {
 		s = String(value);
 	}
-	return s
-		.replace(/\b\d{13}\b/g, "<ts>") // epoch ms
-		.replace(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?/g, "<iso>")
-		.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "<uuid>")
-		.replace(/\b[0-9a-f]{40}\b/gi, "<sha>");
+	// ONE alternation pass, so replacement order cannot matter: two strings that
+	// differ only in whether a uuid precedes a timestamp must normalize equal
+	// (a sequential chain leaves "<uuid><ts>" vs "<ts><uuid>" and the loop
+	// escapes detection by reordering its volatile tokens).
+	return s.replace(VOLATILE_PATTERN, (match) => {
+		if (/^\d{13}$/.test(match)) return "<ts>"; // epoch ms
+		if (UUID_RE.test(match)) return "<uuid>";
+		if (/^\d{4}-/.test(match)) return "<iso>"; // ISO date-time
+		return "<sha>";
+	});
 }
 
 /** Keys sorted at every depth, so param order never changes the fingerprint. */
@@ -114,7 +124,7 @@ export function computeToolFingerprint(name: string, params: unknown, result: un
 
 export class ProgressWatchdog {
 	private readonly states = new Map<string, ConversationProgressState>();
-	private readonly options: ProgressWatchdogOptions;
+	private options: ProgressWatchdogOptions;
 	private readonly now: () => number;
 
 	constructor(options: Partial<ProgressWatchdogOptions> = {}) {
@@ -153,6 +163,23 @@ export class ProgressWatchdog {
 
 	/** A new user message starts a fresh judgement window for the conversation. */
 	beginTurn(conversationId: string): void {
+		this.states.delete(conversationId);
+	}
+
+	/** Apply settings read after construction (config loads later than the
+	 * engine). Undefined fields keep the current value. */
+	configure(options: Partial<ProgressWatchdogOptions>): void {
+		const next: ProgressWatchdogOptions = { ...this.options };
+		if (options.stallWindowMs !== undefined) next.stallWindowMs = options.stallWindowMs;
+		if (options.windowSize !== undefined) next.windowSize = options.windowSize;
+		if (options.softStopAfterWindows !== undefined) next.softStopAfterWindows = options.softStopAfterWindows;
+		this.options = next;
+	}
+
+	/** Drop all state for one conversation: called when its turn actually
+	 * finishes, so an idle process never accumulates per-conversation churn and
+	 * a later turn cannot inherit a stale window. */
+	endTurn(conversationId: string): void {
 		this.states.delete(conversationId);
 	}
 

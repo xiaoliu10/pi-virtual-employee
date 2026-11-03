@@ -434,7 +434,7 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
  * failure is swallowed, so instrumentation can never break a tool.
  * A refusal counts as NOT ok — it is friction the agent should be able to see.
  */
-function withTelemetry(
+export function withTelemetry(
 	tool: AgentTool<any>,
 	onEvent: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string }) => void,
 ): AgentTool<any> {

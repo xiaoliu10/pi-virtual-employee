@@ -43,7 +43,7 @@ import type { DocumentService, FileSender } from "../documents/document-service.
 import type { FileSystemService } from "../filesystem/filesystem-service.js";
 import type { ReportService } from "../reports/report-service.js";
 import type { DownloadService } from "../downloads/download-service.js";
-import { buildSystemPrompt, buildTools, guardTool } from "./definition.js";
+import { buildSystemPrompt, buildTools, guardTool, withTelemetry } from "./definition.js";
 import type { UpdateOperations } from "./tools/update.js";
 import { hasActiveShellCommands } from "./tools/shell.js";
 import {effectiveAuthorizationRole, ROLE_RANK, checkPermission, isLocalConversation, resolveRole} from "../security/permissions.js";
@@ -365,6 +365,16 @@ export class EmployeeEngine implements EmployeeRuntime {
 		options: EngineOptions = {},
 	) {
 		this.opts = { timeoutMs: options.timeoutMs ?? 0, streamFn: options.streamFn, retrySleepFn: options.retrySleepFn, kernel: options.kernel ?? "legacy" };
+		// Configured thresholds MUST reach the watchdog, otherwise every knob in
+		// Settings is dead code and the defaults silently win.
+		const pwCfg = this.config.all().general.progressWatchdog;
+		if (pwCfg) {
+			this.progress.configure({
+				stallWindowMs: pwCfg.stallWindowMs,
+				windowSize: pwCfg.windowSize,
+				softStopAfterWindows: pwCfg.softStopAfterWindows,
+			});
+		}
 		this.credentialStore = options.credentialStore ?? new FileCredentialStore();
 		this.models = createModels({ credentials: this.credentialStore });
 		for (const provider of builtinProviders()) this.models.setProvider(provider);
@@ -650,6 +660,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 					this.turnSendFile.delete(id); this.turnSendImage.delete(id);
 				}
 			}, onRecovered,
+			// Progress-window lifecycle belongs to the EXECUTION, not the call:
+			// `send` is admission (queued behind the running turn), `execute` is
+			// when work actually starts.
+			onTurnStart: (id) => this.progress.beginTurn(id),
+			onTurnEnd: (id) => this.progress.endTurn(id),
 		});
 		return this.durableRuntime;
 	}
@@ -747,6 +762,21 @@ export class EmployeeEngine implements EmployeeRuntime {
 			this.lastLlmCallAt.set(conversationId, Date.now());
 			this.llmFirstByteAt.delete(conversationId);
 			this.touchActivity(conversationId);
+			// The in-flight credit is released when the stream is SETTLED, not when
+			// the stream object exists. pi-ai's streamSimple resolves SYNCHRONOUSLY
+			// and performs the HTTP request inside its own async IIFE, so a
+			// `finally` around this call released the credit before a single byte
+			// had been requested: llmInFlight stayed 0 for the whole (possibly
+			// infinite) wait and the hung-request cap was structurally inert
+			// (independent review, P0). `release` is idempotent; one of the paths
+			// below always runs exactly once.
+			let released = false;
+			const release = (): void => {
+				if (released) return;
+				released = true;
+				this.llmInFlight.set(conversationId, Math.max(0, (this.llmInFlight.get(conversationId) ?? 1) - 1));
+				this.touchActivity(conversationId);
+			};
 			try {
 				const response = await this.rawStreamFn(model, context, options);
 				// First-byte detector: the stall watchdog exempts an in-flight
@@ -760,9 +790,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 				// otherwise passes every call through.
 				const rawIterator = (response as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator];
 				if (typeof rawIterator !== "function") {
-					// Not an async-iterable stream (test doubles, exotic providers):
-					// pass through untouched; the hung-request cap then relies on the
-					// request timeout for this path, as before.
+					// Not an async-iterable stream (test doubles, exotic providers): we
+					// cannot observe its lifetime, so settle immediately — the
+					// per-request timeout bounds that path, exactly as before.
+					release();
 					return response;
 				}
 				let primed = false;
@@ -778,14 +809,38 @@ export class EmployeeEngine implements EmployeeRuntime {
 					return {
 						next: async (...args: [] | [undefined]) => {
 							// Passthrough: the wrapper only observes the first iteration.
-							const step = (await iteratorAny.next(...args)) as IteratorResult<unknown>;
-							if (!primed) {
+							let step: IteratorResult<unknown>;
+							try {
+								step = (await iteratorAny.next(...args)) as IteratorResult<unknown>;
+							} catch (error) {
+								release();
+								throw error;
+							}
+							// "First byte" means the FIRST NETWORK EVENT, not the local
+							// `start`. pi-ai pushes `start` synchronously BEFORE the HTTP
+							// request is made (openai-completions.js), so counting it would
+							// mark a never-responsive request as alive on the very first
+							// pull and disable the hung cap exactly when it is needed.
+							// Any real event — text, thinking, tool call, done or error —
+							// is proof of life; `start` is not.
+							const eventType = (step.done ? undefined : (step.value as { type?: string } | undefined)?.type);
+							if (!primed && (step.done || eventType !== "start")) {
 								primed = true;
 								this.llmFirstByteAt.set(conversationId, Date.now());
 							}
+							// Stream finished: the request is over, give the credit back.
+							if (step.done) release();
 							return step;
 						},
-						return: (value?: unknown) => iteratorAny.return?.(value),
+						return: async (value?: unknown) => {
+							// Consumer stopped early (abort, model switch, retry): the
+							// request is over for us, so the credit must go back.
+							try {
+								return (await iteratorAny.return?.(value)) ?? { done: true as const, value: undefined };
+							} finally {
+								release();
+							}
+						},
 						throw: (error?: unknown) => iteratorAny.throw?.(error),
 						[Symbol.asyncIterator]() {
 							return this;
@@ -793,8 +848,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 					};
 				}) as typeof response[typeof Symbol.asyncIterator];
 				return wrapped;
-			} finally {
-				this.llmInFlight.set(conversationId, Math.max(0, (this.llmInFlight.get(conversationId) ?? 1) - 1));
+			} catch (error) {
+				release();
+				throw error;
 			}
 		};
 	}
@@ -2265,9 +2321,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	async send(agent: Agent, message: string, ctx?: SendCtx): Promise<SendResult> {
-		// A new user message opens a fresh progress window: the previous turn's
-		// repetition history must never escalate the next one.
-		if (!ctx?.ephemeral) this.progress.beginTurn(agent.sessionId ?? "default");
+		// NOTE: beginTurn deliberately does NOT run here. `send` is queue
+		// admission: under durable a second message for the same conversation
+		// waits for the running turn, so resetting here would erase the ACTIVE
+		// loop's history (review finding) — i.e. the queued message would give
+		// the runaway a fresh budget. The window is opened at execution start
+		// (beginExecution) and dropped when the turn ends.
 		if (this.opts.kernel === "durable" && !ctx?.ephemeral) {
 			if (!this.durableRuntime) throw new Error("Durable runtime is unavailable; refusing to replay through legacy");
 			return this.durableRuntime.send(agent, message, ctx);

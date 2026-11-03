@@ -73,6 +73,12 @@ interface RuntimeOptions {
 	stream(id: string, options: SimpleStreamOptions, messages: Message[]): ReturnType<StreamFn>;
 	withActor<T>(id: string, ctx: SendCtx, text: string, run: () => Promise<T>): Promise<T>;
 	onRecovered(id: string, result: SendResult, occurrenceId: string): Promise<void>;
+	/** Turn lifecycle for the progress watchdog. `execute` is the REAL start of a
+	 *  turn (after same-conversation queueing), so the repetition window must open
+	 *  here — opening it at `send` would let a queued message wipe the running
+	 *  loop's history and hand the runaway a fresh budget. */
+	onTurnStart?(conversationId: string): void;
+	onTurnEnd?(conversationId: string): void;
 }
 
 /** One durable conversation per submission: queued senders can never overwrite identity. */
@@ -270,6 +276,20 @@ export class DurableRuntime {
 	}
 	private async execute(agent: Agent, text: string, ctx?: SendCtx): Promise<SendResult> {
 		if (this.closing) throw new Error("Durable runtime is closing");
+		const id = agent.sessionId ?? "default";
+		// Real turn start (not admission): fresh repetition window.
+		this.opts.onTurnStart?.(id);
+		try {
+			return await this.executeTurn(agent, text, ctx);
+		} finally {
+			// Turn finished (replied, failed, aborted or handed off): drop the
+			// window so an idle process accumulates no per-conversation state and
+			// no later turn inherits a stale one.
+			this.opts.onTurnEnd?.(id);
+		}
+	}
+
+	private async executeTurn(agent: Agent, text: string, ctx?: SendCtx): Promise<SendResult> {
 		const id = agent.sessionId ?? "default";
 		const conv = await this.host.harness.createConversation({ ownership: { kind: "ownerless" }, agent: { model: { provider: "ve-runtime", modelId: "current" }, instructions: agent.state.systemPrompt }, init: async (tx, cid) => {
 			const route = await tx.doc(Route, cid);
