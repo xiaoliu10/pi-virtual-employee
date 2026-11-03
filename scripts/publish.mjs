@@ -20,6 +20,7 @@
  * Auth: GITEE_TOKEN env (personal access token). Dry-run: --dry-run lists
  * what would be uploaded without touching Gitee.
  */
+import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { execFileSync, spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -91,7 +92,11 @@ async function collectArtifacts() {
 			const p = join(releaseDir, name);
 			try {
 				const s = await stat(p);
-				out.push({ name, path: p, size: s.size });
+				// Every artifact carries its own sha512 so verification can compare
+				// PUBLISHED bytes against local bytes — the HEAD-302 check missed a
+				// CDN bad-body for 20 minutes on 2026-11-03 and wedged auto-update.
+				const sha512 = createHash("sha512").update(await readFile(p)).digest("base64");
+				out.push({ name, path: p, size: s.size, sha512 });
 			} catch {
 				console.error(`[publish] missing artifact: ${name} (run package:win first)`);
 				process.exit(1);
@@ -179,7 +184,19 @@ async function uploadAsset(releaseId, artifact) {
 	console.log(`[publish] uploaded ${artifact.name} → ${url}`);
 }
 
-/** Re-fetch the release and HEAD-check every asset URL is live. */
+/** Re-fetch the release and verify every asset BYTE-FOR-BYTE.
+ *
+ * History (field 2026-11-03): the old check was a HEAD per asset, treating
+ * Gitee's 302→CDN as "live". That night the CDN served a TRUNCATED/STALE body
+ * for the `latest`-ref asset (94.7 MB instead of 99.3 MB) for roughly the
+ * first 20 minutes after publishing — HEAD still returned 302, so publish
+ * declared victory while every auto-update download on the box failed its
+ * sha512 check, wedging three profiles into an update-retry loop exactly when
+ * an incident response was restarting them. The only reliable check is to
+ * download the published bytes back and compare digests; a mismatch re-uploads
+ * (bounded retries) and re-verifies, so a silent CDN bad-body can no longer
+ * ship as a "verified" release.
+ */
 async function verifyAssets(releaseId, artifacts) {
 	if (dryRun) { console.log("[publish] (dry-run) skipping verification"); return; }
 	const r = await fetch(`${API}/repos/${OWNER}/${REPO}/releases/${releaseId}?access_token=${encodeURIComponent(token)}`);
@@ -190,11 +207,66 @@ async function verifyAssets(releaseId, artifacts) {
 	for (const a of artifacts) {
 		if (!got.has(a.name)) throw new Error(`verify: ${a.name} missing from release assets`);
 		const asset = j.assets.find((x) => x.name === a.name);
-		const hr = await fetch(asset.browser_download_url, { method: "HEAD", redirect: "manual" });
-		// Gitee redirects to its CDN (302) — that's a live asset.
-		if (!hr.ok && hr.status !== 302) throw new Error(`verify: ${a.name} HEAD ${hr.status}`);
-		console.log(`[publish] verified ${a.name} (${hr.status === 302 ? "302→cdn" : hr.status})`);
+		if (a.sha512) {
+			await verifyAssetBytes(asset, a, releaseId);
+		} else {
+			// No digest recorded for this artifact (e.g. the feed yml): a live
+			// URL is the best we can do — but say so, loudly.
+			const hr = await fetch(asset.browser_download_url, { method: "HEAD", redirect: "manual" });
+			if (!hr.ok && hr.status !== 302) throw new Error(`verify: ${a.name} HEAD ${hr.status}`);
+			console.log(`[publish] verified ${a.name} (URL-only, no digest: ${hr.status === 302 ? "302→cdn" : hr.status})`);
+		}
 	}
+}
+
+/** Download the published asset back and compare its sha512 to the local file.
+ * Gitee's CDN has served truncated/stale bodies right after an upload (field
+ * 2026-11-03): a mismatch triggers one re-upload + re-verify before failing
+ * the release. Large artifacts need a generous read timeout. */
+async function verifyAssetBytes(asset, local, releaseId) {
+	const maxAttempts = 2;
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		let digest = "";
+		let size = 0;
+		try {
+			// Follow the 302 manually: fetch() follows redirects by default, but
+			// explicit handling keeps the CDN hop visible in the log.
+			const res = await fetch(asset.browser_download_url, { redirect: "follow" });
+			if (!res.ok) throw new Error(`GET ${res.status}`);
+			const buf = Buffer.from(await res.arrayBuffer());
+			size = buf.length;
+			digest = createHash("sha512").update(buf).digest("base64");
+		} catch (err) {
+			console.warn(`[publish] verify ${asset.name}: download failed (${err instanceof Error ? err.message : err})`);
+		}
+		if (digest && digest === local.sha512) {
+			console.log(`[publish] verified ${asset.name} (bytes ${(size / 1_048_576).toFixed(1)}MB sha512 match)`);
+			return;
+		}
+		console.warn(`[publish] verify ${asset.name}: BYTE MISMATCH (got ${size}B vs local ${local.size}B) — attempt ${attempt}/${maxAttempts}`);
+		if (attempt < maxAttempts) {
+			await reuploadAsset(asset, local, releaseId);
+			continue;
+		}
+	}
+	throw new Error(
+		`verify: ${asset.name} content mismatch after ${maxAttempts} attempts — the published bytes do not match the local file. ` +
+		`This is the exact failure that wedged the box's auto-update on 2026-11-03; fix the CDN/upload before publishing.`,
+	);
+}
+
+/** Delete + re-upload one asset on the release (Gitee API v5). */
+async function reuploadAsset(asset, local, releaseId) {
+	const del = await fetch(`${API}/repos/${OWNER}/${REPO}/releases/assets/${asset.id}?access_token=${encodeURIComponent(token)}`, { method: "DELETE" });
+	if (!del.ok && del.status !== 404) console.warn(`[publish] re-upload: delete old asset ${del.status} (continuing)`);
+	const buf = await readFile(local.path);
+	const form = new FormData();
+	form.append("file", new Blob([buf]), asset.name);
+	const up = await fetch(`${API}/repos/${OWNER}/${REPO}/releases/${releaseId}/files?access_token=${encodeURIComponent(token)}`, {
+		method: "POST", body: form,
+	});
+	if (!up.ok) throw new Error(`re-upload ${asset.name} failed: ${up.status}`);
+	console.log(`[publish] re-uploaded ${asset.name}`);
 }
 
 /**

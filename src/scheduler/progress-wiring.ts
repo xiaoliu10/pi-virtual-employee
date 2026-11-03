@@ -97,16 +97,34 @@ export interface RunProgressOptions {
  * Notifier for one scheduled-task fire. Same rule as above: `isRunAlive` comes
  * from the runner, not from `agent.state.isStreaming` (which is permanently
  * false on the durable kernel).
+ *
+ * Field 2026-11-03 (box Orion): the 72-minute reconciliation run produced ZERO
+ * progress notes. The old wiring mapped `isTimedOut()` (the scheduler's 60-min
+ * record-a-loss timer) onto `suppress`, so every note after minute 60 was
+ * dropped while the run kept working and eventually delivered its result "ok".
+ * The user saw silence, then a completion — the opposite of what progress
+ * notes are for. Long runs that outlive the scheduler's bookkeeping timeout
+ * are exactly the ones that NEED narration, so the gate is replaced by an
+ * explicit annotation: notes after the timeout still flow, marked as
+ * 「已超调度时限仍在执行」— no contradiction with the recorded loss (the note
+ * itself says the scheduler already flagged it), and no more silent hour.
  */
 export function createRunProgressNotifier(opts: RunProgressOptions) {
-	return createProgressNotifier({
+	const base = createProgressNotifier({
 		title: opts.task.title,
 		target: opts.task.conversation_id,
 		intervalMin: opts.intervalMin,
-		summarize: opts.summarize,
+		summarize: async () => {
+			const { text, degraded } = await opts.summarize();
+			if (!opts.isTimedOut()) return { text, degraded };
+			// Overdue but alive: keep narrating, with the state named. The old
+			// suppress() here silenced the entire overhang of every long run.
+			return { text: `${text}\n⚠️ 已超过调度器时限，任务仍在执行中；完成后会另发最终结果`, degraded };
+		},
 		push: async (conversationId, text) => { await opts.push(conversationId, text); },
 		isRunning: () => opts.isRunAlive(),
-		suppress: () => opts.isTimedOut(),
+		// (suppress removed — see the function comment: overdue runs narrate with
+		// an explicit annotation instead of going silent.)
 		// The preflight probe is "would ANY note be deliverable", so it must not
 		// pass an empty note: shouldPushScheduledResult() rejects empty text, and
 		// probing with "" therefore closed the gate for every scheduled task —
@@ -117,4 +135,5 @@ export function createRunProgressNotifier(opts: RunProgressOptions) {
 		mayPush: (note) => shouldPushScheduledResult(opts.task, undefined, note),
 		log: (level, message) => opts.log?.(level, message),
 	});
+	return base;
 }
