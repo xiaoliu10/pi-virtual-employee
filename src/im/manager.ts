@@ -460,7 +460,14 @@ export class IMAdapterManager {
 							progressInFlight = true;
 							void this.engine.progressBrief(agent, msg.conversationId)
 								.then((note) => {
-									if (!agent.state.isStreaming) return;
+									// Ask the KERNEL, not agent.state.isStreaming: under the
+									// durable kernel (default since v0.2.167) that flag is never
+									// set, so this gate dropped every heartbeat silently for
+									// IM chats — the same defect v0.2.173 fixed for scheduled
+									// tasks, work windows and the autonomous heartbeat, but this
+									// IM instance was missed (field report 2026-11-03: group chat
+									// task ran 6+ minutes with zero progress notes).
+									if (!this.engine.isConversationStreaming(msg.conversationId)) return;
 									// Bucket derived at PUSH time, from the same interval the timer
 									// above was sized with — never a second hardcoded cadence.
 									const occurrenceId = msg.messageId
