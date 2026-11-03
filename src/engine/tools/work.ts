@@ -1,6 +1,6 @@
 /** Source-scoped work administration and scheduler-only working memory. */
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { bool, lit, num, obj, opt, str, union } from "@earendil-works/pi-schema";
 import type { WorkItemStore } from "../../db/work-item-store.js";
 import type { ConfigStore } from "../../db/config-store.js";
 import { isExplicitConfirmation, type ActorContext } from "./admin.js";
@@ -116,10 +116,10 @@ export function createWorkTools(deps: {
 			"仅在当前自主任务的 work:<id> 工作窗口内记录信息；需要该任务创建管理员的有效调度身份且任务正在执行。" +
 			"action=set_conditions：记录执行条件/时间窗/依赖；action=add_lesson：记录踩坑；action=set_progress：更新进展。" +
 			"这些信息会跨窗口保留。资源或人工阻塞应等待来源会话的管理员恢复，不要通过笔记自行恢复。",
-		parameters: Type.Object({
-			action: Type.Union([Type.Literal("set_conditions"), Type.Literal("add_lesson"), Type.Literal("set_progress")]),
-			content: Type.String({ description: "要记录的内容，简明具体" }),
-		}),
+		parameters: obj({
+			action: union([lit("set_conditions"), lit("add_lesson"), lit("set_progress")]),
+			content: str({ description: "要记录的内容，简明具体" }),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const p = params as { action: "set_conditions" | "add_lesson" | "set_progress"; content: string };
 			const itemId = conversationId.startsWith("work:") ? conversationId.slice(5) : "";
@@ -163,22 +163,22 @@ export function createWorkTools(deps: {
 			"action=update：按管理员要求调整自主任务——title/goal/conditions 在非执行中状态（排队/等待人工/已计划/提案）可改；执行中请先 action=pause 暂停再调整（避免在飞窗口覆盖你的修改）；nextCheck 可改约下次跟进时间（距现在至少 15 分钟，仅排队/等待人工/已计划状态可改，执行中不能改期）；maxMinutes 可调本任务的窗口时长上限（分钟，仅排队/等待人工/已计划状态可改；执行中不能改——当前窗口按开工时的上限跑完，改动对下一个窗口生效）——任务连续因时间上限顺延、装不进窗口时用它调大，比拆任务更顺手；" +
 			"action=pause：管理员暂停执行中/排队/计划中的任务，尽快中止当前窗口并等待管理员明确恢复；" +
 			"action=cancel：来源会话的管理员取消未完成任务。id 可用 list 中的唯一短前缀，歧义时必须提供完整 id。",
-		parameters: Type.Object({
-			action: Type.Union([
-				Type.Literal("list"), Type.Literal("get"), Type.Literal("mine"),
-				Type.Literal("create"), Type.Literal("confirm"), Type.Literal("resume"), Type.Literal("cancel"),
-				Type.Literal("update"), Type.Literal("pause"),
+		parameters: obj({
+			action: union([
+				lit("list"), lit("get"), lit("mine"),
+				lit("create"), lit("confirm"), lit("resume"), lit("cancel"),
+				lit("update"), lit("pause"),
 			]),
-			id: Type.Optional(Type.String({ description: "自主任务完整 id 或短前缀（list 里取；普通成员的前缀在本来源会话内唯一，管理员在全部会话内唯一）" })),
-			answer: Type.Optional(Type.String({ description: "resume 时对暂停问题的答复，先持久化再排队执行" })),
-			title: Type.Optional(Type.String({ description: "confirm/update 时按管理员要求改写的标题（≤80 字）；不修改则省略" })),
-			goal: Type.Optional(Type.String({ description: "confirm/update 时按管理员要求改写的目标（≤2000 字）；不修改则省略" })),
-			conditions: Type.Optional(Type.String({ description: "confirm/update 时按管理员要求改写的执行条件（≤1000 字）；不修改则省略" })),
-			nextCheck: Type.Optional(Type.String({ description: "update 时改约下次跟进时间，如「30m」「明天09:40」（距现在至少 15 分钟）；仅排队/等待人工/已计划状态可改" })),
-			reason: Type.Optional(Type.String({ description: "update 时为改期写明依据（随 nextCheck 保存）；pause 时为暂停原因" })),
-			maxMinutes: Type.Optional(Type.Number({ description: "update 时调整本任务的工作窗口时长上限（分钟，正数；建议 30-480）。任务连续因时间上限自动顺延、装不进窗口时用它调大。仅非执行中状态可改，改动对下一个窗口生效；不修改则省略" })),
-			resident: Type.Optional(Type.Boolean({ description: "create 时声明任务性质：巡检/监控/每日对账这类**无自然终点**的常驻任务必须 true——此类任务不允许自行宣布完成（DONE 会被引擎拦截为按节奏顺延并推送管理员）；有明确完成标志的一次性任务省略或 false" })),
-		}),
+			id: opt(str({ description: "自主任务完整 id 或短前缀（list 里取；普通成员的前缀在本来源会话内唯一，管理员在全部会话内唯一）" })),
+			answer: opt(str({ description: "resume 时对暂停问题的答复，先持久化再排队执行" })),
+			title: opt(str({ description: "confirm/update 时按管理员要求改写的标题（≤80 字）；不修改则省略" })),
+			goal: opt(str({ description: "confirm/update 时按管理员要求改写的目标（≤2000 字）；不修改则省略" })),
+			conditions: opt(str({ description: "confirm/update 时按管理员要求改写的执行条件（≤1000 字）；不修改则省略" })),
+			nextCheck: opt(str({ description: "update 时改约下次跟进时间，如「30m」「明天09:40」（距现在至少 15 分钟）；仅排队/等待人工/已计划状态可改" })),
+			reason: opt(str({ description: "update 时为改期写明依据（随 nextCheck 保存）；pause 时为暂停原因" })),
+			maxMinutes: opt(num({ description: "update 时调整本任务的工作窗口时长上限（分钟，正数；建议 30-480）。任务连续因时间上限自动顺延、装不进窗口时用它调大。仅非执行中状态可改，改动对下一个窗口生效；不修改则省略" })),
+			resident: opt(bool({ description: "create 时声明任务性质：巡检/监控/每日对账这类**无自然终点**的常驻任务必须 true——此类任务不允许自行宣布完成（DONE 会被引擎拦截为按节奏顺延并推送管理员）；有明确完成标志的一次性任务省略或 false" })),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const p = params as {
 				action: "list" | "get" | "mine" | "create" | "confirm" | "resume" | "cancel" | "update" | "pause";

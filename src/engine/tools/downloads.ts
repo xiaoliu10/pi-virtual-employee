@@ -13,7 +13,7 @@
  * stays on the two-step delete_files tool.
  */
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { int, lit, obj, opt, str, union } from "@earendil-works/pi-schema";
 import { readFile, stat } from "node:fs/promises";
 import { extname } from "node:path";
 import type { DownloadService } from "../../downloads/download-service.js";
@@ -56,9 +56,9 @@ export function createDownloadTools(
 		label: "下载：列出已下载文件",
 		description:
 			"列出浏览器最近下载并保存到受管目录的文件（文件名、大小、来源网址、下载页面、时间、状态）。浏览器下载会自动存盘，用本工具找到文件后，再用 read_file 读取或 inspect_spreadsheet 分析表格。",
-		parameters: Type.Object({
-			limit: Type.Optional(Type.Integer({ description: "返回条数，默认 20，最多 100" })),
-		}),
+		parameters: obj({
+			limit: opt(int({ description: "返回条数，默认 20，最多 100" })),
+		}, { open: true }),
 		async execute(_id, params) {
 			try {
 				const limit = (params as { limit?: number }).limit;
@@ -82,10 +82,10 @@ export function createDownloadTools(
 		label: "文件：读取内容",
 		description:
 			"读取一个已下载/受管文件的文本内容。支持 txt/md/csv/json/html/log（原文）、docx（正文）、xlsx/xls（转 CSV 文本）、pdf（正文）。二进制或超大文件按 maxBytes（默认 64KB）截断并标注。表格文件若要按结构/聚合分析，请改用 inspect_spreadsheet。仅可读取受管下载目录或已配置允许目录内的文件。",
-		parameters: Type.Object({
-			path: Type.String({ description: "文件绝对路径（来自 list_downloads 或允许目录内）" }),
-			maxBytes: Type.Optional(Type.Integer({ description: "最多读取的字节数，默认 65536" })),
-		}),
+		parameters: obj({
+			path: str({ description: "文件绝对路径（来自 list_downloads 或允许目录内）" }),
+			maxBytes: opt(int({ description: "最多读取的字节数，默认 65536" })),
+		}, { open: true }),
 		async execute(_id, params) {
 			try {
 				const p = params as { path: string; maxBytes?: number };
@@ -118,18 +118,18 @@ export function createDownloadTools(
 		label: "表格：结构化分析",
 		description:
 				"结构化分析 xlsx/xls/xlsm 表格。两种模式：preview（默认）返回工作表列表、行列数、表头和前 N 行样本（默认20，可调大到最多 5000 行全量读取，带类型推断）；summary 做聚合——给定 groupBy 列按组计数/求和/平均等，不给 groupBy 则返回总行数和各数值列的 sum/avg/min/max。行数不超过 5000 的表用 preview 全量读取即可；超过 5000 行的超大表才需要用 summary 模式先聚合再下结论。",
-		parameters: Type.Object({
-			path: Type.String({ description: "表格文件绝对路径" }),
-			sheet: Type.Optional(Type.String({ description: "工作表名，默认第一个" })),
-			mode: Type.Optional(Type.Union([Type.Literal("preview"), Type.Literal("summary")], { description: "preview=预览表头与样本行（默认）；summary=聚合统计" })),
-			groupBy: Type.Optional(Type.String({ description: "summary 模式按此列分组（列名，表头须存在）" })),
-			aggColumn: Type.Optional(Type.String({ description: "summary 模式要聚合的数值列（默认仅计数）" })),
-			aggFunc: Type.Optional(Type.Union(
-				[Type.Literal("sum"), Type.Literal("count"), Type.Literal("avg"), Type.Literal("min"), Type.Literal("max")],
+		parameters: obj({
+			path: str({ description: "表格文件绝对路径" }),
+			sheet: opt(str({ description: "工作表名，默认第一个" })),
+			mode: opt(union([lit("preview"), lit("summary")], { description: "preview=预览表头与样本行（默认）；summary=聚合统计" })),
+			groupBy: opt(str({ description: "summary 模式按此列分组（列名，表头须存在）" })),
+			aggColumn: opt(str({ description: "summary 模式要聚合的数值列（默认仅计数）" })),
+			aggFunc: opt(union(
+				[lit("sum"), lit("count"), lit("avg"), lit("min"), lit("max")],
 				{ description: "聚合方式，默认 count" },
 			)),
-				limit: Type.Optional(Type.Integer({ description: "preview 样本行数（默认20，最多可到 5000 全量）；summary 分组上限200" })),
-		}),
+				limit: opt(int({ description: "preview 样本行数（默认20，最多可到 5000 全量）；summary 分组上限200" })),
+		}, { open: true }),
 		async execute(_id, params) {
 			try {
 				const p = params as {
@@ -213,9 +213,9 @@ export function createDownloadTools(
 		label: "浏览器：触发下载",
 		description:
 			"点击当前页面上一个会触发文件下载的元素（导出/下载按钮、链接），自动等待下载完成并存入受管下载目录。用于页面点击会弹出『另存为』/直接下载文件的场景。下载完成后用 list_downloads 找到文件，再用 read_file 或 inspect_spreadsheet 处理。",
-		parameters: Type.Object({
-			selector: Type.String({ description: "会触发下载的元素的 CSS 选择器，如 'button.export'、'a.download-link'" }),
-		}),
+		parameters: obj({
+			selector: str({ description: "会触发下载的元素的 CSS 选择器，如 'button.export'、'a.download-link'" }),
+		}, { open: true }),
 		async execute(_id, params) {
 			try {
 				const selector = (params as { selector: string }).selector;

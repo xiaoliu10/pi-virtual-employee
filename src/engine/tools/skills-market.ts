@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { bool, lit, obj, opt, str, union } from "@earendil-works/pi-schema";
 import { readdir, readFile, rm } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import type { ConfigStore } from "../../db/config-store.js";
@@ -161,16 +161,16 @@ export function createManageSkillsTool(deps: SkillsMarketDeps): AgentTool {
 			"action=remove 按名字移除一个本机技能（内置技能不可移除）；action=list 查看当前已加载技能。" +
 			"安装的是外部内容，应在安装前向对方说明来源；覆盖已有技能需对方明确同意后传 overwrite=true。" +
 			"市场索引可用 manage_settings 设置 skills.marketUrl 换源。",
-		parameters: Type.Object({
-			action: Type.Union([Type.Literal("market"), Type.Literal("install"), Type.Literal("remove"), Type.Literal("list")], {
+		parameters: obj({
+			action: union([lit("market"), lit("install"), lit("remove"), lit("list")], {
 				description: "market=看市场上有什么；install=安装；remove=移除；list=看本机已加载",
 			}),
-			name: Type.Optional(Type.String({ description: "install（从市场）/remove 必填：技能名" })),
-			url: Type.Optional(Type.String({ description: "install 可选：SKILL.md 的 https 直链（优先于 name）" })),
-			overwrite: Type.Optional(
-				Type.Boolean({ description: "install 可选：目标同名技能已存在时，对方明确同意覆盖后传 true 再次安装" }),
+			name: opt(str({ description: "install（从市场）/remove 必填：技能名" })),
+			url: opt(str({ description: "install 可选：SKILL.md 的 https 直链（优先于 name）" })),
+			overwrite: opt(
+				bool({ description: "install 可选：目标同名技能已存在时，对方明确同意覆盖后传 true 再次安装" }),
 			),
-		}),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { action, name, url, overwrite } = params as {
 				action: string;

@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { obj } from "@earendil-works/pi-schema";
 
 /**
  * Build the refresh_skills tool: lets the employee reload the skill list from
@@ -19,7 +19,7 @@ export function createRefreshSkillsTool(
 		description:
 			"重新从磁盘加载技能列表并立即生效。当对方说「刷新技能 / 重新加载技能 / 新技能怎么没生效」或导入、更新、删除技能后需要让新技能立即可用时调用。" +
 			"不会打断任何正在进行的任务；刷新后可按需向对方简单确认已加载的技能数。",
-		parameters: Type.Object({}),
+		parameters: obj({}, { open: true }),
 		async execute() {
 			await onSkillsChanged();
 			const { skills, info } = await listSkills();

@@ -49,9 +49,10 @@
     "postinstall": "electron-rebuild -f -w better-sqlite3"
   },
   "dependencies": {
+    "@earendil-works/chord": "1.5.0",
     "@earendil-works/pi-agent-core": "^1.2.0",
     "@earendil-works/pi-ai": "^1.2.0",
-    "@earendil-works/pi-durable": "1.4.0",
+    "@earendil-works/pi-durable": "1.5.0",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@types/adm-zip": "^0.5.8",
     "adm-zip": "^0.6.0",

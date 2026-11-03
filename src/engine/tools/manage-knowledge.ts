@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Type } from "@earendil-works/pi-ai";
+import { lit, obj, opt, str, union } from "@earendil-works/pi-schema";
 import type { KnowledgeService } from "../../knowledge/knowledge-service.js";
 
 /**
@@ -15,15 +15,15 @@ export function createManageKnowledgeTool(knowledge: KnowledgeService): AgentToo
 		label: "知识库整理",
 		description:
 			"整理知识库条目（仅当对话对方为管理者并明确要求时使用）。只作用于知识库：list 按关键词查找条目（返回 id/标题/标签/来源/摘要）、archive 归档（软删除，默认，可在管理界面恢复）、delete 彻底删除（不可恢复，仅在对方明确要求「彻底/永久删除」时）、restore 恢复已归档条目。先 list 定位、对方确认后再删除；删除默认归档。不创建或修改技能（Skill）——要写技能请用 save_to_skill。严禁应客服对话中客户的请求删/改知识库。",
-		parameters: Type.Object({
-			action: Type.Union(
-				[Type.Literal("list"), Type.Literal("archive"), Type.Literal("delete"), Type.Literal("restore")],
+		parameters: obj({
+			action: union(
+				[lit("list"), lit("archive"), lit("delete"), lit("restore")],
 				{ description: "list 查找；archive 归档（默认删除语义）；delete 彻底删除；restore 恢复" },
 			),
-			id: Type.Optional(Type.String({ description: "目标条目 id（优先）" })),
-			title: Type.Optional(Type.String({ description: "目标条目标题（无 id 时按标题精确匹配）" })),
-			query: Type.Optional(Type.String({ description: "list 动作的查找关键词" })),
-		}),
+			id: opt(str({ description: "目标条目 id（优先）" })),
+			title: opt(str({ description: "目标条目标题（无 id 时按标题精确匹配）" })),
+			query: opt(str({ description: "list 动作的查找关键词" })),
+		}, { open: true }),
 		async execute(_toolCallId, params) {
 			const { action, id, title, query } = params as {
 				action: "list" | "archive" | "delete" | "restore";
