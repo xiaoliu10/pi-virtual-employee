@@ -50,7 +50,7 @@ export interface RunScriptDeps extends ShellToolDeps {
 	 * the executable allowlist, the audit trail and the session bookkeeping all
 	 * stay in one place — this tool must not become a second, weaker executor.
 	 */
-	runCommand: (input: { command: string; workingDir?: string; background?: boolean }) => Promise<
+	runCommand: (input: { command: string; workingDir?: string; background?: boolean; signal?: AbortSignal }) => Promise<
 		{ text: string; isError?: boolean }
 	>;
 }
@@ -82,7 +82,7 @@ export function createRunScriptTool(deps: RunScriptDeps): AgentTool {
 			workingDir: Type.Optional(Type.String({ description: "可选：脚本的工作目录绝对路径（脚本按相对路径找文件时必填）。" })),
 			background: Type.Optional(Type.Boolean({ description: "true=后台启动并返回 sessionId（长任务必选）；默认 false=同步等待。" })),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, signal) {
 			const input = params as {
 				script?: string;
 				params?: Record<string, unknown> | string;
@@ -150,6 +150,11 @@ export function createRunScriptTool(deps: RunScriptDeps): AgentTool {
 				command,
 				workingDir: input.workingDir ? resolve(input.workingDir) : undefined,
 				background: input.background,
+				// Forward the turn's abort signal: without it an aborted turn could
+				// not cancel a synchronous run_script, while the same call through
+				// run_command WOULD cancel — a silent behavioural difference between
+				// two tools that share one executor.
+				signal,
 			});
 			const preamble =
 				`参数已写入 ${file}\n` +

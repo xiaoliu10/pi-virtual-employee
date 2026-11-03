@@ -360,7 +360,7 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 			...shellDeps,
 			userDataDir: options.userDataDir,
 			runCommand: async (input) => {
-				const result = await executeCommand(shellDeps, input);
+				const result = await executeCommand(shellDeps, input, input.signal);
 				const text = result.content.map((c) => c.text).join("\n");
 				return { text, isError: result.details?.refused === true };
 			},

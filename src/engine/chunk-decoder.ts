@@ -85,11 +85,38 @@ export function isUtf8(bytes: Uint8Array): boolean {
 export function createChunkDecoder(): ChunkDecoder {
 	let pending: Buffer = Buffer.alloc(0);
 	let settled: Encoding | undefined;
-	const decoders: Record<Encoding, InstanceType<typeof TextDecoder>> = {
+	// Evidence for each side, in decisive (non-ASCII) bytes. One chunk can be
+	// wrong (a single "→" in a banner, or a GBK character whose bytes happen to
+	// form a valid UTF-8 sequence), so the latch waits until one side is clearly
+	// ahead instead of trusting the first non-ASCII chunk.
+	let utf8Votes = 0;
+	let gbkVotes = 0;
+	/** Set once output has been produced; from then on the encoding is final. */
+	let emitted: Encoding | undefined;
+	/** Consecutive decisive chunks agreeing before the stream latches for good. */
+	const DECISIVE_MARGIN = 2;
+	// Count CHUNKS, not bytes: a 12-byte banner with one arrow must not outweigh a
+	// 4-byte GBK payload just because it is longer. A run of agreement is the
+	// signal, and a single contradicting chunk resets the run.
+	const vote = (encoding: Encoding): void => {
+		if (encoding === "utf8") {
+			utf8Votes += 1;
+			gbkVotes = 0;
+		} else {
+			gbkVotes += 1;
+			utf8Votes = 0;
+		}
+		// Latch only on a RUN of agreement; a contradicting chunk resets the run, so
+		// one misleading banner cannot poison the stream.
+		if (utf8Votes >= DECISIVE_MARGIN) settled = "utf8";
+		else if (gbkVotes >= DECISIVE_MARGIN) settled = "gbk";
+	};
+	const makeDecoders = (): Record<Encoding, InstanceType<typeof TextDecoder>> => ({
 		utf8: new TextDecoder("utf-8", { fatal: false }),
 		// GB18030 is a superset of GBK/CP936, which is what Chinese Windows uses.
 		gbk: new TextDecoder("gb18030", { fatal: false }),
-	};
+	});
+	let decoders = makeDecoders();
 	const decode = (as: Encoding, bytes: Buffer, stream = true): string =>
 		decoders[as].decode(bytes, { stream });
 
@@ -97,31 +124,67 @@ export function createChunkDecoder(): ChunkDecoder {
 		write(chunk: Buffer): string {
 			if (chunk.length === 0) return "";
 			if (settled) return decode(settled, chunk);
+			// Once anything has been EMITTED the encoding is fixed: the TextDecoder
+			// bound to it holds internal state, and flipping later would leave the
+			// emitted prefix and the coming bytes in different encodings.
+			if (emitted) return decode(emitted, chunk);
 
 			const joined: Buffer = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-			// ASCII alone decides nothing — both encodings agree on it.
+			// ASCII alone decides nothing — both encodings agree on it, so this must
+			// NOT fix the encoding (an English banner precedes GBK output all the
+			// time). It is emitted straight through; the decision still waits.
 			if (joined.every((byte) => byte < 0x80)) return decode("utf8", joined);
 
 			const state = utf8State(joined);
-			if (state === "incomplete") {
+			// "Incomplete" only means anything while we are still deciding between
+			// UTF-8 and GBK. Once GBK is established a trailing byte that LOOKS like
+			// a truncated UTF-8 lead is just the first half of a GBK character, and
+			// holding it would swallow the byte (field: a GBK stream split mid
+			// character emitted its first character and then nothing).
+			// Hold only while the encoding is still undecided: an incomplete tail there
+			// is a UTF-8 character in flight. Once latched, GB18030 reassembles split
+			// GBK characters on its own, so holding would swallow the byte.
+			const holding = settled === undefined && state === "incomplete";
+			if (holding) {
 				// Hold everything: the rest of the character is still in flight.
 				pending = Buffer.from(joined);
 				return "";
 			}
 			pending = Buffer.alloc(0);
-			if (state === "valid") {
-				settled = "utf8";
-				return decode("utf8", joined);
+			// Record evidence, then choose. Until the margin is met we decode with the
+			// leading side WITHOUT latching, so a later chunk can still flip it — this
+			// is what stops one misleading chunk from poisoning the whole stream.
+			vote(state === "valid" ? "utf8" : "gbk");
+			if (!settled) {
+				// Not latched yet: emit with the CURRENT leaning so a genuinely UTF-8
+				// stream is readable from its first chunk. If the lean later proves
+				// wrong the latch switches and REBUILDS the decoder; the already
+				// emitted prefix keeps whatever it decoded to (it cannot be rewritten),
+				// which is the accepted boundary of a single-decoder design.
+				emitted = gbkVotes > 0 && gbkVotes >= utf8Votes ? "gbk" : "utf8";
+				pending = Buffer.alloc(0);
+				return decode(emitted, joined);
 			}
-			settled = "gbk";
-			return decode("gbk", joined);
+			// Latched. If the leaning we were emitting with was the OTHER encoding, the
+			// decoder in use is holding state for it (possibly half a character) —
+			// start clean so that state cannot glue onto the new encoding's bytes.
+			if (emitted !== settled) {
+				decoders = makeDecoders();
+				emitted = settled;
+			}
+			pending = Buffer.alloc(0);
+			return decode(settled, joined);
 		},
 		end(): string {
 			const rest = pending;
 			pending = Buffer.alloc(0);
 			// A tail still marked incomplete at stream end is a truncated character:
 			// decode it in the settled encoding (or UTF-8) and accept the U+FFFD.
-			const as: Encoding = settled ?? "utf8";
+			// Undecided at end: prefer GBK. The two mistakes are NOT symmetric —
+			// GBK bytes read as UTF-8 produce a run of U+FFFD (content destroyed),
+			// while UTF-8 bytes read as GB18030 produce visible mojibake the caller
+			// can still recognise and retry.
+			const as: Encoding = settled ?? (gbkVotes > 0 ? "gbk" : "utf8");
 			return rest.length ? decoders[as].decode(rest) : decoders[as].decode();
 		},
 	};

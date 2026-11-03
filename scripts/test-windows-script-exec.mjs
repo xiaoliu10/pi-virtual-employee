@@ -226,3 +226,105 @@ test("a script path containing shell metacharacters is refused (injection guard)
 	const ok = await okTool.execute("c2", { script: "/tmp/我的 脚本/job.py" });
 	assert.ok(!/元字符/.test(ok.content.map((c) => c.text).join("")), "spaces and CJK must remain allowed");
 });
+
+// ---- Review P1-1: the latch must not commit on ONE misleading chunk ----
+
+test("an ASCII banner does not lock the encoding (mixed-prefix case)", () => {
+	// The realistic shape: an English banner (ASCII) followed by GBK payload. ASCII
+	// is identical in both encodings, so it must never decide.
+	const banner = Buffer.from("loading...\n", "utf8");
+	const body = Buffer.from([0xd6, 0xd0, 0xce, 0xc4]); // 中文 in GBK
+	const out = drain([banner, body]);
+	assert.ok(out.startsWith("loading..."), `banner must survive: ${JSON.stringify(out)}`);
+	assert.ok(out.endsWith("中文"), `GBK body must decode: ${JSON.stringify(out)}`);
+});
+
+test("KNOWN BOUNDARY: one process does not mix UTF-8 and GBK in one stream", () => {
+	// A stream whose FIRST chunk is genuine UTF-8 (e.g. "→") and whose LATER chunks
+	// are GBK cannot be decoded correctly by a single decoder: the prefix was
+	// already emitted in UTF-8, so switching would leave two encodings in one
+	// string. This is accepted, not solved — on Windows one program writes in one
+	// code page. Documented so a future reader does not assume it is handled.
+	const banner = Buffer.from("→", "utf8");
+	const gbk = Buffer.from([0xd6, 0xd0]);
+	const out = drain([banner, gbk]);
+	assert.ok(out.startsWith("→"), "the genuine UTF-8 prefix is decoded correctly");
+});
+
+test("a GBK stream that begins with bytes forming valid UTF-8 still decodes as GBK (P1-1)", () => {
+	// 0xB0 0xA1 is valid UTF-8 (U+3030 area) yet is GBK "啊". Repeating it makes the
+	// GBK evidence accumulate and the latch flip.
+	const pair = Buffer.concat(Array(6).fill(Buffer.from([0xb0, 0xa1])));
+	const out = drain([pair]);
+	assert.equal(out, "啊啊啊啊啊啊", `GBK must win on evidence, got ${JSON.stringify(out)}`);
+});
+
+test("a GBK stream split mid-character is not swallowed (P1-2)", () => {
+	// 0xC4 alone looks like a truncated UTF-8 lead; holding it dropped the byte and
+	// the stream went silent after the first character.
+	const GBK2 = Buffer.from([0xd6, 0xd0, 0xce, 0xc4]);
+	assert.equal(drain([GBK2.subarray(0, 3), GBK2.subarray(3)]), "中文");
+});
+
+test("a GBK split whose tail looks like a UTF-8 lead is not held (guard on gbkVotes)", () => {
+	// 0xC4 alone is a plausible UTF-8 lead; if the decoder holds it "waiting for
+	// the rest of the character" the byte is swallowed and the stream goes silent
+	// after the first character. GBK evidence must disable that holding.
+	const GBK2 = Buffer.from([0xd6, 0xd0, 0xce, 0xc4]);
+	const d = createChunkDecoder();
+	const first = d.write(GBK2.subarray(0, 2)); // 中
+	const rest = d.write(GBK2.subarray(2)); // 文 as one whole char
+	assert.equal(first + rest + d.end(), "中文", `got ${JSON.stringify(first + rest + d.end())}`);
+});
+
+test("an undecided stream that ends is decoded as GBK, not UTF-8 (no U+FFFD)", () => {
+	// Two GBK bytes with no clear majority yet: decoding them as UTF-8 would give
+	// U+FFFD. GBK gives readable text, which is the recoverable failure mode.
+	const out = drain([Buffer.from([0xd6, 0xd0])]);
+	assert.equal(out, "中");
+	assert.ok(!out.includes("\uFFFD"), "must not produce replacement characters");
+});
+
+test("an incomplete tail held at end() is flushed as GBK, not as U+FFFD", () => {
+	// The stream ends while a byte is still held as "maybe a truncated UTF-8
+	// character". Those bytes are GBK in practice, so end() must not decode them
+	// as UTF-8 — that would emit U+FFFD and destroy the last character.
+	const d = createChunkDecoder();
+	// 0xD6 0xD0 = 中, but split so the tail is held as a possible UTF-8 lead.
+	const head = d.write(Buffer.from([0xd6]));
+	const rest = d.write(Buffer.from([0xd0, 0xce, 0xc4])); // 中文
+	const tail = d.end();
+	const out = head + rest + tail;
+	assert.equal(out, "中文", `held tail must flush as GBK, got ${JSON.stringify(out)}`);
+	assert.ok(!out.includes("\uFFFD"), "no replacement characters");
+});
+
+test("switching encoding rebuilds the decoder (no half-character carried over)", () => {
+	// When the latch flips, the previously chosen TextDecoder may be holding half a
+	// character from the OLD encoding. Reusing it would glue that half onto bytes
+	// from the new encoding.
+	const d = createChunkDecoder();
+	// Lean UTF-8 first: a partial 3-byte lead, which the utf8 decoder buffers.
+	d.write(Buffer.from([0xe4, 0xb8]));
+	// Now two GBK chunks in a row: the latch flips to GBK and must start clean.
+	const a = d.write(Buffer.from([0xd6, 0xd0]));
+	const b = d.write(Buffer.from([0xce, 0xc4]));
+	const out = a + b + d.end();
+	assert.ok(out.includes("中文"), `GBK must decode after the flip, got ${JSON.stringify(out)}`);
+});
+
+test("KNOWN BOUNDARY: a stream that starts UTF-8 and turns GBK cannot be repaired", () => {
+	// The rebuild exists so the decoder does not glue a half UTF-8 character onto
+	// GBK bytes. It cannot UNDO what was already emitted: one string cannot hold
+	// two encodings. That is accepted — on Windows a single program writes in one
+	// code page, so this only shows up for a mixed stream, which no decoder can
+	// render faithfully.
+	const d = createChunkDecoder();
+	const first = d.write(Buffer.from([0xe4, 0xb8, 0xad])); // 中 as UTF-8
+	const a = d.write(Buffer.from([0xd6, 0xd0]));
+	const b = d.write(Buffer.from([0xce, 0xc4]));
+	const out = first + a + b + d.end();
+	assert.equal(first, "中", "the genuine UTF-8 prefix decodes correctly");
+	// Document the limit rather than pretend it is handled.
+	assert.ok(out.length > 0);
+});
