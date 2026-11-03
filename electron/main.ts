@@ -29,7 +29,7 @@ import { ContextStore } from "../src/context/store.js";
 import { KnowledgeService } from "../src/knowledge/knowledge-service.js";
 import { BrowserService } from "../src/browser/browser-service.js";
 import { BrowserRuntime, type RuntimeStatus } from "../src/browser/runtime.js";
-import { createInstallRunner, DEFAULT_DOWNLOAD_HOSTS, revisionFromExecutablePath } from "../src/browser/installer.js";
+import { createInstallRunner, DEFAULT_DOWNLOAD_HOSTS, revisionFromExecutablePath, headlessShellPath } from "../src/browser/installer.js";
 import { chromium as playwrightChromium } from "playwright";
 import { ComputerService } from "../src/computer/computer-service.js";
 import { ScheduledTaskStore, type ScheduledTaskRow } from "../src/db/scheduled-task-store.js";
@@ -503,6 +503,14 @@ async function main(): Promise<void> {
 	const browserRuntime = new BrowserRuntime({
 		executablePath: browserExecutablePath,
 		exists: (file) => existsSync(file),
+		// Headless (the default) launches the separate headless-shell binary;
+		// windowed mode uses full Chromium. Require exactly what will launch so
+		// a partial install / AV-quarantined binary is detected and repaired.
+		requiredPaths: () => {
+			const full = browserExecutablePath();
+			if (!full) return [];
+			return config.all().browser.headless ? [full, headlessShellPath(full)].filter(Boolean) : [full];
+		},
 		revision: () => revisionFromExecutablePath(browserExecutablePath()),
 		runner: createInstallRunner({ electronExe: app.getPath("exe"), playwrightCli }),
 		// Read on every ensure so a settings-page change to the download source
@@ -1880,6 +1888,11 @@ ${tailForProgress(decision.text)}`;
 	});
 	ipcMain.handle("browser:runtimeStatus", () => browserRuntime.getStatus());
 	ipcMain.handle("browser:runtimeEnsure", async () => {
+		// A disabled browser must never download. The settings card offers the
+		// retry action inside the browser section; downloading only makes sense
+		// while the capability is enabled (the runtime is also prefetched /
+		// ensured automatically on enable and on first use).
+		if (!config.all().browser.enabled) return browserRuntime.getStatus();
 		const status = await browserRuntime.ensure({ force: true });
 		publishBrowserRuntime(status);
 		return status;

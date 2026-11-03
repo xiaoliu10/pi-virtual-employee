@@ -168,3 +168,61 @@ test("BrowserService launch aborts with BrowserRuntimeUnavailableError when runt
 		(err) => err.name === "BrowserRuntimeUnavailableError" || /download failed/.test(err.message),
 	);
 });
+
+// ---- P2 fixes from independent review ----
+const inst = await bundle("src/browser/installer.ts", "installer.mjs");
+
+test("headlessShellPath derives the separate headless-shell binary per platform", () => {
+	const win = "C:/Users/x/AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe";
+	assert.equal(
+		inst.headlessShellPath(win, "win32"),
+		"C:/Users/x/AppData/Local/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell-win64/chrome-headless-shell.exe",
+	);
+	const macArm = "/c/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing";
+	assert.match(inst.headlessShellPath(macArm, "darwin"), /chromium_headless_shell-1234\/chrome-headless-shell-mac-arm64\/chrome-headless-shell$/);
+	assert.match(inst.headlessShellPath("/c/ms-playwright/chromium-1234/chrome-linux/chrome", "linux"), /chromium_headless_shell-1234\/chrome-headless-shell-linux64\/chrome-headless-shell$/);
+	assert.equal(inst.headlessShellPath("garbage", "win32"), "");
+});
+
+test("headless readiness requires BOTH chromium and headless-shell (partial install not ready)", () => {
+	const full = "/ms/chromium-1234/chrome-win64/chrome.exe";
+	const shell = inst.headlessShellPath(full, "win32");
+	const present = new Set([full]); // full present, headless-shell missing
+	const runtime = new BrowserRuntime({
+		executablePath: () => full,
+		exists: (f) => present.has(f),
+		revision: () => "1234",
+		requiredPaths: () => [full, shell],
+		runner: async () => ({ ok: false, tail: "n/a" }),
+		hosts: [undefined],
+	});
+	assert.equal(runtime.isReady(), false, "headless launch would fail without headless-shell");
+	present.add(shell);
+	assert.equal(runtime.isReady(), true, "both present → ready");
+});
+
+test("ensure() never throws: a rejecting runner lands in phase=error", async () => {
+	const runtime = new BrowserRuntime({
+		executablePath: () => "/x/chromium-1/chrome.exe",
+		exists: () => false,
+		revision: () => "1",
+		runner: async () => { throw new Error("spawn ENOENT"); },
+		hosts: [undefined],
+	});
+	const s = await runtime.ensure();
+	assert.equal(s.phase, "error");
+	assert.match(s.error, /ENOENT/);
+});
+
+test("ensure() never throws: a throwing hosts() lands in phase=error", async () => {
+	const runtime = new BrowserRuntime({
+		executablePath: () => "/x/chromium-1/chrome.exe",
+		exists: () => false,
+		revision: () => "1",
+		runner: async () => ({ ok: false, tail: "" }),
+		hosts: () => { throw new Error("config boom"); },
+	});
+	const s = await runtime.ensure();
+	assert.equal(s.phase, "error");
+	assert.match(s.error, /config boom/);
+});

@@ -64,6 +64,14 @@ export type InstallRunner = (
 export interface RuntimeDeps {
 	/** Path the bundled Playwright would launch (encodes the wanted revision). */
 	executablePath: () => string;
+	/**
+	 * All binaries the launch configuration actually requires. Playwright's
+	 * default headless launch uses the SEPARATE headless-shell binary (not the
+	 * full Chromium) — checking only chromium.executablePath() reports ready on
+	 * a partial install and then headless launch fails. The installer
+	 * (`playwright install chromium`) fetches both, so require both.
+	 */
+	requiredPaths?: () => string[];
 	/** fs.existsSync for that path. */
 	exists: (file: string) => boolean;
 	/** Bundled browser revision label (for status/UI), e.g. "1234". */
@@ -137,10 +145,18 @@ export class BrowserRuntime {
 		}
 	}
 
-	/** Cheap synchronous readiness check: does the wanted binary exist? */
+	/** Cheap synchronous readiness check: every required binary is present. */
 	isReady(): boolean {
-		const p = this.safePath();
-		return !!p && this.deps.exists(p);
+		const paths = this.required();
+		return paths.length > 0 && paths.every((p) => p && this.deps.exists(p));
+	}
+
+	/** Binaries that must exist. Falls back to the single executablePath. */
+	private required(): string[] {
+		const list = this.deps.requiredPaths ? this.deps.requiredPaths() : [];
+		const single = this.safePath();
+		const all = list.length > 0 ? list : single ? [single] : [];
+		return [...new Set(all.filter(Boolean))];
 	}
 
 	/**
@@ -170,37 +186,48 @@ export class BrowserRuntime {
 			return this.getStatus();
 		}
 
-		const hostList = typeof this.deps.hosts === "function" ? this.deps.hosts() : this.deps.hosts;
-		const hosts = hostList && hostList.length > 0 ? hostList : [undefined];
-		let lastTail = "";
+		try {
+			const hostList = typeof this.deps.hosts === "function" ? this.deps.hosts() : this.deps.hosts;
+			const hosts = hostList && hostList.length > 0 ? hostList : [undefined];
+			let lastTail = "";
 
-		for (let i = 0; i < hosts.length; i++) {
-			const host = hosts[i];
-			this.emit({
-				phase: "installing",
-				progress: 0,
-				attempt: i + 1,
-				source: host ? host : "playwright-cdn",
-				error: "",
-			});
-			const result = await this.deps.runner(
-				(percent) => this.emit({ phase: "installing", progress: clampPct(percent) }),
-				host,
-			);
-			lastTail = result.tail;
-			// The CLI may exit 0 while a later Playwright still can't see the file
-			// (partial/AV-quarantined download) — trust the filesystem, not the code.
-			if (result.ok && this.isReady()) {
-				this.emit({ phase: "ready", progress: 100, error: "", checkedAt: this.now() });
-				return this.getStatus();
+			for (let i = 0; i < hosts.length; i++) {
+				const host = hosts[i];
+				this.emit({
+					phase: "installing",
+					progress: 0,
+					attempt: i + 1,
+					source: host ? host : "playwright-cdn",
+					error: "",
+				});
+				const result = await this.deps.runner(
+					(percent) => this.emit({ phase: "installing", progress: clampPct(percent) }),
+					host,
+				);
+				lastTail = result.tail;
+				// The CLI may exit 0 while a later Playwright still can't see the file
+				// (partial/AV-quarantined download) — trust the filesystem, not the code.
+				if (result.ok && this.isReady()) {
+					this.emit({ phase: "ready", progress: 100, error: "", checkedAt: this.now() });
+					return this.getStatus();
+				}
 			}
-		}
 
-		this.emit({
-			phase: "error",
-			progress: 0,
-			error: summarizeError(lastTail) || "browser download failed",
-		});
+			this.emit({
+				phase: "error",
+				progress: 0,
+				error: summarizeError(lastTail) || "browser download failed",
+			});
+		} catch (err) {
+			// The documented contract is "never throws": a rejecting runner or a
+			// throwing hosts() must land in a terminal error, never a stuck
+			// checking/installing phase or an unhandled rejection.
+			this.emit({
+				phase: "error",
+				progress: 0,
+				error: (err as Error)?.message || "browser install failed",
+			});
+		}
 		return this.getStatus();
 	}
 
