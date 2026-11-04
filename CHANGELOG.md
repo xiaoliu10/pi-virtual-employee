@@ -4,6 +4,40 @@
 
 开源前的内部迭代细节不在此逐一罗列（完整历史见 git log）；以下从开源基线版本开始记录。
 
+## v0.2.190 — Router/Worker dispatch, script authoring without escaping, heartbeat fix
+
+### English
+
+**Long tasks no longer occupy the chat (Router/Worker P1, gray release)**: the single biggest field complaint — a 09:42 monitor job holding a conversation for 85 minutes while a 10:21 message queued for 30 — is an architecture problem, not a model one. A message the planner judges task-shaped (≥2 numbered steps AND a long-running verb: deploy/scrape/batch/export/reconcile/build…) is now acknowledged and handed to a background work item; the chat stays responsive and progress/results push back to the same conversation. Triage is deliberately conservative: simple questions, single-step commands, question-shaped text, and EVERY failure mode (no plan, LLM down, non-admin sender, dispatch error) stay inline — a triage failure can never swallow a message. `general.chatDispatch` is OFF by default; with it off the behaviour is unchanged. Dispatched tasks also jump the queue (`work_items.priority` = 0 vs 100 for mined work) so "已转后台" cannot mean "queued behind a mining window".
+
+**Authoring a script no longer means fighting three layers of escaping**: VE had no write tool at all, so creating a script meant inline `echo >` / `Set-Content` / `python -c` — JSON argument, shell quoting and the target language's syntax stacked on top of each other, failing repeatedly in exactly the way the user never asked about. New `write_text_file` takes the file body as an ordinary argument (UTF-8, no BOM), verifies by reading back, writes atomically (temp file + rename) so a failed write cannot destroy a working script, and is confined by the same whitelist as list/delete plus a deny-list for the app's own databases and config. The workspace lives in its own root, outside every profile.
+
+**Progress notes actually fire again (P0)**: the IM heartbeat read `agent.state.isStreaming`, which the durable kernel never sets — so every tick returned silently and a 20-minute turn produced zero progress notes despite `longTaskProgressMin=10`. The fix had been written on 2026-11-03 but never merged to main. It now asks the kernel instead.
+
+**Plans are gated and readable**: a plan is pushed to chat only when the work is estimated at ≥30 minutes (a task that finishes in a minute does not need a plan pushed at it), and what IS pushed is a short human outline — goal, flow, ETA — instead of a mechanical numbered checklist. The full steps still go to the executing turn as context.
+
+**Recovery: parked messages are re-driven**: a submission left in `placed` (queued behind a run the restart killed) used to sit until recovery timed out, reporting "执行已暂停" for a message that never ran. Recovery now re-drives it with a durable `continue`.
+
+**MCP: the guard test could not fail**: the test pinning "MCP tools are visible to the durable kernel" read `harness.registry`, which does not exist — so its assertions never executed and the fix shipped behind a permanently green check. Repaired, plus a real stdio end-to-end chain (startup connect, late connect, RBAC execution).
+
+**Update watchdog: profile identity survives a mangled launch**: a main process without `--profile` was recorded as the default profile, so the watchdog relaunched it bare — an instance with no identity, and every later snapshot inherited it. The identity is now recovered from a child's `--user-data-dir` (requiring ≥2 agreeing children, so an orphan cannot confer the wrong profile).
+
+### 中文
+
+**长任务不再占死聊天（Router/Worker P1，灰度）**：最大的现场抱怨——09:42 的监控任务占住会话 85 分钟、10:21 的消息排队 30 分钟——是架构问题不是模型问题。规划判定为任务型（≥2 编号步骤 **且** 含耗时动词：部署/抓取/批量/导出/对账/构建…）的消息现在先进回执、再交给后台工作项执行；前台继续可聊，进度与结果回投同一会话。分诊刻意保守：简单问答、单步命令、提问形状、以及**任何失败**（无规划、模型不可用、非管理员、派发异常）一律留在前台——分诊失败绝不吞消息。`general.chatDispatch` 默认关闭，关时行为不变。转派的任务还会插队（`work_items.priority` = 0，挖掘任务 100），「已转后台」不会变成「排在挖掘窗口后面」。
+
+**写脚本不再和三层转义搏斗**：VE 此前根本没有写文件工具，创建脚本只能用内联 `echo >` / `Set-Content` / `python -c`——JSON 参数、shell 引号、目标语言语法三层叠加，反复以与用户任务无关的方式失败。新增 `write_text_file`：文件内容作为普通参数（UTF-8 无 BOM）、写完读回校验、原子写（临时文件 + rename，失败不毁掉可用的旧脚本），并受与 list/delete 相同的白名单约束，另加应用自身数据库与配置的黑名单。工作区位于 profile 之外的独立根目录。
+
+**进度汇报恢复推送（P0）**：IM 心跳读 `agent.state.isStreaming`，而 durable 内核从不设置该标志——每个 tick 静默早退，20 分钟的回合零进度（`longTaskProgressMin=10` 明明生效）。该修复 2026-11-03 就写好了但从未合入 main。现在改为问内核。
+
+**规划加了时长门控、可读性提升**：只有预计 ≥30 分钟的任务才把规划推到聊天（一分钟就完的任务不需要被推一份规划），且推的是简短人话大纲——目标、流程、预计耗时——而不是机械编号清单。完整步骤仍作为上下文交给执行回合。
+
+**恢复：已排队（placed）的消息会被重新驱动**：排在「被重启杀掉的那次运行」之后的 submission 原来只能干等到超时，并对一条从未执行的消息报「执行已暂停」。现在用 durable `continue` 重新驱动。
+
+**MCP：那条守护测试根本不可能失败**：用来钉住「MCP 工具对 durable 内核可见」的测试读 `harness.registry`——该句柄不存在，断言从未执行，修复在永远绿的勾选下发布。已修复，并补了真实 stdio 端到端链路（启动期连接、迟到连接、RBAC 实际执行）。
+
+**更新 watchdog：参数被剥离时身份不丢**：无 `--profile` 的主进程被记为 default profile，watchdog 于是裸启动它——一个没有身份的实例，且后续每次快照都继承这个空条目。现在从子进程的 `--user-data-dir` 反推身份（要求 ≥2 个一致子进程，防止孤儿子进程撞 PID 导致的错配）。
+
 ## v0.2.189 — task planning budget fix, progress push readability, turn-settle process inventory
 
 ### English
