@@ -603,21 +603,24 @@ export class IMAdapterManager {
 							try {
 								const plan = await this.engine.planTaskBrief(agent, msg.text, msg.conversationId);
 									if (plan) {
-										planText = plan;
+										// The turn gets the FULL plan; the chat gets `chatText`,
+										// which the planner leaves undefined for short tasks (user
+										// ruling 2026-11-04: no plan for work that finishes fast).
+										planText = plan.turnContext;
 										const occurrenceId = msg.messageId
 											? chatHeartbeatOccurrenceId(msg.channel ?? "im", msg.messageId, Date.now(), 60_000)
 											: undefined;
 										// Push it. A failed push must NOT block execution: the plan
 										// still goes to the turn — the chat just didn't see it.
-										if (ctx?.onProgress) {
-											await ctx.onProgress(plan, { occurrenceId: occurrenceId || undefined, kind: "task-plan" })
+										if (plan.chatText && ctx?.onProgress) {
+											await ctx.onProgress(plan.chatText, { occurrenceId: occurrenceId || undefined, kind: "task-plan" })
 												.catch((err) => console.warn("[im] task plan push failed:", err instanceof Error ? err.message : err));
 										}
 										// Router/Worker dispatch (docs/design/router-worker.md P1). Conservative
 										// and OFF by default: when it fires, the message does NOT run in this chat
 										// turn — it becomes a work item and this turn returns the ACK instead.
 										// Every failure path falls through to inline execution (no black holes).
-										const dispatched = await this.tryDispatchToWorker(msg, plan);
+										const dispatched = await this.tryDispatchToWorker(msg, plan.turnContext);
 										if (dispatched) return dispatched;
 									}
 							} catch (err) {

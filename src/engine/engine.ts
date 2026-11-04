@@ -19,7 +19,7 @@ import { sidePassMaxTokens } from "./side-pass-budget.js";
 import { runningBackgroundProcesses } from "./tools/shell.js";
 import type { Skill } from "./skills/types.js";
 import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "./pi-compaction.js";
-import { formatPlanMessage, looksLikeTask, parsePlan, PLAN_PROMPT_HEADER } from "./task-planner.js";
+import { formatPlanForTurn, formatPlanMessage, looksLikeTask, parsePlan, PLAN_PROMPT_HEADER, shouldPushPlanToChat } from "./task-planner.js";
 import { createModels, normalizeContext, ModelsError } from "@earendil-works/pi-ai";
 import { SIDE_PASS_DEFAULT_LEVEL, applyThinkingDeclaration } from "../shared/thinking.js";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
@@ -2961,7 +2961,17 @@ export class EmployeeEngine implements EmployeeRuntime {
 		return runningBackgroundProcesses(this.config, conversationId);
 	}
 
-	async planTaskBrief(agent: Agent, message: string, conversationId?: string): Promise<string | null> {
+	/**
+	 * Plan-ahead side pass.
+	 *
+	 * Two consumers, deliberately separated (user ruling 2026-11-04):
+	 *   - the executing turn gets the FULL numbered plan as context;
+	 *   - the chat gets a SHORT human line, and ONLY when the task is estimated
+	 *     to run ≥ PLAN_CHAT_THRESHOLD_MIN — a task that wraps up in a minute
+	 *     does not need a plan pushed at it. Planning itself still runs for short
+	 *     tasks (the turn benefits); only the push is gated.
+	 */
+	async planTaskBrief(agent: Agent, message: string, conversationId?: string): Promise<{ turnContext: string; chatText?: string } | null> {
 		if (!looksLikeTask(message)) return null;
 		try {
 			const model = agent.state.model;
@@ -2998,7 +3008,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 				if (conversationId) this.endSideLlmCall(conversationId);
 			}
 			const plan = parsePlan(raw);
-			return plan ? formatPlanMessage(plan) : null;
+			if (!plan) return null;
+			const push = shouldPushPlanToChat(plan);
+			console.log(`[engine] task plan ready: eta=${plan.estimatedMinutes}min push=${push}`);
+			return {
+				turnContext: formatPlanForTurn(plan),
+				chatText: push ? formatPlanMessage(plan) : undefined,
+			};
 		} catch (err) {
 			console.warn("[engine] task planning failed:", err instanceof Error ? err.message : err);
 			return null;
