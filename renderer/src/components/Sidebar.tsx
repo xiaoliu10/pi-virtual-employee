@@ -1,5 +1,11 @@
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ConversationRow, UpdateState } from "../lib/types";
+import {
+	clampSidebarWidth,
+	SIDEBAR_DEFAULT_WIDTH,
+	SIDEBAR_WIDTH_KEY,
+	widthFromDrag,
+} from "../lib/sidebar-width";
 
 interface SidebarProps {
 	view: "chat" | "settings";
@@ -37,6 +43,53 @@ export function Sidebar(props: SidebarProps) {
 	const settingsActive = view === "settings";
 	const [search, setSearch] = useState("");
 	const [searchOpen, setSearchOpen] = useState(false);
+
+	// Drag-to-resize, remembered across restarts. A corrupted stored value falls
+	// back to the default (clampSidebarWidth never throws), so a bad entry can
+	// never wedge the layout.
+	const [width, setWidth] = useState<number>(() => {
+		try {
+			const raw = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+			return raw === null ? SIDEBAR_DEFAULT_WIDTH : clampSidebarWidth(Number(raw));
+		} catch {
+			return SIDEBAR_DEFAULT_WIDTH;
+		}
+	});
+	const [dragging, setDragging] = useState(false);
+	const dragRef = useRef<{ startX: number; startWidth: number } | null>(null);
+
+	const persistWidth = useCallback((next: number) => {
+		setWidth(next);
+		try {
+			localStorage.setItem(SIDEBAR_WIDTH_KEY, String(next));
+		} catch {
+			/* storage disabled: the width still applies for this run */
+		}
+	}, []);
+
+	// Pointer handlers live on window so a fast drag that leaves the 3px strip
+	// keeps tracking (otherwise resizing stops the moment you overshoot).
+	useEffect(() => {
+		if (!dragging) return;
+		const onMove = (e: PointerEvent) => {
+			const drag = dragRef.current;
+			if (!drag) return;
+			// Moving the divider LEFT widens the sidebar.
+			persistWidth(widthFromDrag(drag.startWidth, drag.startX - e.clientX));
+		};
+		const onUp = () => {
+			dragRef.current = null;
+			setDragging(false);
+		};
+		window.addEventListener("pointermove", onMove);
+		window.addEventListener("pointerup", onUp);
+		window.addEventListener("pointercancel", onUp);
+		return () => {
+			window.removeEventListener("pointermove", onMove);
+			window.removeEventListener("pointerup", onUp);
+			window.removeEventListener("pointercancel", onUp);
+		};
+	}, [dragging, persistWidth]);
 	// Badge only when there's actionable news; everything else (idle/none/
 	// checking…) stays quiet to avoid nagging on every 6h recheck.
 	const updateVersion = update.state?.phase === "available" || update.state?.phase === "downloading"
@@ -50,7 +103,10 @@ export function Sidebar(props: SidebarProps) {
 		: conversations;
 
 	return (
-		<aside className="titlebar-drag flex w-[366px] shrink-0 flex-col bg-[#f6f6f7]">
+		<aside
+			className="titlebar-drag relative flex shrink-0 flex-col bg-[#f6f6f7]"
+			style={{ width }}
+		>
 			{/* Brand — pi-desktop style: serif π mark + name stack */}
 			<div className="flex items-center gap-3 px-5 pb-2 pt-7">
 				<div className="select-none font-serif text-[30px] leading-none text-[#1d1d1f]">π</div>
@@ -174,6 +230,29 @@ export function Sidebar(props: SidebarProps) {
 					{update.state?.currentVersion && <span className="shrink-0">v{update.state.currentVersion}</span>}
 				</div>
 			</div>
+			{/*
+			 * Drag handle. Sits on the sidebar's right edge with a negative right
+			 * offset so it straddles the border (a 3px strip is hard to hit), and
+			 * widens its grab zone only while hovered/dragging so it never steals
+			 * clicks from the chat column.
+			 * Double-click restores the default width (user ruling 2026-11-04).
+			 */}
+			<div
+				role="separator"
+				aria-orientation="vertical"
+				aria-valuenow={width}
+				aria-label="拖动调整侧栏宽度，双击恢复默认"
+				onPointerDown={(e) => {
+					e.preventDefault();
+					dragRef.current = { startX: e.clientX, startWidth: width };
+					setDragging(true);
+				}}
+				onDoubleClick={() => persistWidth(SIDEBAR_DEFAULT_WIDTH)}
+				className={`absolute right-0 top-0 z-20 h-full w-[3px] -translate-x-0 cursor-col-resize transition-colors ${
+					dragging ? "bg-accent/60" : "bg-transparent hover:bg-black/10"
+				}`}
+				style={{ right: -1 }}
+			/>
 		</aside>
 	);
 }
