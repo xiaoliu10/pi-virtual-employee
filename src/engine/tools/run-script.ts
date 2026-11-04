@@ -60,7 +60,7 @@ export function createRunScriptTool(deps: RunScriptDeps): AgentTool {
 		name: "run_script",
 		label: "执行脚本（参数走文件）",
 		description:
-			"执行一个脚本文件，**参数通过 JSON 文件传递，不走命令行**。凡是要给脚本传参数，优先用这个而不是 run_command——" +
+			"执行一个脚本文件，**参数通过 JSON 文件传递，不走命令行**。脚本不存在时先用 write_text_file 创建（内容原样落盘，无需转义）。凡是要给脚本传参数，优先用这个而不是 run_command——" +
 			"Windows 的 cmd 会重新切分命令行、中文参数会乱码、引号要转两层，参数写在命令行里极易出错且难以排查。" +
 			"本工具把参数写成 JSON 文件，命令行只剩「运行时 + 脚本路径 + --params-file <绝对路径>」，不含任何用户数据。" +
 			"支持的脚本类型：.py .ps1 .js/.mjs/.cjs .bat/.cmd .sh（按扩展名选运行时）。" +

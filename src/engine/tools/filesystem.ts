@@ -10,7 +10,15 @@
  *    the gate — it never deletes without confirmed, and never touches directories
  *    or paths outside the whitelist.
  *
- * No write/modify tools exist: this capability is listing + authorized delete only.
+ * No arbitrary file modification tools exist beyond `write_text_file`: this
+ * capability is listing + verbatim text write + authorized delete only.
+ *
+ *  - write_text_file: create or update a TEXT file (typically a script) with
+ *    the content passed as a plain tool argument — no shell quoting, no
+ *    escaping, UTF-8 without BOM, read-back verified. This is the ONLY
+ *    supported way to author scripts on Windows; inline shell writes
+ *    (`echo >`, `Set-Content`, `python -c`) stack three escaping layers and
+ *    were a recurring field failure.
  */
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { arr, bool, obj, opt, str } from "@earendil-works/pi-schema";
@@ -67,6 +75,46 @@ export function createFilesystemTools(filesystem: FileSystemService): AgentTool[
 		},
 	};
 
+	const write: AgentTool = {
+		name: "write_text_file",
+		label: "文件系统：写文本文件（脚本落盘）",
+		description:
+			"把文本内容原样写入文件（UTF-8 无 BOM），**创建/修改脚本一律用这个工具**，不要用 run_command 内联 echo / Set-Content / python -c 写文件（那些方式要同时处理 shell 引号与脚本语言的双重转义，在 Windows 上反复失败）。" +
+			"内容作为普通参数传递，不需要任何转义；写完会自动读回校验，只有磁盘内容与请求完全一致才报成功。" +
+			"默认允许覆盖已存在的同名文件（脚本迭代场景）；设 overwrite=false 可防止误覆盖。" +
+			"路径限制在允许目录内（默认含本实例的 scripts 工作区与 inbound 目录，外加 filesystem.allowedDirs 白名单）。" +
+			"写完脚本后用 run_script 执行（参数走 JSON 文件），整条链路零命令行转义。",
+		parameters: obj({
+			path: str({ description: "目标文件绝对路径，如 C:\\Users\\me\\work\\spay.py（须在允许目录内）" }),
+			content: str({ description: "要写入的完整文本内容（脚本源码等），原样落盘，无需转义" }),
+			overwrite: opt(bool({ description: "已存在同名文件时是否覆盖，默认 true；设为 false 可在文件已存在时报错而不是覆盖" })),
+		}, { open: true }),
+		async execute(_toolCallId, params) {
+			const { path: targetPath, content, overwrite } = params as { path: string; content: string; overwrite?: boolean };
+			if (!targetPath?.trim()) {
+				return { content: [{ type: "text", text: "path 不能为空，请给出目标文件的绝对路径。" }], details: { ok: false } };
+			}
+			if (typeof content !== "string") {
+				return { content: [{ type: "text", text: "content 必须是字符串（要写入的完整文本）。" }], details: { ok: false } };
+			}
+			try {
+				const result = await filesystem.writeTextFile(targetPath, content, overwrite !== false);
+				// When replacing, say WHAT was replaced (old size) — a silent
+				// overwrite of a large existing file is exactly the case a user
+				// needs to notice (independent review P1-3).
+				const replaced = result.overwritten
+					? `，覆盖了已存在的同名文件（原 ${result.replacedBytes ?? "?"} 字节 → 现 ${result.bytes} 字节）`
+					: "";
+				const text =
+					`已写入 ${result.path}（${result.bytes} 字节${replaced}），读回校验一致。` +
+					(result.firstLine ? `\n首行预览：${result.firstLine}` : "");
+				return { content: [{ type: "text", text }], details: { ok: true, ...result } };
+			} catch (err) {
+				return { content: [{ type: "text", text: `写入失败：${(err as Error).message}` }], details: { ok: false } };
+			}
+		},
+	};
+
 	const del: AgentTool = {
 		name: "delete_files",
 		label: "文件系统：删除文件",
@@ -105,5 +153,5 @@ export function createFilesystemTools(filesystem: FileSystemService): AgentTool[
 		},
 	};
 
-	return [list, del];
+	return [list, write, del];
 }
