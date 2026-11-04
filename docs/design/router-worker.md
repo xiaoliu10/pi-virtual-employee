@@ -95,7 +95,7 @@ work item 持久化于 sqlite，窗口重启 resume 已有（0.2.174 语义）�
 
 ### D6 与现有开关的关系
 
-新增 `general.chatDispatch`（默认 off 首发灰度 → 验证后默认 on）：
+`general.chatDispatch` 默认开启；旧配置缺少该字段时也视为开启，显式设置 `enabled: false` 则保留关闭。v0.2.190 首发时默认关闭，后续按用户要求改为默认开启：
 - off：完全现状（前台执行）。
 - on：分诊 + 转 Worker。
 进度心跳节奏沿用 taskProgressMin（任务级 30 分钟）——转后台后这个节奏是

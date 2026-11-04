@@ -1225,14 +1225,14 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 												/>
 											</Field>
 
-											<Field label="长任务转后台执行（灰度）" hint="开启后，群/单聊里判断为多步骤且耗时的任务（规划 ≥2 步 + 含部署/抓取/批量/导出等动作）会先回执「已转后台」再交给工作项后台执行，期间可继续聊别的；完成后结果回到本会话。简单问答、提问、单步命令永不受影响（短任务也可能留在前台——只有预计 ≥30 分钟的才会转后台）。默认关闭（保持原有前台执行行为）。依赖「任务规划」保持开启，关闭任务规划时本开关不生效。">
+											<Field label="长任务转后台执行" hint="开启后，群/单聊里判断为多步骤且耗时的任务（规划 ≥2 步 + 含部署/抓取/批量/导出等动作）会先回执「已转后台」再交给工作项后台执行，期间可继续聊别的；完成后结果回到本会话。仅管理员发起且满足分诊条件的任务会转后台；简单问答、提问和单步命令留在前台。默认开启（长任务不再占住会话；关闭后回到前台执行）。依赖「任务规划」保持开启，关闭任务规划时本开关不生效。">
 												<label className="flex items-center gap-2 text-sm">
 													<input
 														type="checkbox"
-														checked={draft.general.chatDispatch?.enabled === true}
+														checked={draft.general.chatDispatch?.enabled !== false}
 														onChange={(e) => setGeneral({ chatDispatch: { enabled: e.target.checked } })}
 													/>
-													{draft.general.chatDispatch?.enabled === true ? "已开启" : "已关闭（默认）"}
+													{draft.general.chatDispatch?.enabled !== false ? "已开启（默认）" : "已关闭"}
 												</label>
 											</Field>
 

@@ -979,6 +979,11 @@ ${tailForProgress(decision.text)}`;
 	 */
 	const workService = new WorkService({
 		store: workItemStore,
+		// Five concurrent windows (user ruling 2026-11-04: "5个吧 没关系的
+		// 机器可以再加资源"). Chat tasks now route here, so a single window would
+		// serialize the whole profile — the scheduler would be slower than the
+		// per-conversation queue it replaced.
+		maxConcurrent: 5,
 		// One authority for "is this sender an admin/owner": isAdmin() already
 		// treats owner as a strict superset of admin. The previous inline copy
 		// compared === "admin", so a task CREATED BY AN OWNER passed creation

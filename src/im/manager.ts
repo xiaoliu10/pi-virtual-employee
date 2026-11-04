@@ -220,8 +220,11 @@ export class IMAdapterManager {
 	private async tryDispatchToWorker(msg: InboundMessage, plan: string): Promise<string | undefined> {
 		try {
 			const cfg = this.config.all();
-			const enabled = cfg.general.chatDispatch?.enabled === true;
-			if (!enabled) return undefined; // gray release: default off
+			// DEFAULT ON: absent means enabled (user ruling 2026-11-04). Only an
+			// explicit `enabled: false` restores the old inline behaviour — the
+			// same "absent = on" convention as taskPlanning.
+			const enabled = cfg.general.chatDispatch?.enabled !== false;
+			if (!enabled) return undefined;
 			const decision = triageMessage({ text: msg.text, plan, looksLikeTask: true }, true);
 			if (!decision.dispatch) {
 				console.log(`[im] dispatch triage: inline (${decision.reason}, steps=${decision.steps})`);
@@ -240,7 +243,12 @@ export class IMAdapterManager {
 			// (review P1-2).
 			if (!isDeclaredAdmin(this.config, msg.actor?.senderId)) {
 				console.log(`[im] dispatch triage: inline (non-admin ${msg.actor?.senderId ?? "?"} cannot own a work item)`);
-				return `⚠️ 后台任务仅支持管理员发起。该任务将继续在会话内执行（耗时较长，期间本会话的其他消息需要排队）。如需转后台，请联系管理员重新发送。`;
+				// MUST return undefined, not the notice: the caller treats a nonempty
+				// result as "dispatched" and returns before engine.send — the message
+				// would be acknowledged in text and then never executed (review P1-1,
+				// field 2026-11-04). The notice is a courtesy push; execution continues
+				// inline either way.
+				return undefined;
 			}
 			const title = (msg.text.trim().split(/\r?\n/, 1)[0] ?? "").slice(0, 60) || "聊天转后台任务";
 			const item = store.create({
@@ -647,7 +655,7 @@ export class IMAdapterManager {
 												.catch((err) => console.warn("[im] task plan push failed:", err instanceof Error ? err.message : err));
 										}
 										// Router/Worker dispatch (docs/design/router-worker.md P1). Conservative
-										// and OFF by default: when it fires, the message does NOT run in this chat
+										// and ON by default: when it fires, the message does NOT run in this chat
 										// turn — it becomes a work item and this turn returns the ACK instead.
 										// Every failure path falls through to inline execution (no black holes).
 										const dispatched = await this.tryDispatchToWorker(msg, plan.turnContext);

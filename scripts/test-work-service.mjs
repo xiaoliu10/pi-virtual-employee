@@ -55,14 +55,15 @@ function fixture(t, overrides = {}) {
 	h.create = (status = "queued", extra = {}) => h.store.create({ title: "月末对账", goal: "完成月末核对", status, createdBy: "admin", originConversation: "dt:source", ...extra });
 	h.gate = () => { const gate = deferred(); h.gates.push(gate); return gate; };
 	t.after(async () => {
-		// stop() FIRST, then resolve gates: a resolved gate can let a still-running
-		// window finish and (since the timeout-defer ruling) schedule a follow-up
-		// whose tick would re-arm work AFTER cleanup — leaving the process waiting
-		// on a handle nobody clears. Settling the service before releasing the
-		// gates keeps teardown deterministic.
+		// ORDER: stop() (abort is now non-blocking) → resolve gates → whenIdle().
+		// Resolving AFTER stop() means a window cannot finish and schedule a
+		// follow-up whose tick re-arms work during teardown; awaiting whenIdle()
+		// LAST means a gate-blocked send cannot deadlock cleanup (with several
+		// concurrent windows, waiting on them before releasing their gates hangs
+		// forever — the concurrency suite hit exactly that).
 		await h.service.stop();
-		await h.service.whenIdle();
 		for (const gate of h.gates) gate.resolve({ reply: "[[TASK_DONE]]" });
+		await h.service.whenIdle();
 		await flush();
 		db.close();
 	});
@@ -193,8 +194,10 @@ test("restart recovery never repeats working effects; queued and due survive and
 	assert.equal(h.store.get(future.id).status, "scheduled");
 });
 
+// Runs at maxConcurrent:1 — the SERIAL-LOCK contract (a busy board queues new
+// work and drains it in order). Concurrency itself is covered separately below.
 test("busy confirmations and resumes stay queued and eventually execute FIFO", async t => {
-	const h = fixture(t, { send: h => h.sends.length === 1 ? gate.promise : { reply: "[[TASK_DONE]]" } });
+	const h = fixture(t, { options: { maxConcurrent: 1 }, send: h => h.sends.length === 1 ? gate.promise : { reply: "[[TASK_DONE]]" }});
 	const gate = h.gate(); const first = h.create(); h.service.start(); await flush();
 	const second = h.create("proposed"); const third = h.create("waiting_human");
 	h.store.confirm(second.id, "admin");
@@ -209,7 +212,7 @@ test("busy confirmations and resumes stay queued and eventually execute FIFO", a
 });
 
 test("cancel aborts immediately, holds single-window lock until send settles, and late DONE cannot overwrite", async t => {
-	const h = fixture(t, { send: h => h.sends.length === 1 ? gate.promise : { reply: "[[TASK_DONE]]" } });
+	const h = fixture(t, { options: { maxConcurrent: 1 }, send: h => h.sends.length === 1 ? gate.promise : { reply: "[[TASK_DONE]]" }});
 	const gate = h.gate(); const first = h.create(); const second = h.create();
 	h.service.start(); await flush(); h.store.cancel(first.id); await flush();
 	assert.deepEqual(h.aborted, [first.id]);
@@ -224,7 +227,7 @@ test("cancel aborts immediately, holds single-window lock until send settles, an
 });
 
 test("admin pause mid-window aborts the send; a late reply cannot overwrite the pause", async t => {
-	const h = fixture(t, { send: h => h.sends.length === 1 ? gate.promise : { reply: "[[TASK_DONE]]" } });
+	const h = fixture(t, { options: { maxConcurrent: 1 }, send: h => h.sends.length === 1 ? gate.promise : { reply: "[[TASK_DONE]]" }});
 	const gate = h.gate(); const first = h.create(); const second = h.create();
 	h.service.start(); await flush();
 	assert.equal(h.store.get(first.id).status, "working");
@@ -292,7 +295,7 @@ test("later turns, resumed, progress-carrying and scheduled wakes skip the plan 
 test("deadline actually aborts a hung send, never races it with a new send", async t => {
 	// Explicit 30-minute budget: this test drives the DEADLINE timer, and the
 	// default window budget is a separate concern (pinned by its own test).
-	const h = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } }, send: h => h.sends.length === 1 ? gate.promise : { reply: "[[TASK_DONE]]" } });
+	const h = fixture(t, { options: { maxConcurrent: 1, budget: { maxTurns: 0, maxMinutes: 30 } }, send: h => h.sends.length === 1 ? gate.promise : { reply: "[[TASK_DONE]]" }});
 	const gate = h.gate(); const first = h.create("waiting_human"); h.store.resume(first.id, "已审批，请核查");
 	h.service.start(); await flush(); const second = h.create();
 	await h.clock.advance(30 * 60_000);
@@ -347,7 +350,7 @@ test("revocation after a turn forbids the next send and persists human block", a
 });
 
 test("shutdown clears due timers and aborts without dispatching queued work", async t => {
-	const h = fixture(t, { send: () => gate.promise });
+	const h = fixture(t, { options: { maxConcurrent: 1 }, send: () => gate.promise});
 	const gate = h.gate(); const item = h.create(); const queued = h.create();
 	h.service.start(); await flush();
 	const stopping = h.service.stop(); await flush();
@@ -413,7 +416,7 @@ test("no dispatch before start; stop clears the sole future due timer", async t 
 });
 
 test("cleanup also retains the window lock until release settles", async t => {
-	const h = fixture(t, { release: h => h.released.length === 1 ? gate.promise : undefined });
+	const h = fixture(t, { options: { maxConcurrent: 1 }, release: h => h.released.length === 1 ? gate.promise : undefined});
 	const gate = h.gate(); const first = h.create(); const second = h.create();
 	h.service.start(); await flush();
 	assert.equal(h.store.get(first.id).status, "done");
@@ -1067,4 +1070,92 @@ test("resident DONE defer does NOT accumulate the same-daily-slot streak (review
 	// Engine defer must HOLD the streak (not +1 → no false cron warning, not reset
 	// → prior model-declared rhythm survives; review P2).
 	assert.equal(h.store.get(item.id).fixed_streak, 2);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONCURRENCY (user ruling 2026-11-04): a profile routes task-shaped chat
+// messages to work items, so a single window would serialize the WHOLE profile
+// — worse than the per-conversation serialization it replaced. These pin the
+// new contract: N windows run at once, the board still never exceeds the cap,
+// and each window's abort/cancel touches only its own session.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("concurrency: several windows run AT ONCE (default 5), not one-by-one", async t => {
+	const h = fixture(t);
+	h.create(); h.create(); h.create();
+	h.service.start(); await flush();
+	assert.equal(h.sends.length, 3, "all three start without waiting for each other");
+	assert.deepEqual(h.store.listDue(Date.now()), [], "none left queued");
+});
+
+test("concurrency: the board never exceeds maxConcurrent, and the rest wait durably", async t => {
+	// Every send hangs on the same gate, so no window can finish and free a slot:
+	// this is what makes the cap observable. (With instant-completing replies the
+	// next tick legitimately admits the queued items as slots free up — that is
+	// covered by the "a slot freed by one window" test below.)
+	const h = fixture(t, { options: { maxConcurrent: 2 }, send: () => gate.promise });
+	const gate = h.gate();
+	for (let i = 0; i < 5; i++) h.create();
+	h.service.start(); await flush();
+	assert.equal(h.sends.length, 2, "capped at two windows");
+	assert.equal(h.store.listDue(Date.now()).length, 3, "the remaining three stay queued, not dropped");
+});
+
+test("concurrency: cancel aborts ONLY its own window, the others keep running", async t => {
+	const h = fixture(t, { send: (hx) => hx.sends.length === 1 ? gate.promise : { reply: "[[TASK_DONE]]" } });
+	const gate = h.gate();
+	const first = h.create(); h.create(); h.create();
+	h.service.start(); await flush();
+	assert.equal(h.sends.length, 3);
+	h.store.cancel(first.id); await flush();
+	assert.deepEqual(h.aborted, [first.id], "exactly one session aborted");
+	gate.resolve({ reply: "[[TASK_DONE]]" }); await flush();
+	assert.equal(h.store.get(first.id).status, "cancelled");
+});
+
+test("concurrency: pause aborts only the paused window", async t => {
+	const h = fixture(t, { send: () => gate.promise });
+	// Fixture default is maxConcurrent=5; two gated windows run together.
+	const gate = h.gate();
+	const a = h.create(); const b = h.create();
+	h.service.start(); await flush();
+	assert.equal(h.sends.length, 2);
+	h.store.pause(a.id, "先核对口径"); await flush();
+	assert.deepEqual(h.aborted, [a.id], "the paused window only");
+	assert.equal(h.store.get(b.id).status, "working", "the other window is untouched");
+});
+
+test("concurrency: a slot freed by one window immediately admits a queued one", async t => {
+	// First TWO windows gate (they fill the cap), the third only starts once a
+	// slot is released. Gating "sends.length === 1" would let the second window
+	// complete instantly and free a slot before the third is ever considered.
+	const h = fixture(t, { options: { maxConcurrent: 2 }, send: (hx) => hx.sends.length <= 2 ? gate.promise : { reply: "[[TASK_DONE]]" } });
+	const gate = h.gate();
+	for (let i = 0; i < 3; i++) h.create();
+	h.service.start(); await flush();
+	assert.equal(h.sends.length, 2);
+	gate.resolve({ reply: "[[TASK_DONE]]" }); await flush();
+	assert.equal(h.sends.length, 3, "the third starts as soon as a slot frees");
+});
+
+test("concurrency: fireItem reports queued (not lost) when the board is full", async t => {
+	const h = fixture(t, { options: { maxConcurrent: 1 }, send: () => gate.promise });
+	const gate = h.gate();
+	h.create(); h.service.start(); await flush();
+	const extra = h.create();
+	assert.equal(h.service.fireItem(extra.id), false, "no free slot → false");
+	assert.equal(h.store.get(extra.id).status, "queued", "but durably queued, not dropped");
+	gate.resolve({ reply: "[[TASK_DONE]]" }); await flush();
+	assert.equal(h.store.get(extra.id).status, "done", "and it runs once the slot frees");
+});
+
+test("concurrency: stop() aborts EVERY in-flight window and leaves nothing running", async t => {
+	const h = fixture(t, { send: () => gate.promise });
+	const gate = h.gate();
+	const a = h.create(); const b = h.create(); const c = h.create();
+	h.service.start(); await flush();
+	const stopping = h.service.stop(); await flush();
+	assert.deepEqual([...h.aborted].sort(), [a.id, b.id, c.id].sort(), "all three aborted");
+	gate.resolve({ reply: "[[TASK_DONE]]" }); await stopping; await flush();
+	assert.equal(h.store.get(c.id).status, "waiting_human", "each window persists its own stop");
 });
