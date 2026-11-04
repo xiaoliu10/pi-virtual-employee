@@ -99,8 +99,14 @@ export function createFilesystemTools(filesystem: FileSystemService): AgentTool[
 			}
 			try {
 				const result = await filesystem.writeTextFile(targetPath, content, overwrite !== false);
+				// When replacing, say WHAT was replaced (old size) — a silent
+				// overwrite of a large existing file is exactly the case a user
+				// needs to notice (independent review P1-3).
+				const replaced = result.overwritten
+					? `，覆盖了已存在的同名文件（原 ${result.replacedBytes ?? "?"} 字节 → 现 ${result.bytes} 字节）`
+					: "";
 				const text =
-					`已写入 ${result.path}（${result.bytes} 字节${result.overwritten ? "，覆盖了已存在的同名文件" : ""}），读回校验一致。` +
+					`已写入 ${result.path}（${result.bytes} 字节${replaced}），读回校验一致。` +
 					(result.firstLine ? `\n首行预览：${result.firstLine}` : "");
 				return { content: [{ type: "text", text }], details: { ok: true, ...result } };
 			} catch (err) {

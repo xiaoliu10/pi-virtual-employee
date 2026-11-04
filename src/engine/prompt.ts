@@ -75,8 +75,15 @@ export function buildSystemPrompt(parts: PromptParts): string {
 		sections.push(`## 管理者追加指令\n以下补充要求同样必须遵守：\n\n${parts.extra.trim()}`);
 	}
 	if (parts.isScheduledRun) {
+		// Only advertise write_text_file when the tool is actually registered
+		// (filesystem.enabled gates it in definition.ts). Unconditionally telling
+		// the model to call a missing tool burns a turn on exactly the failure
+		// mode this feature exists to remove (independent review P1-1).
+		const scriptAdvice = parts.filesystemEnabled
+			? "\n脚本落盘用 write_text_file（源码作为参数原样传入，零转义；绝不用 echo/Set-Content/python -c 内联写文件），需要传参数时用 run_script（参数走 JSON 文件）。"
+			: "";
 		sections.push(
-			"## 定时任务运行（内置，勿删）\n本次对话由定时任务自动触发、无人值守，执行结果会自动推送回创建任务的会话。\n任务跟随创建人权限：系统记录创建人身份，到点以创建人当前的角色执行其可用工具；prompt 里要求执行的受控操作直接做即可（无人值守，无需也无法要求「确认」）。若工具被拒，如实说明是创建人角色不足，不要反复重试。\nrun_command 用法：脚本先落盘为文件，按文件路径执行（如 python scripts/gen_report.py），并通过 workingDir 参数传脚本所在目录的绝对路径；不要用解释器内联代码，日期等计算放进脚本内部完成。\n脚本落盘用 write_text_file（源码作为参数原样传入，零转义；绝不用 echo/Set-Content/python -c 内联写文件），需要传参数时用 run_script（参数走 JSON 文件）。",
+			"## 定时任务运行（内置，勿删）\n本次对话由定时任务自动触发、无人值守，执行结果会自动推送回创建任务的会话。\n任务跟随创建人权限：系统记录创建人身份，到点以创建人当前的角色执行其可用工具；prompt 里要求执行的受控操作直接做即可（无人值守，无需也无法要求「确认」）。若工具被拒，如实说明是创建人角色不足，不要反复重试。\nrun_command 用法：脚本先落盘为文件，按文件路径执行（如 python scripts/gen_report.py），并通过 workingDir 参数传脚本所在目录的绝对路径；不要用解释器内联代码，日期等计算放进脚本内部完成。" + scriptAdvice,
 		);
 	}
 	return sections.join("\n\n");

@@ -15,7 +15,7 @@
  *    enforced by the agent + system-prompt rule; the confirmed flag is the
  *    tool-level gate that makes a two-step flow mandatory.
  */
-import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, realpath, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ConfigStore } from "../db/config-store.js";
@@ -73,6 +73,65 @@ export class FileSystemService {
 		const resolved = path.resolve(this.expand(absPath));
 		const ok = this.allowedDirs().some((dir) => resolved === dir || resolved.startsWith(dir + path.sep));
 		if (!ok) throw new Error(`路径不在允许访问的目录内：${absPath}`);
+		// Deny-list for the app's own sensitive files. The allowed dirs are
+		// app-managed, but on Windows a junction/symlink inside one can point at
+		// the profile's database, config, skills or logs — a write there is
+		// self-escalation (RBAC lives in that DB). See assertAllowedReal below.
+		if (this.isSensitive(resolved)) throw new Error(`拒绕访问应用自身数据文件：${absPath}`);
+	}
+
+	/** Absolute paths the employee must never read-modify even inside a whitelist. */
+	private sensitiveDirs: string[] = [];
+
+	/** Register the app's own data dirs (profile root) as off-limits for writes. */
+	addSensitiveDir(dir: string | undefined): void {
+		if (!dir) return;
+		const abs = path.resolve(dir);
+		if (!this.sensitiveDirs.includes(abs)) this.sensitiveDirs.push(abs);
+	}
+
+	private isSensitive(resolved: string): boolean {
+		return this.sensitiveDirs.some((dir) => resolved === dir || resolved.startsWith(dir + path.sep));
+	}
+
+	/**
+	 * Resolve symlinks/junctions before the whitelist check. A literal prefix
+	 * compare is not enough on Windows: `scripts/link -> ..` yields a path that
+	 * LOOKS allowed while the write lands in the profile. Real-path checking is
+	 * defence in depth — the workspace also lives outside the profile.
+	 *
+	 * For a not-yet-existing target the deepest EXISTING ancestor is resolved
+	 * and the remaining segments are appended, so a link cannot be laundered
+	 * through a file name that does not exist yet.
+	 */
+	private async assertAllowedReal(absPath: string): Promise<void> {
+		this.assertAllowed(absPath);
+		let probe = path.resolve(this.expand(absPath));
+		const suffix: string[] = [];
+		for (let i = 0; i < 64; i++) {
+			let real: string;
+			try {
+				real = await realpath(probe);
+			} catch {
+				const parent = path.dirname(probe);
+				if (parent === probe) break; // reached the root without an existing ancestor
+				suffix.unshift(path.basename(probe));
+				probe = parent;
+				continue;
+			}
+			const final = suffix.length ? path.join(real, ...suffix) : real;
+			// Compare against the REAL path of every allowed dir too: the literal
+			// configured path may itself be a link (/var -> /private/var on macOS,
+			// 8.3 short names or junctions on Windows). Comparing a resolved target
+			// against an unresolved allowed dir rejects legitimate writes.
+			const allowedReal = await Promise.all(
+				this.allowedDirs().map((dir) => realpath(dir).catch(() => path.resolve(dir))),
+			);
+			const ok = allowedReal.some((dir) => final === dir || final.startsWith(dir + path.sep));
+			if (!ok) throw new Error(`路径不在允许访问的目录内（符号链接解析后）：${absPath}`);
+			if (this.isSensitive(final)) throw new Error(`拒绕访问应用自身数据文件：${absPath}`);
+			return;
+		}
 	}
 
 	/**
@@ -182,26 +241,56 @@ export class FileSystemService {
 		targetPath: string,
 		content: string,
 		overwrite: boolean,
-	): Promise<{ path: string; bytes: number; overwritten: boolean; firstLine: string }> {
+	): Promise<{ path: string; bytes: number; overwritten: boolean; firstLine: string; replacedBytes?: number }> {
+		// Reject unencodable content BEFORE touching the disk: a lone surrogate
+		// becomes U+FFFD on write, so the read-back would fail AFTER the previous
+		// good file was already destroyed (independent review P1-2).
+		if (/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(content)) {
+			throw new Error("内容含未配对的 UTF-16 代理项（无法无损编码为 UTF-8），未写入任何内容。请检查传入的字符串。");
+		}
 		const abs = path.resolve(this.expand(targetPath));
-		this.assertAllowed(abs);
-		const existed = await stat(abs).then((s) => s.isFile()).catch(() => false);
+		// Same-conversation writes go through the symlink-resolving check so a
+		// junction inside the workspace cannot redirect the write into the profile.
+		await this.assertAllowedReal(abs);
+		const prior = await stat(abs).then((s) => ({ isFile: s.isFile(), size: s.size })).catch(() => undefined);
+		const existed = prior?.isFile === true;
 		if (existed && !overwrite) {
 			throw new Error(`文件已存在且未允许覆盖：${abs}（如需更新脚本内容，设 overwrite=true）`);
 		}
 		await mkdir(path.dirname(abs), { recursive: true });
+		// Write to a sibling temp file and rename over the target only after the
+		// content verifies, so a failed write can never destroy a working script.
+		const tmp = `${abs}.tmp-${process.pid}-${Date.now()}`;
 		// No BOM: a BOM breaks `node script.mjs` shebang-less ESM detection on
 		// some runtimes and shows up as an invisible first-character diff.
-		await writeFile(abs, content, { encoding: "utf8" });
-		const back = await readFile(abs, "utf8");
-		if (back !== content) {
-			throw new Error(`写入校验失败：磁盘内容与请求不一致（请求 ${content.length} 字符，读回 ${back.length} 字符）——文件可能被截断或被其他进程修改，请重试`);
+		await writeFile(tmp, content, { encoding: "utf8" });
+		let back: string;
+		try {
+			back = await readFile(tmp, "utf8");
+		} catch (err) {
+			await unlink(tmp).catch(() => {});
+			throw err;
 		}
+		if (back !== content) {
+			await unlink(tmp).catch(() => {});
+			throw new Error(
+				`写入校验失败：内容无法无损写入（请求 ${content.length} 字符，读回 ${back.length} 字符）。` +
+					`原文件未被修改。请检查内容是否含无法编码的字符，不要盲目重试。`,
+			);
+		}
+		// rename replaces an existing target atomically on both POSIX and Windows
+		// (Node's rename maps to MoveFileEx with REPLACE_EXISTING).
+		const { rename } = await import("node:fs/promises");
+		await rename(tmp, abs).catch(async (err) => {
+			await unlink(tmp).catch(() => {});
+			throw err;
+		});
 		return {
 			path: abs,
 			bytes: Buffer.byteLength(content, "utf8"),
 			overwritten: existed,
 			firstLine: (content.split(/\r?\n/, 1)[0] ?? "").slice(0, 80),
+			...{ replacedBytes: existed ? prior?.size : undefined },
 		};
 	}
 }

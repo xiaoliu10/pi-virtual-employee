@@ -446,8 +446,19 @@ async function main(): Promise<void> {
 	filesystem.addAllowedDir(inboundDir);
 	// The per-profile script workspace is writable by default (write_text_file):
 	// authoring a script must not require the user to first edit a whitelist.
-	// Same app-managed-dir mechanism as inbound/ (field 2026-09-18).
-	filesystem.addAllowedDir(path.join(userData, "scripts"));
+	//
+	// It lives OUTSIDE the profile dir on purpose. Inside, `scripts/` would sit
+	// next to pi-employee.sqlite / config.json / skills / logs — and a single
+	// junction (`mklink /J scripts\x ..`) would let write_text_file overwrite the
+	// RBAC database and promote itself (independent review, reproduced). Keeping
+	// the workspace in a sibling directory plus the sensitive-dir deny-list
+	// below makes that chain require two independent failures instead of one.
+	const scriptWorkspace = path.join(app.getPath("appData"), "pi-virtual-employee", "workspaces", activeProfile, "scripts");
+	filesystem.addAllowedDir(scriptWorkspace);
+	// Defence in depth: even though the workspace no longer overlaps the profile,
+	// refuse writes into the app's own data so a stray junction can never reach
+	// the database, config, skills or logs.
+	filesystem.addSensitiveDir(app.getPath("userData"));
 
 	// Browser downloads: capture into a managed workspace so the employee can
 	// list/read/analyze downloaded files (Excel exports, etc.) without touching

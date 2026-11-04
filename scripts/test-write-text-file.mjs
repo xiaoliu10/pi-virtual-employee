@@ -151,13 +151,14 @@ test("read-back verification rejects a file that does not match the request", as
 	assert.equal(ok.bytes, 5);
 	assert.equal(readFileSync(target, "utf8"), "good\n");
 
-	// Mismatch path: a surrogate-half string cannot be encoded losslessly, so
-	// read-back returns a DIFFERENT string than requested → must throw.
+	// Mismatch path: an unpaired surrogate cannot be encoded losslessly. It is
+	// now refused BEFORE the write (review P1-2), which is strictly safer than
+	// detecting it afterwards — and either way it must throw, never "succeed".
 	const lone = "half\ud800\n";
 	await assert.rejects(
 		() => fs.writeTextFile(join(allowed, "lone.py"), lone, true),
-		/写入校验失败/,
-		"lossy content must be rejected by read-back, not silently accepted",
+		/未配对的 UTF-16 代理项|写入校验失败/,
+		"lossy content must be rejected, not silently accepted",
 	);
 });
 
@@ -170,4 +171,85 @@ test("the tool is wired into the filesystem tool set and gated", async () => {
 	);
 	// Every tool must carry a schema the harness can hand to the model.
 	for (const t of tools) assert.ok(t.parameters, `${t.name} has no parameters schema`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P0 (independent review): the write tool must not be able to reach the app's
+// own database/config through the workspace. The reviewer reproduced a full
+// self-escalation chain: a junction inside `scripts/` pointed at `..`, so a
+// write "inside the workspace" landed on pi-employee.sqlite and config.json —
+// and the read-back verification reported it as a success.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("P0: a JUNCTION inside the workspace cannot redirect a write into the profile", async () => {
+	// Layout mirrors the box: profile dir (DB/config) beside a writable workspace.
+	const profile = join(work, "profile");
+	const dbPath = join(profile, "pi-employee.sqlite");
+	mkdirSync(profile, { recursive: true });
+	writeFileSync(dbPath, "REAL-DB-CONTENT");
+	const ws = join(work, "ws");
+	mkdirSync(ws, { recursive: true });
+
+	const fs = service([ws]);
+	fs.addSensitiveDir(profile);
+
+	// Simulate the junction: a directory link inside the workspace pointing at
+	// the profile. On Windows this is `mklink /J`; symlink() stands in here (both
+	// resolve through realpath, which is what the guard now checks).
+	let linked = false;
+	try {
+		const { symlinkSync } = await import("node:fs");
+		symlinkSync(profile, join(ws, "link"), "junction");
+		linked = true;
+	} catch { /* no symlink privilege on this host — the literal-prefix case below still runs */ }
+
+	if (linked) {
+		await assert.rejects(
+			() => fs.writeTextFile(join(ws, "link", "pi-employee.sqlite"), "PWNED-DB", true),
+			/app's own|拒绕访问|不在允许访问的目录内|sensitive|自身数据/i,
+			"a junction must not launder the profile into the whitelist",
+		);
+		assert.equal(readFileSync(dbPath, "utf8"), "REAL-DB-CONTENT", "the database must be byte-identical");
+	}
+});
+
+test("P0: a sensitive dir is refused even when it IS inside an allowed dir", async () => {
+	// The deny-list must win over the allow-list — this is the defence that
+	// survives a mistake in the workspace location itself.
+	const outer = join(work, "outer");
+	const inner = join(outer, "profile");
+	mkdirSync(inner, { recursive: true });
+	const fs = service([outer]); // outer is allowed...
+	fs.addSensitiveDir(inner); // ...but the profile inside it is not
+	const target = join(inner, "config.json");
+	writeFileSync(target, '{"ok":true}');
+	await assert.rejects(() => fs.writeTextFile(target, '{"security":{"admin":["x"]}}', true), /自身数据/);
+	assert.equal(readFileSync(target, "utf8"), '{"ok":true}', "config must be untouched");
+});
+
+test("P1-2: unencodable content is refused BEFORE the previous file is destroyed", async () => {
+	const target = join(allowed, "keep-me.py");
+	const fs = service();
+	await fs.writeTextFile(target, "print('v1 working script')\n", true);
+	const before = readFileSync(target, "utf8");
+	await assert.rejects(
+		() => fs.writeTextFile(target, "half\ud800\n", true),
+		/未配对的 UTF-16 代理项/,
+		"the error must name the real cause (encoding), not suggest a retry",
+	);
+	assert.equal(readFileSync(target, "utf8"), before, "the working v1 script must survive a failed write");
+});
+
+test("P1-3: overwriting reports the previous byte size", async () => {
+	const target = join(allowed, "resize.py");
+	const fs = service();
+	await fs.writeTextFile(target, "x".repeat(500), true);
+	const second = await fs.writeTextFile(target, "y", true);
+	assert.equal(second.overwritten, true);
+	assert.equal(second.replacedBytes, 500, "the result must expose what was replaced");
+	const tools = createFilesystemTools(service());
+	const write = tools.find((t) => t.name === "write_text_file");
+	const res = await write.execute("call-3", { path: target, content: "z" });
+	const text = res.content.map((c) => c.text ?? "").join("");
+	assert.match(text, /原 1 字节/, `the report must mention the replaced size: ${text}`);
 });
