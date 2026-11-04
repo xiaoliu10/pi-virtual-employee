@@ -175,12 +175,25 @@ export class DurableRuntime {
 		// re-admitted got continued, the other was silently dropped).
 		const unfinished: ConversationId[] = [];
 		// `status` takes ONE value, so both non-terminal states are scanned.
+		const placedInputs = new Set<ConversationId>();
 		for (const status of ["queued", "placed"] as const) {
 			let subCursor: Cursor | undefined;
 			do {
 				const page = await runtime.host.storage.scanSubmissions({ status }, 200, subCursor, context);
 				for (const record of page.items) {
 					if (!unfinished.includes(record.conversationId)) unfinished.push(record.conversationId);
+					// A PLACED INPUT is never driven by anyone after recovery: resume()
+					// only wakes RUNS, and a submission parked in `placed` (queued
+					// behind a run that the restart killed) would sit there until
+					// finishRecovered times out — the user then gets "执行已暂停" for
+					// a message that was NEVER executed (field 2026-11-04, Nova:
+					// a 10:21 message hung placed for 40+ minutes while other chats
+					// worked fine). Redrive it with `continue`: pi-durable starts a
+					// run on the context as-is and places queued inbox items FIRST,
+					// so the parked message finally executes. Busy conversations are
+					// rejected (ConversationBusy) — fine: a live run already places
+					// inbox items at its next boundary, nothing is stuck there.
+					if (status === "placed" && record.type === "input") placedInputs.add(record.conversationId);
 				}
 				subCursor = page.next;
 			} while (subCursor);
@@ -196,6 +209,13 @@ export class DurableRuntime {
 		}
 		runtime.host.resume();
 		for (const { conv, conversationId } of recoveries) {
+			// Redrive parked inputs BEFORE waiting on them: without this the wait
+			// below can only ever time out for a placed input.
+			if (placedInputs.has(conv.id)) {
+				void conv.submit({ type: "continue" }, context).catch((err) => {
+					console.warn(`[durable] placed-input redrive rejected for ${conversationId}: ${err instanceof Error ? err.message : err}`);
+				});
+			}
 			runtime.track(conv, conversationId);
 			const work = runtime.finishRecovered(conv, conversationId).finally(() => runtime.untrack(conv, conversationId));
 			runtime.tasks.add(work);

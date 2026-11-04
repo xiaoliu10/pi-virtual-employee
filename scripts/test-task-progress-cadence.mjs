@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { build } from "esbuild";
@@ -40,19 +40,23 @@ await build({
 });
 const { ConfigStore, WorkService, WorkItemStore } = await import(pathToFileURL(bundle).href);
 
-function makeDb() {
+async function makeDb() {
 	const db = new DatabaseSync(":memory:");
 	db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
-	db.exec(`CREATE TABLE work_items (id TEXT PRIMARY KEY, title TEXT, goal TEXT, conditions TEXT, status TEXT, progress TEXT, lessons TEXT,
-		origin_conversation TEXT, origin_note TEXT, question TEXT, answer TEXT, next_check_at INTEGER, next_check_reason TEXT, fixed_streak INTEGER DEFAULT 0,
-		kicked_off INTEGER DEFAULT 0, fallback_streak INTEGER DEFAULT 0, last_remind_at INTEGER, remind_count INTEGER DEFAULT 0, cadence_ms INTEGER,
-		created_by TEXT, created_channel TEXT, resident INTEGER DEFAULT 0, timeout_streak INTEGER DEFAULT 0, max_minutes INTEGER,
-		created_at INTEGER, updated_at INTEGER);`);
+	// Single source of truth: take the schema from sqlite.ts so a column added
+	// there (e.g. priority, Router/Worker P2) can never silently diverge from
+	// this fixture — the same convention test-work-service.mjs follows.
+	// Base schema from sqlite.ts, then the same ALTER columns the real migrate
+	// path adds (answer/created_channel/priority/resident are post-hoc columns).
+	db.exec((await readFile(join(root, "src/db/sqlite.ts"), "utf8")).match(/CREATE TABLE IF NOT EXISTS work_items \([\s\S]*?\);/)[0]);
+	for (const col of ["answer TEXT", "created_channel TEXT", "priority INTEGER NOT NULL DEFAULT 100", "resident INTEGER NOT NULL DEFAULT 0"]) {
+		try { db.exec(`ALTER TABLE work_items ADD COLUMN ${col}`); } catch { /* already present */ }
+	}
 	return db;
 }
 
-test("chat cadence and task cadence are independent config keys", () => {
-	const db = makeDb();
+test("chat cadence and task cadence are independent config keys", async () => {
+	const db = await makeDb();
 	const config = new ConfigStore(db);
 	config.update({ general: { longTaskProgressMin: 10 } });
 	const cfg = config.all().general;
@@ -65,7 +69,7 @@ test("chat cadence and task cadence are independent config keys", () => {
 });
 
 test("a work window stops and drains its progress notifier before the completion push", async (t) => {
-	const db = makeDb();
+	const db = await makeDb();
 	const store = new WorkItemStore(db);
 	const item = store.create({ title: "长窗口任务", goal: "g", conditions: "c", created_by: "admin1", originConversation: "dt:admin1" });
 	store.confirm(item.id, "admin1");
@@ -100,7 +104,7 @@ test("a work window stops and drains its progress notifier before the completion
 });
 
 test("a window whose send throws still stops and drains the notifier", async (t) => {
-	const db = makeDb();
+	const db = await makeDb();
 	const store = new WorkItemStore(db);
 	const boom = store.create({ title: "会炸的窗口", goal: "g", conditions: "c", created_by: "admin1" });
 	store.confirm(boom.id, "admin1");

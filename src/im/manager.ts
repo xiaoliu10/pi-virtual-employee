@@ -16,14 +16,15 @@ import { DingtalkAdapter } from "./adapters/dingtalk.js";
 import type { IMAdapter, IMIO, InboundActor } from "./types.js";
 import { isCancelPhrase, looksLikeCommandAttempt, parseCommand, type ParsedCommand } from "./commands.js";
 import { diag } from "./diag.js";
-import { CAPABILITY_LABEL, checkPermission, describeAccess, isAdmin } from "../security/permissions.js";
+import { CAPABILITY_LABEL, checkPermission, describeAccess, isAdmin, isDeclaredAdmin } from "../security/permissions.js";
 import { maskId } from "../engine/tools/admin.js";
 import { isAuthorizationPhrase } from "../engine/authorization.js";
 import { startStallWatchdog } from "./watchdog.js";
 import { splitForPush } from "./chunks.js";
 import { gateOutboundText } from "./credential-egress.js";
+import { triageMessage } from "./triage.js";
 import { chatHeartbeatOccurrenceId, DeliveryLedger } from "./delivery-ledger.js";
-import type { AdapterCapabilities, AdapterHealth } from "./types.js";
+import type { AdapterCapabilities, AdapterHealth, InboundMessage } from "./types.js";
 
 /** Shared deps handed to adapter factories that need them (e.g. image hosting). */
 export interface AdapterDeps {
@@ -203,6 +204,85 @@ export class IMAdapterManager {
 	 * { ok:true, skipped:true } without sending, and a failed attempt stays
 	 * retryable under the same id. Without it, behaviour is unchanged.
 	 */
+	/**
+	 * Router → Worker dispatch (docs/design/router-worker.md P1).
+	 *
+	 * Returns the ACK text when the message was handed to a background work
+	 * item, or undefined to let the caller run it inline. The triage itself is
+	 * pure (src/im/triage.ts) and conservative: no plan / <2 numbered steps / a
+	 * question shape / no long-running verb / dispatch disabled → inline, which
+	 * is byte-for-byte the pre-Router behaviour.
+	 *
+	 * ANY failure while creating the work item returns undefined (inline), so a
+	 * broken dispatch can never swallow a message. The work item keeps the
+	 * origin conversation, so progress/results push back here (D3/D4).
+	 */
+	private async tryDispatchToWorker(msg: InboundMessage, plan: string): Promise<string | undefined> {
+		try {
+			const cfg = this.config.all();
+			const enabled = cfg.general.chatDispatch?.enabled === true;
+			if (!enabled) return undefined; // gray release: default off
+			const decision = triageMessage({ text: msg.text, plan, looksLikeTask: true }, true);
+			if (!decision.dispatch) {
+				console.log(`[im] dispatch triage: inline (${decision.reason}, steps=${decision.steps})`);
+				return undefined;
+			}
+			const store = this.engine.workItems;
+			const bridge = this.engine.workBridge;
+			if (!store || !bridge) {
+				console.log("[im] dispatch triage: inline (work items unavailable)");
+				return undefined;
+			}
+			// Work windows demand a declared-admin creator (WorkService.run gates
+			// on created_by; every other creation path goes through adminGate).
+			// Dispatching a non-admin would ACK and then immediately park as
+			// "管理员身份缺失" — dishonest twice over. Refuse with the real reason
+			// (review P1-2).
+			if (!isDeclaredAdmin(this.config, msg.actor?.senderId)) {
+				console.log(`[im] dispatch triage: inline (non-admin ${msg.actor?.senderId ?? "?"} cannot own a work item)`);
+				return `⚠️ 后台任务仅支持管理员发起。该任务将继续在会话内执行（耗时较长，期间本会话的其他消息需要排队）。如需转后台，请联系管理员重新发送。`;
+			}
+			const title = (msg.text.trim().split(/\r?\n/, 1)[0] ?? "").slice(0, 60) || "聊天转后台任务";
+			const item = store.create({
+				title,
+				// The plan IS the goal: the worker window reads it as the task spec,
+				// so what the user was promised is exactly what runs.
+				goal: `${plan}\n\n[用户原始指令]\n${msg.text}`,
+				originConversation: msg.conversationId,
+				originNote: "从聊天转派（Router）",
+				// MUST be "queued": fireItem/listDue/claim only accept queued (or a
+				// due scheduled). "working" is a terminal orphan — the real
+				// WorkService probe returned false for it while the user already
+				// held the "已转后台" ACK, and after a restart recoverWorking()
+				// would file it as a FALSE crash-recovery notice (review P0-1).
+				status: "queued",
+				createdBy: msg.actor?.senderId ?? null,
+				createdChannel: msg.actor?.channel ?? null,
+				// A user's task jumps the queue: mined/scheduled items default to
+				// 100, so a due mining window cannot starve the promised "已转后台".
+				priority: 0,
+			});
+			// Fire immediately so the work starts now rather than at the next tick.
+			const fired = bridge.fireItem(item.id);
+			console.log(`[im] dispatch triage: WORKER item=${item.id} steps=${decision.steps} fired=${fired} conv=${msg.conversationId}`);
+			const shortId = item.id.slice(0, 8);
+			// ACK promises only what EXISTS today (review P1-1: /stop targets the
+			// chat session, not the work item; 「前台执行」 and 「<id> 进度」 have no
+			// inbound handlers yet — the design-doc wording was copied before the
+			// mechanisms landed). Progress notes push automatically; admins manage
+			// the item from the 任务 list. Restore the richer wording when the
+			// deterministic inbound router lands.
+			return [
+				`🚀 已转后台执行（编号 ${shortId}），进展与完成会自动推送回本会话。`,
+				`管理员可在控制台任务列表查看或取消该任务。`,
+			].join("\n");
+		} catch (err) {
+			// Never let dispatch break the turn: fall back to inline execution.
+			console.warn("[im] dispatch failed, running inline:", err instanceof Error ? err.message : err);
+			return undefined;
+		}
+	}
+
 	/**
 	 * Turn-settle background-process inventory. ASYNC BY DESIGN (user ruling
 	 * 2026-11-04): the settle path never waits on process bookkeeping, and the
@@ -489,7 +569,14 @@ export class IMAdapterManager {
 							progressInFlight = true;
 							void this.engine.progressBrief(agent, msg.conversationId)
 								.then((note) => {
-									if (!agent.state.isStreaming) return;
+									// Ask the KERNEL, not agent.state.isStreaming: under the
+									// durable kernel (default since v0.2.167) that flag is never
+									// set, so this gate dropped every heartbeat silently for
+									// IM chats — the same defect v0.2.173 fixed for scheduled
+									// tasks, work windows and the autonomous heartbeat, but this
+									// IM instance was missed (field report 2026-11-03: group chat
+									// task ran 6+ minutes with zero progress notes).
+									if (!this.engine.isConversationStreaming(msg.conversationId)) return;
 									// Bucket derived at PUSH time, from the same interval the timer
 									// above was sized with — never a second hardcoded cadence.
 									const occurrenceId = msg.messageId
@@ -546,15 +633,30 @@ export class IMAdapterManager {
 							try {
 								const plan = await this.engine.planTaskBrief(agent, msg.text, msg.conversationId);
 									if (plan) {
-										planText = plan;
+										// The turn gets the FULL plan; the chat gets `chatText`,
+										// which the planner leaves undefined for short tasks (user
+										// ruling 2026-11-04: no plan for work that finishes fast).
+										planText = plan.turnContext;
 										const occurrenceId = msg.messageId
 											? chatHeartbeatOccurrenceId(msg.channel ?? "im", msg.messageId, Date.now(), 60_000)
 											: undefined;
 										// Push it. A failed push must NOT block execution: the plan
 										// still goes to the turn — the chat just didn't see it.
-										if (ctx?.onProgress) {
-											await ctx.onProgress(plan, { occurrenceId: occurrenceId || undefined, kind: "task-plan" })
+										if (plan.chatText && ctx?.onProgress) {
+											await ctx.onProgress(plan.chatText, { occurrenceId: occurrenceId || undefined, kind: "task-plan" })
 												.catch((err) => console.warn("[im] task plan push failed:", err instanceof Error ? err.message : err));
+										}
+										// Router/Worker dispatch (docs/design/router-worker.md P1). Conservative
+										// and OFF by default: when it fires, the message does NOT run in this chat
+										// turn — it becomes a work item and this turn returns the ACK instead.
+										// Every failure path falls through to inline execution (no black holes).
+										const dispatched = await this.tryDispatchToWorker(msg, plan.turnContext);
+										if (dispatched) {
+											// The early return skips engine.send's onActivity — fire it
+											// so the renderer task list shows the new item immediately
+											// (review P2-3).
+											this.onActivity?.(msg.conversationId);
+											return dispatched;
 										}
 									}
 							} catch (err) {

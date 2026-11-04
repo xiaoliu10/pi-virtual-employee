@@ -307,6 +307,20 @@ export interface AppConfig {
 			enabled: boolean;
 		};
 		/**
+		 * Router/Worker dispatch (v0.2.190, docs/design/router-worker.md). When on,
+		 * a message the planner judged task-shaped (≥2 numbered steps + a
+		 * long-running verb) is acknowledged in ≤5s and handed to a background
+		 * work item instead of occupying the chat turn — so the conversation stays
+		 * responsive while long work runs. Triage is CONSERVATIVE and every failure
+		 * mode (no plan, LLM down, single step, question shape) stays inline.
+		 *
+		 * Default OFF for the gray release: off restores byte-for-byte the old
+		 * behaviour. Absent is treated as off.
+		 */
+		chatDispatch?: {
+			enabled: boolean;
+		};
+		/**
 		 * Unattended auto-update mode. "full" (default for fresh installs and
 		 * configs predating this tri-state): check → download → idle → restart &
 		 * install without a human. "download_only": check + download, but STOP at
