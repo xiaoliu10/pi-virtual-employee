@@ -15,6 +15,7 @@ import { DurableRuntime } from "./durable/runtime.js";
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import type { AgentEvent, AgentMessage, FinishTurn, StreamFn } from "@earendil-works/pi-agent-core";
 import { createSessionHost, type SessionHost } from "./session-host.js";
+import { sidePassMaxTokens } from "./side-pass-budget.js";
 import type { Skill } from "./skills/types.js";
 import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "./pi-compaction.js";
 import { formatPlanMessage, looksLikeTask, parsePlan, PLAN_PROMPT_HEADER } from "./task-planner.js";
@@ -2888,19 +2889,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				raw = await generateSummary(
 					context,
 					model,
-					// Thinking and the answer SHARE this output ceiling (qwen field
-					// 2026-11-02: default-thinking consumed the old 0.8×512=409 cap and
-					// every side pass died with "hit the token cap"). User ruling
-					// 2026-11-02: DON'T self-limit — follow the model's own max-output
-					// resolution (per-model override → gateway model-info → 32k relay
-					// default). pi-ai computes maxTokens = 0.8×reserve clamped to
-					// model.maxTokens, so reserving ceil(maxOut/0.8) lands exactly on
-					// maxOut; a ceiling only caps runaway generation, it must not
-					// silently shrink what the model is allowed to produce.
-					(() => {
-						const maxOut = model.maxTokens && model.maxTokens > 0 ? model.maxTokens : 32_768;
-						return Math.ceil(maxOut / 0.8);
-					})(),
+					sidePassMaxTokens(model),
 					undefined, // apiKey
 					signal,
 					"这是正在执行中的任务的对话记录节选：最新一条用户请求是当前回合的指令，它可能是对同一任务的补充要求（如“换下一张”“继续”），也可能是新任务。请结合执行记录判断真实任务目标，严格只针对这个正在进行的任务，用不超过120字的中文汇报进展，且必须严格按以下四段结构输出，四段缺一不可，用中文标签：「已完成：…」「剩余：…」「正在：…」「卡点：…」。记录里查不到依据的段落一律写「暂未确认」——严禁在记录没有依据时推断成「无」，严禁编造数字或进度；但**执行记录本身就是依据**：助手叙述、工具调用与工具返回结果里真实发生的事（如「登录态有效，改用 Playwright 访问 spay」「已导出到第 3 批」）必须如实归纳进对应字段，不许因为「没有现成的进度数字」就整段写暂未确认——工具正在做什么、卡在哪一步、用户还需要做什么，这些都是有效信息；卡点查不到依据时写「暂无」；只有当执行记录明确显示当前没有任何障碍时，卡点才可以写「无」。禁止输出「## Goal」「## Constraints & Preferences」「## Next Steps」等英文模板标题——那是会话压缩总结的模板，不是进展汇报，出现了就是错误输出；禁止照抄任务目标原文或执行条件来充当进展；节选中更早的其他请求都是早已完成的旧任务，绝对不要提及；把琐碎的执行步骤归纳为阶段性成果，禁止提及工具名、参数、重试等技术细节；只依据记录中真实发生的事，绝不编造未发生的进度。",
@@ -2974,7 +2963,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 				raw = await generateSummary(
 					[{ role: "user", content: message, timestamp: Date.now() }],
 					model,
-					512,
+					// Field regression 2026-11-04: this pass still hard-coded 512 —
+					// the exact magic number the 2026-11-02 ruling abolished for the
+					// progress brief — so qwen's default-thinking alone blew the cap
+					// and EVERY task plan was skipped ("hit the token cap"). Same
+					// budget resolution as every other side pass.
+					sidePassMaxTokens(model),
 					undefined,
 					signal,
 					PLAN_PROMPT_HEADER,

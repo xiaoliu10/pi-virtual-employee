@@ -182,18 +182,33 @@ test("wiring: main turn default stays off; every switch path syncs the level", (
 	assert.ok(syncs.length >= 3, `default loop, pin, unpin all sync (found ${syncs.length})`);
 });
 
-test("wiring: side pass reads the agent level; reserve follows the model max output", () => {
-	// User ruling 2026-11-02: don't self-limit the side pass. The reserve must
-	// follow the model's own max-output resolution (override → model-info → 32k
-	// default), expressed as ceil(maxOut/0.8) because pi-ai takes 0.8×reserve.
+test("wiring: side pass reads the agent level; budget delegated to sidePassMaxTokens", () => {
+	// User ruling 2026-11-02: don't self-limit the side pass. The budget lives in
+	// sidePassMaxTokens (override → model-info → 32k default, ceil(maxOut/0.8)
+	// because pi-ai takes 0.8×reserve); its VALUES are pinned by
+	// scripts/test-side-pass-budget.mjs. Here we pin the WIRING: every side pass
+	// must delegate — a hard-coded number here is how planTaskBrief regressed on
+	// 2026-11-04 (512 → thinking blew the cap → every plan silently skipped).
 	const i = engineSrc.indexOf("async progressBriefDetailed");
 	const body = engineSrc.slice(i, i + 9000);
 	assert.ok(!body.includes("findSupplier(model.provider)"), "no supplier lookup by registry provider id");
 	assert.match(body, /agent\.state\.thinkingLevel/);
-	assert.match(body, /model\.maxTokens && model\.maxTokens > 0 \? model\.maxTokens : 32_768/,
-		"reserve follows the model max output, defaulting to 32k");
-	assert.match(body, /Math\.ceil\(maxOut \/ 0\.8\)/,
-		"reserve compensates pi-ai's 0.8 factor so the cap lands on maxOut");
+	assert.match(body, /sidePassMaxTokens\(model\)/,
+		"progress brief budget delegated to sidePassMaxTokens");
 	assert.ok(!body.includes("4_096,"), "hard-coded 4096 reserve removed");
 	assert.ok(!body.includes("0.8×512 tokens"), "old 409 reserve gone");
+});
+
+test("wiring: task planning uses the same side-pass budget (2026-11-04 regression guard)", () => {
+	// planTaskBrief hard-coded 512 AFTER the 2026-11-02 ruling — the exact
+	// regression this guard exists to stop. Any new side pass must call
+	// sidePassMaxTokens, never a literal.
+	const i = engineSrc.indexOf("async planTaskBrief");
+	assert.ok(i > 0, "planTaskBrief present");
+	const body = engineSrc.slice(i, i + 4000);
+	assert.match(body, /sidePassMaxTokens\(model\)/,
+		"planTaskBrief budget delegated to sidePassMaxTokens");
+	const generateBlock = body.slice(body.indexOf("generateSummary("), body.indexOf("PLAN_PROMPT_HEADER"));
+	assert.ok(!/\b(\d{2,})\b,\n/.test(generateBlock.replace(/sidePassMaxTokens\(model\)/g, "")),
+		"no hard-coded token budget inside the planTaskBrief generateSummary call");
 });
