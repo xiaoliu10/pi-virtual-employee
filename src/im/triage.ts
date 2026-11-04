@@ -21,13 +21,16 @@
 /** Verbs that imply work measured in minutes, not seconds. */
 const LONG_RUNNING_VERBS: readonly string[] = [
 	"部署", "上线", "发布",
-	"抓取", "爬取", "爬", "采集", "批量", "遍历", "循环处理",
-	"监控", "盯", "持续观察", "轮询", "定时",
+	"抓取", "爬取", "采集", "批量", "遍历", "循环处理",
+	"监控", "持续观察", "持续盯", "轮询", "定时",
 	"录入", "导入", "导出", "生成报告", "生成日报", "生成报表", "对账", "核对全部",
 	"全量", "重跑", "回放", "迁移", "备份", "归档",
 	"跑完", "跑一遍", "跑测试", "编译", "构建", "打包",
 	"下载全部", "下载所有", "逐条", "逐个",
 ];
+// Review probe 2026-11-04: 「老板天天盯着我们」「周末去爬山」 + a 2-step plan
+// both mis-dispatched because the single characters 盯/爬 match casual chat.
+// Only multi-character forms stay.
 
 /** Verbs that are explicitly SHORT — presence forces the foreground even if a
  *  long verb also appears (「监控脚本在哪」is a question about a script). */
@@ -35,6 +38,11 @@ const QUESTION_MARKERS: readonly RegExp[] = [
 	/^(请问|问下|问一下|帮我查一下|查一下|查查)/,
 	/(在哪|是什么|什么意思|为什么|怎么回事|怎么样|吗|呢)[？?]?$/,
 	/^\s*(你好|在吗|hi|hello)/i,
+	// Leading interrogatives: 「为什么昨天的对账任务又失败了帮我重新对一遍」 has
+	// no ending marker — the ending-anchored rules above let it mis-dispatch
+	// (review probe 2026-11-04). A message that OPENS with a question word is a
+	// question even when it later contains task verbs.
+	/^(为什么|怎么|如何|啥|什么)[，,？?]/,
 ];
 
 export interface TriageInput {
@@ -64,7 +72,10 @@ export function countPlanSteps(plan: string | undefined): number {
 	if (!plan) return 0;
 	let max = 0;
 	for (const line of plan.split(/\r?\n/)) {
-		const m = /^\s*(\d{1,2})\s*[.)、．]\s*\S/.exec(line);
+		// Same separator set as parsePlan ([.、）)]), so the step count the
+		// triage sees matches the plan the parser accepted (review P2-2: the
+		// fullwidth ） was counted by parsePlan but not here → safe undercount).
+		const m = /^\s*(\d{1,2})\s*[.)、）．]\s*\S/.exec(line);
 		if (!m) continue;
 		const n = Number(m[1]);
 		// Require the sequence to start at 1 and stay monotonic-ish; a stray

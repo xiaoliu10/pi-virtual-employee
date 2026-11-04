@@ -376,6 +376,7 @@ function migrate(db: DB): void {
 			kicked_off           INTEGER NOT NULL DEFAULT 0,
 			created_by           TEXT,
 			created_channel      TEXT,
+			priority             INTEGER NOT NULL DEFAULT 100,
 			resident             INTEGER NOT NULL DEFAULT 0,
 			created_at           INTEGER NOT NULL,
 			updated_at           INTEGER NOT NULL

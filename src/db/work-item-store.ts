@@ -38,6 +38,8 @@ export interface WorkItemRow {
 	/** Verified confirming admin, not the conversation's proposer. */
 	created_by: string | null;
 	created_channel: string | null;
+	/** 越小越先被 listDue 选中（Router 转派 0，默认 100）。 */
+	priority: number;
 	resident: number;
 	/** Retained until the first successful resumed send. */
 	answer: string | null;
@@ -55,6 +57,8 @@ export interface CreateWorkItemInput {
 	createdChannel?: string | null;
 	/** 常驻巡检：无自然终点，模型 DONE 被拦截为按节奏顺延（field 2026-10-17）。 */
 	resident?: boolean;
+	/** 越小越先跑（Router 转派 0，默认 100）。只影响 listDue 的选取顺序。 */
+	priority?: number;
 }
 
 export class WorkItemStore {
@@ -76,7 +80,7 @@ export class WorkItemStore {
 			id: randomUUID(), title: input.title, goal: input.goal,
 			conditions: null, progress: null, lessons: null,
 			origin_conversation: input.originConversation ?? null,
-			origin_note: input.originNote ?? null, status: input.status ?? "proposed",
+			origin_note: input.originNote ?? null, status: input.status ?? "proposed", priority: input.priority ?? 100,
 			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0, fallback_streak: 0, timeout_streak: 0, max_minutes: null, last_remind_at: null, remind_count: 0, cadence_ms: null, kicked_off: 0,
 				created_by: input.createdBy ?? null,
 			created_channel: input.createdChannel ?? null,
@@ -84,8 +88,8 @@ export class WorkItemStore {
 			answer: null, created_at: now, updated_at: now,
 		};
 		this.db.prepare(`INSERT INTO work_items
-			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, timeout_streak, max_minutes, last_remind_at, remind_count, cadence_ms, kicked_off, created_by, created_channel, resident, answer, created_at, updated_at)
-			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @timeout_streak, @max_minutes, @last_remind_at, @remind_count, @cadence_ms, @kicked_off, @created_by, @created_channel, @resident, @answer, @created_at, @updated_at)`).run(row);
+			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, timeout_streak, max_minutes, last_remind_at, remind_count, cadence_ms, kicked_off, created_by, created_channel, priority, resident, answer, created_at, updated_at)
+			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @timeout_streak, @max_minutes, @last_remind_at, @remind_count, @cadence_ms, @kicked_off, @created_by, @created_channel, @priority, @resident, @answer, @created_at, @updated_at)`).run(row);
 		this.changed(row.id);
 		return row;
 	}
@@ -100,7 +104,7 @@ export class WorkItemStore {
 	listDue(now: number): WorkItemRow[] {
 		return this.db.prepare(`SELECT * FROM work_items WHERE status = 'queued'
 			OR (status = 'scheduled' AND next_check_at IS NOT NULL AND next_check_at <= ?)
-			ORDER BY CASE WHEN status = 'queued' THEN updated_at ELSE next_check_at END ASC, created_at ASC, rowid ASC`).all(now) as WorkItemRow[];
+			ORDER BY priority ASC, CASE WHEN status = 'queued' THEN updated_at ELSE next_check_at END ASC, created_at ASC, rowid ASC`).all(now) as WorkItemRow[];
 	}
 	nextWakeAt(): number | undefined {
 		const row = this.db.prepare("SELECT MIN(next_check_at) AS at FROM work_items WHERE status = 'scheduled'").get() as { at: number | null };

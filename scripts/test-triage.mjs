@@ -135,6 +135,7 @@ function makeMemoryStore() {
 			return row;
 		},
 		list() { return [...rows]; },
+		get(id) { return rows.find((r) => r.id === id); },
 	};
 }
 
@@ -161,9 +162,30 @@ test("dispatch WIRING: creates a work item, fires it, returns an ACK, keeps orig
 
 	const fired = [];
 	// The manager only needs `engine.workItems` / `engine.workBridge` and the
-	// config for this path — everything else is untouched by dispatch.
-	const engine = { workItems: store, workBridge: { fireItem: (id) => { fired.push(id); return true; }, push: async () => ({ ok: true }) } };
-	const config = { all: () => ({ general: { chatDispatch: { enabled: true } }, capabilities: {} }) };
+	// config for this path. The stub mimics the REAL contract (work-service.ts:141):
+	// only a queued row fires — an unconditional-true stub is exactly how the
+	// P0-1 false green survived review.
+	const engine = {
+		workItems: store,
+		workBridge: {
+			fireItem: (id) => {
+				const row = store.get(id);
+				const ok = !!row && row.status === "queued";
+				fired.push({ id, ok, status: row?.status });
+				return ok;
+			},
+			push: async () => ({ ok: true }),
+		},
+	};
+	const config = {
+		all: () => ({
+			general: { chatDispatch: { enabled: true } },
+			// Work windows demand a declared-admin creator (review P1-2) — the
+			// dispatching actor must be one, exactly like the admin-tool path.
+			security: { adminStaffIds: ["u1"], ownerStaffIds: [], people: [], defaultRole: "viewer" },
+			capabilities: {},
+		}),
+	};
 	const manager = Object.create(IMAdapterManager.prototype);
 	Object.defineProperties(manager, {
 		engine: { value: engine },
@@ -177,7 +199,12 @@ test("dispatch WIRING: creates a work item, fires it, returns an ACK, keeps orig
 
 	assert.ok(ack, "a dispatch must return the ACK text (that is what the user sees)");
 	assert.match(ack, /已转后台执行/);
-	assert.match(ack, /前台执行/, "the escape hatch must be advertised (design D6 risk table)");
+	// Review P1-1: the ACK used to promise 「前台执行」/「<id> 进度」//stop — none
+	// of which had an inbound handler (the design-doc wording was copied before
+	// the mechanisms landed). It now promises ONLY what exists: automatic
+	// progress/completion pushes, and admin management from the task list.
+	assert.match(ack, /进展与完成会自动推送/);
+	assert.doesNotMatch(ack, /前台执行|\/stop/, "the ACK must not promise unbuilt mechanisms");
 
 	const items = store.list();
 	assert.equal(items.length, 1, "exactly one work item must be created");
@@ -185,9 +212,13 @@ test("dispatch WIRING: creates a work item, fires it, returns an ACK, keeps orig
 	assert.equal(item.origin_conversation, "dt:single:abc", "results must be pushed back to the origin conversation");
 	assert.equal(item.created_by, "u1");
 	assert.equal(item.created_channel, "dingtalk");
+	// P0-1: fireItem/listDue/claim only accept "queued". Creating the item as
+	// "working" made it a permanent orphan while the user held the ACK.
+	assert.equal(item.status, "queued", `dispatch must create runnable items: ${item.status}`);
 	assert.match(item.goal, /登录 spay/, "the plan must become the worker's task spec");
 	assert.match(item.goal, /用户原始指令/, "the original wording must be preserved for the worker");
-	assert.deepEqual(fired, [item.id], "the window must be fired immediately, not on the next tick");
+	assert.deepEqual(fired.map((f) => f.id), [item.id], "the window must be fired immediately");
+	assert.equal(fired[0].ok, true, `real fireItem contract must accept it: ${JSON.stringify(fired)}`);
 	const shortId = item.id.slice(0, 8);
 	assert.ok(ack.includes(shortId), `the ACK must name the item (${shortId}) so the user can follow it: ${ack}`);
 
@@ -210,7 +241,13 @@ test("dispatch WIRING: flag off → inline (no work item, old behaviour)", async
 	const { IMAdapterManager } = await import(pathToFileURL(managerBundle).href + `?t=${Date.now()}`);
 	const store = makeMemoryStore();
 	const fired = [];
-	const engine = { workItems: store, workBridge: { fireItem: (id) => { fired.push(id); return true; }, push: async () => ({ ok: true }) } };
+	const engine = {
+		workItems: store,
+		workBridge: {
+			fireItem: (id) => { const row = store.get(id); const ok = !!row && row.status === "queued"; fired.push({ id, ok }); return ok; },
+			push: async () => ({ ok: true }),
+		},
+	};
 	// Gray release default: absent → off.
 	const config = { all: () => ({ general: {}, capabilities: {} }) };
 	const manager = Object.create(IMAdapterManager.prototype);
