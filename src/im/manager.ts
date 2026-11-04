@@ -22,8 +22,9 @@ import { isAuthorizationPhrase } from "../engine/authorization.js";
 import { startStallWatchdog } from "./watchdog.js";
 import { splitForPush } from "./chunks.js";
 import { gateOutboundText } from "./credential-egress.js";
+import { FOREGROUND_ESCAPE_HINT, triageMessage } from "./triage.js";
 import { chatHeartbeatOccurrenceId, DeliveryLedger } from "./delivery-ledger.js";
-import type { AdapterCapabilities, AdapterHealth } from "./types.js";
+import type { AdapterCapabilities, AdapterHealth, InboundMessage } from "./types.js";
 
 /** Shared deps handed to adapter factories that need them (e.g. image hosting). */
 export interface AdapterDeps {
@@ -203,6 +204,62 @@ export class IMAdapterManager {
 	 * { ok:true, skipped:true } without sending, and a failed attempt stays
 	 * retryable under the same id. Without it, behaviour is unchanged.
 	 */
+	/**
+	 * Router → Worker dispatch (docs/design/router-worker.md P1).
+	 *
+	 * Returns the ACK text when the message was handed to a background work
+	 * item, or undefined to let the caller run it inline. The triage itself is
+	 * pure (src/im/triage.ts) and conservative: no plan / <2 numbered steps / a
+	 * question shape / no long-running verb / dispatch disabled → inline, which
+	 * is byte-for-byte the pre-Router behaviour.
+	 *
+	 * ANY failure while creating the work item returns undefined (inline), so a
+	 * broken dispatch can never swallow a message. The work item keeps the
+	 * origin conversation, so progress/results push back here (D3/D4).
+	 */
+	private async tryDispatchToWorker(msg: InboundMessage, plan: string): Promise<string | undefined> {
+		try {
+			const cfg = this.config.all();
+			const enabled = cfg.general.chatDispatch?.enabled === true;
+			if (!enabled) return undefined; // gray release: default off
+			const decision = triageMessage({ text: msg.text, plan, looksLikeTask: true }, true);
+			if (!decision.dispatch) {
+				console.log(`[im] dispatch triage: inline (${decision.reason}, steps=${decision.steps})`);
+				return undefined;
+			}
+			const store = this.engine.workItems;
+			const bridge = this.engine.workBridge;
+			if (!store || !bridge) {
+				console.log("[im] dispatch triage: inline (work items unavailable)");
+				return undefined;
+			}
+			const title = (msg.text.trim().split(/\r?\n/, 1)[0] ?? "").slice(0, 60) || "聊天转后台任务";
+			const item = store.create({
+				title,
+				// The plan IS the goal: the worker window reads it as the task spec,
+				// so what the user was promised is exactly what runs.
+				goal: `${plan}\n\n[用户原始指令]\n${msg.text}`,
+				originConversation: msg.conversationId,
+				originNote: "从聊天转派（Router）",
+				status: "working",
+				createdBy: msg.actor?.senderId ?? null,
+				createdChannel: msg.actor?.channel ?? null,
+			});
+			// Fire immediately so the work starts now rather than at the next tick.
+			const fired = bridge.fireItem(item.id);
+			console.log(`[im] dispatch triage: WORKER item=${item.id} steps=${decision.steps} fired=${fired} conv=${msg.conversationId}`);
+			const shortId = item.id.slice(0, 8);
+			return [
+				`🚀 已转后台执行（编号 ${shortId}），完成后在本会话通知。`,
+				`期间可随时发送「${shortId} 进度」查看，或 /stop 取消。${FOREGROUND_ESCAPE_HINT}。`,
+			].join("\n");
+		} catch (err) {
+			// Never let dispatch break the turn: fall back to inline execution.
+			console.warn("[im] dispatch failed, running inline:", err instanceof Error ? err.message : err);
+			return undefined;
+		}
+	}
+
 	/**
 	 * Turn-settle background-process inventory. ASYNC BY DESIGN (user ruling
 	 * 2026-11-04): the settle path never waits on process bookkeeping, and the
@@ -556,6 +613,12 @@ export class IMAdapterManager {
 											await ctx.onProgress(plan, { occurrenceId: occurrenceId || undefined, kind: "task-plan" })
 												.catch((err) => console.warn("[im] task plan push failed:", err instanceof Error ? err.message : err));
 										}
+										// Router/Worker dispatch (docs/design/router-worker.md P1). Conservative
+										// and OFF by default: when it fires, the message does NOT run in this chat
+										// turn — it becomes a work item and this turn returns the ACK instead.
+										// Every failure path falls through to inline execution (no black holes).
+										const dispatched = await this.tryDispatchToWorker(msg, plan);
+										if (dispatched) return dispatched;
 									}
 							} catch (err) {
 								console.warn("[im] task planning skipped:", err instanceof Error ? err.message : err);

@@ -1225,6 +1225,17 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 												/>
 											</Field>
 
+											<Field label="长任务转后台执行（灰度）" hint="开启后，群/单聊里判断为多步骤且耗时的任务（规划 ≥2 步 + 含部署/抓取/批量/导出等动作）会先回执「已转后台」再交给工作项后台执行，期间可继续聊别的；完成后结果回到本会话。简单问答、提问、单步命令永不受影响。默认关闭（保持原有前台执行行为）。">
+												<label className="flex items-center gap-2 text-sm">
+													<input
+														type="checkbox"
+														checked={draft.general.chatDispatch?.enabled === true}
+														onChange={(e) => setGeneral({ chatDispatch: { enabled: e.target.checked } })}
+													/>
+													{draft.general.chatDispatch?.enabled === true ? "已开启" : "已关闭（默认）"}
+												</label>
+											</Field>
+
 											<Field label="一次性任务会话保留天数" hint="定时任务执行、自主任务、评测跑出来的会话（列表里那些机器生成的记录）在停止更新超过该天数后自动删除，避免任务列表无限堆积。0 = 不自动清理。你与员工的 IM 对话、控制台自己的会话永不自动删除（只能手动删）。默认 30 天，保存后立即生效。">
 												<input
 													type="number"
