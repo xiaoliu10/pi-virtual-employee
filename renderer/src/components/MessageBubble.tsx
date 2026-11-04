@@ -1,8 +1,12 @@
 import ReactMarkdown from "react-markdown";
+import { ThinkingBox } from "./ThinkingBox";
 
 interface MessageBubbleProps {
 	role: "user" | "assistant";
 	content: string;
+	/** Model reasoning for this turn (rendered in a collapsible box, never
+	 *  merged into the answer text). */
+	thinking?: string;
 	streaming?: boolean;
 }
 
@@ -16,7 +20,7 @@ const MARKDOWN_CLASSES =
 
 /** pi-desktop message shapes: user = right-aligned light-gray bubble (max
  * 68%); assistant = flat full-width markdown, no avatar, no card. */
-export function MessageBubble({ role, content, streaming }: MessageBubbleProps) {
+export function MessageBubble({ role, content, thinking, streaming }: MessageBubbleProps) {
 	const isUser = role === "user";
 	if (isUser) {
 		return (
@@ -29,12 +33,14 @@ export function MessageBubble({ role, content, streaming }: MessageBubbleProps) 
 	}
 	return (
 		<div className="animate-fade-in text-[15px] leading-relaxed text-[#1d1d1f]">
+			{thinking ? <ThinkingBox text={thinking} streaming={streaming} /> : null}
 			{content ? (
 				<div className={`${MARKDOWN_CLASSES} ${streaming ? "streaming-caret" : ""}`}>
 					<ReactMarkdown>{content}</ReactMarkdown>
 				</div>
 			) : (
-				streaming && (
+				streaming &&
+				!thinking && (
 					<span className="flex items-center gap-2 text-[12.5px] text-[#a1a1a6]">
 						<span className="streaming-caret" />
 						思考中…
