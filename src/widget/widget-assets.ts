@@ -73,8 +73,9 @@ input, textarea { font-family: inherit; }
 .step > summary:hover .t-chev, .think > summary:hover .t-chev,
 .step[open] > summary .t-chev, .think[open] > summary .t-chev { opacity:1; }
 .think[open] > summary .t-chev, .step[open] > summary .t-chev { transform:rotate(90deg); }
-.think-b { margin:0 0 10px; padding:2px 2px 2px 14px; border-left:1px solid #e8e8ed;
-  font-size:13px; line-height:1.65; color:#86868b; white-space:pre-wrap; word-break:break-word;
+/* 思考正文：浅灰虚化（用户要求）——浅灰 + 极轻 blur，读感是「背景过程」而非结论 */
+.think-b { margin:0 0 10px; padding:2px 2px 2px 14px; border-left:1px solid #f0f0f2;
+  font-size:13px; line-height:1.65; color:#a9a9ae; filter:blur(.3px); white-space:pre-wrap; word-break:break-word;
   max-height:240px; overflow-y:auto; }
 .msg.streaming::after { content:"▍"; color:#4f6ef7; animation:ve-blink 1s step-start infinite; }
 @keyframes ve-blink { 50% { opacity:0; } }
@@ -424,6 +425,7 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
     if (body) body.textContent = text;
     if (streaming) {
       wrap.classList.add("on");
+      wrap.setAttribute("open", "open"); // 思考（再）开始 → 展开
       wrap._veTitle.textContent = "正在思考";
       if (wrap._veTicker) {
         var flat = String(text)
@@ -460,7 +462,9 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
     box.classList.add("streaming");
     var m = msgs();
     var aiText = "";          // 当前气泡累计文本
-    var thinkEl = null;       // 思考面板
+    // 最早出现：回合一开始就建好思考面板（用户要求），插在回答气泡之前。
+    // 从不思考的模型在 finish() 时移除空面板，不留噪音。
+    var thinkEl = addThinking(m, box);
     var thinkText = "";
     var tools = {};           // toolCallId → step 元素
     var lastTool = null;
@@ -469,7 +473,10 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
     function finish() {
       if (ended) return;
       ended = true;
-      if (thinkEl) paintThinking(thinkEl, thinkText, false);
+      if (thinkEl) {
+        if (thinkText) paintThinking(thinkEl, thinkText, false);
+        else { thinkEl.remove(); thinkEl = null; } // 从不思考的模型：不留空面板
+      }
       box.classList.remove("streaming");
       if (!box.textContent || box.textContent === "正在思考…") box.textContent = aiText || "（空回复）";
       state.busy = false;
@@ -486,15 +493,19 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
           case "delta":
             aiText += ev.text;
             box.textContent = aiText;
+            // 回答文本开始 → 思考阶段结束，按用户要求收起面板（思考恢复会重开）
+            if (thinkEl) paintThinking(thinkEl, thinkText, false);
             scrollEnd();
             break;
           case "replace":
             aiText = ev.text;
             box.textContent = aiText || "（内容已按安全策略隐藏）";
+            if (thinkEl) paintThinking(thinkEl, thinkText, false);
             scrollEnd();
             break;
           case "tool_start":
             if (!aiText) box.textContent = "";
+            if (thinkEl) paintThinking(thinkEl, thinkText, false);
             lastTool = addStep(m, ev.toolName);
             if (ev.toolCallId) tools[ev.toolCallId] = lastTool;
             scrollEnd();
@@ -796,6 +807,7 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     if (body) body.textContent = text;
     if (streaming) {
       wrap.classList.add("on");
+      wrap.setAttribute("open", "open"); // 思考（再）开始 → 展开
       wrap._veTitle.textContent = "正在思考";
       if (wrap._veTicker) {
         var flat = String(text)
@@ -827,7 +839,8 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     var box = add("ai", "正在思考…");
     box.classList.add("streaming");
     var aiText = "";
-    var thinkEl = null;
+    // 最早出现：同浮窗通道——回合一开始即建面板，插在回答气泡之前。
+    var thinkEl = addThinking(list, box);
     var thinkText = "";
     var tools = {};
     var lastTool = null;
@@ -835,7 +848,10 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     function finish() {
       if (ended) return;
       ended = true;
-      if (thinkEl) paintThinking(thinkEl, thinkText, false);
+      if (thinkEl) {
+        if (thinkText) paintThinking(thinkEl, thinkText, false);
+        else { thinkEl.remove(); thinkEl = null; } // 从不思考的模型：不留空面板
+      }
       box.classList.remove("streaming");
       if (!box.textContent || box.textContent === "正在思考…") box.textContent = aiText || "（空回复）";
       busy = false; el("send").disabled = false; el("box").focus();
@@ -849,15 +865,19 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
           case "delta":
             aiText += ev.text;
             box.textContent = aiText;
+            // 回答文本开始 → 思考阶段结束，按用户要求收起面板（思考恢复会重开）
+            if (thinkEl) paintThinking(thinkEl, thinkText, false);
             scrollEnd();
             break;
           case "replace":
             aiText = ev.text;
             box.textContent = aiText || "（内容已按安全策略隐藏）";
+            if (thinkEl) paintThinking(thinkEl, thinkText, false);
             scrollEnd();
             break;
           case "tool_start":
             if (!aiText) box.textContent = "";
+            if (thinkEl) paintThinking(thinkEl, thinkText, false);
             lastTool = addStep(list, ev.toolName);
             if (ev.toolCallId) tools[ev.toolCallId] = lastTool;
             scrollEnd();

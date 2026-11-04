@@ -110,41 +110,43 @@ class El {
 	}
 }
 
-/** SSE body read with getReader() — exactly the shape the client consumes.
- *  splitBefore: index at which the second read() resolves, so a test can
- *  observe the DOM mid-stream (streaming state before `done`). */
-function sseBody(events, onGap) {
-	const text = events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join("");
-	const bytes = new TextEncoder().encode(text);
-	const first = onGap
-		? new TextEncoder().encode(`data: ${JSON.stringify(events[0])}\n\n`)
-		: bytes;
-	const rest = onGap ? bytes.slice(first.length) : null;
-	let reads = 0;
+/** SSE body read with getReader().
+ *  gaps: [{ afterCount, fn }] — the stream is split into chunks after each
+ *  afterCount-cumulative event, pausing in a gap so the test can observe the
+ *  mid-stream DOM at MULTIPLE points (e.g. collapse at answer start, then
+ *  re-open when thinking resumes). */
+function sseBody(events, gaps = null) {
+	const enc = (evs) => new TextEncoder().encode(evs.map((e) => `data: ${JSON.stringify(e)}\n\n`).join(""));
+	const segments = [];
+	if (!gaps || !gaps.length) {
+		segments.push({ bytes: enc(events), gap: null });
+	} else {
+		let prev = 0;
+		for (const g of gaps) {
+			segments.push({ bytes: enc(events.slice(prev, g.afterCount)), gap: g.fn });
+			prev = g.afterCount;
+		}
+		segments.push({ bytes: enc(events.slice(prev)), gap: null });
+	}
+	let idx = 0;
+	let pendingGap = null;
+	const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 	return {
 		getReader() {
 			return {
 				async read() {
-					if (rest) {
-						// Chunked mode: first read delivers the thinking event; second
-						// read pauses in a gap (the test observes the live DOM), then
-						// delivers the rest; done afterwards.
-						if (reads === 0) {
-							reads += 1;
-							return { done: false, value: first };
-						}
-						if (reads === 1) {
-							reads += 1;
-							await new Promise((r) => setTimeout(r, 30));
-							if (onGap) onGap();
-							await new Promise((r) => setTimeout(r, 30));
-							return { done: false, value: rest };
-						}
-						return { done: true, value: undefined };
+					// 上一块的观察点必须在「客户端已消费该块」之后执行：放到下一次 read 开头
+					if (pendingGap) {
+						const g = pendingGap;
+						pendingGap = null;
+						await sleep(25);
+						g();
+						await sleep(25);
 					}
-					if (reads >= 1) return { done: true, value: undefined };
-					reads += 1;
-					return { done: false, value: bytes };
+					if (idx >= segments.length) return { done: true, value: undefined };
+					const seg = segments[idx++];
+					if (seg.gap) pendingGap = seg.gap;
+					return { done: false, value: seg.bytes };
 				},
 			};
 		},
@@ -155,7 +157,7 @@ function sseBody(events, onGap) {
  * Boot the REAL page script (renderWidgetPage) with the stub DOM and return
  * its transcript plus the exposed send hook.
  */
-function bootPage(pageHtml, events, onMidStream) {
+function bootPage(pageHtml, events, hooks = null, opts = {}) {
 	const code = pageHtml.match(/<script>([\s\S]*?)<\/script>/)[1];
 	const transcript = new El("div");
 	transcript.className = "msgs";
@@ -200,11 +202,11 @@ function bootPage(pageHtml, events, onMidStream) {
 	const sandbox = {
 		document: doc,
 		window: { addEventListener() {}, matchMedia: () => ({ matches: false, addEventListener() {} }), innerWidth: 1280 },
-		fetch: async () => ({
+		fetch: opts.hang ? () => new Promise(() => {}) : async () => ({
 			ok: true,
 			status: 200,
 			headers: { get: (k) => (String(k).toLowerCase() === "content-type" ? "text/event-stream" : null) },
-			body: sseBody(events, onMidStream),
+			body: sseBody(events, hooks),
 			json: async () => ({}),
 		}),
 		console,
@@ -263,21 +265,26 @@ test("DURING streaming the panel is live (title=正在思考); answer bubble sta
 	];
 	const html = renderWidgetPage({ title: "t", suggestions: [], disclaimer: "" });
 	let seen = null;
-	const { transcript, send } = bootPage(html, events, () => {
-		// mid-stream: thinking panel exists, in live state, sitting ABOVE the answer
-		const kinds = transcript.children.map((c) => String(c.className));
-		const thinkIdx = kinds.findIndex((c) => c.includes("think"));
-		const answerIdx = kinds.findIndex((c) => c.includes("ai"));
-		const wrap = transcript.children[thinkIdx];
-		seen = {
-			thinkIdx,
-			answerIdx,
-			title: String(wrap?._veTitle?.textContent ?? ""),
-			on: wrap ? wrap.classList.contains("on") : false,
-			open: wrap ? wrap.hasAttribute("open") : false,
-			tickerLen: wrap ? String(wrap._veTicker?.textContent ?? "").length : 0,
-		};
-	});
+	const { transcript, send } = bootPage(html, events, [
+		{
+			afterCount: 1,
+			fn: () => {
+				// mid-stream: thinking panel exists, in live state, sitting ABOVE the answer
+				const kinds = transcript.children.map((c) => String(c.className));
+				const thinkIdx = kinds.findIndex((c) => c.includes("think"));
+				const answerIdx = kinds.findIndex((c) => c.includes("ai"));
+				const wrap = transcript.children[thinkIdx];
+				seen = {
+					thinkIdx,
+					answerIdx,
+					title: String(wrap?._veTitle?.textContent ?? ""),
+					on: wrap ? wrap.classList.contains("on") : false,
+					open: wrap ? wrap.hasAttribute("open") : false,
+					tickerLen: wrap ? String(wrap._veTicker?.textContent ?? "").length : 0,
+				};
+			},
+		},
+	]);
 	assert.ok(typeof send === "function");
 	await send("你好");
 	await new Promise((r) => setTimeout(r, 60));
@@ -289,4 +296,106 @@ test("DURING streaming the panel is live (title=正在思考); answer bubble sta
 	assert.equal(seen.open, true, "Desktop keeps the note expanded while streaming");
 	assert.match(seen.title, /正在思考/, "mid-stream title is 正在思考");
 	assert.ok(seen.tickerLen > 0, "the tail ticker must carry the streaming text");
+});
+
+test("THE PANEL APPEARS BEFORE ANY EVENT: eager at send, above the answer", () => {
+	const html = renderWidgetPage({ title: "t", suggestions: [], disclaimer: "" });
+	// fetch 永不 resolve：若面板在发送瞬间建立，此刻 DOM 已有它——与任何事件无关
+	const { transcript, send } = bootPage(html, [], undefined, { hang: true });
+	send("你好");
+	const kinds = transcript.children.map((c) => String(c.className));
+	const thinkIdx = kinds.findIndex((c) => c.includes("think"));
+	const answerIdx = kinds.findIndex((c) => c.includes("ai"));
+	assert.ok(thinkIdx >= 0, "面板必须在发送瞬间就存在（不等第一条思考事件）");
+	assert.ok(answerIdx >= 0);
+	assert.ok(thinkIdx < answerIdx, "且在回答气泡之上");
+	assert.equal(transcript.children[thinkIdx].hasAttribute("open"), true, "思考中默认展开");
+});
+
+test("collapse happens when the ANSWER text starts, not only at done", async () => {
+	const events = [
+		{ type: "thinking_delta", text: "思考中" },
+		{ type: "delta", text: "答案出来了" },
+		{ type: "done" },
+	];
+	const html = renderWidgetPage({ title: "t", suggestions: [], disclaimer: "" });
+	let seen = null;
+	// 分块点在第 2 个事件后：观察点在 done 之前——若实现只在 done 收起，这里仍是展开态
+	const { transcript, send } = bootPage(html, events, [
+		{
+			afterCount: 2,
+			fn: () => {
+				const kinds = transcript.children.map((c) => String(c.className));
+				const wrap = transcript.children[kinds.findIndex((c) => c.includes("think"))];
+				seen = { open: wrap.hasAttribute("open"), title: String(wrap._veTitle.textContent) };
+			},
+		},
+	]);
+	await send("你好");
+	await new Promise((r) => setTimeout(r, 80));
+	assert.ok(seen, "gap 必须在 done 前触发");
+	assert.equal(seen.open, false, "答文开始时面板必须已收起（不等 done）");
+	assert.match(seen.title, /思考 · 用时 \d+ 秒/, "标题已切到用时");
+});
+
+test("thinking body is light-gray faded", () => {
+	const html = renderWidgetPage({ title: "t", suggestions: [], disclaimer: "" });
+	assert.ok(/\.think-b \{[^}]*color:#a9a9ae/.test(html), "正文必须浅灰（#a9a9ae）");
+	assert.ok(/\.think-b \{[^}]*filter:blur\(\.3px\)/.test(html), "正文必须虚化（极轻 blur）");
+});
+
+test("a model that NEVER thinks leaves no empty panel behind", async () => {
+	const events = [{ type: "delta", text: "直接回答" }, { type: "done" }];
+	const html = renderWidgetPage({ title: "t", suggestions: [], disclaimer: "" });
+	const { transcript, send } = bootPage(html, events);
+	await send("你好");
+	await new Promise((r) => setTimeout(r, 60));
+	const kinds = transcript.children.map((c) => String(c.className));
+	assert.equal(kinds.findIndex((c) => c.includes("think")), -1, "空思考面板必须被移除");
+	assert.ok(kinds.some((c) => c.includes("ai")));
+});
+
+test("thinking RESUMING after the answer re-expands the note (思考的时候展开)", async () => {
+	const events = [
+		{ type: "thinking_delta", text: "第一段思考" },
+		{ type: "delta", text: "答案" },
+		{ type: "thinking_delta", text: "又想到一点" },
+		{ type: "done" },
+	];
+	const html = renderWidgetPage({ title: "t", suggestions: [], disclaimer: "" });
+	const obs = [];
+	const { transcript, send } = bootPage(html, events, [
+		{
+			afterCount: 2,
+			fn: () => {
+				const kinds = transcript.children.map((c) => String(c.className));
+				const wrap = transcript.children[kinds.findIndex((c) => c.includes("think"))];
+				obs.push({
+					open: wrap.hasAttribute("open"),
+					title: String(wrap._veTitle.textContent),
+					on: wrap.classList.contains("on"),
+				});
+			},
+		},
+		{
+			afterCount: 3,
+			fn: () => {
+				const kinds = transcript.children.map((c) => String(c.className));
+				const wrap = transcript.children[kinds.findIndex((c) => c.includes("think"))];
+				obs.push({
+					open: wrap.hasAttribute("open"),
+					title: String(wrap._veTitle.textContent),
+					on: wrap.classList.contains("on"),
+				});
+			},
+		},
+	]);
+	await send("你好");
+	// 读流是异步的：等两个观察点都触发（最多 2s），不靠猜 sleep 时长
+	for (let i = 0; i < 100 && obs.length < 2; i++) await new Promise((r) => setTimeout(r, 20));
+	assert.equal(obs.length, 2, "两个观察点都要触发");
+	assert.equal(obs[0].open, false, "答文开始 → 收起");
+	assert.equal(obs[1].open, true, "思考恢复 → 重新展开");
+	assert.match(obs[1].title, /正在思考/, "恢复后标题回到进行中");
+	assert.equal(obs[1].on, true, "恢复后处于流式态");
 });
