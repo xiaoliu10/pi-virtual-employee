@@ -4,7 +4,7 @@
  * hard-coded 0.8×512=409 cap and every side pass died with "hit the token cap".
  * User ruling 2026-11-02: DON'T self-limit — follow the model's own max-output
  * resolution (per-model override → gateway model-info → 32k relay default).
- * pi-ai computes maxTokens = 0.8×reserve clamped to model.maxTokens, so
+ * pi-compaction (vendored, pi-compaction.ts:518) computes maxTokens = 0.8×reserve clamped to model.maxTokens, so
  * reserving ceil(maxOut/0.8) lands exactly on maxOut; a ceiling only caps
  * runaway generation, it must not silently shrink what the model may produce.
  * Exported for tests: every side pass MUST call this — a hard-coded number here
