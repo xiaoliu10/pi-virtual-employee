@@ -190,11 +190,20 @@ test("wiring: side pass reads the agent level; budget delegated to sidePassMaxTo
 	// must delegate — a hard-coded number here is how planTaskBrief regressed on
 	// 2026-11-04 (512 → thinking blew the cap → every plan silently skipped).
 	const i = engineSrc.indexOf("async progressBriefDetailed");
-	const body = engineSrc.slice(i, i + 9000);
+	// Bound the slice at planTaskBrief: the two functions are ~5.5k chars apart,
+	// and an unbounded window lets the PLANNER's delegation satisfy this
+	// assertion while the brief itself regresses (review P1, mutation-proved).
+	const end = engineSrc.indexOf("async planTaskBrief");
+	assert.ok(end > i, "planTaskBrief follows progressBriefDetailed");
+	const body = engineSrc.slice(i, end);
 	assert.ok(!body.includes("findSupplier(model.provider)"), "no supplier lookup by registry provider id");
 	assert.match(body, /agent\.state\.thinkingLevel/);
-	assert.match(body, /sidePassMaxTokens\(model\)/,
-		"progress brief budget delegated to sidePassMaxTokens");
+	// The 3rd positional argument of generateSummary must BE the helper call —
+	// comment lines between arguments are tolerated, a literal is not (a
+	// line-anchored negative scan once false-passed on the 180_000 timeout
+	// parameter and missed same-line literals; review P1/P2-1 on 2026-11-04).
+	assert.match(body, /generateSummary\(\s*context,\s*\n\s*model,\s*(\/\/[^\n]*\n\s*)*sidePassMaxTokens\(model\)/,
+		"progress brief budget delegated (3rd argument of generateSummary)");
 	assert.ok(!body.includes("4_096,"), "hard-coded 4096 reserve removed");
 	assert.ok(!body.includes("0.8×512 tokens"), "old 409 reserve gone");
 });
@@ -209,6 +218,9 @@ test("wiring: task planning uses the same side-pass budget (2026-11-04 regressio
 	assert.match(body, /sidePassMaxTokens\(model\)/,
 		"planTaskBrief budget delegated to sidePassMaxTokens");
 	const generateBlock = body.slice(body.indexOf("generateSummary("), body.indexOf("PLAN_PROMPT_HEADER"));
-	assert.ok(!/\b(\d{2,})\b,\n/.test(generateBlock.replace(/sidePassMaxTokens\(model\)/g, "")),
-		"no hard-coded token budget inside the planTaskBrief generateSummary call");
+	// The 3rd positional argument must BE the helper call — not merely present
+	// somewhere in the block (a dead decoy call or a same-line literal used to
+	// slip past a line-anchored regex; review P2-1).
+	assert.match(generateBlock, /generateSummary\(\s*\[\{ role: "user"[\s\S]*?\n\s*model,\s*(\/\/[^\n]*\n\s*)*sidePassMaxTokens\(model\)/,
+		"3rd argument of the planner's generateSummary is sidePassMaxTokens(model)");
 });

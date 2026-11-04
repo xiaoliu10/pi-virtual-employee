@@ -2875,8 +2875,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// INVISIBLE to the stall watchdog — and, worse, field 2026-09-29: a hung
 			// call left the manager's progressInFlight flag stuck true, so ALL later
 			// heartbeats were silently skipped ("30 minutes with no push"). Count it
-			// as in-flight life and bound it: a heartbeat brief is a tiny 512-token
-			// call, but a busy relay can legitimately take minutes — 180s keeps
+			// as in-flight life and bound it: a heartbeat brief is a small
+			// side-pass call (its budget is sidePassMaxTokens — never hard-code a
+			// token number here; see the 2026-11-02 ruling), but a busy relay can
+			// legitimately take minutes — 180s keeps
 			// progressInFlight from sticking forever without starving slow paths
 			// (field 2026-09-30: 60s aborted almost every attempt under load, so
 			// heartbeats degraded to the generic line).
@@ -2957,7 +2959,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 		try {
 			const model = agent.state.model;
 			if (!model) return null;
-			const signal = conversationId ? this.beginSideLlmCall(conversationId, 60_000) : undefined;
+			// 180s, matching the progress brief (review note on 2026-11-04): a
+			// thinking model legitimately emitting up to its max-output under load
+			// can exceed 60s — the old cap would have aborted exactly the plans
+			// this fix exists to deliver.
+			const signal = conversationId ? this.beginSideLlmCall(conversationId, 180_000) : undefined;
 			let raw: string | undefined;
 			try {
 				raw = await generateSummary(
