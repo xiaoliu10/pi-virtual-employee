@@ -4,6 +4,24 @@
 
 开源前的内部迭代细节不在此逐一罗列（完整历史见 git log）；以下从开源基线版本开始记录。
 
+## v0.2.188 — task planning budget fix, progress push readability, turn-settle process inventory
+
+### English
+
+**Task planning actually delivers (field regression fix)**: the plan-ahead side pass still carried the hard-coded 512-token reserve that the 2026-11-02 ruling abolished for progress briefs — qwen's default-thinking alone blew the cap and EVERY plan was silently skipped (`generation hit the token cap`). The budget now lives in one place, `sidePassMaxTokens()` (max-output resolution, ceil(maxOut/0.8)), shared by the progress brief and the planner; the planner's side-call timeout aligns at 180s. Regression guards: the wiring test asserts each side pass delegates to the helper (a same-line literal or a decoy call turns it red — mutation-proved), and the helper's values are pinned by dedicated tests. An independent code review round (APPROVE, no P0/P1) inventoried all `generateSummary` call sites and numerically probed the clamp across 11 values.
+
+**Progress pushes stop reading like delivery bugs**: scheduled-progress pushes hard-cut the last progress text with `slice(-500)` — mid-sentence, under a full title. The cut now lands on paragraph boundaries (`tailExcerpt`), honestly marked 「……（以下为上次进展的节选）」. The three autonomous-task push templates (progress / done / needs-human) gained basic structure: section separators and labeled metadata (下次跟进 / 跟进原因 / 恢复方式).
+
+**Turn-settle background-process inventory (async by design)**: a monitor script kept running after its task result was already pushed and nothing told the user — silent strays read as delivery bugs. 5s after a turn settles (fire-and-forget; the settle path never waits on process bookkeeping), any still-running background process for that conversation is reported with sessionId/pid/command plus poll/kill guidance. Silent when nothing is running.
+
+### 中文
+
+**任务规划真正送达（字段回归修复）**：规划旁路仍带着 2026-11-02 裁定为进度旁路废除的硬编码 512 token 预留——qwen 默认思考单独就能吃满预算，**每条任务规划都被静默跳过**（`generation hit the token cap`）。预算收敛到一处 `sidePassMaxTokens()`（按模型 max-output 解析，ceil(maxOut/0.8)），进度旁路与规划共用；规划旁路超时对齐 180 秒。回归守卫：wiring 测试断言每个旁路必须委托 helper（同行字面量或 decoy 调用都会转红——变异实测），helper 数值由专项测试钉死。独立 code review 一轮（APPROVE，无 P0/P1）盘点全部 `generateSummary` 调用点并对钳制做 11 值数值探针。
+
+**进度推送不再像投递 bug**：定时任务阶段进展用 `slice(-500)` 硬切上次进展——句子中间开口、顶着完整标题。现在切点落在段落边界（`tailExcerpt`），并如实标注「……（以下为上次进展的节选）」。三条自主任务推送模板（进展/完成/需人工）补基本结构：分节分隔线与字段化元信息（下次跟进 / 跟进原因 / 恢复方式）。
+
+**回合收尾后台进程盘点（异步，用户裁定）**：数币监控的结果已推送，监控脚本仍在后台运行，没有任何消息告知用户——静默的游离进程被当成投递 bug。回合收尾 5 秒后（fire-and-forget；结算路径永不等待进程簿记），如该会话仍有运行中的后台进程，推送一条盘点（sessionId/pid/命令 + poll/kill 指引）；无运行进程则静默。
+
 ## v0.2.184 — work gates accept owner, progress notes finally push, per-model thinking levels
 
 ### English
