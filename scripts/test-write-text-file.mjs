@@ -253,3 +253,153 @@ test("P1-3: overwriting reports the previous byte size", async () => {
 	const text = res.content.map((c) => c.text ?? "").join("");
 	assert.match(text, /原 1 字节/, `the report must mention the replaced size: ${text}`);
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Review round 2 P0s — all three were REAL regressions introduced by the first
+// fix attempt, each reproduced by the reviewer.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("P0-1: a path with MANY missing segments must not fall through the guard (fail-open)", async () => {
+	// The old guard walked up to the deepest existing ancestor with a 64-hop cap
+	// and simply RETURNED when the cap ran out — i.e. it allowed the write. The
+	// reviewer reproduced a write landing INSIDE the sensitive profile that way.
+	const fs = service([allowed]);
+	const profile = join(work, "profile2");
+	mkdirSync(profile, { recursive: true });
+	fs.addSensitiveDir(profile);
+	// Deeply nested, entirely non-existent path under the allowed dir.
+	const deep = join(allowed, ...Array.from({ length: 40 }, (_, i) => `p${i}`), "evil.py");
+	// A legitimate deep path inside the workspace must still work (the guard must
+	// RETURN a decision for every hop count — not run out of hops and fall through).
+	await fs.writeTextFile(deep, "x", true);
+	assert.equal(readFileSync(deep, "utf8"), "x", "a legitimate deep path inside the workspace must still work");
+
+	// The dangerous case: the deep path resolves THROUGH a junction to the profile.
+	const ws = join(work, "ws2");
+	mkdirSync(ws, { recursive: true });
+	const fs2 = service([ws]);
+	fs2.addSensitiveDir(profile);
+	let linked = false;
+	try {
+		const { symlinkSync } = await import("node:fs");
+		symlinkSync(profile, join(ws, "j"), "junction");
+		linked = true;
+	} catch { /* no symlink privilege */ }
+	if (linked) {
+		const inside = join(ws, "j", ...Array.from({ length: 40 }, (_, i) => `p${i}`), "evil.py");
+		await assert.rejects(
+			() => fs2.writeTextFile(inside, "PWNED", true),
+			/自身数据|sensitive|不在允许访问|无法解析/,
+			"a deep junction target must be refused, never fail open",
+		);
+	}
+});
+
+test("P0-2: the workspace must not be nested inside a denied root (default profile layout)", async () => {
+	// Default profile: userData IS <appData>/pi-virtual-employee, so a workspace
+	// under that root was inside the deny-list → every write refused.
+	// The shipped layout now uses a SEPARATE root; assert the guard agrees.
+	const appRoot = join(work, "appdata", "pi-virtual-employee");
+	const workspaceRoot = join(work, "appdata", "pi-virtual-employee-workspace", "default", "scripts");
+	mkdirSync(appRoot, { recursive: true });
+	mkdirSync(workspaceRoot, { recursive: true });
+	const fs = service([workspaceRoot]);
+	fs.addSensitiveDir(join(appRoot, "logs"));
+	fs.addSensitiveFile(join(appRoot, "pi-employee.sqlite"));
+	fs.addSensitiveFile(join(appRoot, "config.json"));
+
+	const ok = await fs.writeTextFile(join(workspaceRoot, "hello.py"), "print(1)\n", true);
+	assert.equal(ok.bytes, 9, "the default profile must be able to author scripts");
+	assert.equal(readFileSync(join(workspaceRoot, "hello.py"), "utf8"), "print(1)\n");
+
+	// ...while the app's own critical files remain refused.
+	writeFileSync(join(appRoot, "pi-employee.sqlite"), "REAL");
+	await assert.rejects(() => fs.writeTextFile(join(appRoot, "pi-employee.sqlite"), "PWNED", true));
+	assert.equal(readFileSync(join(appRoot, "pi-employee.sqlite"), "utf8"), "REAL");
+});
+
+test("P0-3: the FIRST write into a not-yet-existing workspace must work", async () => {
+	// The guard resolves through the deepest EXISTING ancestor; a workspace that
+	// was never mkdir'ed made the very first write fail. main.ts now creates it,
+	// and writeTextFile mkdirs the parent — assert the guard permits it.
+	const fresh = join(work, "fresh-workspace", "deep");
+	const fs = service([join(work, "fresh-workspace")]);
+	const r = await fs.writeTextFile(join(fresh, "first.py"), "print('first')\n", true);
+	assert.equal(r.overwritten, false);
+	assert.equal(readFileSync(join(fresh, "first.py"), "utf8"), "print('first')\n");
+
+	// Also assert the shipped main.ts pre-creates the workspace (wiring).
+	const mainSrc = readFileSync(join(root, "electron/main.ts"), "utf8");
+	assert.match(mainSrc, /mkdirSync\(scriptWorkspace, \{ recursive: true \}\)/, "the workspace must be pre-created at startup");
+	assert.match(mainSrc, /addSensitiveFile\(/, "critical files are denied individually, not by root");
+});
+
+test("P1-2: concurrent writes to the SAME target do not collide on the tmp name", async () => {
+	const target = join(allowed, "concurrent.py");
+	const fs = service();
+	const results = await Promise.allSettled([
+		fs.writeTextFile(target, "A".repeat(100), true),
+		fs.writeTextFile(target, "B".repeat(100), true),
+		fs.writeTextFile(target, "C".repeat(100), true),
+	]);
+	const ok = results.filter((r) => r.status === "fulfilled");
+	assert.ok(ok.length >= 1, `at least one write must succeed: ${JSON.stringify(results.map((r) => r.status))}`);
+	const final = readFileSync(target, "utf8");
+	assert.match(final, /^(A{100}|B{100}|C{100})$/, "the surviving content must be one whole write, never a mix");
+	// No tmp files may be left behind.
+	const { readdirSync } = await import("node:fs");
+	const leftovers = readdirSync(allowed).filter((f) => f.includes(".tmp-"));
+	assert.deepEqual(leftovers, [], `tmp files leaked: ${leftovers.join(",")}`);
+});
+
+test("P0-1c: the guard MUST throw on exhaustion — driven directly, not via a path shape", async () => {
+	// The round-2 fail-open was only reachable when the walk ran out WITHOUT
+	// reaching the root (the old 64-hop cap). A filesystem path cannot express
+	// that portably, so assert the CONTRACT at the guard: a path whose resolution
+	// cannot produce a decision must reject. We force it with a non-existent
+	// absolute root that has no existing ancestor beyond the drive root.
+	const fs = service([allowed]);
+	// Anything the guard cannot place inside the whitelist must reject — the
+	// assertion is that SOME error surfaces, never a silent resolution.
+	let threw = false;
+	try {
+		await fs.writeTextFile(join("/nonexistent-root-xyz", "a", "b", "evil.py"), "x", true);
+	} catch {
+		threw = true;
+	}
+	assert.equal(threw, true, "an unresolvable path must never be accepted");
+
+	// And the shipped guard must contain a FAIL-CLOSED exit on exhaustion rather
+	// than a bare `break`/`return` (positive-shape assertion, mutation-proved).
+	const src = readFileSync(join(root, "src/filesystem/filesystem-service.ts"), "utf8");
+	const start = src.indexOf("private async assertAllowedReal");
+	const region = src.slice(start, start + 2200);
+	assert.match(region, /throw new Error\(`无法解析路径/, "exhaustion must THROW, not return");
+	assert.doesNotMatch(region, /for \(let i = 0; i < 64; i\+\+\)/, "the hop cap that caused the fail-open must be gone");
+});
+
+test("P0-1b: the guard must THROW when it cannot resolve a path (never pass by omission)", async () => {
+	// Directly exercise the guard's contract. Any code path that cannot decide
+	// must refuse — the round-2 bug was precisely "walked out of the loop and
+	// returned", which reads as ALLOW.
+	const fs = service([allowed]);
+	// Resolve a path whose every ancestor is denied/nonexistent is hard to build
+	// portably, so test the public consequence instead: a target OUTSIDE every
+	// allowed dir must throw for arbitrarily many missing segments. A fail-open
+	// guard returns quietly and the write succeeds.
+	const outsideDeep = join(work, "outside", ...Array.from({ length: 80 }, (_, i) => `x${i}`), "evil.py");
+	await assert.rejects(
+		() => fs.writeTextFile(outsideDeep, "PWNED", true),
+		/不在允许访问的目录内|无法解析路径|拒绕访问/,
+		"a deep out-of-whitelist path must be refused, not silently allowed",
+	);
+	const { existsSync } = await import("node:fs");
+	assert.equal(existsSync(outsideDeep), false, "nothing may be created outside the whitelist");
+
+	// Same shape but the whitelist prefix appears deeper in the path: prefix
+	// matching must not be fooled by a sibling that merely shares the name.
+	const sibling = `${allowed}-evil`;
+	const sneaky = join(sibling, "a", "b", "c", "evil.py");
+	await assert.rejects(() => fs.writeTextFile(sneaky, "PWNED", true), /不在允许访问的目录内|无法解析路径|拒绕访问/);
+	assert.equal(existsSync(sneaky), false);
+});

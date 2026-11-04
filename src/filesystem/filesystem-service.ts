@@ -15,6 +15,7 @@
  *    enforced by the agent + system-prompt rule; the confirmed flag is the
  *    tool-level gate that makes a two-step flow mandatory.
  */
+import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, realpath, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -82,6 +83,8 @@ export class FileSystemService {
 
 	/** Absolute paths the employee must never read-modify even inside a whitelist. */
 	private sensitiveDirs: string[] = [];
+	/** Individual files (databases, config) that are always off-limits. */
+	private sensitiveFiles: string[] = [];
 
 	/** Register the app's own data dirs (profile root) as off-limits for writes. */
 	addSensitiveDir(dir: string | undefined): void {
@@ -90,8 +93,22 @@ export class FileSystemService {
 		if (!this.sensitiveDirs.includes(abs)) this.sensitiveDirs.push(abs);
 	}
 
+	/**
+	 * Register ONE file as off-limits. Preferred over denying a whole root: the
+	 * app's databases and config sit in the same directory as plenty of things a
+	 * legitimate workspace may belong to, so a directory deny-list would either
+	 * miss them or be too broad (review round 2, P0-2).
+	 */
+	addSensitiveFile(file: string | undefined): void {
+		if (!file) return;
+		const abs = path.resolve(file);
+		if (!this.sensitiveFiles.includes(abs)) this.sensitiveFiles.push(abs);
+	}
+
 	private isSensitive(resolved: string): boolean {
-		return this.sensitiveDirs.some((dir) => resolved === dir || resolved.startsWith(dir + path.sep));
+		const target = path.resolve(resolved);
+		if (this.sensitiveFiles.includes(target)) return true;
+		return this.sensitiveDirs.some((dir) => target === dir || target.startsWith(dir + path.sep));
 	}
 
 	/**
@@ -108,13 +125,22 @@ export class FileSystemService {
 		this.assertAllowed(absPath);
 		let probe = path.resolve(this.expand(absPath));
 		const suffix: string[] = [];
-		for (let i = 0; i < 64; i++) {
+		// Walk up to the deepest EXISTING ancestor. NO hop cap: a cap that runs
+		// out must never fall through to "allowed" — the earlier `for (i<64)`
+		// version simply returned after 64 iterations, and a path with 63 real
+		// segments + 63 missing ones therefore passed the guard and wrote into
+		// the profile through a junction (review round 2, P0-1). The climb is
+		// bounded naturally: every step strips one segment.
+		for (;;) {
 			let real: string;
 			try {
 				real = await realpath(probe);
 			} catch {
 				const parent = path.dirname(probe);
-				if (parent === probe) break; // reached the root without an existing ancestor
+				if (parent === probe) {
+					// Reached the filesystem root without resolving anything.
+					throw new Error(`无法解析路径（已到达根目录仍不存在），拒绝操作：${absPath}`);
+				}
 				suffix.unshift(path.basename(probe));
 				probe = parent;
 				continue;
@@ -122,15 +148,37 @@ export class FileSystemService {
 			const final = suffix.length ? path.join(real, ...suffix) : real;
 			// Compare against the REAL path of every allowed dir too: the literal
 			// configured path may itself be a link (/var -> /private/var on macOS,
-			// 8.3 short names or junctions on Windows). Comparing a resolved target
-			// against an unresolved allowed dir rejects legitimate writes.
-			const allowedReal = await Promise.all(
-				this.allowedDirs().map((dir) => realpath(dir).catch(() => path.resolve(dir))),
-			);
+			// 8.3 short names or junctions on Windows). An allowed dir that does
+			// not exist yet must be normalized the SAME way (deepest existing
+			// ancestor + remaining segments) — otherwise a literal-path fallback
+			// never matches a resolved target and the FIRST write into a fresh
+			// workspace is refused (review round 2, P0-3).
+			const allowedReal = await Promise.all(this.allowedDirs().map((dir) => this.resolveRealish(dir)));
 			const ok = allowedReal.some((dir) => final === dir || final.startsWith(dir + path.sep));
 			if (!ok) throw new Error(`路径不在允许访问的目录内（符号链接解析后）：${absPath}`);
 			if (this.isSensitive(final)) throw new Error(`拒绕访问应用自身数据文件：${absPath}`);
 			return;
+		}
+	}
+
+	/**
+	 * Real path of `p`, or — when it does not exist yet — the real path of its
+	 * deepest existing ancestor with the remaining segments re-appended. Without
+	 * this an allowed dir created lazily can never match a resolved target.
+	 */
+	private async resolveRealish(p: string): Promise<string> {
+		let probe = path.resolve(this.expand(p));
+		const suffix: string[] = [];
+		for (;;) {
+			try {
+				const real = await realpath(probe);
+				return suffix.length ? path.join(real, ...suffix) : real;
+			} catch {
+				const parent = path.dirname(probe);
+				if (parent === probe) return path.resolve(this.expand(p));
+				suffix.unshift(path.basename(probe));
+				probe = parent;
+			}
 		}
 	}
 
@@ -260,7 +308,11 @@ export class FileSystemService {
 		await mkdir(path.dirname(abs), { recursive: true });
 		// Write to a sibling temp file and rename over the target only after the
 		// content verifies, so a failed write can never destroy a working script.
-		const tmp = `${abs}.tmp-${process.pid}-${Date.now()}`;
+		// The suffix must be UNIQUE per call: pid+millis collides for two writes to
+		// the same target in the same millisecond, and then one call reads the
+		// other's bytes (bogus "cannot encode" error) while the other has its tmp
+		// deleted out from under it (review round 2, P1-2).
+		const tmp = `${abs}.tmp-${process.pid}-${randomUUID()}`;
 		// No BOM: a BOM breaks `node script.mjs` shebang-less ESM detection on
 		// some runtimes and shows up as an invisible first-character diff.
 		await writeFile(tmp, content, { encoding: "utf8" });

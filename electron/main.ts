@@ -450,15 +450,33 @@ async function main(): Promise<void> {
 	// It lives OUTSIDE the profile dir on purpose. Inside, `scripts/` would sit
 	// next to pi-employee.sqlite / config.json / skills / logs — and a single
 	// junction (`mklink /J scripts\x ..`) would let write_text_file overwrite the
-	// RBAC database and promote itself (independent review, reproduced). Keeping
-	// the workspace in a sibling directory plus the sensitive-dir deny-list
-	// below makes that chain require two independent failures instead of one.
-	const scriptWorkspace = path.join(app.getPath("appData"), "pi-virtual-employee", "workspaces", activeProfile, "scripts");
+	// RBAC database and promote itself (independent review, reproduced).
+	//
+	// NOTE the default profile: main.ts only redirects userData for NAMED
+	// profiles, so the default profile's userData IS <appData>/pi-virtual-employee
+	// — the same root the workspace would live under. Putting the workspace there
+	// made the sensitive-dir deny-list refuse every write (review round 2, P0-2).
+	// It therefore lives in a SEPARATE root that never overlaps any profile.
+	const scriptWorkspace = path.join(app.getPath("appData"), "pi-virtual-employee-workspace", activeProfile, "scripts");
+	// Create it up front: the guard resolves symlinks through the deepest EXISTING
+	// ancestor, so a not-yet-created workspace would fail the first write — the
+	// exact "can never author its first script" failure this feature exists to
+	// remove (review round 2, P0-3). inboundDir is pre-created for the same reason.
+	mkdirSync(scriptWorkspace, { recursive: true });
 	filesystem.addAllowedDir(scriptWorkspace);
-	// Defence in depth: even though the workspace no longer overlaps the profile,
-	// refuse writes into the app's own data so a stray junction can never reach
-	// the database, config, skills or logs.
-	filesystem.addSensitiveDir(app.getPath("userData"));
+	// Defence in depth: refuse writes into the app's own data so a stray junction
+	// can never reach the database, config, skills or logs. Only CRITICAL paths
+	// are denied — denying the whole userData root would also deny anything the
+	// user adds under it (and, for the default profile, the workspace itself).
+	const appRoot = app.getPath("userData");
+	filesystem.addSensitiveDir(path.join(appRoot, "logs"));
+	filesystem.addSensitiveDir(path.join(appRoot, "skills"));
+	filesystem.addSensitiveDir(path.join(appRoot, "proposals"));
+	filesystem.addSensitiveDir(path.join(appRoot, "documents"));
+	for (const dbFile of ["pi-employee.sqlite", "durable-default.sqlite"]) {
+		filesystem.addSensitiveFile(path.join(appRoot, dbFile));
+	}
+	filesystem.addSensitiveFile(path.join(appRoot, "config.json"));
 
 	// Browser downloads: capture into a managed workspace so the employee can
 	// list/read/analyze downloaded files (Excel exports, etc.) without touching
