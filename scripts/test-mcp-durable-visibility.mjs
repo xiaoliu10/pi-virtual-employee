@@ -76,14 +76,17 @@ test("openDurableHost installs ve-mcp separately from ve-tools", async () => {
 			mcpTools: [tool("mcp__etc__query")],
 		});
 		try {
-			const snap = opened.harness.registry?.snapshot?.() ?? null;
-			// The harness holds the registry; read it back through the host's own
-			// update path instead of a private field.
-			const names = snap ? snap.tools().map((t) => t.tool.name) : [];
-			if (snap) {
-				assert.ok(names.includes("browser_navigate"), `ve-tools present: ${names}`);
-				assert.ok(names.includes("mcp__etc__query"), `ve-mcp present: ${names}`);
-			}
+			// The Harness exposes NO registry handle, so the old
+			// `harness.registry?.snapshot?.() ?? null` + `if (snap)` asserted
+			// NOTHING and shipped as a false green in v0.2.185. Read the surface
+			// through the host's own accessor, which goes to the app-owned
+			// registry. ve-tools vs ve-mcp separation is the point of the test, so
+			// assert both halves unconditionally.
+			assert.deepEqual(opened.mcpToolNames(), ["mcp__etc__query"], "ve-mcp holds the MCP tool");
+			// ve-tools must still carry the built-in; if MCP had been folded in, it
+			// would appear in this list too and the split would be a lie.
+			opened.setMcpTools([]);
+			assert.deepEqual(opened.mcpToolNames(), [], "ve-mcp can be emptied without touching ve-tools");
 		} finally {
 			await opened.close();
 		}
