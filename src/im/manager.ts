@@ -243,7 +243,12 @@ export class IMAdapterManager {
 			// (review P1-2).
 			if (!isDeclaredAdmin(this.config, msg.actor?.senderId)) {
 				console.log(`[im] dispatch triage: inline (non-admin ${msg.actor?.senderId ?? "?"} cannot own a work item)`);
-				return `⚠️ 后台任务仅支持管理员发起。该任务将继续在会话内执行（耗时较长，期间本会话的其他消息需要排队）。如需转后台，请联系管理员重新发送。`;
+				// MUST return undefined, not the notice: the caller treats a nonempty
+				// result as "dispatched" and returns before engine.send — the message
+				// would be acknowledged in text and then never executed (review P1-1,
+				// field 2026-11-04). The notice is a courtesy push; execution continues
+				// inline either way.
+				return undefined;
 			}
 			const title = (msg.text.trim().split(/\r?\n/, 1)[0] ?? "").slice(0, 60) || "聊天转后台任务";
 			const item = store.create({

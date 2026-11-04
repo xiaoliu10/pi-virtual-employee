@@ -274,8 +274,18 @@ test("dispatch WIRING: flag off → inline (no work item, old behaviour)", async
 			push: async () => ({ ok: true }),
 		},
 	};
-	// Explicit opt-out must still bypass dispatch.
-	const config = { all: () => ({ general: { chatDispatch: { enabled: false } }, capabilities: {} }) };
+	// Explicit opt-out must still bypass dispatch. The security block is present
+	// on purpose: WITHOUT it a run that reached isDeclaredAdmin() would throw on
+	// the missing adminStaffIds and the broad catch would return undefined — the
+	// test would pass even if the flag guard were deleted (review P2-1, mutation
+	// verified: removing `if (!enabled) return undefined` stayed green).
+	const config = {
+		all: () => ({
+			general: { chatDispatch: { enabled: false } },
+			security: { adminStaffIds: ["u1"], ownerStaffIds: [], people: [], defaultRole: "viewer" },
+			capabilities: {},
+		}),
+	};
 	const manager = Object.create(IMAdapterManager.prototype);
 	Object.defineProperties(manager, {
 		engine: { value: engine },
@@ -330,4 +340,38 @@ test("dispatch WIRING: no work-item subsystem → inline", async () => {
 	});
 	const ack = await manager.tryDispatchToWorker({ conversationId: "c", text: "部署测试环境并执行完整回归测试", actor: undefined }, PLAN3);
 	assert.equal(ack, undefined);
+});
+
+test("dispatch WIRING: a NON-ADMIN keeps executing inline (never swallowed)", async () => {
+	// Review P1-1 (field 2026-11-04): the non-admin branch used to RETURN the
+	// courtesy warning. The caller treats any nonempty result as "dispatched"
+	// and returns before engine.send, so a viewer's task was acknowledged in
+	// text and then never executed. The branch must return undefined.
+	const managerBundle = join(outDir, "mgr5.mjs");
+	await build({
+		stdin: { contents: `export { IMAdapterManager } from "./src/im/manager.ts";`, resolveDir: root, loader: "ts" },
+		outfile: managerBundle, bundle: true, platform: "node", format: "esm",
+		packages: "external", logLevel: "silent",
+	});
+	const { IMAdapterManager } = await import(pathToFileURL(managerBundle).href + `?t=${Date.now()}`);
+	const store = makeMemoryStore();
+	const engine = {
+		workItems: store,
+		workBridge: { fireItem: () => true, push: async () => ({ ok: true }) },
+	};
+	const config = {
+		all: () => ({
+			general: {}, // absent → default ON, the path that exposes this to legacy installs
+			security: { adminStaffIds: ["admin1"], ownerStaffIds: [], people: [], defaultRole: "viewer" },
+			capabilities: {},
+		}),
+	};
+	const manager = Object.create(IMAdapterManager.prototype);
+	Object.defineProperties(manager, { engine: { value: engine }, config: { value: config } });
+	const ack = await manager.tryDispatchToWorker(
+		{ conversationId: "dt:single:abc", text: "登录 spay 系统抓取昨日账单，然后导出 Excel 发我", actor: { senderId: "viewer1", channel: "dingtalk", chatType: "single" } },
+		PLAN3,
+	);
+	assert.equal(ack, undefined, "a viewer must fall through to inline execution, not get an ACK");
+	assert.equal(store.list().length, 0, "and no work item may be created for them");
 });

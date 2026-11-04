@@ -1,8 +1,17 @@
 import { nextStallStep, STALL_QUIET_RETRIES } from "./autonomous.js";
 /**
- * Persistent, single-window work dispatcher. No periodic polling: store lifecycle
+ * Persistent, multi-window work dispatcher. No periodic polling: store lifecycle
  * events wake queued work; one timer wakes the earliest model-selected due time.
- * Abort requests never release the dispatch lock until send actually settles.
+ * Abort requests never release a window's slot until send actually settles.
+ *
+ * CONCURRENCY (user ruling 2026-11-04): this used to run exactly ONE window per
+ * profile. That was fine while only mined/scheduled work used it, but routing
+ * chat tasks here as well would have made the whole profile globally serial —
+ * strictly WORSE than the per-conversation serialization it replaced (two
+ * chats could run in parallel before; they could not any more). Windows now run
+ * up to maxConcurrent at once (default 5), each independently claimed/tracked.
+ * Safety: WorkItemStore.claim() is an atomic UPDATE ... WHERE status='queued',
+ * so two windows can never start the same row even if listDue() races.
  */
 import type { WorkItemRow, WorkItemStore } from "../db/work-item-store.js";
 import { buildWorkWindowPrefix, DEFAULT_NEXT_CHECK_MS, DEFAULT_WINDOW_BUDGET, nextRoutineStreak, parseWindowReply, REMIND_DEFAULT_MS, REMIND_MAX_MS, REMIND_MIN_MS } from "./work.js";
@@ -59,6 +68,10 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	 * per window; the service starts it, then stops and drains it before the
 	 * window's completion push. */
 	progress?(item: WorkItemRow, session: Session, conversationId: string): { start(): void; stop(): void; drain(timeoutMs?: number): Promise<void> } | undefined;
+	/** How many windows may run at once (default 5). User ruling 2026-11-04:
+	 * a profile routes ALL task-shaped chat messages here, so one window would
+	 * serialize the whole profile; the box can afford five. */
+	maxConcurrent?: number;
 	clock?: Clock;
 	onError?(error: unknown): void;
 	/** Latest inbound (user) message time in a conversation since a timestamp —
@@ -103,17 +116,25 @@ const TIMEOUT_DEFER_MS = 5 * 60_000;
  * does not fit the budget; a human must resize it (raise max_minutes) or
  * split it. */
 const MAX_CONSECUTIVE_TIMEOUTS = 2;
+/** Default concurrent work windows per profile (user ruling 2026-11-04). */
+const DEFAULT_MAX_CONCURRENT = 5;
 
 export class WorkService<Session extends WorkSession> {
 	private running = false;
 	private recovered = false;
 	private unsubscribe?: () => void;
 	private wakeTimer?: ReturnType<typeof setTimeout>;
-	private active?: ActiveWindow<Session>;
+	/** Running windows, keyed by work-item id. Bounded by maxConcurrent. */
+	private readonly active = new Set<ActiveWindow<Session>>();
+	private readonly maxConcurrent: number;
 	private readonly clock: Clock;
 	private readonly budget: { maxTurns: number; maxMinutes: number };
 	constructor(private readonly opts: WorkServiceOptions<Session>) {
 		this.clock = opts.clock ?? { now: Date.now, setTimeout, clearTimeout };
+		// Bounded sanity, not a policy: a nonsense value must not wedge dispatch
+		// into "0 windows" (nothing ever runs) or an unbounded fan-out.
+		const requested = opts.maxConcurrent ?? DEFAULT_MAX_CONCURRENT;
+		this.maxConcurrent = Number.isFinite(requested) && requested >= 1 ? Math.floor(requested) : DEFAULT_MAX_CONCURRENT;
 		const b = opts.budget ?? DEFAULT_WINDOW_BUDGET;
 		this.budget = {
 			// maxTurns 0 = unlimited (the default, user ruling 2026-10-13). Invalid
@@ -128,14 +149,21 @@ export class WorkService<Session extends WorkSession> {
 		if (!this.recovered) { this.opts.store.recoverWorking(); this.recovered = true; }
 		this.running = true;
 		this.unsubscribe = this.opts.store.subscribe((id) => {
-			if (id && id === this.active?.id) {
+			// With several windows in flight the changed row may be ANY of them:
+			// cancel/pause must abort the matching window, not "the" window.
+			const running = id ? this.findActive(id) : undefined;
+			if (running && id) {
 				const fresh = this.opts.store.get(id);
-				if (fresh?.status === "cancelled") this.abortActive("任务已取消");
-				else if (fresh?.status === "waiting_human" && fresh.question?.startsWith("管理员暂停")) this.abortActive("管理员已暂停任务");
+				if (fresh?.status === "cancelled") this.abortActive(running, "任务已取消");
+				else if (fresh?.status === "waiting_human" && fresh.question?.startsWith("管理员暂停")) this.abortActive(running, "管理员已暂停任务");
 			}
 			queueMicrotask(() => this.tick());
 		});
 		this.tick();
+	}
+	private findActive(id: string): ActiveWindow<Session> | undefined {
+		for (const window of this.active) if (window.id === id) return window;
+		return undefined;
 	}
 	/** Request dispatch. False means still durably queued, not a lost request. */
 	fireItem(id: string): boolean {
@@ -143,27 +171,51 @@ export class WorkService<Session extends WorkSession> {
 		const row = this.opts.store.get(id);
 		if (!row || !(row.status === "queued" || (row.status === "scheduled" && row.next_check_at !== null && row.next_check_at <= this.clock.now()))) return false;
 		this.tick();
-		return this.active?.id === id;
+		// True only when a window actually took it now; with a full board the item
+		// stays durably queued and fires when a slot frees up.
+		return !!this.findActive(id);
 	}
+	/** Stop dispatching and abort every window.
+	 *
+	 * MUST NOT await the in-flight sends. A session whose send ignores abort()
+	 * never settles, and a test/fake session that hangs forever would make
+	 * shutdown hang with it (the concurrency suite deadlocked for exactly this
+	 * reason). The single-window code had the same shape but only ever waited on
+	 * ONE window, so the hazard was invisible. Callers that genuinely need the
+	 * sends drained can await whenIdle() themselves AFTER the abort has been
+	 * requested — stop() returns as soon as the abort is on the wire.
+	 */
 	async stop(): Promise<void> {
 		this.running = false;
 		this.unsubscribe?.(); this.unsubscribe = undefined;
 		this.clearWake();
-		this.abortActive("应用停止执行；请核查已发生的操作后由管理员明确恢复。");
-		await this.active?.settled;
+		for (const window of [...this.active]) this.abortActive(window, "应用停止执行；请核查已发生的操作后由管理员明确恢复。");
 	}
 	/** Test/drain hook; does not race or abandon an in-flight engine send. */
-	async whenIdle(): Promise<void> { await this.active?.settled; }
+	async whenIdle(): Promise<void> { await Promise.all([...this.active].map((window) => window.settled)); }
+	/** Arm the SINGLE timer that wakes the earliest due item / reminder.
+	 * Idempotent: every tick re-arms, so the previous timer must be cleared
+	 * first or repeated ticks stack timers for the same instant (the old
+	 * single-window code cleared at the top of tick and could not race itself;
+	 * with several windows finishing at once it can).
+	 */
+	private armWake(): void {
+		this.clearWake();
+		const at = Math.min(this.opts.store.nextWakeAt() ?? Number.POSITIVE_INFINITY, ...this.remindDeadlines());
+		if (at === Number.POSITIVE_INFINITY) return;
+		this.wakeTimer = this.clock.setTimeout(() => { this.wakeTimer = undefined; this.tick(); }, Math.min(2_147_483_647, Math.max(0, at - this.clock.now())));
+	}
 	private clearWake(): void {
 		if (this.wakeTimer !== undefined) this.clock.clearTimeout(this.wakeTimer);
 		this.wakeTimer = undefined;
 	}
-	private abortActive(reason: string): void {
-		if (!this.active || this.active.stopReason) return;
-		this.active.stopReason = reason;
-		if (this.active.deadline !== undefined) this.clock.clearTimeout(this.active.deadline);
-		this.active.deadline = undefined;
-		try { this.active.session?.abort(); } catch (err) { this.opts.onError?.(err); }
+	/** Abort ONE window. Never "the" window: several may be running. */
+	private abortActive(window: ActiveWindow<Session>, reason: string): void {
+		if (window.stopReason) return;
+		window.stopReason = reason;
+		if (window.deadline !== undefined) this.clock.clearTimeout(window.deadline);
+		window.deadline = undefined;
+		try { window.session?.abort(); } catch (err) { this.opts.onError?.(err); }
 	}
 	/** Reminder interval for a waiting_human row: the item's OWN rhythm
 	 * (EMA of its declared NEXT_CHECK gaps), clamped. A 2h-rhythm task that
@@ -233,35 +285,58 @@ export class WorkService<Session extends WorkSession> {
 	}
 
 	private tick(): void {
-		if (!this.running || this.active) return;
-		this.clearWake();
+		if (!this.running) return;
+		// Do NOT clear the wake timer here: a full board still needs the wake to
+		// fire the earliest due item the moment a slot frees up.
+		if (this.active.size >= this.maxConcurrent) {
+			this.armWake();
+			return;
+		}
 		try {
 			this.sweepReminders();
-			const due = this.opts.store.listDue(this.clock.now())[0];
-			if (!due) {
+			const due = this.opts.store.listDue(this.clock.now());
+			if (!due.length) {
 				// Wake for the earliest of: scheduled follow-up OR pending waiting_human
 				// reminder. Without the reminder half, an all-waiting_human board has NO
 				// timer at all — tick never fires and reminders never happen (the exact
 				// silent-death this sweep exists to prevent).
-				const at = Math.min(this.opts.store.nextWakeAt() ?? Number.POSITIVE_INFINITY, ...this.remindDeadlines());
-				if (at !== Number.POSITIVE_INFINITY) this.wakeTimer = this.clock.setTimeout(() => { this.wakeTimer = undefined; this.tick(); }, Math.min(2_147_483_647, Math.max(0, at - this.clock.now())));
+				this.armWake();
 				return;
 			}
-			// Set the lock BEFORE starting any async setup, and keep it through cleanup.
-			const active: ActiveWindow<Session> = {
-				id: due.id, settled: Promise.resolve(),
-				dueAt: due.next_check_at, prevReason: due.next_check_reason, prevStreak: due.fixed_streak ?? 0,
-				prevFallback: due.fallback_streak ?? 0,
-				prevKicked: due.kicked_off ?? 0,
-				prevResident: due.resident ?? 0,
-				prevTimeouts: due.timeout_streak ?? 0,
-				prevCadenceMs: due.cadence_ms ?? null,
-			};
-			this.active = active;
-			active.settled = Promise.resolve().then(() => this.run(active)).catch((err) => this.opts.onError?.(err)).finally(() => {
-				this.active = undefined;
-				queueMicrotask(() => this.tick());
-			});
+			// Fill every free slot, highest priority first (listDue already ordered).
+			// The slot is registered BEFORE any async setup and held through cleanup
+			// so a concurrent tick can never double-start the same row (claim() would
+			// also reject it, but the slot must not be counted as free).
+			// CLAIM THE SLOTS FIRST, START THEM AFTER. Adding a window and starting
+			// its run in the same loop iteration is a re-entrancy bug: a window whose
+			// fake/live send resolves instantly deletes itself in the SAME microtask
+			// drain, so `active.size` drops back under the cap and the loop admits
+			// one more — the board then runs 5 windows despite maxConcurrent=2
+			// (reproduced: size 0→1→0→1→... while claiming). Reserving every slot
+			// up front makes the cap a hard limit regardless of how fast a window
+			// settles.
+			const starting: ActiveWindow<Session>[] = [];
+			for (const row of due) {
+				if (this.active.size >= this.maxConcurrent) break;
+				if (this.findActive(row.id)) continue;
+				const active: ActiveWindow<Session> = {
+					id: row.id, settled: Promise.resolve(),
+					dueAt: row.next_check_at, prevReason: row.next_check_reason, prevStreak: row.fixed_streak ?? 0,
+					prevFallback: row.fallback_streak ?? 0,
+					prevKicked: row.kicked_off ?? 0,
+					prevResident: row.resident ?? 0,
+					prevTimeouts: row.timeout_streak ?? 0,
+					prevCadenceMs: row.cadence_ms ?? null,
+				};
+				this.active.add(active);
+				starting.push(active);
+			}
+			for (const active of starting) {
+				active.settled = Promise.resolve().then(() => this.run(active)).catch((err) => this.opts.onError?.(err)).finally(() => {
+					this.active.delete(active);
+					queueMicrotask(() => this.tick());
+				});
+			}
 		} catch (err) { this.opts.onError?.(err); }
 	}
 
@@ -299,7 +374,7 @@ export class WorkService<Session extends WorkSession> {
 			// review P1 2026-10-23). Read ONCE at window start: a change mid-window
 			// lands on the next window, never retargeting a cap already running.
 			if (item.max_minutes && item.max_minutes > 0) budget = { ...this.budget, maxMinutes: item.max_minutes };
-			active.deadline = this.clock.setTimeout(() => this.abortActive(TIMEOUT_STOP_REASON), budget.maxMinutes * 60_000);
+			active.deadline = this.clock.setTimeout(() => this.abortActive(active, TIMEOUT_STOP_REASON), budget.maxMinutes * 60_000);
 			for (let turn = 0; budget.maxTurns <= 0 || turn < budget.maxTurns; turn++) {
 				// Fresh notebook and live identity on EVERY turn (including turn zero).
 				const fresh = store.get(item.id);
