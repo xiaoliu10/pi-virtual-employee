@@ -74,6 +74,16 @@ input, textarea { font-family: inherit; }
 .step[open] > summary .t-chev, .think[open] > summary .t-chev { opacity:1; }
 .think[open] > summary .t-chev, .step[open] > summary .t-chev { transform:rotate(90deg); }
 /* 思考正文：浅灰虚化（用户要求）——浅灰 + 极轻 blur，读感是「背景过程」而非结论 */
+/* 拖拽调整大小（v0.2.193）：右下角抓手，浮窗与独立页共用 */
+.rzer { position:absolute; right:0; bottom:0; width:22px; height:22px; z-index:3;
+  cursor:nwse-resize; touch-action:none; user-select:none; -webkit-user-select:none; }
+.rzer::after { content:""; position:absolute; right:5px; bottom:5px; width:9px; height:9px;
+  border-right:2px solid #c9c9cf; border-bottom:2px solid #c9c9cf; border-radius:0 0 3px 0;
+  opacity:.75; transition:opacity .15s ease; }
+.rzer:hover::after { opacity:1; border-color:#8e8e93; }
+/* 拖动期间：禁掉选中/文本光标，避免拖出蓝色选区 */
+.ve-resizing, .ve-resizing * { user-select:none !important; -webkit-user-select:none !important;
+  cursor:nwse-resize !important; }
 .think-b { margin:0 0 10px; padding:2px 2px 2px 14px; border-left:1px solid #f0f0f2;
   font-size:13px; line-height:1.65; color:#a9a9ae; filter:blur(.3px); white-space:pre-wrap; word-break:break-word;
   max-height:240px; overflow-y:auto; }
@@ -216,6 +226,97 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
   }
 
   function q(sel) { return panel.querySelector(sel); }
+
+  /* ── 可拖拽调整大小（v0.2.193，用户：对话框太小，要能拖大拖小）─────────
+     面板锚在右下角，所以抓右下角往左上拖 = 变大。尺寸存 localStorage，
+     刷新/重开都保留；视口缩小时按上限夹取，绝不留下够不着的面板。 */
+  var SIZE_KEY = "ve-widget-size";
+  var MIN_W = 300, MIN_H = 360;
+  function clampNum(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
+  function panelLimits() {
+    // 与 CSS 的 max-width/max-height 保持同一口径，避免 CSS 把内联高度截短
+    return {
+      maxW: Math.max(MIN_W, (window.innerWidth || 1280) - 32),
+      maxH: Math.max(MIN_H, (window.innerHeight || 800) - 130)
+    };
+  }
+  function setPanelSize(w, h) {
+    var lim = panelLimits();
+    panel.style.width = clampNum(w, MIN_W, lim.maxW) + "px";
+    panel.style.height = clampNum(h, MIN_H, lim.maxH) + "px";
+  }
+  function readSize() {
+    try {
+      if (!window.localStorage) return null;
+      var raw = window.localStorage.getItem(SIZE_KEY);
+      if (!raw) return null;
+      var o = JSON.parse(raw);
+      if (!o || typeof o.w !== "number" || typeof o.h !== "number") return null;
+      if (!isFinite(o.w) || !isFinite(o.h)) return null;
+      return o;
+    } catch (e) { return null; }
+  }
+  function writeSize(w, h) {
+    try {
+      if (window.localStorage) window.localStorage.setItem(SIZE_KEY, JSON.stringify({ w: Math.round(w), h: Math.round(h) }));
+    } catch (e) { /* 隐私模式/localStorage 关闭：只是不记忆，不影响拖拽 */ }
+  }
+  function initResize() {
+    var saved = readSize();
+    // 打开时先套用记忆尺寸（视口兜底），再做一次窗口适配
+    if (saved) setPanelSize(saved.w, saved.h);
+    var grip = document.createElement("div");
+    grip.className = "rzer";
+    grip.setAttribute("title", "拖动调整大小");
+    grip.setAttribute("aria-label", "拖动调整大小");
+    panel.appendChild(grip);
+    var start = null;
+    function onDown(e) {
+      var r = panel.getBoundingClientRect();
+      start = { x: e.clientX, y: e.clientY, w: r.width, h: r.height };
+      document.documentElement.classList.add("ve-resizing") || document.body.classList.add("ve-resizing");
+      if (grip.setPointerCapture && e.pointerId != null) { try { grip.setPointerCapture(e.pointerId); } catch (err) {} }
+      if (e.preventDefault) e.preventDefault();
+    }
+    function onMove(e) {
+      if (!start) return;
+      // 锚在右下角：向左上拖为正增长
+      setPanelSize(start.w + (start.x - e.clientX), start.h + (start.y - e.clientY));
+    }
+    function onUp(e) {
+      if (!start) return;
+      start = null;
+      var r = panel.getBoundingClientRect();
+      writeSize(r.width, r.height);
+      var root2 = document.documentElement;
+      if (root2 && root2.classList) root2.classList.remove("ve-resizing");
+      if (document.body && document.body.classList) document.body.classList.remove("ve-resizing");
+      if (grip.releasePointerCapture && e && e.pointerId != null) { try { grip.releasePointerCapture(e.pointerId); } catch (err) {} }
+    }
+    grip.addEventListener("pointerdown", onDown);
+    grip.addEventListener("pointermove", onMove);
+    grip.addEventListener("pointerup", onUp);
+    grip.addEventListener("pointercancel", onUp);
+    // 键盘可达：方向键微调，给不方便拖鼠标的场景留一条路
+    grip.addEventListener("keydown", function (e) {
+      var r = panel.getBoundingClientRect();
+      var dx = e.key === "ArrowLeft" ? 24 : e.key === "ArrowRight" ? -24 : 0;
+      var dy = e.key === "ArrowUp" ? 24 : e.key === "ArrowDown" ? -24 : 0;
+      if (!dx && !dy) return;
+      setPanelSize(r.width + dx, r.height + dy);
+      var r2 = panel.getBoundingClientRect();
+      writeSize(r2.width, r2.height);
+      if (e.preventDefault) e.preventDefault();
+    });
+    // 视口变化：按新上限夹取，别把记忆尺寸撑出屏幕
+    window.addEventListener("resize", function () {
+      var cur = panel.getBoundingClientRect();
+      if (!cur || !cur.width) return;
+      setPanelSize(cur.width, cur.height);
+    });
+    window.__veWidgetResize = { grip: grip, setPanelSize: setPanelSize, readSize: readSize };
+  }
+  initResize();
   function body() { return q(".body"); }
   function msgs() { return q(".msgs"); }
   function scrollEnd() { body().scrollTop = body().scrollHeight; }
@@ -584,7 +685,7 @@ export function renderWidgetPage(): string {
 ${SHARED_CSS}
 body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; background:#f7f8fa;
   display:flex; justify-content:center; }
-.wrap { width:100%; max-width:720px; display:flex; flex-direction:column; height:100vh; background:#fff; }
+.wrap { position:relative; width:100%; max-width:720px; display:flex; flex-direction:column; height:100vh; background:#fff; }
 .head { padding:16px 20px; border-bottom:1px solid #eef0f4; font-size:16px; font-weight:600; color:#1f2329; }
 .body { flex:1; overflow-y:auto; padding:20px; }
 .hero { font-size:24px; font-weight:700; color:#1f2329; margin-bottom:16px; }
@@ -638,6 +739,89 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
   var busy = false;
   function el(id) { return document.getElementById(id); }
   function scrollEnd() { var b = el("body"); b.scrollTop = b.scrollHeight; }
+
+  /* ── 可拖拽调整大小（v0.2.193）：与浮窗同一语义，抓右下角拖宽/拖高 ── */
+  var SIZE_KEY = "ve-widget-page-size";
+  var MIN_W = 360, MIN_H = 420;
+  var wrapEl = document.querySelector(".wrap");
+  function clampNum(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
+  function pageLimits() {
+    return {
+      maxW: Math.max(MIN_W, (window.innerWidth || 1280) - 32),
+      maxH: Math.max(MIN_H, (window.innerHeight || 800) - 24)
+    };
+  }
+  function setPageSize(w, h) {
+    if (!wrapEl) return;
+    var lim = pageLimits();
+    wrapEl.style.maxWidth = "none";           // 默认 max-width:720 会让「拖宽」无效
+    wrapEl.style.width = clampNum(w, MIN_W, lim.maxW) + "px";
+    wrapEl.style.height = clampNum(h, MIN_H, lim.maxH) + "px";
+  }
+  function readSize() {
+    try {
+      if (!window.localStorage) return null;
+      var raw = window.localStorage.getItem(SIZE_KEY);
+      if (!raw) return null;
+      var o = JSON.parse(raw);
+      if (!o || typeof o.w !== "number" || typeof o.h !== "number") return null;
+      if (!isFinite(o.w) || !isFinite(o.h)) return null;
+      return o;
+    } catch (e) { return null; }
+  }
+  function writeSize(w, h) {
+    try {
+      if (window.localStorage) window.localStorage.setItem(SIZE_KEY, JSON.stringify({ w: Math.round(w), h: Math.round(h) }));
+    } catch (e) {}
+  }
+  (function initResize() {
+    if (!wrapEl) return;
+    var saved = readSize();
+    if (saved) setPageSize(saved.w, saved.h);
+    var grip = document.createElement("div");
+    grip.className = "rzer";
+    grip.setAttribute("title", "拖动调整大小");
+    grip.setAttribute("aria-label", "拖动调整大小");
+    wrapEl.appendChild(grip);
+    var start = null;
+    grip.addEventListener("pointerdown", function (e) {
+      var r = wrapEl.getBoundingClientRect();
+      start = { x: e.clientX, y: e.clientY, w: r.width, h: r.height };
+      if (document.body && document.body.classList) document.body.classList.add("ve-resizing");
+      if (grip.setPointerCapture && e.pointerId != null) { try { grip.setPointerCapture(e.pointerId); } catch (err) {} }
+      if (e.preventDefault) e.preventDefault();
+    });
+    grip.addEventListener("pointermove", function (e) {
+      if (!start) return;
+      setPageSize(start.w + (e.clientX - start.x), start.h + (e.clientY - start.y));
+    });
+    function end(e) {
+      if (!start) return;
+      start = null;
+      var r = wrapEl.getBoundingClientRect();
+      writeSize(r.width, r.height);
+      if (document.body && document.body.classList) document.body.classList.remove("ve-resizing");
+      if (grip.releasePointerCapture && e && e.pointerId != null) { try { grip.releasePointerCapture(e.pointerId); } catch (err) {} }
+    }
+    grip.addEventListener("pointerup", end);
+    grip.addEventListener("pointercancel", end);
+    grip.addEventListener("keydown", function (e) {
+      var r = wrapEl.getBoundingClientRect();
+      var dx = e.key === "ArrowRight" ? 24 : e.key === "ArrowLeft" ? -24 : 0;
+      var dy = e.key === "ArrowDown" ? 24 : e.key === "ArrowUp" ? -24 : 0;
+      if (!dx && !dy) return;
+      setPageSize(r.width + dx, r.height + dy);
+      var r2 = wrapEl.getBoundingClientRect();
+      writeSize(r2.width, r2.height);
+      if (e.preventDefault) e.preventDefault();
+    });
+    window.addEventListener("resize", function () {
+      var cur = wrapEl.getBoundingClientRect();
+      if (!cur || !cur.width) return;
+      setPageSize(cur.width, cur.height);
+    });
+    window.__veWidgetResize = { grip: grip, setPageSize: setPageSize, readSize: readSize };
+  })();
   function add(cls, text) {
     var d = document.createElement("div");
     d.className = "msg " + cls; d.textContent = text;

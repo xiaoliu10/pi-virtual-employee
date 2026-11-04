@@ -102,6 +102,12 @@ class El {
 	}
 	addEventListener() {}
 	focus() {}
+	/** resize 钳制要读真实尺寸：stub 里给一个可控矩形。 */
+	getBoundingClientRect() {
+		const w = Number.parseFloat(this.style.width) || 380;
+		const h = Number.parseFloat(this.style.height) || 560;
+		return { width: w, height: h, top: 0, left: 0, right: w, bottom: h };
+	}
 	querySelector() {
 		return new El("div");
 	}
@@ -191,17 +197,36 @@ function bootPage(pageHtml, events, hooks = null, opts = {}) {
 	const attrs = new Map([["data-ticket", "test-ticket"], ["data-token", ""], ["data-user", "u"], ["data-title", ""]]);
 	scriptEl.getAttribute = (k) => attrs.get(k) ?? null;
 
+	const wrap = new El("div");
+	wrap.className = "wrap";
 	const doc = {
 		currentScript: scriptEl,
 		createElement: (tag) => new El(tag),
 		createTextNode: (text) => ({ textContent: String(text) }),
 		getElementById: (id) => byId.get(id) ?? new El("div"),
+		querySelector: (sel) => (sel === ".wrap" ? wrap : new El("div")),
 		addEventListener() {},
 		body: new El("body"),
+		documentElement: new El("html"),
+	};
+	const store = new Map();
+	const localStorage = {
+		getItem: (k) => (store.has(k) ? store.get(k) : null),
+		setItem: (k, v) => store.set(k, String(v)),
+		removeItem: (k) => store.delete(k),
 	};
 	const sandbox = {
 		document: doc,
-		window: { addEventListener() {}, matchMedia: () => ({ matches: false, addEventListener() {} }), innerWidth: 1280 },
+		localStorage,
+		innerWidth: 1280,
+		innerHeight: 900,
+		window: {
+			addEventListener() {},
+			matchMedia: () => ({ matches: false, addEventListener() {} }),
+			innerWidth: 1280,
+			innerHeight: 900,
+			localStorage,
+		},
 		fetch: opts.hang ? () => new Promise(() => {}) : async () => ({
 			ok: true,
 			status: 200,
