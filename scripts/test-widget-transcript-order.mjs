@@ -399,3 +399,70 @@ test("thinking RESUMING after the answer re-expands the note (思考的时候展
 	assert.match(obs[1].title, /正在思考/, "恢复后标题回到进行中");
 	assert.equal(obs[1].on, true, "恢复后处于流式态");
 });
+
+test("a MANUALLY opened note is not re-collapsed by later deltas (user: 支持手动打开)", async () => {
+	const events = [
+		{ type: "thinking_delta", text: "想好了" },
+		{ type: "delta", text: "答案一" },
+		{ type: "delta", text: "答案二" },
+		{ type: "delta", text: "答案三" },
+		{ type: "done" },
+	];
+	const html = renderWidgetPage({ title: "t", suggestions: [], disclaimer: "" });
+	let openAfterManual = null;
+	const { transcript, send } = bootPage(html, events, [
+		{
+			afterCount: 2,
+			fn: () => {
+				const kinds = transcript.children.map((c) => String(c.className));
+				const wrap = transcript.children[kinds.findIndex((c) => c.includes("think"))];
+				assert.equal(wrap.hasAttribute("open"), false, "答文开始已自动收起");
+				wrap.setAttribute("open", "open"); // 用户手动点开
+			},
+		},
+		{
+			afterCount: 4,
+			fn: () => {
+				const kinds = transcript.children.map((c) => String(c.className));
+				const wrap = transcript.children[kinds.findIndex((c) => c.includes("think"))];
+				openAfterManual = wrap.hasAttribute("open");
+			},
+		},
+	]);
+	await send("你好");
+	for (let i = 0; i < 100 && openAfterManual === null; i++) await new Promise((r) => setTimeout(r, 20));
+	assert.equal(openAfterManual, true, "用户手动展开后，后续 delta 不得把它重新关掉");
+});
+
+test("a MANUALLY collapsed note stays closed while thinking continues (user control wins)", async () => {
+	const events = [
+		{ type: "thinking_delta", text: "第一段" },
+		{ type: "thinking_delta", text: "第二段" },
+		{ type: "thinking_delta", text: "第三段" },
+		{ type: "done" },
+	];
+	const html = renderWidgetPage({ title: "t", suggestions: [], disclaimer: "" });
+	let openLater = null;
+	const { transcript, send } = bootPage(html, events, [
+		{
+			afterCount: 1,
+			fn: () => {
+				const kinds = transcript.children.map((c) => String(c.className));
+				const wrap = transcript.children[kinds.findIndex((c) => c.includes("think"))];
+				assert.equal(wrap.hasAttribute("open"), true, "思考一开始默认展开");
+				wrap.removeAttribute("open"); // 用户主动收起
+			},
+		},
+		{
+			afterCount: 3,
+			fn: () => {
+				const kinds = transcript.children.map((c) => String(c.className));
+				const wrap = transcript.children[kinds.findIndex((c) => c.includes("think"))];
+				openLater = wrap.hasAttribute("open");
+			},
+		},
+	]);
+	await send("你好");
+	for (let i = 0; i < 100 && openLater === null; i++) await new Promise((r) => setTimeout(r, 20));
+	assert.equal(openLater, false, "思考仍在进行，但用户手动关闭必须被尊重（不得每来一段就弹开）");
+});

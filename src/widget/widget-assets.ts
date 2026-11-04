@@ -423,9 +423,13 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
     if (!wrap || !wrap._veTitle) return;
     var body = wrap.children[1];
     if (body) body.textContent = text;
+    var phaseNow = streaming ? "thinking" : "done";
+    var phaseBefore = wrap._vePhase;
+    wrap._vePhase = phaseNow;
     if (streaming) {
       wrap.classList.add("on");
-      wrap.setAttribute("open", "open"); // 思考（再）开始 → 展开
+      // 只有进入思考阶段才自动展开：同一阶段内不反复改写用户的手动开合
+      if (phaseBefore !== "thinking") wrap.setAttribute("open", "open");
       wrap._veTitle.textContent = "正在思考";
       if (wrap._veTicker) {
         var flat = String(text)
@@ -440,7 +444,9 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
       var secs = Math.max(1, Math.ceil((Date.now() - (wrap._veStartedAt || Date.now())) / 1000));
       wrap._veTitle.textContent = "思考 · 用时 " + secs + " 秒";
       if (wrap._veTicker) wrap._veTicker.textContent = "";
-      wrap.removeAttribute("open");
+      // 只在「思考刚结束」这一刻自动收起；此后 delta/tool_start 反复调用
+      // 不得再关掉用户手动展开的面板（用户要求：可手动打开查看）。
+      if (phaseBefore === "thinking") wrap.removeAttribute("open");
     }
   }
 
@@ -805,9 +811,13 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     if (!wrap || !wrap._veTitle) return;
     var body = wrap.children[1];
     if (body) body.textContent = text;
+    var phaseNow = streaming ? "thinking" : "done";
+    var phaseBefore = wrap._vePhase;
+    wrap._vePhase = phaseNow;
     if (streaming) {
       wrap.classList.add("on");
-      wrap.setAttribute("open", "open"); // 思考（再）开始 → 展开
+      // 只有进入思考阶段才自动展开：同一阶段内不反复改写用户的手动开合
+      if (phaseBefore !== "thinking") wrap.setAttribute("open", "open");
       wrap._veTitle.textContent = "正在思考";
       if (wrap._veTicker) {
         var flat = String(text)
@@ -822,7 +832,9 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
       var secs = Math.max(1, Math.ceil((Date.now() - (wrap._veStartedAt || Date.now())) / 1000));
       wrap._veTitle.textContent = "思考 · 用时 " + secs + " 秒";
       if (wrap._veTicker) wrap._veTicker.textContent = "";
-      wrap.removeAttribute("open");
+      // 只在「思考刚结束」这一刻自动收起；此后 delta/tool_start 反复调用
+      // 不得再关掉用户手动展开的面板（用户要求：可手动打开查看）。
+      if (phaseBefore === "thinking") wrap.removeAttribute("open");
     }
   }
 
