@@ -31,15 +31,22 @@ const source = readFileSync(join(root, SRC), "utf8");
 
 /** Heartbeat body with comments stripped, so prose about a bad pattern cannot
  *  trip the "must not read agent.state.isStreaming" assertion. */
+/**
+ * GATE LOCATION MOVED (2026-11-04): heartbeats are no longer a timer created in
+ * the inbound-message handler. That timer died with the process and was never
+ * recreated after a restart, so a resumed task ran for an hour with ONE note
+ * (field report). Reporting is now driven by the GLOBAL PUMP, so the liveness
+ * gate lives in the pump's push path — and these assertions follow it there.
+ */
 const heartbeatRegion = source
-	.slice(source.indexOf("const onProgress = ctx?.onProgress;"), source.indexOf("// Turn watchdog"))
+	.slice(source.indexOf("private async pumpOne("), source.indexOf("private readonly inventoryTimers"))
 	.replace(/^\s*\/\/.*$/gm, "")
 	.replace(/\/\*[\s\S]*?\*\//g, "");
 
-test("IM heartbeat gates on the kernel-aware query, not agent.state.isStreaming", () => {
+test("the pump gates on the kernel-aware query, not agent.state.isStreaming", () => {
 	assert.ok(
-		heartbeatRegion.includes("this.engine.isConversationStreaming(msg.conversationId)"),
-		"the heartbeat must ask engine.isConversationStreaming (durable-kernel aware)",
+		heartbeatRegion.includes("this.engine.isConversationStreaming(conversationId)"),
+		"the pump must ask engine.isConversationStreaming (durable-kernel aware)",
 	);
 	assert.ok(
 		!heartbeatRegion.includes("agent.state.isStreaming"),
@@ -47,10 +54,17 @@ test("IM heartbeat gates on the kernel-aware query, not agent.state.isStreaming"
 	);
 });
 
-test("heartbeat still requires an interval and an adapter onProgress", () => {
-	// Both guards must stay: a 0 interval must not burn side LLM calls, and a
-	// console/HTTP session has no channel to push into.
-	assert.ok(heartbeatRegion.includes("progressMin > 0 && onProgress"), "keep the interval+target guard");
+test("the pump still requires a positive interval before firing", () => {
+	// A 0 interval must not burn side LLM calls. The interval guard now lives in
+	// two places: startProgressPump (no timer at all) and decidePump (pure rule).
+	assert.ok(
+		source.includes("const intervalMs = (this.config.all().general.longTaskProgressMin ?? 0) * 60_000;"),
+		"startProgressPump must read the configured cadence",
+	);
+	assert.ok(
+		source.includes("if (intervalMs <= 0) return;"),
+		"a zero/negative interval must disable the pump instead of firing forever",
+	);
 });
 
 // ---- Behavioral probe: kernel-busy, no isStreaming flag, push still happens ----

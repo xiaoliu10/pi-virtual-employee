@@ -9,6 +9,7 @@
  * credential change).
  */
 import type { ConfigStore, ImChannelConfig } from "../db/config-store.js";
+import { decidePump, isUsableBrief, prunePumpState, type PumpState } from "../scheduler/progress-pump.js";
 import type { EmployeeEngine, ModelOption } from "../engine/engine.js";
 import type { ReportService } from "../reports/report-service.js";
 import { EchoAdapter } from "./adapters/echo.js";
@@ -300,6 +301,96 @@ export class IMAdapterManager {
 	 */
 	private inventoryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+	/**
+	 * GLOBAL PROGRESS PUMP.
+	 *
+	 * Heartbeats used to live exclusively inside the inbound-message handler
+	 * (a setInterval created when a message arrived). That timer dies with the
+	 * process, and after a restart the handler never runs again for the already
+	 * consumed message — so no timer is ever recreated, even though durable
+	 * happily resumes the WORK. Field 2026-11-04: a reconciliation task ran 1h+
+	 * after a restart and produced exactly one progress note before going silent
+	 * ("只汇报了一次就停了").
+	 *
+	 * The pump asks the engine which conversations are BUSY right now and notes
+	 * each one on the configured cadence, so reporting survives restarts and does
+	 * not depend on how the work started (fresh turn, redriven placed input, or
+	 * crash recovery).
+	 */
+	private readonly pumpState = new Map<string, PumpState>();
+	private pumpTimer?: ReturnType<typeof setInterval>;
+
+	/** Start the pump. Idempotent; interval comes from longTaskProgressMin. */
+	startProgressPump(): void {
+		if (this.pumpTimer) return;
+		const intervalMs = (this.config.all().general.longTaskProgressMin ?? 0) * 60_000;
+		if (intervalMs <= 0) return; // explicitly disabled
+		// Tick often relative to the cadence so a conversation that just became due
+		// is noticed promptly; decidePump() enforces the real interval per chat.
+		const tickMs = Math.max(30_000, Math.min(intervalMs, 5 * 60_000));
+		this.pumpTimer = setInterval(() => this.pumpTick(), tickMs);
+		// Never hold the process open for a heartbeat.
+		this.pumpTimer.unref?.();
+	}
+
+	stopProgressPump(): void {
+		if (this.pumpTimer) clearInterval(this.pumpTimer);
+		this.pumpTimer = undefined;
+		this.pumpState.clear();
+	}
+
+	private pumpTick(): void {
+		try {
+			const intervalMs = (this.config.all().general.longTaskProgressMin ?? 0) * 60_000;
+			const busy = this.engine.busyConversations?.() ?? [];
+			prunePumpState(this.pumpState, busy);
+			const actions = decidePump({ busy, state: this.pumpState, now: Date.now(), intervalMs });
+			for (const action of actions) {
+				if (action.kind === "fire") {
+					void this.pumpOne(action.conversationId, intervalMs);
+				} else if (!this.pumpState.has(action.conversationId)) {
+					// Arm the clock on first sighting so a restart does not spam a
+					// note for every live conversation at once.
+					this.pumpState.set(action.conversationId, { lastSentAt: Date.now(), inFlight: false });
+				}
+			}
+		} catch (err) {
+			// A pump failure must never break messaging.
+			console.warn("[im] progress pump tick failed:", (err as Error).message);
+		}
+	}
+
+	private async pumpOne(conversationId: string, intervalMs: number): Promise<void> {
+		const st = this.pumpState.get(conversationId);
+		if (!st || st.inFlight) return;
+		st.inFlight = true;
+		try {
+			const agent = this.engine.getOrCreateSession(conversationId);
+			const note = await this.engine.progressBrief(agent, conversationId);
+			if (!isUsableBrief(note)) return;
+			// Re-check liveness: the brief can take minutes, and the turn may have
+			// ended while it was generating (pushing then would be a stale "still
+			// working" note).
+			if (!this.engine.isConversationStreaming(conversationId)) return;
+			const occurrenceId = chatHeartbeatOccurrenceId("pump", conversationId, Date.now(), intervalMs);
+			await this.onProgressPush?.(conversationId, note, occurrenceId);
+			st.lastSentAt = Date.now();
+		} catch (err) {
+			console.warn(`[im] progress pump push failed for ${conversationId}: ${(err as Error).message}`);
+		} finally {
+			st.inFlight = false;
+		}
+	}
+
+	/** Injected by main.ts: how the pump reaches the IM channel of a conversation. */
+	private onProgressPush?: (conversationId: string, text: string, occurrenceId: string) => Promise<unknown>;
+
+	setProgressPusher(fn: (conversationId: string, text: string, occurrenceId: string) => Promise<unknown>): void {
+		this.onProgressPush = fn;
+	}
+
+
+
 	private scheduleBackgroundInventory(conversationId: string): void {
 		const prev = this.inventoryTimers.get(conversationId);
 		if (prev) clearTimeout(prev);
@@ -568,36 +659,16 @@ export class IMAdapterManager {
 					// bucket's beat is a new occurrence — the deliberate v0.2.162 cadence
 					// (one note every `longTaskProgressMin` for as long as the turn runs)
 					// is preserved, only true duplicates are deduped.
+					// Progress notes are now driven by the GLOBAL PUMP
+					// (startProgressPump), not by a timer created here. A timer created
+					// in this handler dies with the process and is NEVER recreated after
+					// a restart — the message was consumed long ago — so a resumed task
+					// ran for an hour with one note and then went silent (field
+					// 2026-11-04). The pump reads live busy-conversations from the
+					// engine, so reporting follows the work however it started.
 					const onProgress = ctx?.onProgress;
-					const progressMin = this.config.all().general.longTaskProgressMin;
-					let progressInFlight = false;
-					const heartbeat = progressMin > 0 && onProgress
-						? setInterval(() => {
-							if (progressInFlight) return;
-							progressInFlight = true;
-							void this.engine.progressBrief(agent, msg.conversationId)
-								.then((note) => {
-									// Ask the KERNEL, not agent.state.isStreaming: under the
-									// durable kernel (default since v0.2.167) that flag is never
-									// set, so this gate dropped every heartbeat silently for
-									// IM chats — the same defect v0.2.173 fixed for scheduled
-									// tasks, work windows and the autonomous heartbeat, but this
-									// IM instance was missed (field report 2026-11-03: group chat
-									// task ran 6+ minutes with zero progress notes).
-									if (!this.engine.isConversationStreaming(msg.conversationId)) return;
-									// Bucket derived at PUSH time, from the same interval the timer
-									// above was sized with — never a second hardcoded cadence.
-									const occurrenceId = msg.messageId
-										? chatHeartbeatOccurrenceId(msg.channel ?? "im", msg.messageId, Date.now(), progressMin * 60_000)
-										: undefined;
-									return onProgress(note, { occurrenceId: occurrenceId || undefined, kind: "chat-progress" });
-								})
-								.catch((err) => console.warn("[im] progress push failed:", (err as Error).message))
-								.finally(() => {
-									progressInFlight = false;
-								});
-						}, progressMin * 60_000)
-						: undefined;
+					void onProgress;
+
 					// Turn watchdog — STALL-based (0.2.73): the per-conversation queue is
 					// strict, so ONE wedged turn (hung LLM call / hung socket / hung
 					// remote session) would block that chat forever — field incident: a
@@ -697,7 +768,6 @@ export class IMAdapterManager {
 						}
 						return result.reply;
 					} finally {
-						if (heartbeat) clearInterval(heartbeat);
 						if (watchdog) watchdog.stop();
 						// Fire-and-forget: never blocks settle; the note lands 5s after
 						// the result (async by design — user ruling 2026-11-04).

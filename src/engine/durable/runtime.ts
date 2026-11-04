@@ -21,6 +21,10 @@ interface RouteDoc {
 }
 /** How long a recovered run may take to reach a terminal state before we report it as unfinished. */
 const RECOVERY_WAIT_MS = 10 * 60_000;
+/** Attempts for re-driving a submission parked in `placed` (see redrivePlacedInput). */
+const PLACED_REDRIVE_ATTEMPTS = 5;
+/** Base backoff between redrive attempts (linear: 20s, 40s, 60s, 80s). */
+const PLACED_REDRIVE_DELAY_MS = 20_000;
 /**
  * Durable's usage ledger (`appendAssistant → recordUsage → addUsage`) reads every
  * counter of `assistant.usage` unconditionally — an undefined usage faults the
@@ -212,9 +216,19 @@ export class DurableRuntime {
 			// Redrive parked inputs BEFORE waiting on them: without this the wait
 			// below can only ever time out for a placed input.
 			if (placedInputs.has(conv.id)) {
-				void conv.submit({ type: "continue" }, context).catch((err) => {
-					console.warn(`[durable] placed-input redrive rejected for ${conversationId}: ${err instanceof Error ? err.message : err}`);
-				});
+				// RETRY ON BUSY. A single rejection used to be final: the parked
+				// message then sat in `placed` forever (field 2026-11-04, Nova
+				// conv 222880 — a chat turn was killed mid-LLM-request, its task
+				// stayed `running` and therefore held the conversation "busy", so
+				// the redrive was rejected once and never retried. From the user's
+				// side the task simply stopped: one progress note at 16:43 and
+				// silence afterwards).
+				//
+				// Each attempt re-checks: a live run eventually parks its inbox
+				// items itself, and a zombie task is cleared by the recovery sweep,
+				// so the retry succeeds as soon as the conversation is genuinely
+				// free. Bounded so a permanently wedged conversation cannot spin.
+				void runtime.redrivePlacedInput(conv, conversationId);
 			}
 			runtime.track(conv, conversationId);
 			const work = runtime.finishRecovered(conv, conversationId).finally(() => runtime.untrack(conv, conversationId));
@@ -245,6 +259,34 @@ export class DurableRuntime {
 	 * that need "is a turn running?" must ask the kernel instead (v0.2.173).
 	 */
 	isBusyConversation(id: string): boolean { return (this.active.get(id)?.size ?? 0) > 0; }
+
+	/**
+	 * Conversations with live work RIGHT NOW, mapped to their channel ids.
+	 *
+	 * The progress pump needs this because a heartbeat tied to the inbound
+	 * message handler dies with the turn that received the message — and does not
+	 * come back after a restart, even though durable resumes the work. Pumping
+	 * from the runtime's live set instead keeps reporting for as long as the work
+	 * actually runs, however it started (fresh turn, redriven placed input, or
+	 * crash recovery).
+	 */
+	busyConversations(): { conversationId: string }[] {
+		const out: { conversationId: string }[] = [];
+		for (const [id, set] of this.active) {
+			if ((set?.size ?? 0) === 0) continue;
+			// `active` is keyed by the raw conversation id (string); `routes` by the
+			// branded ConversationId, hence the cast.
+			const route = this.routes.get(id as unknown as ConversationId);
+			// A route is how we know which IM channel/conversation this belongs to;
+			// window conversations (work:/sched:) are reported by their own
+			// notifiers and must not be pumped twice.
+			if (!route) continue;
+			const cid = route.conversationId;
+			if (cid.startsWith("work:") || cid.startsWith("sched:")) continue;
+			out.push({ conversationId: cid });
+		}
+		return out;
+	}
 
 	/**
 	 * Replace the MCP tool surface on the LIVE host.
@@ -545,6 +587,38 @@ export class DurableRuntime {
 		this.opts.history.appendMessageOnce(route.conversationId, "assistant", result.reply, `durable:${conv.id}:answer`);
 		await conv.commit(async (tx) => { (await tx.doc(Route, conv.id)).projected = 1; }, context);
 	}
+	/**
+	 * Re-drive a submission parked in `placed`, retrying while the conversation
+	 * is busy.
+	 *
+	 * Why retry: a restart can leave TWO things behind — the parked submission AND
+	 * a task row still marked `running` (the process died mid-request). The zombie
+	 * row holds the conversation busy, so the first redrive attempt is rejected;
+	 * without a retry the parked message never executes and the user sees a task
+	 * that silently stopped.
+	 *
+	 * Bounded by PLACED_REDRIVE_ATTEMPTS with linear backoff; gives up with a log
+	 * line (never silently) so the next diagnosis is not blind.
+	 */
+	private async redrivePlacedInput(conv: Conversation, conversationId: string): Promise<void> {
+		for (let attempt = 1; attempt <= PLACED_REDRIVE_ATTEMPTS; attempt += 1) {
+			try {
+				// `context` here is the module-level BACKGROUND_CONTEXT import.
+				await conv.submit({ type: "continue" }, context);
+				if (attempt > 1) console.log(`[durable] placed-input redrive succeeded for ${conversationId} on attempt ${attempt}`);
+				return;
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				if (attempt === PLACED_REDRIVE_ATTEMPTS) {
+					console.warn(`[durable] placed-input redrive GAVE UP for ${conversationId} after ${attempt} attempts: ${message}`);
+					return;
+				}
+				console.warn(`[durable] placed-input redrive rejected for ${conversationId} (attempt ${attempt}/${PLACED_REDRIVE_ATTEMPTS}): ${message}`);
+				await new Promise((resolve) => setTimeout(resolve, PLACED_REDRIVE_DELAY_MS * attempt));
+			}
+		}
+	}
+
 	private async finishRecovered(conv: Conversation, conversationId: string): Promise<void> {
 		const route = this.routes.get(conv.id)!;
 		// waitForIdle can resolve BEFORE the resumed run re-admits anything, so poll

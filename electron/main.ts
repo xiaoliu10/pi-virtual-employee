@@ -1389,7 +1389,7 @@ ${tailForProgress(decision.text)}`;
 					const w = config.all().widget;
 					return {
 						title: w.title, suggestions: w.suggestions, disclaimer: w.disclaimer,
-						token: w.token, allowedOrigins: w.allowedOrigins, secret: w.secret, maxRole: w.maxRole,
+						token: w.token, allowedOrigins: w.allowedOrigins, secret: w.secret, maxRole: w.maxRole, ticketTtlSec: w.ticketTtlSec,
 						launcher: { icon: w.launcherIcon, iconUrl: w.launcherIconUrl, size: w.launcherSize },
 					};
 				},
@@ -1444,6 +1444,14 @@ ${tailForProgress(decision.text)}`;
 	// Reconcile IM adapter + autostart with saved config.
 	applyAutostart(config.all().general.autostart);
 	await im.sync().catch((err) => console.error("[im] sync failed", err));
+	// GLOBAL PROGRESS PUMP (v0.2.192). Heartbeats used to be timers created inside
+	// the inbound-message handler, so they died with the process and were never
+	// recreated after a restart — a resumed task then ran for hours with ONE
+	// progress note (field 2026-11-04). The pump reads live busy-conversations from
+	// the engine instead, so reporting follows the WORK, not the request.
+	im.setProgressPusher((conversationId, text, occurrenceId) =>
+		im.pushToConversation(conversationId, text, { occurrenceId, kind: "chat-progress" }));
+	im.startProgressPump();
 	// Start ticking only after IM adapters have connected, so an overdue task fired
 	// during startup can immediately push its result instead of missing the channel.
 	scheduler.start();

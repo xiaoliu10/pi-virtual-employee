@@ -1444,6 +1444,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/** True when a live turn is running on this conversation (steer-able). */
+	/**
+	 * Conversations with live work right now (see DurableRuntime.busyConversations).
+	 *
+	 * Exposed for the IM progress pump: reporting must be driven by LIVE state, not
+	 * by the inbound message that started the work — that handler's timer dies
+	 * with the process and is never recreated after a restart, which silently
+	 * stopped progress notes for hours (field 2026-11-04).
+	 */
+	busyConversations(): { conversationId: string }[] {
+		return this.durableRuntime?.busyConversations() ?? [];
+	}
+
 	isConversationStreaming(conversationId: string): boolean {
 		// The durable kernel drives the harness itself and never sets
 		// agent.state.isStreaming, so asking only the agent reported "idle" for
