@@ -441,6 +441,16 @@ export interface AppConfig {
 		 */
 		maxRole: "viewer" | "operator" | "admin";
 		/**
+		 * Session-ticket lifetime in seconds (0 = built-in default, 30 min).
+		 *
+		 * The embedded assistant holds ONE ticket for a whole conversation, so a
+		 * TTL shorter than a real session forces the business system to re-mint
+		 * mid-chat and surfaces "会话票据已过期" to end users. Tickets stay bound
+		 * to (client address, Origin) and are rejected on mismatch, so a longer
+		 * window does not meaningfully widen the attack surface.
+		 */
+		ticketTtlSec: number;
+		/**
 		 * Launcher look (v0.2.180). Business systems embed the widget as a small
 		 * floating entry point, and the default text bubble reads as a placeholder
 		 * next to their own UI (the ETC integration shipped its own hand-drawn
@@ -619,6 +629,7 @@ const DEFAULTS: AppConfig = {
 		allowedOrigins: [],
 		secret: "",
 		maxRole: "admin" as const,
+		ticketTtlSec: 30 * 60,
 		launcherIcon: "text" as const,
 		launcherIconUrl: "",
 		launcherSize: 52,
