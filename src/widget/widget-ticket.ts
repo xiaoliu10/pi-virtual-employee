@@ -19,7 +19,7 @@
  * Roles are capped at admin: `owner` is the deployment owner and is never
  * reachable from a widget, no matter what the business system claims.
  */
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 /** Roles a widget may ever hold, ascending. `owner` is deliberately absent. */
 export const WIDGET_MAX_ROLE = "admin" as const;
@@ -50,24 +50,42 @@ export interface TicketRecord {
 }
 
 export interface TicketStoreOptions {
-	/** Lifetime of a ticket. Short by design: the browser fetches one per session. */
-	ttlMs?: number;
+	/**
+	 * Lifetime of a ticket. Defaults to DEFAULT_TTL_MS (30 min).
+	 *
+	 * Field 2026-11-04: the old 5-minute default was much shorter than a real
+	 * conversation. An embedded assistant holds ONE ticket for a whole session
+	 * (the business system mints it when the panel opens), so a user who asked a
+	 * second or third question — especially after a slow model turn — hit
+	 * "会话票据已过期". TTL is configurable via widget.ticketTtlSec.
+	 */
+	ttlMs?: number | (() => number | undefined);
 	/** Hard cap on live tickets, so a mint loop cannot exhaust memory. */
 	maxTickets?: number;
 	now?: () => number;
 }
 
-const DEFAULT_TTL_MS = 5 * 60_000;
+/**
+ * 30 minutes. Long enough to cover a real conversation (the embedded assistant
+ * reuses one ticket for the whole session) while staying far below any window
+ * where a leaked ticket would matter — tickets are 32 random bytes, bound to
+ * (client address, Origin), never persisted, and die on restart.
+ */
+const DEFAULT_TTL_MS = 30 * 60_000;
 const DEFAULT_MAX_TICKETS = 1_000;
 
 /**
  * In-memory ticket store. Tickets are intentionally NOT persisted: a restart
  * invalidating every ticket is the safer failure mode (the browser just asks
  * its backend for a new one).
+ *
+ * Security note on the default TTL: guessing is not a realistic attack here —
+ * a ticket is 32 random bytes and redeem() rejects any address/origin mismatch
+ * outright, so the window length does not meaningfully widen the surface.
  */
 export class TicketStore {
 	#tickets = new Map<string, TicketRecord>();
-	#ttlMs: number;
+	#ttlMs: number | (() => number | undefined);
 	#maxTickets: number;
 	#now: () => number;
 
@@ -75,6 +93,12 @@ export class TicketStore {
 		this.#ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
 		this.#maxTickets = options.maxTickets ?? DEFAULT_MAX_TICKETS;
 		this.#now = options.now ?? Date.now;
+	}
+
+	/** Current TTL in ms: fixed value, or the resolver's answer with a safe floor. */
+	ttlMs(): number {
+		const raw = typeof this.#ttlMs === "function" ? this.#ttlMs() : this.#ttlMs;
+		return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TTL_MS;
 	}
 
 	/**
@@ -92,7 +116,10 @@ export class TicketStore {
 		const record: TicketRecord = {
 			user: input.user,
 			role: clampWidgetRole(input.role, ceiling),
-			expiresAt: now + this.#ttlMs,
+			// Resolved per mint so an admin's config change applies to the NEXT ticket
+			// without a restart. A resolver that throws or returns nonsense falls back
+			// to the default rather than minting an already-expired ticket.
+			expiresAt: now + this.ttlMs(),
 			address: input.address,
 			origin: input.origin,
 			conversationKey: input.conversationKey,
@@ -162,8 +189,34 @@ export function secretMatches(presented: string, expected: string): boolean {
  * Conversation namespace for a widget user. Must stay a single safe segment:
  * the user key arrives from the business system and must not be able to point
  * the conversation at an IM/console id.
+ *
+ * MUST BE INJECTIVE (two different users never share a key). The previous
+ * version stripped every non-[A-Za-z0-9_-] character, which silently merged
+ * users — a real cross-user data leak:
+ *
+ *   "zhang.san"          -> "zhangsan"  ┐ identical
+ *   "zhangsan"           -> "zhangsan"  ┘
+ *   "user@example.com"   -> "userexamplecom"
+ *   "userexamplecom"     -> "userexamplecom"
+ *   "张三" / "李四" / ... -> "anon"        ← EVERY non-ASCII user shared one bucket
+ *
+ * The "anon" fallback was the worst of it: a business system using Chinese names
+ * or phone numbers as the user id would put ALL of its users into one
+ * conversation, so each saw the others' chat history — and they shared one
+ * `senderId`, hence one RBAC identity and one memory scope too.
+ *
+ * Now: a readable prefix (safe characters only) PLUS a hash of the original id.
+ * The hash makes collisions cryptographically improbable, and the prefix keeps
+ * conversations identifiable while debugging. Non-ASCII ids hash like anything
+ * else instead of collapsing to "anon".
  */
 export function widgetConversationKey(user: string): string {
-	const clean = user.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
-	return clean || "anon";
+	const raw = String(user ?? "").trim();
+	if (!raw) return "anon";
+	// Readable part: safe characters only, and never empty (a pure-CJK id has no
+	// safe characters at all, so it becomes "u").
+	const readable = raw.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "u";
+	// Uniqueness: hash the ORIGINAL id (never the stripped one).
+	const digest = createHash("sha256").update(raw, "utf8").digest("base64url").slice(0, 16);
+	return `${readable}-${digest}`;
 }
