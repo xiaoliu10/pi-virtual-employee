@@ -383,36 +383,7 @@ function migrate(db: DB): void {
 		);
 		CREATE INDEX IF NOT EXISTS idx_work_items_due ON work_items(status, next_check_at);
 	`);
-	const workCols = new Set(
-		(db.prepare("PRAGMA table_info(work_items)").all() as { name: string }[]).map((r) => r.name),
-	);
-	// Staged reply for a waiting_human resume — consumed by the next window's turn 0.
-	if (!workCols.has("answer")) db.exec("ALTER TABLE work_items ADD COLUMN answer TEXT");
-	if (!workCols.has("created_channel")) db.exec("ALTER TABLE work_items ADD COLUMN created_channel TEXT");
-	// Resident (常驻巡检) marker: the model may NOT terminate these with DONE —
-	// the runner defers instead (field 2026-10-17: a daily reconciliation patrol
-	// was killed by the model declaring DONE on a clean day).
-	if (!workCols.has("resident")) db.exec("ALTER TABLE work_items ADD COLUMN resident INTEGER NOT NULL DEFAULT 0");
-	// Adaptive-cadence bookkeeping: the last self-declared reason (re-injected as
-	// context) and how many consecutive windows picked the same daily slot
-	// (>=2 warns the model it is degenerating into a cron, >=3 suggests the
-	// admin convert it to a scheduled task).
-	if (!workCols.has("next_check_reason")) db.exec("ALTER TABLE work_items ADD COLUMN next_check_reason TEXT");
-	if (!workCols.has("fixed_streak")) db.exec("ALTER TABLE work_items ADD COLUMN fixed_streak INTEGER NOT NULL DEFAULT 0");
-	// Durable "a window has started" marker: makes resume-vs-kickoff
-	// distinguishable even after a crash (firstWindow planning).
-	if (!workCols.has("kicked_off")) db.exec("ALTER TABLE work_items ADD COLUMN kicked_off INTEGER NOT NULL DEFAULT 0");
-	if (!workCols.has("fallback_streak")) db.exec("ALTER TABLE work_items ADD COLUMN fallback_streak INTEGER NOT NULL DEFAULT 0");
-	if (!workCols.has("timeout_streak")) db.exec("ALTER TABLE work_items ADD COLUMN timeout_streak INTEGER NOT NULL DEFAULT 0");
-	// Per-item window budget override (admin "调大 max_minutes"). NULL → the
-	// service-wide default. The circuit-breaker message promises this knob, so it
-	// must actually exist (subagent review P1 2026-10-23: the message pointed at a
-	// `manage_work_items update` field that did not exist — a dead end for the
-	// only ops exit after 2x90 minutes burned).
-	if (!workCols.has("max_minutes")) db.exec("ALTER TABLE work_items ADD COLUMN max_minutes INTEGER");
-	if (!workCols.has("last_remind_at")) db.exec("ALTER TABLE work_items ADD COLUMN last_remind_at INTEGER");
-	if (!workCols.has("remind_count")) db.exec("ALTER TABLE work_items ADD COLUMN remind_count INTEGER NOT NULL DEFAULT 0");
-	if (!workCols.has("cadence_ms")) db.exec("ALTER TABLE work_items ADD COLUMN cadence_ms INTEGER");
+	migrateWorkItems(db);
 
 	// Document resources: a catalog of deliverable docs the employee can hand to
 	// integration partners. kind=file points at a copied file under documents.dir;
@@ -576,4 +547,54 @@ function ftsSupportsTrigram(db: DB): boolean {
 		db.exec("DROP TABLE IF EXISTS fts_trigram_probe;");
 		return false;
 	}
+}
+
+/**
+ * work_items column migrations. EXTRACTED so the UPGRADE path is testable:
+ * every other fixture builds the table from CREATE TABLE (which always carries
+ * the newest columns), so a column added there but forgotten here only breaks on
+ * a real in-place upgrade — exactly what shipped in 0.2.190 (`priority`), where
+ * every existing profile threw "no such column: priority" right after upgrading.
+ * scripts/test-work-store.mjs drives THIS function against a frozen pre-0.2.190
+ * table and asserts no declared column is lost.
+ */
+export function migrateWorkItems(db: DB): void {
+		const workCols = new Set(
+			(db.prepare("PRAGMA table_info(work_items)").all() as { name: string }[]).map((r) => r.name),
+		);
+		// Staged reply for a waiting_human resume — consumed by the next window's turn 0.
+		if (!workCols.has("answer")) db.exec("ALTER TABLE work_items ADD COLUMN answer TEXT");
+		if (!workCols.has("created_channel")) db.exec("ALTER TABLE work_items ADD COLUMN created_channel TEXT");
+		// Resident (常驻巡检) marker: the model may NOT terminate these with DONE —
+		// the runner defers instead (field 2026-10-17: a daily reconciliation patrol
+		// was killed by the model declaring DONE on a clean day).
+		if (!workCols.has("resident")) db.exec("ALTER TABLE work_items ADD COLUMN resident INTEGER NOT NULL DEFAULT 0");
+		// Adaptive-cadence bookkeeping: the last self-declared reason (re-injected as
+		// context) and how many consecutive windows picked the same daily slot
+		// (>=2 warns the model it is degenerating into a cron, >=3 suggests the
+		// admin convert it to a scheduled task).
+		if (!workCols.has("next_check_reason")) db.exec("ALTER TABLE work_items ADD COLUMN next_check_reason TEXT");
+		if (!workCols.has("fixed_streak")) db.exec("ALTER TABLE work_items ADD COLUMN fixed_streak INTEGER NOT NULL DEFAULT 0");
+		// Durable "a window has started" marker: makes resume-vs-kickoff
+		// distinguishable even after a crash (firstWindow planning).
+		if (!workCols.has("kicked_off")) db.exec("ALTER TABLE work_items ADD COLUMN kicked_off INTEGER NOT NULL DEFAULT 0");
+		if (!workCols.has("fallback_streak")) db.exec("ALTER TABLE work_items ADD COLUMN fallback_streak INTEGER NOT NULL DEFAULT 0");
+		if (!workCols.has("timeout_streak")) db.exec("ALTER TABLE work_items ADD COLUMN timeout_streak INTEGER NOT NULL DEFAULT 0");
+		// Per-item window budget override (admin "调大 max_minutes"). NULL → the
+		// service-wide default. The circuit-breaker message promises this knob, so it
+		// must actually exist (subagent review P1 2026-10-23: the message pointed at a
+		// `manage_work_items update` field that did not exist — a dead end for the
+		// only ops exit after 2x90 minutes burned).
+		if (!workCols.has("max_minutes")) db.exec("ALTER TABLE work_items ADD COLUMN max_minutes INTEGER");
+		if (!workCols.has("last_remind_at")) db.exec("ALTER TABLE work_items ADD COLUMN last_remind_at INTEGER");
+		if (!workCols.has("remind_count")) db.exec("ALTER TABLE work_items ADD COLUMN remind_count INTEGER NOT NULL DEFAULT 0");
+		if (!workCols.has("cadence_ms")) db.exec("ALTER TABLE work_items ADD COLUMN cadence_ms INTEGER");
+		// Router/Worker dispatch priority (0 = chat task, 100 = mined/scheduled).
+		// MISSING THIS MIGRATION WAS A RELEASE-BLOCKING DEFECT: the column shipped in
+		// CREATE TABLE only, so every EXISTING profile — whose work_items table was
+		// created before 0.2.190 — had no such column and the first lifecycle write
+		// threw "no such column: priority" (field 2026-11-04, immediately after the
+		// 0.2.190 upgrade, while chatDispatch defaults to ON). Every OTHER work_items
+		// column in this block has the same guard; this one was simply forgotten.
+		if (!workCols.has("priority")) db.exec("ALTER TABLE work_items ADD COLUMN priority INTEGER NOT NULL DEFAULT 100");
 }

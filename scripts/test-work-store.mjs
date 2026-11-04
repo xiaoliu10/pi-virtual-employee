@@ -252,3 +252,60 @@ test("delete only removes TERMINAL items; live items are refused (field 2026-10-
 	assert.equal(store.setStatus(done.id, "scheduled", null, null)?.id, undefined);
 	assert.equal(store.get(done.id), undefined);
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCHEMA/MIGRATION PARITY.
+//
+// Field 2026-11-04 (release-blocking): `priority` was added to CREATE TABLE but
+// forgotten in the ALTER-migration block in sqlite.ts. Every EXISTING profile —
+// whose work_items table predates 0.2.190 — therefore had no such column, and
+// the first lifecycle write threw "no such column: priority" right after the
+// upgrade (while chatDispatch had just defaulted to ON). Nothing caught it
+// because every test fixture builds the table from CREATE TABLE, which always
+// has the new column; only an UPGRADE from an old table exercises the ALTER path.
+//
+// This test reproduces that upgrade: build the OLD table (a frozen snapshot of
+// the pre-0.2.190 shape), run the real migrateWorkItems() from sqlite.ts, and
+// assert every column declared in CREATE TABLE now exists.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Frozen pre-0.2.190 work_items shape — columns added later must be absent. */
+const LEGACY_WORK_ITEMS = `CREATE TABLE work_items (
+	id TEXT PRIMARY KEY, title TEXT NOT NULL, goal TEXT NOT NULL, conditions TEXT,
+	progress TEXT, lessons TEXT, origin_conversation TEXT, origin_note TEXT,
+	status TEXT NOT NULL DEFAULT 'proposed', question TEXT, next_check_at INTEGER,
+	next_check_reason TEXT, fixed_streak INTEGER NOT NULL DEFAULT 0,
+	timeout_streak INTEGER NOT NULL DEFAULT 0, max_minutes INTEGER,
+	fallback_streak INTEGER NOT NULL DEFAULT 0, last_remind_at INTEGER,
+	remind_count INTEGER NOT NULL DEFAULT 0, cadence_ms INTEGER,
+	kicked_off INTEGER NOT NULL DEFAULT 0, created_by TEXT, created_channel TEXT,
+	resident INTEGER NOT NULL DEFAULT 0, answer TEXT,
+	created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);`;
+
+const sqliteBundle = join(tmp, "sqlite.mjs");
+await build({
+	stdin: { contents: `export { migrateWorkItems } from "./src/db/sqlite.ts";`, resolveDir: root, loader: "ts" },
+	outfile: sqliteBundle, bundle: true, platform: "node", format: "esm", packages: "external",
+});
+const { migrateWorkItems } = await import(pathToFileURL(sqliteBundle).href);
+
+test("upgrading a pre-0.2.190 database yields EVERY column declared in CREATE TABLE", t => {
+	const db = new DatabaseSync(":memory:");
+	t.after(() => db.close());
+	db.exec(LEGACY_WORK_ITEMS);
+	// Sanity: the legacy table really is missing priority, or this test proves nothing.
+	assert.equal(db.prepare("PRAGMA table_info(work_items)").all().some(c => c.name === "priority"), false);
+
+	migrateWorkItems(db);
+
+	const after = new Set(db.prepare("PRAGMA table_info(work_items)").all().map(c => c.name));
+	// Every column CREATE TABLE declares must survive the upgrade path.
+	const fresh = new DatabaseSync(":memory:");
+	t.after(() => fresh.close());
+	fresh.exec(schema);
+	const declared = fresh.prepare("PRAGMA table_info(work_items)").all().map(c => c.name);
+	const missing = declared.filter(name => !after.has(name));
+	assert.deepEqual(missing, [], `columns lost on upgrade: ${missing.join(", ")}`);
+	// ...including the one that actually broke the release.
+	assert.ok(after.has("priority"), "priority must exist after upgrading a legacy database");
+});
