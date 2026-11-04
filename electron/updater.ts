@@ -733,6 +733,75 @@ function profileArgs(): string[] {
 }
 
 /**
+ * Parse the wmic process table into the set of running profile names.
+ * Exported for tests: the wmic call itself cannot run off a Windows box, but
+ * the parsing rules below are where the field bug lived, so they are tested
+ * against the REAL wmic /value output captured on 10.188.130.144 (2026-11-04).
+ *
+ * Empty-string entry = the default profile. A main process WITHOUT --profile
+ * is NOT necessarily the default profile: a launch through a shortcut or a
+ * PowerShell Start-Process arg-mangling can strip the flag while the app still
+ * redirects its userData into profiles/<name> (main.ts). Reading a child's
+ * --user-data-dir is the ONLY way to tell "real default" from "named profile
+ * whose args were lost" — treating the latter as default relaunches it with NO
+ * identity, and every later snapshot then inherits the empty entry
+ * (field history: profiles=[Nova,] on every update since 2026-09-30, plus an
+ * extra identity-less instance each time).
+ */
+export function parseRunningProfilesFromWmic(text: string): string[] {
+	interface ProcRow { pid: number; ppid: number; cmd: string }
+	const rows: ProcRow[] = [];
+	let current: Partial<ProcRow> = {};
+	for (const line of text.split(/\r?\n/)) {
+		const m = /^(CommandLine|ParentProcessId|ProcessId)=(.*)$/.exec(line);
+		if (!m) continue;
+		if (m[1] === "CommandLine") current.cmd = m[2].trim();
+		else if (m[1] === "ParentProcessId") current.ppid = Number(m[2].trim());
+		else if (m[1] === "ProcessId") current.pid = Number(m[2].trim());
+		if (current.cmd !== undefined && current.pid !== undefined && current.ppid !== undefined) {
+			rows.push({ pid: current.pid, ppid: current.ppid, cmd: current.cmd });
+			current = {};
+		}
+	}
+	const profiles = new Set<string>();
+	for (const row of rows) {
+		// Electron child processes (renderer/GPU/utility) embed the exe path
+		// plus --type=... and carry no --profile — counting them fabricated
+		// an empty default-profile entry (field: profiles=[b,,a]). They are
+		// EVIDENCE for a parent's identity below, never an entry themselves.
+		if (/--type=/.test(row.cmd)) continue;
+		if (!row.cmd.includes("Pi Virtual Employee.exe")) continue;
+		const p = /--profile[= ]([A-Za-z0-9_-]+)(?=[\s"]|$)/.exec(row.cmd);
+		if (p) { profiles.add(p[1]); continue; }
+		// Identity recovery needs AT LEAST TWO children agreeing on the same
+		// profile (independent review P1-1): a single child cannot be told apart
+		// from an ORPHANED child whose ppid value was reused by an unrelated
+		// main process — recovering from that would start the instance with the
+		// WRONG identity (it would hold the real profile's DB and lock), which
+		// is worse than a bare extra instance. Electron normally spawns GPU +
+		// utility + renderer children, so a live instance has several; an
+		// orphan cluster usually has just one.
+		const names: string[] = [];
+		for (const child of rows) {
+			if (child.ppid !== row.pid || !/--type=/.test(child.cmd)) continue;
+			// Quoted or unquoted; stop at the next flag so an unquoted value
+			// containing a space cannot smear into the next argument.
+			const ud = /--user-data-dir=(?:"([^"]+)"|(.+?))(?=\s+--|$)/.exec(child.cmd);
+			const dir = ud?.[1] ?? ud?.[2];
+			// Windows paths are case-insensitive; the app writes "profiles".
+			const name = dir && /[\\/]profiles[\\/]([A-Za-z0-9_-]+)[\\/]?$/i.exec(dir.trim())?.[1];
+			if (name && name.toLowerCase() !== "default") names.push(name);
+		}
+		const recovered = names.length >= 2 && names.every((n) => n === names[0]) ? names[0] : "";
+		// No/insufficient/conflicting evidence (just started, or an orphan) →
+		// conservative "": same as before, never worse. A wrong guess would be
+		// far worse than a bare extra instance.
+		profiles.add(recovered);
+	}
+	return [...profiles];
+}
+
+/**
  * Profiles of every RUNNING instance of this app on the box (NSIS kills by
  * image name, so all of them go down together — the watchdog must bring back
  * exactly the set that was alive, no more). Snapshotted via wmic just before
@@ -744,23 +813,16 @@ function snapshotRunningProfiles(): string[] {
 	try {
 		const out = spawnSync(
 			"wmic.exe",
-			["process", "where", "name='Pi Virtual Employee.exe'", "get", "commandline", "/value"],
+			["process", "where", "name='Pi Virtual Employee.exe'", "get", "commandline,processid,parentprocessid", "/value"],
 			{ encoding: "utf8", windowsHide: true, timeout: 10_000 },
 		);
-		const text = out.stdout ?? "";
-		const profiles = new Set<string>();
-		for (const line of text.split(/\r?\n/)) {
-			const m = /CommandLine=(.*)/.exec(line);
-			if (!m || !m[1].includes("Pi Virtual Employee.exe")) continue;
-			const cl = m[1];
-			// Electron child processes (renderer/GPU/utility) embed the exe path
-			// plus --type=... and carry no --profile — counting them fabricated
-			// an empty default-profile entry and LaunchApp started a bare extra
-			// instance (field: profiles=[b,,a]).
-			if (/--type=/.test(cl)) continue;
-			const p = /--profile[= ]([\w-]+)/.exec(cl);
-			profiles.add(p ? p[1] : "");
+		// wmic is deprecated/absent on Windows 11: an empty table would silently
+		// reduce the snapshot to THIS instance only, stranding every sibling
+		// profile on the old version with no signal (review P2-4).
+		if (out.status !== 0 || !(out.stdout ?? "").trim()) {
+			log("WARN", `snapshotRunningProfiles: wmic unavailable/empty (status=${out.status}) — only this instance's own profile will be restored`);
 		}
+		const profiles = new Set(parseRunningProfilesFromWmic(out.stdout ?? ""));
 		// Always include self so a wmc miss can't strand the updating instance.
 		profiles.add(profileArgs()[1] ?? "");
 		return [...profiles];
