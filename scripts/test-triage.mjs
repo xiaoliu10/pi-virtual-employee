@@ -9,6 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { DatabaseSync } from "node:sqlite";
 import { build } from "esbuild";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -25,6 +26,29 @@ await build({
 	outfile: bundle, bundle: true, platform: "node", format: "esm", packages: "external", logLevel: "silent",
 });
 const { triageMessage, countPlanSteps, isQuestion, hasLongRunningVerb } = await import(pathToFileURL(bundle).href);
+
+const configBundle = join(outDir, "config.mjs");
+await build({
+	stdin: { contents: 'export { ConfigStore } from "./src/db/config-store.ts";', resolveDir: root, loader: "ts" },
+	outfile: configBundle, bundle: true, platform: "node", format: "esm", packages: "external", logLevel: "silent",
+});
+const { ConfigStore } = await import(pathToFileURL(configBundle).href);
+for (const [label, general, expected] of [
+	["fresh install", undefined, true],
+	["legacy config without dispatch", { taskPlanning: { enabled: true } }, true],
+	["explicit opt-out", { chatDispatch: { enabled: false } }, false],
+]) {
+	test("config default: " + label, () => {
+		const db = new DatabaseSync(":memory:");
+		try {
+			db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+			if (general) db.prepare("INSERT INTO config VALUES ('appconfig', ?)").run(JSON.stringify({ general }));
+			const config = new ConfigStore(db);
+			assert.equal(config.all().general.chatDispatch.enabled, expected);
+			assert.equal(new ConfigStore(db).all().general.chatDispatch.enabled, expected, "persists across reload");
+		} finally { db.close(); }
+	});
+}
 
 const PLAN3 = `📋 任务规划
 1. 登录 spay 系统
@@ -113,7 +137,7 @@ test("hasLongRunningVerb recognises the action vocabulary", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 // WIRING: the triage deciding "dispatch" is worth nothing unless a work item is
 // actually created, fired, and the ACK returned instead of running inline.
-// This drives the REAL manager method against a REAL work-item store.
+// This drives the real manager method against a contract-based store stub.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Minimal in-memory stand-in for WorkItemStore's create/list contract. */
@@ -139,7 +163,8 @@ function makeMemoryStore() {
 	};
 }
 
-test("dispatch WIRING: creates a work item, fires it, returns an ACK, keeps origin", async () => {
+for (const chatDispatch of [undefined, {}, { enabled: true }]) {
+test(`dispatch WIRING: creates and fires with flag ${JSON.stringify(chatDispatch)}`, async () => {
 	const managerBundle = join(outDir, "mgr.mjs");
 	await build({
 		stdin: {
@@ -179,7 +204,7 @@ test("dispatch WIRING: creates a work item, fires it, returns an ACK, keeps orig
 	};
 	const config = {
 		all: () => ({
-			general: { chatDispatch: { enabled: true } },
+			general: { chatDispatch },
 			// Work windows demand a declared-admin creator (review P1-2) — the
 			// dispatching actor must be one, exactly like the admin-tool path.
 			security: { adminStaffIds: ["u1"], ownerStaffIds: [], people: [], defaultRole: "viewer" },
@@ -223,6 +248,7 @@ test("dispatch WIRING: creates a work item, fires it, returns an ACK, keeps orig
 	assert.ok(ack.includes(shortId), `the ACK must name the item (${shortId}) so the user can follow it: ${ack}`);
 
 });
+}
 
 test("dispatch WIRING: flag off → inline (no work item, old behaviour)", async () => {
 	const managerBundle = join(outDir, "mgr2.mjs");
@@ -248,8 +274,8 @@ test("dispatch WIRING: flag off → inline (no work item, old behaviour)", async
 			push: async () => ({ ok: true }),
 		},
 	};
-	// Gray release default: absent → off.
-	const config = { all: () => ({ general: {}, capabilities: {} }) };
+	// Explicit opt-out must still bypass dispatch.
+	const config = { all: () => ({ general: { chatDispatch: { enabled: false } }, capabilities: {} }) };
 	const manager = Object.create(IMAdapterManager.prototype);
 	Object.defineProperties(manager, {
 		engine: { value: engine },
@@ -259,7 +285,7 @@ test("dispatch WIRING: flag off → inline (no work item, old behaviour)", async
 		{ conversationId: "dt:single:abc", text: "登录 spay 抓取昨日账单，导出 Excel 发我", actor: { senderId: "u1", channel: "dingtalk", chatType: "single" } },
 		PLAN3,
 	);
-	assert.equal(ack, undefined, "with the flag absent the caller must run inline");
+	assert.equal(ack, undefined, "with the flag explicitly false the caller must run inline");
 	assert.equal(store.list().length, 0, "no work item may exist");
 	assert.deepEqual(fired, []);
 });
@@ -276,7 +302,9 @@ test("dispatch WIRING: a broken store falls back to INLINE, never a swallowed me
 		workItems: { create: () => { throw new Error("db is gone"); } },
 		workBridge: { fireItem: () => true, push: async () => ({ ok: true }) },
 	};
-	const config = { all: () => ({ general: { chatDispatch: { enabled: true } }, capabilities: {} }) };
+	let createAttempted = false;
+	engine.workItems.create = () => { createAttempted = true; throw new Error("db is gone"); };
+	const config = { all: () => ({ general: {}, security: { adminStaffIds: ["u"], people: [] }, capabilities: {} }) };
 	const manager = Object.create(IMAdapterManager.prototype);
 	Object.defineProperties(manager, { engine: { value: engine }, config: { value: config } });
 	const ack = await manager.tryDispatchToWorker(
@@ -284,6 +312,7 @@ test("dispatch WIRING: a broken store falls back to INLINE, never a swallowed me
 		PLAN3,
 	);
 	assert.equal(ack, undefined, "a throwing store must degrade to inline execution");
+	assert.equal(createAttempted, true, "must reach the failing store rather than fail at an earlier guard");
 });
 
 test("dispatch WIRING: no work-item subsystem → inline", async () => {
@@ -299,6 +328,6 @@ test("dispatch WIRING: no work-item subsystem → inline", async () => {
 		engine: { value: {} },
 		config: { value: { all: () => ({ general: { chatDispatch: { enabled: true } }, capabilities: {} }) } },
 	});
-	const ack = await manager.tryDispatchToWorker({ conversationId: "c", text: "部署环境并跑测试", actor: undefined }, PLAN3);
+	const ack = await manager.tryDispatchToWorker({ conversationId: "c", text: "部署测试环境并执行完整回归测试", actor: undefined }, PLAN3);
 	assert.equal(ack, undefined);
 });

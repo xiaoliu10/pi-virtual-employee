@@ -100,8 +100,8 @@ export function hasLongRunningVerb(text: string): boolean {
 }
 
 /**
- * The triage itself. `enabled` mirrors the `chatDispatch` flag (default off for
- * the gray release), so flipping it off restores byte-for-byte old behaviour.
+ * The triage itself. `enabled` mirrors the `chatDispatch` flag (default on);
+ * explicitly disabling it restores the old inline behaviour.
  */
 export function triageMessage(input: TriageInput, enabled: boolean): TriageDecision {
 	if (!enabled) return { dispatch: false, reason: "disabled", steps: 0 };

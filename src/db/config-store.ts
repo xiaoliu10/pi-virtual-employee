@@ -307,15 +307,16 @@ export interface AppConfig {
 			enabled: boolean;
 		};
 		/**
-		 * Router/Worker dispatch (v0.2.190, docs/design/router-worker.md). When on,
-		 * a message the planner judged task-shaped (≥2 numbered steps + a
-		 * long-running verb) is acknowledged in ≤5s and handed to a background
-		 * work item instead of occupying the chat turn — so the conversation stays
-		 * responsive while long work runs. Triage is CONSERVATIVE and every failure
-		 * mode (no plan, LLM down, single step, question shape) stays inline.
+		 * Router/Worker dispatch (docs/design/router-worker.md). When on, a message
+		 * the planner judged task-shaped (≥2 numbered steps + a long-running verb)
+		 * is acknowledged and handed to a background work item instead of
+		 * occupying the chat turn — so the conversation stays responsive while
+		 * long work runs. Triage is CONSERVATIVE and every failure mode (no plan,
+		 * LLM down, single step, question shape, non-admin) stays inline.
 		 *
-		 * Default OFF for the gray release: off restores byte-for-byte the old
-		 * behaviour. Absent is treated as off.
+		 * Default ON. Setting it off restores the old inline
+		 * behaviour. Absent is treated as ON — the same shape as taskPlanning,
+		 * whose default is also enabled.
 		 */
 		chatDispatch?: {
 			enabled: boolean;
@@ -595,7 +596,7 @@ const DEFAULTS: AppConfig = {
 	identity: { name: "客服小派", role: "虚拟客服", duty: "在线为客户提供专业、礼貌、高效的服务", serviceHours: "7×24h" },
 	im: { enabled: false, channels: [], ack: { enabled: true, text: "👍 收到，正在处理…" } },
 	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 15, taskProgressMin: 30, turnTimeoutMin: 20, maxToolSteps: 20,
-			progressWatchdog: { enabled: true, stallWindowMs: 300_000, windowSize: 32, softStopAfterWindows: 2, hungRequestCapMs: 600_000 }, taskPlanning: { enabled: true }, autoUpdate: true, oneOffRetentionDays: 30, messageRetentionDays: 30, engineKernel: "durable" as const, piRegistryUrl: "" },
+			progressWatchdog: { enabled: true, stallWindowMs: 300_000, windowSize: 32, softStopAfterWindows: 2, hungRequestCapMs: 600_000 }, taskPlanning: { enabled: true }, chatDispatch: { enabled: true }, autoUpdate: true, oneOffRetentionDays: 30, messageRetentionDays: 30, engineKernel: "durable" as const, piRegistryUrl: "" },
 	browser: { enabled: false, headless: true, allowedDomains: [], downloadHost: "" },
 	computer: DEFAULT_COMPUTER_CONFIG,
 	scheduler: { enabled: true },

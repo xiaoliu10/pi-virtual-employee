@@ -220,8 +220,11 @@ export class IMAdapterManager {
 	private async tryDispatchToWorker(msg: InboundMessage, plan: string): Promise<string | undefined> {
 		try {
 			const cfg = this.config.all();
-			const enabled = cfg.general.chatDispatch?.enabled === true;
-			if (!enabled) return undefined; // gray release: default off
+			// DEFAULT ON: absent means enabled (user ruling 2026-11-04). Only an
+			// explicit `enabled: false` restores the old inline behaviour — the
+			// same "absent = on" convention as taskPlanning.
+			const enabled = cfg.general.chatDispatch?.enabled !== false;
+			if (!enabled) return undefined;
 			const decision = triageMessage({ text: msg.text, plan, looksLikeTask: true }, true);
 			if (!decision.dispatch) {
 				console.log(`[im] dispatch triage: inline (${decision.reason}, steps=${decision.steps})`);
@@ -647,7 +650,7 @@ export class IMAdapterManager {
 												.catch((err) => console.warn("[im] task plan push failed:", err instanceof Error ? err.message : err));
 										}
 										// Router/Worker dispatch (docs/design/router-worker.md P1). Conservative
-										// and OFF by default: when it fires, the message does NOT run in this chat
+										// and ON by default: when it fires, the message does NOT run in this chat
 										// turn — it becomes a work item and this turn returns the ACK instead.
 										// Every failure path falls through to inline execution (no black holes).
 										const dispatched = await this.tryDispatchToWorker(msg, plan.turnContext);
