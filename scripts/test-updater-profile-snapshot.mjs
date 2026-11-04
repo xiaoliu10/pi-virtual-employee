@@ -120,8 +120,40 @@ test("unquoted --user-data-dir and --profile=Name forms are handled", () => {
 		row(`${EXE} --profile=Orion `, 900) +
 		mainBare(901) +
 		// No quotes around the directory (Electron only quotes when needed).
-		row(`${EXE} --type=utility --user-data-dir=C:\\Users\\x\\AppData\\Roaming\\pi-virtual-employee\\profiles\\Nova --lang=zh-CN`, 902, 901);
+		row(`${EXE} --type=utility --user-data-dir=C:\\Users\\x\\AppData\\Roaming\\pi-virtual-employee\\profiles\\Nova --lang=zh-CN`, 902, 901) +
+		row(`${EXE} --type=gpu-process --user-data-dir=C:\\Users\\x\\AppData\\Roaming\\pi-virtual-employee\\profiles\\Nova --field-trial-handle=1`, 903, 901);
 	assert.deepEqual([...parseRunningProfilesFromWmic(text)].sort(), ["Nova", "Orion"]);
+});
+
+test("P1-1: an ORPHANED child whose ppid was reused must NOT confer identity", () => {
+	// Independent review: a single child cannot be distinguished from an orphan
+	// left behind by a dead named instance whose ppid value now collides with
+	// this (real default) main process. Recovering there would relaunch the
+	// instance with the WRONG identity and hold the real profile's lock/DB.
+	const text = mainBare(300) + child(301, 300, "Orion");
+	assert.deepEqual(parseRunningProfilesFromWmic(text), [""], "a single child is not enough evidence");
+});
+
+test("P1-1: children DISAGREEING on the profile must NOT confer identity", () => {
+	const text = mainBare(310) + child(311, 310, "Orion") + child(312, 310, "Nova");
+	assert.deepEqual(parseRunningProfilesFromWmic(text), [""], "conflicting evidence stays conservative");
+});
+
+test("P2-2: a differently-cased `Profiles` directory still recovers", () => {
+	// Windows paths are case-insensitive; only the app-written spelling differs.
+	const text =
+		mainBare(320) +
+		row(`${EXE} --type=gpu-process --user-data-dir="C:\\Users\\x\\AppData\\Roaming\\pi-virtual-employee\\Profiles\\Orion"`, 321, 320) +
+		row(`${EXE} --type=utility --user-data-dir="C:\\Users\\x\\AppData\\Roaming\\pi-virtual-employee\\Profiles\\Orion" --lang=zh-CN`, 322, 320);
+	assert.deepEqual(parseRunningProfilesFromWmic(text), ["Orion"]);
+});
+
+test("P2-1: a profile value must end at a boundary (no silent truncation)", () => {
+	// `--profile a.b` used to parse as "a" — a DIFFERENT legal name rather than
+	// a refusal. main.ts only allows [A-Za-z0-9_-], so anything else in the
+	// argument means the value is malformed, not a name to truncate into.
+	const text = row(`${EXE} --profile a.b `, 330) + child(331, 330, "RealName") + child(332, 330, "RealName");
+	assert.deepEqual(parseRunningProfilesFromWmic(text), ["RealName"], "the malformed flag must not truncate into a wrong name");
 });
 
 test("an unrelated process row is ignored, and a partial row cannot crash it", () => {

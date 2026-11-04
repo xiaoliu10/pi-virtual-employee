@@ -771,19 +771,31 @@ export function parseRunningProfilesFromWmic(text: string): string[] {
 		// EVIDENCE for a parent's identity below, never an entry themselves.
 		if (/--type=/.test(row.cmd)) continue;
 		if (!row.cmd.includes("Pi Virtual Employee.exe")) continue;
-		const p = /--profile[= ]([\w-]+)/.exec(row.cmd);
+		const p = /--profile[= ]([A-Za-z0-9_-]+)(?=[\s"]|$)/.exec(row.cmd);
 		if (p) { profiles.add(p[1]); continue; }
-		let recovered = "";
+		// Identity recovery needs AT LEAST TWO children agreeing on the same
+		// profile (independent review P1-1): a single child cannot be told apart
+		// from an ORPHANED child whose ppid value was reused by an unrelated
+		// main process — recovering from that would start the instance with the
+		// WRONG identity (it would hold the real profile's DB and lock), which
+		// is worse than a bare extra instance. Electron normally spawns GPU +
+		// utility + renderer children, so a live instance has several; an
+		// orphan cluster usually has just one.
+		const names: string[] = [];
 		for (const child of rows) {
 			if (child.ppid !== row.pid || !/--type=/.test(child.cmd)) continue;
-			// Quoted or unquoted, and the path may contain spaces.
-			const ud = /--user-data-dir=(?:"([^"]+)"|(\S+))/.exec(child.cmd);
+			// Quoted or unquoted; stop at the next flag so an unquoted value
+			// containing a space cannot smear into the next argument.
+			const ud = /--user-data-dir=(?:"([^"]+)"|(.+?))(?=\s+--|$)/.exec(child.cmd);
 			const dir = ud?.[1] ?? ud?.[2];
-			const name = dir && /[\\/]profiles[\\/]([\w-]+)[\\/]?$/.exec(dir)?.[1];
-			if (name && name !== "default") { recovered = name; break; }
+			// Windows paths are case-insensitive; the app writes "profiles".
+			const name = dir && /[\\/]profiles[\\/]([A-Za-z0-9_-]+)[\\/]?$/i.exec(dir.trim())?.[1];
+			if (name && name.toLowerCase() !== "default") names.push(name);
 		}
-		// No child yet (just started) → conservative "": same as before, never
-		// worse. A wrong guess would be far worse than a bare extra instance.
+		const recovered = names.length >= 2 && names.every((n) => n === names[0]) ? names[0] : "";
+		// No/insufficient/conflicting evidence (just started, or an orphan) →
+		// conservative "": same as before, never worse. A wrong guess would be
+		// far worse than a bare extra instance.
 		profiles.add(recovered);
 	}
 	return [...profiles];
@@ -804,6 +816,12 @@ function snapshotRunningProfiles(): string[] {
 			["process", "where", "name='Pi Virtual Employee.exe'", "get", "commandline,processid,parentprocessid", "/value"],
 			{ encoding: "utf8", windowsHide: true, timeout: 10_000 },
 		);
+		// wmic is deprecated/absent on Windows 11: an empty table would silently
+		// reduce the snapshot to THIS instance only, stranding every sibling
+		// profile on the old version with no signal (review P2-4).
+		if (out.status !== 0 || !(out.stdout ?? "").trim()) {
+			log("WARN", `snapshotRunningProfiles: wmic unavailable/empty (status=${out.status}) — only this instance's own profile will be restored`);
+		}
 		const profiles = new Set(parseRunningProfilesFromWmic(out.stdout ?? ""));
 		// Always include self so a wmc miss can't strand the updating instance.
 		profiles.add(profileArgs()[1] ?? "");
