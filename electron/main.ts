@@ -444,6 +444,10 @@ async function main(): Promise<void> {
 	// service just resolves the configured whitelist at call time.
 	const filesystem = new FileSystemService(config);
 	filesystem.addAllowedDir(inboundDir);
+	// The per-profile script workspace is writable by default (write_text_file):
+	// authoring a script must not require the user to first edit a whitelist.
+	// Same app-managed-dir mechanism as inbound/ (field 2026-09-18).
+	filesystem.addAllowedDir(path.join(userData, "scripts"));
 
 	// Browser downloads: capture into a managed workspace so the employee can
 	// list/read/analyze downloaded files (Excel exports, etc.) without touching

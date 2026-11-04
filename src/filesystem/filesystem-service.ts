@@ -15,7 +15,7 @@
  *    enforced by the agent + system-prompt rule; the confirmed flag is the
  *    tool-level gate that makes a two-step flow mandatory.
  */
-import { readdir, stat, unlink } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ConfigStore } from "../db/config-store.js";
@@ -159,5 +159,49 @@ export class FileSystemService {
 			}
 		}
 		return { dryRun: !confirmed, results };
+	}
+
+	/**
+	 * Write a text file VERBATIM (UTF-8), then read it back and verify the byte
+	 * count — the write is only reported as successful when the content on disk
+	 * matches what was asked (a truncated tool argument must not silently
+	 * produce a half-written script).
+	 *
+	 * WHY this exists: agents on Windows had NO way to create a script file
+	 * except inline shell (`echo > file`, `Set-Content`, `python -c ...`), which
+	 * stacks three escaping layers (JSON argument → shell quoting → the target
+	 * language's own string syntax) and failed repeatedly in the field. Content
+	 * as a plain tool argument removes every one of those layers.
+	 *
+	 * Same whitelist as list/delete (`assertAllowed`, `..` cannot escape).
+	 * Unlike delete there is no two-step confirm: writing inside the allowed
+	 * workspace is the routine script-iteration operation, and the read-back
+	 * result tells the user exactly what landed.
+	 */
+	async writeTextFile(
+		targetPath: string,
+		content: string,
+		overwrite: boolean,
+	): Promise<{ path: string; bytes: number; overwritten: boolean; firstLine: string }> {
+		const abs = path.resolve(this.expand(targetPath));
+		this.assertAllowed(abs);
+		const existed = await stat(abs).then((s) => s.isFile()).catch(() => false);
+		if (existed && !overwrite) {
+			throw new Error(`文件已存在且未允许覆盖：${abs}（如需更新脚本内容，设 overwrite=true）`);
+		}
+		await mkdir(path.dirname(abs), { recursive: true });
+		// No BOM: a BOM breaks `node script.mjs` shebang-less ESM detection on
+		// some runtimes and shows up as an invisible first-character diff.
+		await writeFile(abs, content, { encoding: "utf8" });
+		const back = await readFile(abs, "utf8");
+		if (back !== content) {
+			throw new Error(`写入校验失败：磁盘内容与请求不一致（请求 ${content.length} 字符，读回 ${back.length} 字符）——文件可能被截断或被其他进程修改，请重试`);
+		}
+		return {
+			path: abs,
+			bytes: Buffer.byteLength(content, "utf8"),
+			overwritten: existed,
+			firstLine: (content.split(/\r?\n/, 1)[0] ?? "").slice(0, 80),
+		};
 	}
 }
