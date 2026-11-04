@@ -47,35 +47,35 @@ const SHARED_CSS = `
 button { font-family: inherit; cursor: pointer; }
 input, textarea { font-family: inherit; }
 /* ── 过程展示（v0.2.179）：工具调用行 / 思考折叠 / 流式光标 ── */
-.step { display:flex; align-items:center; gap:6px; margin:4px 0; font-size:12px; color:#86909c; }
-.step .st-ico { font-size:12px; }
-.step .st-spin { display:inline-block; width:14px; text-align:center; color:#4f6ef7; }
-.step .st-spin::after { content:"⋯"; }
-.step.ok .st-spin { color:#00b42a; }
-.step.ok .st-spin::after { content:"✓"; }
-.step.bad { color:#f53f3f; }
-.step.bad .st-spin { color:#f53f3f; }
-.step.bad .st-spin::after { content:"✗"; }
-/* 思考过程：对齐 Desktop 的 pi-execution__note —— 摘要行 + 左侧竖线正文，
-   不是带边框的卡片。桌面端从不用卡片框住过程，框住反而让结果显得更远。 */
+/* ── 过程行：对齐 Desktop pi-tool —— 摘要行（图标+粗体状态词+名称+右侧状态章），
+   无卡片边框；箭头悬停出现、展开旋转 90°（chat.css 同款交互）。 ── */
+.step { margin:2px 0; }
+.step > summary { display:flex; align-items:center; gap:7px; padding:7px 2px; font-size:13px; line-height:20px; color:#6e6e73; cursor:pointer; list-style:none; border-radius:6px; }
+.step > summary::-webkit-details-marker { display:none; }
+.step > summary:hover { background:#f7f8fa; }
+.step .t-run { color:#1d1d1f; font-weight:600; }
+.step .t-chip { margin-left:auto; flex:0 0 auto; font-size:11px; color:#86868b; }
+.step.ok .t-chip { color:#00b42a; }
+.step.bad .t-chip { color:#f53f3f; }
 .think { margin:0 0 10px; }
-.think-h { display:flex; align-items:center; gap:7px; padding:8px 2px; font-size:13px; line-height:20px; color:#86909c; cursor:pointer; user-select:none; border-radius:6px; }
-.think-h:hover { background:#f7f8fa; }
-.think-ico { flex:0 0 auto; font-size:13px; opacity:.75; }
-.think-t { flex:0 0 auto; }
-.think.on .think-t { color:#1d1d1f; font-weight:600; }
-/* 流式尾部：新内容从右推入，旧内容淡出（Desktop 的 ticker） */
+.think > summary { display:flex; align-items:center; gap:7px; padding:8px 2px; font-size:13px; line-height:20px; color:#86909c; cursor:pointer; list-style:none; border-radius:6px; user-select:none; }
+.think > summary::-webkit-details-marker { display:none; }
+.think > summary:hover { background:#f7f8fa; }
+.think.on .t-title { color:#1d1d1f; font-weight:600; }
 .think-ticker { flex:1 1 auto; min-width:0; display:flex; justify-content:flex-end; overflow:hidden;
   -webkit-mask-image:linear-gradient(to right, transparent, #000 10%, #000 92%, transparent);
   mask-image:linear-gradient(to right, transparent, #000 10%, #000 92%, transparent); }
 .think-ticker > span { flex:0 0 auto; white-space:pre; color:#a1a1a6; font-size:12px; }
-.think-chev { flex:0 0 auto; color:#c9c9cf; font-size:12px; transition:transform .12s ease, opacity .16s ease; opacity:0; }
-.think-h:hover .think-chev { opacity:1; }
-.think.open .think-chev { opacity:1; transform:rotate(90deg); }
-.think-b { margin:0 0 10px; padding:2px 2px 2px 12px; border-left:1px solid #e8e8ed;
+.t-ico { flex:0 0 auto; width:16px; height:16px; color:#86868b; }
+.t-ico svg { width:16px; height:16px; display:block; }
+.t-chev { flex:0 0 auto; width:12px; height:12px; color:#c9c9cf; opacity:0; transition:transform .12s ease, opacity .16s ease; }
+.t-chev svg { width:12px; height:12px; display:block; }
+.step > summary:hover .t-chev, .think > summary:hover .t-chev,
+.step[open] > summary .t-chev, .think[open] > summary .t-chev { opacity:1; }
+.think[open] > summary .t-chev, .step[open] > summary .t-chev { transform:rotate(90deg); }
+.think-b { margin:0 0 10px; padding:2px 2px 2px 14px; border-left:1px solid #e8e8ed;
   font-size:13px; line-height:1.65; color:#86868b; white-space:pre-wrap; word-break:break-word;
   max-height:240px; overflow-y:auto; }
-.think-b.hidden { display:none; }
 .msg.streaming::after { content:"▍"; color:#4f6ef7; animation:ve-blink 1s step-start infinite; }
 @keyframes ve-blink { 50% { opacity:0; } }
 `;
@@ -314,20 +314,36 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
     }).catch(function (e) { handlers.onerror("网络错误：" + e); });
   }
 
-  function addStep(msgs, label) {
-    var step = document.createElement("div");
+  /** 工具行 — Desktop pi-tool 摘要：工具族 SVG 图标 + 粗体「正在执行」+ 状态章。 */
+  function addStep(msgs, toolName) {
+    var step = document.createElement("details");
     step.className = "step";
-    step.innerHTML = '<span class="st-ico">⚙</span><span class="st-txt"></span><span class="st-spin"></span>';
-    step.querySelector(".st-txt").textContent = label;
+    var head = document.createElement("summary");
+    head.appendChild(ico(toolIcon(toolName)));
+    var run = document.createElement("span");
+    run.className = "t-run";
+    run.textContent = "正在执行";
+    var name = document.createElement("span");
+    name.textContent = String(toolName || "");
+    var chip = document.createElement("span");
+    chip.className = "t-chip";
+    chip.textContent = "运行中";
+    var chev = document.createElement("span");
+    chev.className = "t-chev";
+    chev.innerHTML = ICONS.chev;
+    head.appendChild(run); head.appendChild(name); head.appendChild(chip); head.appendChild(chev);
+    step.appendChild(head);
     msgs.appendChild(step);
     scrollEnd();
     return step;
   }
-  function finishStep(step, label, ok, ms) {
+  function finishStep(step, ok, ms) {
     if (!step) return;
-    step.querySelector(".st-txt").textContent = label + (ms != null ? "（" + Math.round(ms / 100) / 10 + "s）" : "");
-    step.querySelector(".st-spin").textContent = ok ? "✓" : "✗";
     step.classList.add(ok ? "ok" : "bad");
+    var run = step.querySelector(".t-run");
+    if (run && run.remove) run.remove();
+    var chip = step.querySelector(".t-chip");
+    if (chip) chip.textContent = (ok ? "成功" : "失败") + (ms != null ? " · " + Math.round(ms / 100) / 10 + "s" : "");
   }
   /**
    * Thinking panel, inserted BEFORE the answer bubble it belongs to.
@@ -340,70 +356,91 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
    * the
    * bubble exists.
    */
+  /* Desktop Icons.tsx 的 stroke SVG 子集：过程行不再用 emoji 充数。 */
+  var ICONS = {
+    brain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/><path d="M17.599 6.5a3 3 0 0 0 .399-1.375"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M19.938 10.5a4 4 0 0 1 .585.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M19.964 17.484A4 4 0 0 1 18 18"/></svg>',
+    chev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9.5 6.5 5.5 5.5-5.5 5.5"/></svg>',
+    terminal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="m7 9.5 3 2.5-3 2.5M12.5 15H17"/></svg>',
+    globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.3 2.3 3.4 5.2 3.4 8.5s-1.1 6.2-3.4 8.5c-2.3-2.3-3.4-5.2-3.4-8.5S9.7 5.8 12 3.5Z"/></svg>',
+    file: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v11a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 19V5a1.5 1.5 0 0 1 1-1.5Z"/><path d="M13.5 3.5V8H18"/></svg>',
+    book: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 6.5C10.5 5 8.5 4.5 5.5 4.5c-.6 0-1 .4-1 1v11c0 .6.4 1 1 1 3 0 5 .5 6.5 2 1.5-1.5 3.5-2 6.5-2 .6 0 1-.4 1-1v-11c0-.6-.4-1-1-1-3 0-5 .5-6.5 2Z"/><path d="M12 6.5v13"/></svg>',
+    clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>',
+    wrench: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14.5 12 12 9.5l2.7-3.2Z"/></svg>'
+  };
+  function ico(name) {
+    var el = document.createElement("span");
+    el.className = "t-ico";
+    el.innerHTML = ICONS[name] || ICONS.wrench;
+    return el;
+  }
+  function toolIcon(name) {
+    var n = String(name || "").toLowerCase();
+    if (/bash|shell|command|script|powershell|cmd|exec/.test(n)) return "terminal";
+    if (/browser|web|http|navigate|page/.test(n)) return "globe";
+    if (/file|read|write|edit|text|dir|path/.test(n)) return "file";
+    if (/knowledge|memory|skill|search/.test(n)) return "book";
+    if (/sched|time|cron|task/.test(n)) return "clock";
+    return "wrench";
+  }
+
   /**
-   * 思考过程，插在它所属的回答气泡之前（先思考、再给结果）。
-   *
-   * 结构对齐 Desktop 的 pi-execution__note（chat.css）：摘要行 + 左侧竖线正文，
-   * 不是带边框的小卡片。桌面端从不把过程框成卡片——卡片会把过程和结果在视觉上
-   * 割成两块，而挂在结果下面时（本函数早期的 appendChild 写法）读起来像
-   * 「先给答案、后解释怎么想到的」。现场 2026-11-04 用户反馈正是这一点。
-   *
-   * 流式时摘要行右侧滚动显示思考尾部（Desktop 的 ticker），完成后显示字数并收起。
+   * Thinking note — Desktop pi-execution__note port: native details/summary
+   * (brain icon + bold 正在思考 + right-aligned scrolling tail ticker), body as
+   * a left-rule block. Inserted BEFORE its answer bubble (先思考、再给结果 —
+   * field 2026-11-04). Streaming keeps it open; finish collapses it and the
+   * title switches to 「思考 · 用时 N 秒」, exactly like the desktop note.
    */
   function addThinking(msgs, anchor) {
-    var wrap = document.createElement("div");
+    var wrap = document.createElement("details");
     wrap.className = "think on";
-    var head = document.createElement("div");
-    head.className = "think-h";
-    var ico = document.createElement("span");
-    ico.className = "think-ico";
-    ico.textContent = "🧠";
+    wrap.setAttribute("open", "open");
+    var head = document.createElement("summary");
+    head.appendChild(ico("brain"));
     var title = document.createElement("span");
-    title.className = "think-t";
+    title.className = "t-title";
     title.textContent = "正在思考";
     var ticker = document.createElement("span");
     ticker.className = "think-ticker";
     var tickerInner = document.createElement("span");
     ticker.appendChild(tickerInner);
     var chev = document.createElement("span");
-    chev.className = "think-chev";
-    chev.textContent = "▶";
-    head.appendChild(ico); head.appendChild(title); head.appendChild(ticker); head.appendChild(chev);
+    chev.className = "t-chev";
+    chev.innerHTML = ICONS.chev;
+    head.appendChild(title); head.appendChild(ticker); head.appendChild(chev);
     var bodyEl = document.createElement("div");
-    bodyEl.className = "think-b hidden";
-    head.addEventListener("click", function () {
-      var show = bodyEl.classList.contains("hidden");
-      bodyEl.classList.toggle("hidden", !show);
-      wrap.classList.toggle("open", show);
-    });
+    bodyEl.className = "think-b";
     wrap.appendChild(head); wrap.appendChild(bodyEl);
     if (anchor && anchor.parentNode === msgs) msgs.insertBefore(wrap, anchor);
     else msgs.appendChild(wrap);
-    wrap._veTitle = title; wrap._veTicker = tickerInner; wrap._veBody = bodyEl;
+    wrap._veTitle = title; wrap._veTicker = tickerInner; wrap._veStartedAt = Date.now();
     scrollEnd();
     return wrap;
   }
 
-  /** 把累积的思考文本刷进面板：流式走尾部滚动带，结束显示字数并收起。 */
+  /** 刷新思考面板：流式=滚动尾部（剥 markdown 装饰取尾 160 字）；完成=用时+折叠。 */
   function paintThinking(wrap, text, streaming) {
-    if (!wrap || !wrap._veBody) return;
-    wrap._veBody.textContent = text;
+    if (!wrap || !wrap._veTitle) return;
+    var body = wrap.children[1];
+    if (body) body.textContent = text;
     if (streaming) {
       wrap.classList.add("on");
-      if (wrap._veTitle) wrap._veTitle.textContent = "正在思考";
+      wrap._veTitle.textContent = "正在思考";
       if (wrap._veTicker) {
-        var flat = String(text).replace(/\s+/g, " ").trim();
+        var flat = String(text)
+          .replace(/\\*\\*(.+?)\\*\\*/g, "$1")
+          .replace(/\\*(.+?)\\*/g, "$1")
+          .replace(/[\\x60]([^\\x60]+?)[\\x60]/g, "$1")
+          .replace(/\\s+/g, " ").trim();
         wrap._veTicker.textContent = flat.length > 160 ? flat.slice(-160) : flat;
       }
     } else {
       wrap.classList.remove("on");
-      if (wrap._veTitle) wrap._veTitle.textContent = "思考过程 · " + String(text).length + " 字";
+      var secs = Math.max(1, Math.ceil((Date.now() - (wrap._veStartedAt || Date.now())) / 1000));
+      wrap._veTitle.textContent = "思考 · 用时 " + secs + " 秒";
       if (wrap._veTicker) wrap._veTicker.textContent = "";
-      wrap._veBody.classList.add("hidden");
-      wrap.classList.remove("open");
+      wrap.removeAttribute("open");
     }
   }
-
 
   function send(text) {
     text = (text || "").trim();
@@ -458,13 +495,13 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
             break;
           case "tool_start":
             if (!aiText) box.textContent = "";
-            lastTool = addStep(m, "调用工具 " + ev.toolName + " …");
+            lastTool = addStep(m, ev.toolName);
             if (ev.toolCallId) tools[ev.toolCallId] = lastTool;
             scrollEnd();
             break;
           case "tool_end": {
             var step = (ev.toolCallId && tools[ev.toolCallId]) || lastTool;
-            finishStep(step, "工具 " + ev.toolName, !ev.isError, ev.durationMs);
+            finishStep(step, !ev.isError, ev.durationMs);
             break;
           }
           case "thinking_delta":
@@ -660,85 +697,122 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
       return pump();
     }).catch(function (e) { handlers.onerror("网络错误：" + e); });
   }
-  function addStep(list, label) {
-    var step = document.createElement("div");
+  /** 工具行 — Desktop pi-tool 摘要：工具族 SVG 图标 + 粗体「正在执行」+ 状态章。 */
+  function addStep(list, toolName) {
+    var step = document.createElement("details");
     step.className = "step";
-    step.innerHTML = '<span class="st-ico">⚙</span><span class="st-txt"></span><span class="st-spin"></span>';
-    step.querySelector(".st-txt").textContent = label;
+    var head = document.createElement("summary");
+    head.appendChild(ico(toolIcon(toolName)));
+    var run = document.createElement("span");
+    run.className = "t-run";
+    run.textContent = "正在执行";
+    var name = document.createElement("span");
+    name.textContent = String(toolName || "");
+    var chip = document.createElement("span");
+    chip.className = "t-chip";
+    chip.textContent = "运行中";
+    var chev = document.createElement("span");
+    chev.className = "t-chev";
+    chev.innerHTML = ICONS.chev;
+    head.appendChild(run); head.appendChild(name); head.appendChild(chip); head.appendChild(chev);
+    step.appendChild(head);
     list.appendChild(step);
     scrollEnd();
     return step;
   }
-  function finishStep(step, label, ok, ms) {
+  function finishStep(step, ok, ms) {
     if (!step) return;
-    step.querySelector(".st-txt").textContent = label + (ms != null ? "（" + Math.round(ms / 100) / 10 + "s）" : "");
-    step.querySelector(".st-spin").textContent = ok ? "✓" : "✗";
     step.classList.add(ok ? "ok" : "bad");
+    var run = step.querySelector(".t-run");
+    if (run && run.remove) run.remove();
+    var chip = step.querySelector(".t-chip");
+    if (chip) chip.textContent = (ok ? "成功" : "失败") + (ms != null ? " · " + Math.round(ms / 100) / 10 + "s" : "");
   }
+  /* Desktop Icons.tsx 的 stroke SVG 子集：过程行不再用 emoji 充数。 */
+  var ICONS = {
+    brain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/><path d="M17.599 6.5a3 3 0 0 0 .399-1.375"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M19.938 10.5a4 4 0 0 1 .585.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M19.964 17.484A4 4 0 0 1 18 18"/></svg>',
+    chev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9.5 6.5 5.5 5.5-5.5 5.5"/></svg>',
+    terminal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="m7 9.5 3 2.5-3 2.5M12.5 15H17"/></svg>',
+    globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.3 2.3 3.4 5.2 3.4 8.5s-1.1 6.2-3.4 8.5c-2.3-2.3-3.4-5.2-3.4-8.5S9.7 5.8 12 3.5Z"/></svg>',
+    file: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v11a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 19V5a1.5 1.5 0 0 1 1-1.5Z"/><path d="M13.5 3.5V8H18"/></svg>',
+    book: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 6.5C10.5 5 8.5 4.5 5.5 4.5c-.6 0-1 .4-1 1v11c0 .6.4 1 1 1 3 0 5 .5 6.5 2 1.5-1.5 3.5-2 6.5-2 .6 0 1-.4 1-1v-11c0-.6-.4-1-1-1-3 0-5 .5-6.5 2Z"/><path d="M12 6.5v13"/></svg>',
+    clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>',
+    wrench: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14.5 12 12 9.5l2.7-3.2Z"/></svg>'
+  };
+  function ico(name) {
+    var el = document.createElement("span");
+    el.className = "t-ico";
+    el.innerHTML = ICONS[name] || ICONS.wrench;
+    return el;
+  }
+  function toolIcon(name) {
+    var n = String(name || "").toLowerCase();
+    if (/bash|shell|command|script|powershell|cmd|exec/.test(n)) return "terminal";
+    if (/browser|web|http|navigate|page/.test(n)) return "globe";
+    if (/file|read|write|edit|text|dir|path/.test(n)) return "file";
+    if (/knowledge|memory|skill|search/.test(n)) return "book";
+    if (/sched|time|cron|task/.test(n)) return "clock";
+    return "wrench";
+  }
+
   /**
-   * 思考过程，插在它所属的回答气泡之前（先思考、再给结果）。
-   *
-   * 结构对齐 Desktop 的 pi-execution__note（chat.css）：摘要行 + 左侧竖线正文，
-   * 不是带边框的小卡片。桌面端从不把过程框成卡片——卡片会把过程和结果在视觉上
-   * 割成两块，而挂在结果下面时（本函数早期的 appendChild 写法）读起来像
-   * 「先给答案、后解释怎么想到的」。现场 2026-11-04 用户反馈正是这一点。
-   *
-   * 流式时摘要行右侧滚动显示思考尾部（Desktop 的 ticker），完成后显示字数并收起。
+   * Thinking note — Desktop pi-execution__note port: native details/summary
+   * (brain icon + bold 正在思考 + right-aligned scrolling tail ticker), body as
+   * a left-rule block. Inserted BEFORE its answer bubble (先思考、再给结果 —
+   * field 2026-11-04). Streaming keeps it open; finish collapses it and the
+   * title switches to 「思考 · 用时 N 秒」, exactly like the desktop note.
    */
   function addThinking(list, anchor) {
-    var wrap = document.createElement("div");
+    var wrap = document.createElement("details");
     wrap.className = "think on";
-    var head = document.createElement("div");
-    head.className = "think-h";
-    var ico = document.createElement("span");
-    ico.className = "think-ico";
-    ico.textContent = "🧠";
+    wrap.setAttribute("open", "open");
+    var head = document.createElement("summary");
+    head.appendChild(ico("brain"));
     var title = document.createElement("span");
-    title.className = "think-t";
+    title.className = "t-title";
     title.textContent = "正在思考";
     var ticker = document.createElement("span");
     ticker.className = "think-ticker";
     var tickerInner = document.createElement("span");
     ticker.appendChild(tickerInner);
     var chev = document.createElement("span");
-    chev.className = "think-chev";
-    chev.textContent = "▶";
-    head.appendChild(ico); head.appendChild(title); head.appendChild(ticker); head.appendChild(chev);
+    chev.className = "t-chev";
+    chev.innerHTML = ICONS.chev;
+    head.appendChild(title); head.appendChild(ticker); head.appendChild(chev);
     var bodyEl = document.createElement("div");
-    bodyEl.className = "think-b hidden";
-    head.addEventListener("click", function () {
-      var show = bodyEl.classList.contains("hidden");
-      bodyEl.classList.toggle("hidden", !show);
-      wrap.classList.toggle("open", show);
-    });
+    bodyEl.className = "think-b";
     wrap.appendChild(head); wrap.appendChild(bodyEl);
     if (anchor && anchor.parentNode === list) list.insertBefore(wrap, anchor);
     else list.appendChild(wrap);
-    wrap._veTitle = title; wrap._veTicker = tickerInner; wrap._veBody = bodyEl;
+    wrap._veTitle = title; wrap._veTicker = tickerInner; wrap._veStartedAt = Date.now();
     scrollEnd();
     return wrap;
   }
 
-  /** 把累积的思考文本刷进面板：流式走尾部滚动带，结束显示字数并收起。 */
+  /** 刷新思考面板：流式=滚动尾部（剥 markdown 装饰取尾 160 字）；完成=用时+折叠。 */
   function paintThinking(wrap, text, streaming) {
-    if (!wrap || !wrap._veBody) return;
-    wrap._veBody.textContent = text;
+    if (!wrap || !wrap._veTitle) return;
+    var body = wrap.children[1];
+    if (body) body.textContent = text;
     if (streaming) {
       wrap.classList.add("on");
-      if (wrap._veTitle) wrap._veTitle.textContent = "正在思考";
+      wrap._veTitle.textContent = "正在思考";
       if (wrap._veTicker) {
-        var flat = String(text).replace(/\s+/g, " ").trim();
+        var flat = String(text)
+          .replace(/\\*\\*(.+?)\\*\\*/g, "$1")
+          .replace(/\\*(.+?)\\*/g, "$1")
+          .replace(/[\\x60]([^\\x60]+?)[\\x60]/g, "$1")
+          .replace(/\\s+/g, " ").trim();
         wrap._veTicker.textContent = flat.length > 160 ? flat.slice(-160) : flat;
       }
     } else {
       wrap.classList.remove("on");
-      if (wrap._veTitle) wrap._veTitle.textContent = "思考过程 · " + String(text).length + " 字";
+      var secs = Math.max(1, Math.ceil((Date.now() - (wrap._veStartedAt || Date.now())) / 1000));
+      wrap._veTitle.textContent = "思考 · 用时 " + secs + " 秒";
       if (wrap._veTicker) wrap._veTicker.textContent = "";
-      wrap._veBody.classList.add("hidden");
-      wrap.classList.remove("open");
+      wrap.removeAttribute("open");
     }
   }
-
 
   function send(text) {
     text = (text || "").trim();
@@ -784,13 +858,13 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
             break;
           case "tool_start":
             if (!aiText) box.textContent = "";
-            lastTool = addStep(list, "调用工具 " + ev.toolName + " …");
+            lastTool = addStep(list, ev.toolName);
             if (ev.toolCallId) tools[ev.toolCallId] = lastTool;
             scrollEnd();
             break;
           case "tool_end": {
             var step = (ev.toolCallId && tools[ev.toolCallId]) || lastTool;
-            finishStep(step, "工具 " + ev.toolName, !ev.isError, ev.durationMs);
+            finishStep(step, !ev.isError, ev.durationMs);
             break;
           }
           case "thinking_delta":

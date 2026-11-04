@@ -87,9 +87,18 @@ class El {
 		if (i >= 0) this.parentNode.children.splice(i, 1);
 		this.parentNode = null;
 	}
-	setAttribute() {}
-	getAttribute() {
-		return null;
+	_attrs = new Map();
+	setAttribute(k, v) {
+		this._attrs.set(String(k), String(v));
+	}
+	getAttribute(k) {
+		return this._attrs.has(String(k)) ? this._attrs.get(String(k)) : null;
+	}
+	removeAttribute(k) {
+		this._attrs.delete(String(k));
+	}
+	hasAttribute(k) {
+		return this._attrs.has(String(k));
 	}
 	addEventListener() {}
 	focus() {}
@@ -241,11 +250,9 @@ test("thinking panel renders ABOVE the answer, Desktop-style summary line, colla
 	assert.ok(thinkIdx < answerIdx, `思考必须在结果上方（think=${thinkIdx}, answer=${answerIdx}）——现场报障正是相反`);
 
 	const wrap = transcript.children[thinkIdx];
-	const body = wrap.children[1];
 	assert.equal(wrap.classList.contains("on"), false, "完成后不能停留在流式态");
-	assert.equal(body.classList.contains("hidden"), true, "完成后思考正文必须收起，结论直接可见");
-	assert.match(String(wrap._veTitle.textContent), /思考过程/, "完成态标题从「正在思考」切换为摘要");
-	assert.match(String(wrap._veTitle.textContent), /字/, "显示思考字数");
+	assert.equal(wrap.hasAttribute("open"), false, "完成后 details 必须收起，结论直接可见");
+	assert.match(String(wrap._veTitle.textContent), /思考 · 用时 \d+ 秒/, "完成态标题 = Desktop 的用时格式");
 });
 
 test("DURING streaming the panel is live (title=正在思考); answer bubble stays empty until its text arrives", async () => {
@@ -267,7 +274,8 @@ test("DURING streaming the panel is live (title=正在思考); answer bubble sta
 			answerIdx,
 			title: String(wrap?._veTitle?.textContent ?? ""),
 			on: wrap ? wrap.classList.contains("on") : false,
-			bodyHidden: wrap ? wrap.children[1].classList.contains("hidden") : true,
+			open: wrap ? wrap.hasAttribute("open") : false,
+			tickerLen: wrap ? String(wrap._veTicker?.textContent ?? "").length : 0,
 		};
 	});
 	assert.ok(typeof send === "function");
@@ -278,6 +286,7 @@ test("DURING streaming the panel is live (title=正在思考); answer bubble sta
 	assert.ok(seen.thinkIdx >= 0, "thinking panel exists mid-stream");
 	assert.ok(seen.thinkIdx < seen.answerIdx, "mid-stream order: thinking ABOVE answer");
 	assert.equal(seen.on, true, "mid-stream panel must be in live state");
+	assert.equal(seen.open, true, "Desktop keeps the note expanded while streaming");
 	assert.match(seen.title, /正在思考/, "mid-stream title is 正在思考");
-	assert.equal(seen.bodyHidden, false, "Desktop keeps the body readable while streaming (expanded)");
+	assert.ok(seen.tickerLen > 0, "the tail ticker must carry the streaming text");
 });
