@@ -28,7 +28,7 @@ export interface ConversationDigest {
 	title: string;
 	lines: string[];
 	/** Actual scanned user snippets, after sensitive-message filtering. */
-	messages?: { id: string; content: string }[];
+	messages?: { id: string; content: string; createdAt?: number }[];
 }
 
 export interface MinedProposal {
@@ -103,6 +103,57 @@ export function validateMiningProposal(p: MinedProposal, source: ConversationDig
 	const message = source.messages?.find((m) => m.id === p.evidenceMessageId);
 	return !!message && message.content.includes(p.evidence) &&
 		!hasMiningSecrets([p.title, p.goal, p.evidence, p.conditions].join("\n"));
+}
+
+/**
+ * Proposal shapes that CLAIM ongoing/repetitive work, versus a one-off ask.
+ *
+ * Field report 2026-11-04: a user bound two channel endpoints in the test
+ * environment ONCE in a day and got a proposal to "turn this into a reusable
+ * skill script". Nothing was repetitive — the model inferred a pattern from a
+ * single session. The prompt already says 适合提案：重复手工且步骤明确的工作, but
+ * a prompt line is not a gate: every proposal it produced passed validation
+ * because validation only asked "is this quote real?", never "is this
+ * actually repetitive?".
+ */
+const REPETITION_CLAIM = /重复|反复|每次|每次都|屡次|常常|经常|每次都要|again and again|repetitive|every time/i;
+
+/**
+ * Evidence threshold for a proposal that claims REPETITIVE work.
+ *
+ * Field 2026-11-04 (user report): binding two channel endpoints in the test
+ * environment ONCE in a day produced "将测试环境渠道接口绑定操作整理为可复用技能
+ * 脚本". Two runs in one afternoon are not a pattern — they are ONE task. The
+ * prompt already says 适合提案：重复手工且步骤明确的工作, but a prompt line is not
+ * a gate: every proposal passed validation because validation only asked "is
+ * this quote real?", never "is this actually repetitive?".
+ *
+ * The rule is therefore MECHANICAL and deliberately strict: a repetition claim
+ * must show the SAME kind of work on at least TWO DISTINCT DAYS. Same-day
+ * retries, rephrasings and follow-up messages do not count — that is exactly the
+ * shape the user rejected.
+ *
+ * One-off explicit asks are unaffected: "帮我盯着 X", "提醒我 Y" are direct
+ * instructions, not inferred patterns, so they need no repetition proof.
+ */
+export function hasRepetitionEvidence(
+	p: MinedProposal,
+	source: ConversationDigest,
+	options: { minDistinctDays?: number } = {},
+): boolean {
+	const minDays = options.minDistinctDays ?? 2;
+	if (!REPETITION_CLAIM.test(`${p.title}\n${p.goal}`)) return true; // not claiming a pattern
+	const messages = source.messages ?? [];
+	if (!messages.some((m) => m.id === p.evidenceMessageId)) return false;
+	// Group by calendar day. Timestamps are required: without them we cannot
+	// distinguish "the same task twice today" from "a recurring chore", and the
+	// safe answer for an inferred pattern is NO.
+	const days = new Set<string>();
+	for (const m of messages) {
+		if (typeof m.createdAt !== "number" || !Number.isFinite(m.createdAt)) continue;
+		days.add(new Date(m.createdAt).toISOString().slice(0, 10));
+	}
+	return days.size >= minDays;
 }
 
 /** Exact normalized goals, or substantial full containment; never compare just a prefix. */

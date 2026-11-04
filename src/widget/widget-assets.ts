@@ -56,9 +56,25 @@ input, textarea { font-family: inherit; }
 .step.bad { color:#f53f3f; }
 .step.bad .st-spin { color:#f53f3f; }
 .step.bad .st-spin::after { content:"✗"; }
-.think { margin:4px 0; border:1px solid #eef0f4; border-radius:8px; overflow:hidden; }
-.think-h { padding:6px 10px; font-size:12px; color:#86909c; cursor:pointer; user-select:none; background:#f7f8fa; }
-.think-b { padding:8px 10px; font-size:12px; color:#4e5969; white-space:pre-wrap; word-break:break-word; max-height:220px; overflow-y:auto; background:#fafbfc; }
+/* 思考过程：对齐 Desktop 的 pi-execution__note —— 摘要行 + 左侧竖线正文，
+   不是带边框的卡片。桌面端从不用卡片框住过程，框住反而让结果显得更远。 */
+.think { margin:0 0 10px; }
+.think-h { display:flex; align-items:center; gap:7px; padding:8px 2px; font-size:13px; line-height:20px; color:#86909c; cursor:pointer; user-select:none; border-radius:6px; }
+.think-h:hover { background:#f7f8fa; }
+.think-ico { flex:0 0 auto; font-size:13px; opacity:.75; }
+.think-t { flex:0 0 auto; }
+.think.on .think-t { color:#1d1d1f; font-weight:600; }
+/* 流式尾部：新内容从右推入，旧内容淡出（Desktop 的 ticker） */
+.think-ticker { flex:1 1 auto; min-width:0; display:flex; justify-content:flex-end; overflow:hidden;
+  -webkit-mask-image:linear-gradient(to right, transparent, #000 10%, #000 92%, transparent);
+  mask-image:linear-gradient(to right, transparent, #000 10%, #000 92%, transparent); }
+.think-ticker > span { flex:0 0 auto; white-space:pre; color:#a1a1a6; font-size:12px; }
+.think-chev { flex:0 0 auto; color:#c9c9cf; font-size:12px; transition:transform .12s ease, opacity .16s ease; opacity:0; }
+.think-h:hover .think-chev { opacity:1; }
+.think.open .think-chev { opacity:1; transform:rotate(90deg); }
+.think-b { margin:0 0 10px; padding:2px 2px 2px 12px; border-left:1px solid #e8e8ed;
+  font-size:13px; line-height:1.65; color:#86868b; white-space:pre-wrap; word-break:break-word;
+  max-height:240px; overflow-y:auto; }
 .think-b.hidden { display:none; }
 .msg.streaming::after { content:"▍"; color:#4f6ef7; animation:ve-blink 1s step-start infinite; }
 @keyframes ve-blink { 50% { opacity:0; } }
@@ -313,20 +329,81 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
     step.querySelector(".st-spin").textContent = ok ? "✓" : "✗";
     step.classList.add(ok ? "ok" : "bad");
   }
-  function addThinking(msgs) {
+  /**
+   * Thinking panel, inserted BEFORE the answer bubble it belongs to.
+   *
+   * Field 2026-11-04: reasoning rendered BELOW the answer, so a finished turn
+   * read "result … then what it thought getting there". Desktop (and any
+   * transcript) puts the process first: thinking → tools → answer. The answer
+   * bubble is already in the list when reasoning arrives, so appending puts it
+   * after; the anchor is guarded because a caller may create the panel before
+   * the
+   * bubble exists.
+   */
+  /**
+   * 思考过程，插在它所属的回答气泡之前（先思考、再给结果）。
+   *
+   * 结构对齐 Desktop 的 pi-execution__note（chat.css）：摘要行 + 左侧竖线正文，
+   * 不是带边框的小卡片。桌面端从不把过程框成卡片——卡片会把过程和结果在视觉上
+   * 割成两块，而挂在结果下面时（本函数早期的 appendChild 写法）读起来像
+   * 「先给答案、后解释怎么想到的」。现场 2026-11-04 用户反馈正是这一点。
+   *
+   * 流式时摘要行右侧滚动显示思考尾部（Desktop 的 ticker），完成后显示字数并收起。
+   */
+  function addThinking(msgs, anchor) {
     var wrap = document.createElement("div");
-    wrap.className = "think";
+    wrap.className = "think on";
     var head = document.createElement("div");
     head.className = "think-h";
-    head.textContent = "💭 思考过程";
+    var ico = document.createElement("span");
+    ico.className = "think-ico";
+    ico.textContent = "🧠";
+    var title = document.createElement("span");
+    title.className = "think-t";
+    title.textContent = "正在思考";
+    var ticker = document.createElement("span");
+    ticker.className = "think-ticker";
+    var tickerInner = document.createElement("span");
+    ticker.appendChild(tickerInner);
+    var chev = document.createElement("span");
+    chev.className = "think-chev";
+    chev.textContent = "▶";
+    head.appendChild(ico); head.appendChild(title); head.appendChild(ticker); head.appendChild(chev);
     var bodyEl = document.createElement("div");
     bodyEl.className = "think-b hidden";
-    head.addEventListener("click", function () { bodyEl.classList.toggle("hidden"); });
+    head.addEventListener("click", function () {
+      var show = bodyEl.classList.contains("hidden");
+      bodyEl.classList.toggle("hidden", !show);
+      wrap.classList.toggle("open", show);
+    });
     wrap.appendChild(head); wrap.appendChild(bodyEl);
-    msgs.appendChild(wrap);
+    if (anchor && anchor.parentNode === msgs) msgs.insertBefore(wrap, anchor);
+    else msgs.appendChild(wrap);
+    wrap._veTitle = title; wrap._veTicker = tickerInner; wrap._veBody = bodyEl;
     scrollEnd();
-    return bodyEl;
+    return wrap;
   }
+
+  /** 把累积的思考文本刷进面板：流式走尾部滚动带，结束显示字数并收起。 */
+  function paintThinking(wrap, text, streaming) {
+    if (!wrap || !wrap._veBody) return;
+    wrap._veBody.textContent = text;
+    if (streaming) {
+      wrap.classList.add("on");
+      if (wrap._veTitle) wrap._veTitle.textContent = "正在思考";
+      if (wrap._veTicker) {
+        var flat = String(text).replace(/\s+/g, " ").trim();
+        wrap._veTicker.textContent = flat.length > 160 ? flat.slice(-160) : flat;
+      }
+    } else {
+      wrap.classList.remove("on");
+      if (wrap._veTitle) wrap._veTitle.textContent = "思考过程 · " + String(text).length + " 字";
+      if (wrap._veTicker) wrap._veTicker.textContent = "";
+      wrap._veBody.classList.add("hidden");
+      wrap.classList.remove("open");
+    }
+  }
+
 
   function send(text) {
     text = (text || "").trim();
@@ -355,6 +432,7 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
     function finish() {
       if (ended) return;
       ended = true;
+      if (thinkEl) paintThinking(thinkEl, thinkText, false);
       box.classList.remove("streaming");
       if (!box.textContent || box.textContent === "正在思考…") box.textContent = aiText || "（空回复）";
       state.busy = false;
@@ -391,16 +469,16 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
           }
           case "thinking_delta":
             if (!aiText) box.textContent = "";
-            if (!thinkEl) thinkEl = addThinking(m);
+            if (!thinkEl) thinkEl = addThinking(m, box);
             thinkText += ev.text;
-            thinkEl.textContent = thinkText;
+            paintThinking(thinkEl, thinkText, true);
             scrollEnd();
             break;
           case "thinking_replace":
             if (!aiText) box.textContent = "";
-            if (!thinkEl) thinkEl = addThinking(m);
+            if (!thinkEl) thinkEl = addThinking(m, box);
             thinkText = ev.text;
-            thinkEl.textContent = thinkText;
+            paintThinking(thinkEl, thinkText, true);
             scrollEnd();
             break;
           case "error":
@@ -430,6 +508,9 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
   launcher.addEventListener("click", function () { state.open ? close() : open(); });
   panel.querySelector(".head button").addEventListener("click", close);
   q(".send").addEventListener("click", function () { send(q(".box").value); q(".box").value = ""; });
+  // Test hook (no-op in production): lets headless suites drive the REAL send
+  // path instead of guessing at the DOM. Never read by the widget itself.
+  window.__veWidgetSend = send;
   q(".box").addEventListener("keydown", function (e) {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(q(".box").value); q(".box").value = ""; }
   });
@@ -594,26 +675,76 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     step.querySelector(".st-spin").textContent = ok ? "✓" : "✗";
     step.classList.add(ok ? "ok" : "bad");
   }
-  function addThinking(list) {
+  /**
+   * 思考过程，插在它所属的回答气泡之前（先思考、再给结果）。
+   *
+   * 结构对齐 Desktop 的 pi-execution__note（chat.css）：摘要行 + 左侧竖线正文，
+   * 不是带边框的小卡片。桌面端从不把过程框成卡片——卡片会把过程和结果在视觉上
+   * 割成两块，而挂在结果下面时（本函数早期的 appendChild 写法）读起来像
+   * 「先给答案、后解释怎么想到的」。现场 2026-11-04 用户反馈正是这一点。
+   *
+   * 流式时摘要行右侧滚动显示思考尾部（Desktop 的 ticker），完成后显示字数并收起。
+   */
+  function addThinking(list, anchor) {
     var wrap = document.createElement("div");
-    wrap.className = "think";
+    wrap.className = "think on";
     var head = document.createElement("div");
     head.className = "think-h";
-    head.textContent = "💭 思考过程";
+    var ico = document.createElement("span");
+    ico.className = "think-ico";
+    ico.textContent = "🧠";
+    var title = document.createElement("span");
+    title.className = "think-t";
+    title.textContent = "正在思考";
+    var ticker = document.createElement("span");
+    ticker.className = "think-ticker";
+    var tickerInner = document.createElement("span");
+    ticker.appendChild(tickerInner);
+    var chev = document.createElement("span");
+    chev.className = "think-chev";
+    chev.textContent = "▶";
+    head.appendChild(ico); head.appendChild(title); head.appendChild(ticker); head.appendChild(chev);
     var bodyEl = document.createElement("div");
     bodyEl.className = "think-b hidden";
-    head.addEventListener("click", function () { bodyEl.classList.toggle("hidden"); });
+    head.addEventListener("click", function () {
+      var show = bodyEl.classList.contains("hidden");
+      bodyEl.classList.toggle("hidden", !show);
+      wrap.classList.toggle("open", show);
+    });
     wrap.appendChild(head); wrap.appendChild(bodyEl);
-    list.appendChild(wrap);
+    if (anchor && anchor.parentNode === list) list.insertBefore(wrap, anchor);
+    else list.appendChild(wrap);
+    wrap._veTitle = title; wrap._veTicker = tickerInner; wrap._veBody = bodyEl;
     scrollEnd();
-    return bodyEl;
+    return wrap;
   }
+
+  /** 把累积的思考文本刷进面板：流式走尾部滚动带，结束显示字数并收起。 */
+  function paintThinking(wrap, text, streaming) {
+    if (!wrap || !wrap._veBody) return;
+    wrap._veBody.textContent = text;
+    if (streaming) {
+      wrap.classList.add("on");
+      if (wrap._veTitle) wrap._veTitle.textContent = "正在思考";
+      if (wrap._veTicker) {
+        var flat = String(text).replace(/\s+/g, " ").trim();
+        wrap._veTicker.textContent = flat.length > 160 ? flat.slice(-160) : flat;
+      }
+    } else {
+      wrap.classList.remove("on");
+      if (wrap._veTitle) wrap._veTitle.textContent = "思考过程 · " + String(text).length + " 字";
+      if (wrap._veTicker) wrap._veTicker.textContent = "";
+      wrap._veBody.classList.add("hidden");
+      wrap.classList.remove("open");
+    }
+  }
+
 
   function send(text) {
     text = (text || "").trim();
     if (!text || busy) return;
     if (!ticket) {
-      addMsg("err", "未配置会话票据（#ticket=）。请业务系统后端先调用 POST /api/widget/session 换取票据。");
+      add("err", "未配置会话票据（#ticket=）。请业务系统后端先调用 POST /api/widget/session 换取票据。");
       return;
     }
     busy = true; el("send").disabled = true;
@@ -630,6 +761,7 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     function finish() {
       if (ended) return;
       ended = true;
+      if (thinkEl) paintThinking(thinkEl, thinkText, false);
       box.classList.remove("streaming");
       if (!box.textContent || box.textContent === "正在思考…") box.textContent = aiText || "（空回复）";
       busy = false; el("send").disabled = false; el("box").focus();
@@ -663,16 +795,16 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
           }
           case "thinking_delta":
             if (!aiText) box.textContent = "";
-            if (!thinkEl) thinkEl = addThinking(list);
+            if (!thinkEl) thinkEl = addThinking(list, box);
             thinkText += ev.text;
-            thinkEl.textContent = thinkText;
+            paintThinking(thinkEl, thinkText, true);
             scrollEnd();
             break;
           case "thinking_replace":
             if (!aiText) box.textContent = "";
-            if (!thinkEl) thinkEl = addThinking(list);
+            if (!thinkEl) thinkEl = addThinking(list, box);
             thinkText = ev.text;
-            thinkEl.textContent = thinkText;
+            paintThinking(thinkEl, thinkText, true);
             scrollEnd();
             break;
           case "error":
@@ -686,6 +818,8 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     });
   }
   el("send").addEventListener("click", function () { send(el("box").value); el("box").value = ""; });
+  // Test hook — see the floating-widget branch above.
+  window.__veWidgetSend = send;
   el("box").addEventListener("keydown", function (e) {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(el("box").value); el("box").value = ""; }
   });

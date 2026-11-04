@@ -13,6 +13,8 @@ interface RouteDoc {
 	conversationId: string;
 	requestId: string;
 	staffId: string;
+	/** Verified widget grant for this execution; "" = absent (pre-fix records). */
+	verifiedRole: string;
 	name: string;
 	channel: string;
 	chatType: string;
@@ -63,7 +65,7 @@ function withUsage(message: AssistantMessage): AssistantMessage {
 export const Route = defineDoc<RouteDoc>({
 	kind: "ve.execution", version: 1, scope: "conversation", history: "latest", fork: "initial",
 	checkpointWhen: () => false,
-	initial: () => ({ conversationId: "", requestId: "", staffId: "", name: "", channel: "", chatType: "", text: "", projected: 0 }),
+	initial: () => ({ conversationId: "", requestId: "", staffId: "", verifiedRole: "", name: "", channel: "", chatType: "", text: "", projected: 0 }),
 });
 interface RuntimeOptions {
 	userDataDir: string;
@@ -243,7 +245,17 @@ export class DurableRuntime {
 	}
 
 	private actorContext(cid: ConversationId, route: Readonly<RouteDoc>): SendCtx {
-		return { ...this.liveContexts.get(cid), actor: route.staffId ? { senderId: route.staffId, senderName: route.name, channel: route.channel, chatType: route.chatType === "group" ? "group" : "single" } : undefined };
+		// Recover the grant from trusted execution metadata, not an in-memory
+		// callback: liveContexts is empty after restart. Old/invalid grants fail
+		// closed, and IM identities still resolve against current security config.
+		const verifiedRole = route.channel === "widget" &&
+			(route.verifiedRole === "viewer" || route.verifiedRole === "operator" || route.verifiedRole === "admin")
+			? route.verifiedRole : undefined;
+		return { ...this.liveContexts.get(cid), actor: route.staffId ? {
+			senderId: route.staffId, senderName: route.name, channel: route.channel,
+			chatType: route.chatType === "group" ? "group" : "single",
+			...(verifiedRole ? { verifiedRole } : {}),
+		} : undefined };
 	}
 	private track(conv: Conversation, id: string): void {
 		const set = this.active.get(id) ?? new Set(); set.add(conv); this.active.set(id, set);
@@ -355,7 +367,7 @@ export class DurableRuntime {
 		const id = agent.sessionId ?? "default";
 		const conv = await this.host.harness.createConversation({ ownership: { kind: "ownerless" }, agent: { model: { provider: "ve-runtime", modelId: "current" }, instructions: agent.state.systemPrompt }, init: async (tx, cid) => {
 			const route = await tx.doc(Route, cid);
-			Object.assign(route, { conversationId: id, requestId: `ve:${cid}`, staffId: ctx?.actor?.senderId ?? "", name: ctx?.actor?.senderName ?? "", channel: ctx?.actor?.channel ?? "", chatType: ctx?.actor?.chatType ?? "", text });
+			Object.assign(route, { conversationId: id, requestId: `ve:${cid}`, staffId: ctx?.actor?.senderId ?? "", verifiedRole: ctx?.actor?.channel === "widget" ? ctx.actor.verifiedRole ?? "" : "", name: ctx?.actor?.senderName ?? "", channel: ctx?.actor?.channel ?? "", chatType: ctx?.actor?.chatType ?? "", text });
 			// Import only on a NEW execution; resumed executions use their complete
 			// stored tool transcript and never rehydrate lossy UI messages.
 			for (const row of this.opts.history.listMessages(id)) {
