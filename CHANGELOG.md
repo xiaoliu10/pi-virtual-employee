@@ -4,7 +4,7 @@
 
 开源前的内部迭代细节不在此逐一罗列（完整历史见 git log）；以下从开源基线版本开始记录。
 
-## v0.2.188 — task planning budget fix, progress push readability, turn-settle process inventory
+## v0.2.189 — task planning budget fix, progress push readability, turn-settle process inventory
 
 ### English
 
