@@ -524,6 +524,7 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
     if (!wrap || !wrap._veTitle) return;
     var body = wrap.children[1];
     if (body) body.textContent = text;
+    if (text) wrap._veHasText = true;
     var phaseNow = streaming ? "thinking" : "done";
     var phaseBefore = wrap._vePhase;
     wrap._vePhase = phaseNow;
@@ -541,6 +542,9 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
         wrap._veTicker.textContent = flat.length > 160 ? flat.slice(-160) : flat;
       }
     } else {
+      // 从没产生过思考文本：这一相位切换就是「空壳」，直接摘掉而不是画一个
+      // 「思考 · 用时 1 秒」的空面板挂在答文上方（code review P2-1）。
+      if (!wrap._veHasText) { wrap.remove(); return; }
       wrap.classList.remove("on");
       var secs = Math.max(1, Math.ceil((Date.now() - (wrap._veStartedAt || Date.now())) / 1000));
       wrap._veTitle.textContent = "思考 · 用时 " + secs + " 秒";
@@ -995,6 +999,7 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     if (!wrap || !wrap._veTitle) return;
     var body = wrap.children[1];
     if (body) body.textContent = text;
+    if (text) wrap._veHasText = true;
     var phaseNow = streaming ? "thinking" : "done";
     var phaseBefore = wrap._vePhase;
     wrap._vePhase = phaseNow;
@@ -1012,6 +1017,9 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
         wrap._veTicker.textContent = flat.length > 160 ? flat.slice(-160) : flat;
       }
     } else {
+      // 从没产生过思考文本：这一相位切换就是「空壳」，直接摘掉而不是画一个
+      // 「思考 · 用时 1 秒」的空面板挂在答文上方（code review P2-1）。
+      if (!wrap._veHasText) { wrap.remove(); return; }
       wrap.classList.remove("on");
       var secs = Math.max(1, Math.ceil((Date.now() - (wrap._veStartedAt || Date.now())) / 1000));
       wrap._veTitle.textContent = "思考 · 用时 " + secs + " 秒";

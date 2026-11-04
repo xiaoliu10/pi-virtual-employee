@@ -491,3 +491,58 @@ test("a MANUALLY collapsed note stays closed while thinking continues (user cont
 	for (let i = 0; i < 100 && openLater === null; i++) await new Promise((r) => setTimeout(r, 20));
 	assert.equal(openLater, false, "思考仍在进行，但用户手动关闭必须被尊重（不得每来一段就弹开）");
 });
+
+test("MID-TURN: a never-thinking model's empty note is gone once the answer starts (not just at done)", async () => {
+	// code review P2-1: eager creation left an empty「思考 · 用时 1 秒」shell above
+	// the answer for the whole turn. Only the FINAL state was tested before, so a
+	// mid-turn observation is required to catch it.
+	const events = [
+		{ type: "delta", text: "直接回答，没有思考" },
+		{ type: "done" },
+	];
+	const html = renderWidgetPage({ title: "t", suggestions: [], disclaimer: "" });
+	let midTurn = null;
+	const { transcript, send } = bootPage(html, events, [
+		{
+			afterCount: 1,
+			fn: () => {
+				const kinds = transcript.children.map((c) => String(c.className));
+				midTurn = {
+					thinkIdx: kinds.findIndex((c) => c.includes("think")),
+					childCount: transcript.children.length,
+				};
+			},
+		},
+	]);
+	await send("你好");
+	for (let i = 0; i < 100 && midTurn === null; i++) await new Promise((r) => setTimeout(r, 20));
+	assert.ok(midTurn, "观察点必须触发");
+	assert.equal(midTurn.thinkIdx, -1, `答文开始时空思考面板必须已移除（审查 P2-1），实际仍在位置 ${midTurn.thinkIdx}`);
+});
+
+test("MID-TURN: a model with thinking keeps its note visible-above until done (phase edge is correct)", async () => {
+	// 反面保障：修 P2-1 时不能把「有思考文本」的面板也一起摘掉。
+	const events = [
+		{ type: "thinking_delta", text: "真的想了" },
+		{ type: "delta", text: "答案" },
+		{ type: "done" },
+	];
+	const html = renderWidgetPage({ title: "t", suggestions: [], disclaimer: "" });
+	let midTurn = null;
+	const { transcript, send } = bootPage(html, events, [
+		{
+			afterCount: 2,
+			fn: () => {
+				const kinds = transcript.children.map((c) => String(c.className));
+				const idx = kinds.findIndex((c) => c.includes("think"));
+				const wrap = transcript.children[idx];
+				midTurn = { idx, answerIdx: kinds.findIndex((c) => c.includes("ai")), title: String(wrap?._veTitle?.textContent) };
+			},
+		},
+	]);
+	await send("你好");
+	for (let i = 0; i < 100 && midTurn === null; i++) await new Promise((r) => setTimeout(r, 20));
+	assert.ok(midTurn.idx >= 0, "有思考文本的面板不得被移除");
+	assert.ok(midTurn.idx < midTurn.answerIdx, "仍在答文上方");
+	assert.match(midTurn.title, /思考 · 用时 \d+ 秒/, "完成态标题");
+});
