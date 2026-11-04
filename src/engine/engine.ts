@@ -15,6 +15,7 @@ import { DurableRuntime } from "./durable/runtime.js";
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import type { AgentEvent, AgentMessage, FinishTurn, StreamFn } from "@earendil-works/pi-agent-core";
 import { createSessionHost, type SessionHost } from "./session-host.js";
+import { runningBackgroundProcesses } from "./tools/shell.js";
 import type { Skill } from "./skills/types.js";
 import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "./pi-compaction.js";
 import { formatPlanMessage, looksLikeTask, parsePlan, PLAN_PROMPT_HEADER } from "./task-planner.js";
@@ -2963,6 +2964,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * execution by more than the pass itself, and a failure here is silent
 	 * (logged) rather than an error the user sees.
 	 */
+	/** Running background processes for one conversation — the manager's async
+	 * turn-settle inventory reads through here (never blocks, never kills). */
+	inventoryBackgroundProcesses(conversationId: string): Array<{ sessionId: string; pid: number | null; command: string }> {
+		return runningBackgroundProcesses(this.config, conversationId);
+	}
+
 	async planTaskBrief(agent: Agent, message: string, conversationId?: string): Promise<string | null> {
 		if (!looksLikeTask(message)) return null;
 		try {

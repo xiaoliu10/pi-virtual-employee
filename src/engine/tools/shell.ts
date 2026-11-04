@@ -144,6 +144,19 @@ export function disposeShellCommands(config: ConfigStore): void {
 	sessionStores.delete(config);
 }
 
+/** Running background sessions for one conversation — consumed by the manager's
+ * turn-settle inventory (field 2026-11-04: a monitor script kept running after
+ * the result was already pushed and nothing told the user; silent strays read
+ * as delivery bugs). Read-only snapshot; never kills anything. */
+export function runningBackgroundProcesses(
+	config: ConfigStore,
+	conversationId: string,
+): Array<{ sessionId: string; pid: number | null; command: string }> {
+	return [...sessionsFor(config).values()]
+		.filter((entry) => entry.conversationId === conversationId && entry.process.status === "running")
+		.map((entry) => ({ sessionId: entry.process.id, pid: entry.process.pid ?? null, command: entry.command }));
+}
+
 /** Extract the first executable token from a command line (quotes/args stripped). */
 function executableToken(command: string): { raw: string; name: string; tokenLength: number; extension: string } {
 	const trimmed = command.trim();

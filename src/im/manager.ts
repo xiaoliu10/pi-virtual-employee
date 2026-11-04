@@ -203,6 +203,35 @@ export class IMAdapterManager {
 	 * { ok:true, skipped:true } without sending, and a failed attempt stays
 	 * retryable under the same id. Without it, behaviour is unchanged.
 	 */
+	/**
+	 * Turn-settle background-process inventory. ASYNC BY DESIGN (user ruling
+	 * 2026-11-04): the settle path never waits on process bookkeeping, and the
+	 * note is pushed 5s after the result so it lands AFTER the answer. Field
+	 * 2026-11-04: a monitor script kept running after the result was pushed and
+	 * nothing told the user — silent strays read as delivery bugs.
+	 */
+	private inventoryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+	private scheduleBackgroundInventory(conversationId: string): void {
+		const prev = this.inventoryTimers.get(conversationId);
+		if (prev) clearTimeout(prev);
+		const t = setTimeout(() => {
+			this.inventoryTimers.delete(conversationId);
+			void this.pushBackgroundInventory(conversationId).catch(
+				(err) => console.warn("[im] background inventory failed:", (err as Error).message),
+			);
+		}, 5_000);
+		this.inventoryTimers.set(conversationId, t);
+	}
+
+	private async pushBackgroundInventory(conversationId: string): Promise<void> {
+		const inventory = this.engine.inventoryBackgroundProcesses(conversationId);
+		if (!inventory.length) return;
+		const lines = inventory.map((p) => `- \`${p.sessionId.slice(0, 8)}\` pid=${p.pid ?? "?"} ${p.command}`);
+		const text = `⚠️ **回合收尾盘点**：本会话仍有 ${inventory.length} 个后台进程在运行：\n${lines.join("\n")}\n\n完成后用 manage_process poll 确认退出码；需要立即终止用 manage_process kill。`;
+		await this.pushToConversation(conversationId, text);
+	}
+
 	async pushToConversation(conversationId: string, text: string, opts: PushOptions = {}): Promise<PushResult> {
 		const occurrenceId = opts.occurrenceId?.trim();
 		// `deps` may be absent on a manager built without a constructor (tests):
@@ -560,6 +589,9 @@ export class IMAdapterManager {
 					} finally {
 						if (heartbeat) clearInterval(heartbeat);
 						if (watchdog) watchdog.stop();
+						// Fire-and-forget: never blocks settle; the note lands 5s after
+						// the result (async by design — user ruling 2026-11-04).
+						this.scheduleBackgroundInventory(msg.conversationId);
 					}
 				});
 			},
