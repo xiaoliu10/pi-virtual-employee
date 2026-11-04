@@ -733,6 +733,63 @@ function profileArgs(): string[] {
 }
 
 /**
+ * Parse the wmic process table into the set of running profile names.
+ * Exported for tests: the wmic call itself cannot run off a Windows box, but
+ * the parsing rules below are where the field bug lived, so they are tested
+ * against the REAL wmic /value output captured on 10.188.130.144 (2026-11-04).
+ *
+ * Empty-string entry = the default profile. A main process WITHOUT --profile
+ * is NOT necessarily the default profile: a launch through a shortcut or a
+ * PowerShell Start-Process arg-mangling can strip the flag while the app still
+ * redirects its userData into profiles/<name> (main.ts). Reading a child's
+ * --user-data-dir is the ONLY way to tell "real default" from "named profile
+ * whose args were lost" — treating the latter as default relaunches it with NO
+ * identity, and every later snapshot then inherits the empty entry
+ * (field history: profiles=[Nova,] on every update since 2026-09-30, plus an
+ * extra identity-less instance each time).
+ */
+export function parseRunningProfilesFromWmic(text: string): string[] {
+	interface ProcRow { pid: number; ppid: number; cmd: string }
+	const rows: ProcRow[] = [];
+	let current: Partial<ProcRow> = {};
+	for (const line of text.split(/\r?\n/)) {
+		const m = /^(CommandLine|ParentProcessId|ProcessId)=(.*)$/.exec(line);
+		if (!m) continue;
+		if (m[1] === "CommandLine") current.cmd = m[2].trim();
+		else if (m[1] === "ParentProcessId") current.ppid = Number(m[2].trim());
+		else if (m[1] === "ProcessId") current.pid = Number(m[2].trim());
+		if (current.cmd !== undefined && current.pid !== undefined && current.ppid !== undefined) {
+			rows.push({ pid: current.pid, ppid: current.ppid, cmd: current.cmd });
+			current = {};
+		}
+	}
+	const profiles = new Set<string>();
+	for (const row of rows) {
+		// Electron child processes (renderer/GPU/utility) embed the exe path
+		// plus --type=... and carry no --profile — counting them fabricated
+		// an empty default-profile entry (field: profiles=[b,,a]). They are
+		// EVIDENCE for a parent's identity below, never an entry themselves.
+		if (/--type=/.test(row.cmd)) continue;
+		if (!row.cmd.includes("Pi Virtual Employee.exe")) continue;
+		const p = /--profile[= ]([\w-]+)/.exec(row.cmd);
+		if (p) { profiles.add(p[1]); continue; }
+		let recovered = "";
+		for (const child of rows) {
+			if (child.ppid !== row.pid || !/--type=/.test(child.cmd)) continue;
+			// Quoted or unquoted, and the path may contain spaces.
+			const ud = /--user-data-dir=(?:"([^"]+)"|(\S+))/.exec(child.cmd);
+			const dir = ud?.[1] ?? ud?.[2];
+			const name = dir && /[\\/]profiles[\\/]([\w-]+)[\\/]?$/.exec(dir)?.[1];
+			if (name && name !== "default") { recovered = name; break; }
+		}
+		// No child yet (just started) → conservative "": same as before, never
+		// worse. A wrong guess would be far worse than a bare extra instance.
+		profiles.add(recovered);
+	}
+	return [...profiles];
+}
+
+/**
  * Profiles of every RUNNING instance of this app on the box (NSIS kills by
  * image name, so all of them go down together — the watchdog must bring back
  * exactly the set that was alive, no more). Snapshotted via wmic just before
@@ -744,23 +801,10 @@ function snapshotRunningProfiles(): string[] {
 	try {
 		const out = spawnSync(
 			"wmic.exe",
-			["process", "where", "name='Pi Virtual Employee.exe'", "get", "commandline", "/value"],
+			["process", "where", "name='Pi Virtual Employee.exe'", "get", "commandline,processid,parentprocessid", "/value"],
 			{ encoding: "utf8", windowsHide: true, timeout: 10_000 },
 		);
-		const text = out.stdout ?? "";
-		const profiles = new Set<string>();
-		for (const line of text.split(/\r?\n/)) {
-			const m = /CommandLine=(.*)/.exec(line);
-			if (!m || !m[1].includes("Pi Virtual Employee.exe")) continue;
-			const cl = m[1];
-			// Electron child processes (renderer/GPU/utility) embed the exe path
-			// plus --type=... and carry no --profile — counting them fabricated
-			// an empty default-profile entry and LaunchApp started a bare extra
-			// instance (field: profiles=[b,,a]).
-			if (/--type=/.test(cl)) continue;
-			const p = /--profile[= ]([\w-]+)/.exec(cl);
-			profiles.add(p ? p[1] : "");
-		}
+		const profiles = new Set(parseRunningProfilesFromWmic(out.stdout ?? ""));
 		// Always include self so a wmc miss can't strand the updating instance.
 		profiles.add(profileArgs()[1] ?? "");
 		return [...profiles];
