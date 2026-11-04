@@ -590,11 +590,31 @@ export class WorkService<Session extends WorkSession> {
 			const scheduledReason = nowRow.next_check_reason ?? nextReason;
 			const streak = nowRow.fixed_streak ?? 0;
 			const text = nowRow.status === "done"
-				? `✅ **自主任务完成：${nowRow.title}**\n\n${lastText}`
+				? `✅ **自主任务完成：${nowRow.title}**\n\n${lastText}\n\n---\n\n💤 该任务已收尾，不再自动跟进。需要重开请在来源会话说明。`
 				: nowRow.status === "scheduled"
-					? `🔁 **自主任务阶段进展：${nowRow.title}**\n\n${lastText.slice(-500)}\n\n下次跟进：${new Date(scheduledAt).toLocaleString("zh-CN", { hour12: false })}${scheduledReason ? `（${scheduledReason}）` : ""}${streak >= 3 ? `\n\n⚠️ 已连续 ${streak} 次只在相近的固定时间跟进这一个点。如果这是因为它有新信息可查（如某个批次在该时刻生成），写明依据可继续；但记得覆盖今天其他观察点。若这件工作每天只在这一处查、且查了也不需要判断动作，可建议管理员转成定时任务，自主任务留给需要判断力的跟进。` : ""}`
-					: `⏸️ **自主任务需要人工：${nowRow.title}**\n\n${nowRow.question}\n\n管理员在来源会话直接回复答复内容（如验证码、预计解决时间）即可继续；恢复前不会自动执行。`;
+					? `🔁 **自主任务阶段进展：${nowRow.title}**\n\n${tailExcerpt(lastText, 500)}\n\n---\n\n⏭️ **下次跟进**：${new Date(scheduledAt).toLocaleString("zh-CN", { hour12: false })}${scheduledReason ? `\n📋 **跟进原因**：${scheduledReason}` : ""}${streak >= 3 ? `\n\n⚠️ **循环提醒**：已连续 ${streak} 次只在相近的固定时间跟进这一个点。如果这是因为它有新信息可查（如某个批次在该时刻生成），写明依据可继续；但记得覆盖今天其他观察点。若这件工作每天只在这一处查、且查了也不需要判断动作，可建议管理员转成定时任务，自主任务留给需要判断力的跟进。` : ""}`
+					: `⏸️ **自主任务需要人工：${nowRow.title}**\n\n${nowRow.question}\n\n---\n\n💡 **恢复方式**：管理员在来源会话直接回复答复内容（如验证码、预计解决时间）即可继续；恢复前不会自动执行。`;
 			try { await this.opts.push(fresh.origin_conversation, text); } catch (err) { this.opts.onError?.(err); }
 		}
 	}
+}
+
+/**
+ * Tail-clip the last progress text at a PARAGRAPH boundary. Field 2026-11-04:
+ * the previous `slice(-500)` cut mid-sentence — a push opened with a full
+ * title followed by a half sentence ("…3 笔，其中 2 笔，11-02 起）：…"), which
+ * every reader took for a delivery bug. Keep the trailing complete paragraphs
+ * instead, and mark the excerpt honestly when the head was dropped. Exported
+ * for tests: the boundary behavior is the contract.
+ */
+export function tailExcerpt(text: string, maxChars: number): string {
+	const trimmed = text.trim();
+	if (trimmed.length <= maxChars) return trimmed;
+	const tail = trimmed.slice(-maxChars);
+	const para = tail.indexOf("\n\n");
+	const line = tail.indexOf("\n");
+	const cutAt = para >= 0 ? para + 2 : line >= 0 ? line + 1 : 0;
+	const excerpt = tail.slice(cutAt).trim();
+	if (!excerpt) return trimmed.slice(-maxChars);
+	return `……（以下为上次进展的节选）\n\n${excerpt}`;
 }
