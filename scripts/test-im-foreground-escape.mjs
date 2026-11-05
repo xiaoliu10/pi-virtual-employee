@@ -55,7 +55,7 @@ function makeStore() {
 	const db = new DatabaseSync(":memory:");
 	db.exec(`CREATE TABLE IF NOT EXISTS work_items (
 		id TEXT PRIMARY KEY, title TEXT, goal TEXT, conditions TEXT, progress TEXT, lessons TEXT,
-		origin_conversation TEXT, origin_note TEXT, status TEXT, question TEXT,
+		origin_conversation TEXT, origin_note TEXT, origin TEXT, status TEXT, question TEXT,
 		next_check_at INTEGER, next_check_reason TEXT, fixed_streak INTEGER, timeout_streak INTEGER,
 		fallback_streak INTEGER, max_minutes INTEGER, last_remind_at INTEGER, remind_count INTEGER,
 		cadence_ms INTEGER, kicked_off INTEGER, created_by TEXT, created_channel TEXT, priority INTEGER,
@@ -114,6 +114,7 @@ async function dispatchAndEscape({ status = "queued", sender = "u1", extra = {} 
 	);
 	const item = store.list()[0];
 	assert.ok(item, "dispatch must have created the work item");
+	assert.equal(item.origin, "chat", "Router dispatch must stamp the STRUCTURED origin — the note alone is forgeable (2026-11-05)");
 	// Transition the DISPATCHED item (setStatus rejects "working"; claim is the
 	// real transition a WorkService window uses).
 	if (status === "scheduled") store.setStatus(item.id, "scheduled", null, Date.now() + 60_000, "tengine 慢，下个窗口重试");
@@ -167,6 +168,22 @@ test("the escape phrase with NOTHING convertible gets an honest notice, not a mo
 	);
 	assert.match(reply, /没有可切换/);
 	assert.equal(sends.length, 0, "the notice is deterministic — no engine.send");
+});
+
+test("a row claiming chat in its NOTE but marked injected is NOT convertible — structured origin wins", async () => {
+	const { manager, store, sends } = makeManager();
+	const item = store.create({
+		title: "t", goal: `${PLAN}\n\n[用户原始指令]\n${ORIGINAL}`,
+		originConversation: CONV, originNote: "从聊天转派（Router）", origin: "injected",
+		status: "queued", createdBy: "u1", createdChannel: "dingtalk", priority: 0,
+	});
+	const reply = await manager.makeIO().handle(
+		{ conversationId: CONV, text: "前台执行", actor: { senderId: "u1", channel: "dingtalk", chatType: "group" } },
+		undefined,
+	);
+	assert.equal(store.get(item.id).status, "queued", "an injected row must not be escaped however its note reads");
+	assert.match(reply, /没有可切换/, "the refusal is honest — nothing convertible");
+	assert.equal(sends.length, 0);
 });
 
 test("a sentence CONTAINING the words is ordinary text — it goes to the model, not the hatch", async () => {

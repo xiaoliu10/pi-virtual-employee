@@ -64,6 +64,18 @@ assert.deepEqual(reg.owners(), ["owner-B"], "the dead owner is dropped from the 
 reg.forgetByPage(b);
 assert.deepEqual(reg.owners(), [], "closing a tab clears its owner");
 
+// takeover() = TRANSFER, not share: switching to another owner's tab drops the
+// previous owner's pointer — one tab, one live owner, ever.
+const t1 = fakePage("t1");
+const t2 = fakePage("t2");
+reg.set("A", t1);
+reg.set("B", t2);
+const prev = reg.takeover("A", t2);
+assert.equal(prev, "B", "takeover reports the previous owner");
+assert.equal(reg.get("A"), t2, "A now drives the taken tab");
+assert.equal(reg.get("B"), undefined, "B must NOT still hold the same tab");
+reg.clear();
+
 // clear() is used on browser shutdown.
 reg.set("x", fakePage("x"));
 reg.clear();

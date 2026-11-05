@@ -1170,7 +1170,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 						if (!validateMiningProposal(p, source) || isDuplicateGoal(p.goal, existingGoals)) continue;
 						const row = this.workItems.create({
 							title: p.title, goal: p.goal, originConversation: c.id,
-							originNote: `[${c.id} / ${p.evidenceMessageId}] ${p.evidence}`, status: "proposed",
+							originNote: `[${c.id} / ${p.evidenceMessageId}] ${p.evidence}`,
+							// Mined proposal: approval gates its CONFIRM, not its label;
+							// once approved it self-schedules like any autonomous task.
+							origin: "mining", status: "proposed",
 						});
 						const proposal = { title: p.title, goal: p.goal, evidence: p.evidence, conditions: p.conditions, originConversation: c.id, id: row.id, delivered: false, deliveryError: "" };
 						created.push(proposal); // Durable proposal survives even if delivery fails.

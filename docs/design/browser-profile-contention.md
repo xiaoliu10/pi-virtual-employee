@@ -284,18 +284,18 @@ durable conv
 
 ## 6. 源码落地（本次 PR，对齐 Hermes）
 
-三个能力已进 VE 源码，不再是盒子热补：
+**接线状态（如实）**：B（页归属）已在 `BrowserService` 生产路径生效；A（CDP 端点）与 C+（认证快照）是**已测脚手架**——生产代码尚无调用方，`BrowserService.launch()` 仍走 `launchPersistentContext`，快照也没有创建方。进程内接线（launch 切 CDP 端点、快照接入 useRealProfile）是下一个 PR 的事，本 PR 不把它们说成已生效。跨进程共享（盒子上的业务 python 不经 VE 进程）仍由 `.pth` 热补承担。源码模块如下：
 
 | 能力 | 模块 | 关键点 |
 |---|---|---|
 | **A. 无端口竞态的 CDP 端点** | `src/browser/devtools-endpoint.ts` | `--remote-debugging-port=0` + 读 `<udd>/DevToolsActivePort`（Chromium 自己写）。文件被截断重写，**部分读取一律视为"未就绪"**；超时返回 null 让调用方杀掉子进程（否则留孤儿占 profile——browser-use 的原 bug）。flags 刻意不含 `--password-store=basic`/`--use-mock-keychain`、不关 hang monitor |
 | **B. 单浏览器 + 每任务独立页** | `src/browser/shared-session.ts` + `BrowserService` | `PageOwnership` 显式 owner→page 映射。**绝不返回"当前页/第 0 页"**（Playwright #42961 拒绝支持的功能）；死页立即遗忘不发放；未注册的 owner 一律新开页，不复用他人 tab |
 | **C. 同意即快照、撤销即删** | `src/browser/real-profile-consent.ts` + `config.browser.useRealProfile` | 显式布尔，**绝不按路径启发式**（browser-use #4548 的 36 进程抢锁根因）。撤销 / 启动 / 退出三处删除副本；清扫前缀与创建前缀同源（#5422 的 14GB 泄漏根因）。失败必须可见 |
-| **C+. Windows 真实锁场景** | `src/browser/auth-snapshot.ts` | Cookie 库用 **SQLite 在线备份**而非文件复制（浏览器运行中必踩 WinError 32）；cookie 走 5s 预算、其余 0.5s 锁住即跳过；**空表不算登录**（读 `COUNT(*)`，不用文件大小）；复用时如实报新鲜度 |
+| **C+. Windows 真实锁场景** | `src/browser/auth-snapshot.ts` | Cookie 库用 **SQLite 在线备份**（`VACUUM INTO`）而非文件复制（浏览器运行中必踩 WinError 32）；`VACUUM INTO` 不可中断、**无硬超时**（契约如实标注，不做虚假预算宣称）；锁住 → skipped、**权限错误（EPERM/EACCES）归 failed 不算「忙」**；**空表不算登录**（读 `COUNT(*)`，不用文件大小）；复用时如实报新鲜度 |
 
 **为什么不是「每任务一个副本浏览器」**：Hermes 的形态是「一个浏览器 + N 个会话」，内存 1×500MB 而不是 N×500MB。VE 的 `BrowserService` 本来就是单 context + 每 owner 一页，本次把归属从隐式 Map 升级为显式注册表，正是这条路线。
 
 **尚未做（下一 PR）**：跨进程共享（业务脚本在盒子 shell 里跑的 python 不经过 VE 进程）仍需 `.pth` 层方案；本次先把 VE 自托管的浏览器路径做对，并把 Hermes 的两条 Windows 硬坑（SQLite 锁、空库误判）提前吃掉。
 
-**门禁**：typecheck 通过、immutable 16 区未变、**118 套件全绿**、新增 3 个测试套件共 8 处变异全部被杀（M1 部分端点文件 / M2 port 0 / M3 发放死页 / M4 撤销不删副本 / M5 清扫忽略年龄 / M6 退化为文件复制 / M7 cookie 失败降级为跳过 / M8 空表当有效）。
+**门禁**：typecheck 通过、immutable 16 区未变、**119 套件全绿**、新增 3 个测试套件共 8 处变异全部被杀。独立审查（真实 Chromium 复现）确认的 2 个 P1 已修：弹窗归属改事件时反查、并发建页去重；`switchPage` 改为**转移所有权**（前 owner 立即失页，绝无两 owner 共用一 tab）（M1 部分端点文件 / M2 port 0 / M3 发放死页 / M4 撤销不删副本 / M5 清扫忽略年龄 / M6 退化为文件复制 / M7 cookie 失败降级为跳过 / M8 空表当有效）。
 

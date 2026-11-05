@@ -88,6 +88,22 @@ export class PageOwnership {
 		this.pages.delete(ownerId);
 	}
 
+	/**
+	 * Transfer `page` to `ownerId`, dropping whoever held it.
+	 *
+	 * switchPage uses this so a tab can never have two live owners: the previous
+	 * owner's pointer is dropped and it gets a fresh page on its next call. Merely
+	 * logging a takeover still left both owners driving one tab — the exact
+	 * "I navigated your page" failure this registry exists to prevent (review
+	 * P2-6). Returns the previous owner (null when none) so the caller can log.
+	 */
+	takeover(ownerId: string, page: Page): string | null {
+		const previous = this.ownedBy(page);
+		if (previous && previous !== ownerId) this.pages.delete(previous);
+		this.pages.set(ownerId, page);
+		return previous;
+	}
+
 	/** Forget whoever owns `page` (used when a page closes on its own). */
 	forgetByPage(page: Page): void {
 		for (const [owner, p] of this.pages) {

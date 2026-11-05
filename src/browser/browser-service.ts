@@ -244,11 +244,13 @@ export class BrowserService {
 		await this.ensureContext();
 		const target = this.openPages()[index];
 		if (!target) throw new Error(`标签页序号 ${index} 不存在（可用 browser_tabs action=list 查看列表）`);
-		const previous = this.pages.ownedBy(target);
+		// TRANSFER, not share: takeover() drops the previous owner's pointer so one
+		// tab can never have two live owners (review P2-6 — logging alone still
+		// left both driving it). The previous owner opens a fresh page next call.
+		const previous = this.pages.takeover(ownerId, target);
 		if (previous && previous !== ownerId) {
-			console.log(`[browser] tab takeover: owner ${ownerId} switched to a tab owned by ${previous}`);
+			console.log(`[browser] tab takeover: owner ${ownerId} took the tab owned by ${previous} (it gets a fresh page on its next call)`);
 		}
-		this.pages.set(ownerId, target);
 		return { url: target.url(), title: await target.title().catch(() => "") };
 	}
 
@@ -258,8 +260,14 @@ export class BrowserService {
 		const pages = this.openPages();
 		const target = pages[index];
 		if (!target) throw new Error(`标签页序号 ${index} 不存在（可用 browser_tabs action=list 查看列表）`);
+		const heldBy = this.pages.ownedBy(target);
 		await target.close().catch(() => {});
 		this.pages.forgetByPage(target);
+		// Closing another owner's current tab is allowed (the list is global) but
+		// must be traceable, never silent.
+		if (heldBy && heldBy !== ownerId) {
+			console.log(`[browser] owner ${ownerId} closed a tab held by ${heldBy}`);
+		}
 		return { ok: true };
 	}
 

@@ -10,6 +10,7 @@
  */
 import type { ConfigStore, ImChannelConfig } from "../db/config-store.js";
 import { decidePump, isUsableBrief, prunePumpState, type PumpState } from "../scheduler/progress-pump.js";
+import { resolveOrigin, type WorkOrigin } from "../scheduler/work-origin.js";
 import type { EmployeeEngine, ModelOption } from "../engine/engine.js";
 import type { ReportService } from "../reports/report-service.js";
 import { EchoAdapter } from "./adapters/echo.js";
@@ -225,7 +226,11 @@ export class IMAdapterManager {
 		if (!store) return { original: "", notice: "当前没有可切换的前台任务（工作列表不可用）。" };
 		const convertible = store.list()
 			.filter((r) => r.origin_conversation === msg.conversationId
-				&& (r.origin_note ?? "").includes("聊天转派")
+				// Structured origin first (2026-11-05): the note is a claim, not
+				// evidence — a row marked injected must not be escaped however its
+				// note reads. Legacy rows (no column) resolve through the same sniff
+				// this check used to do, so pre-migration items stay convertible.
+				&& resolveOrigin({ origin: (r.origin ?? null) as WorkOrigin | null, originNote: r.origin_note }) === "chat"
 				&& (r.created_by ?? null) === (msg.actor?.senderId ?? null)
 				&& (r.status === "queued" || r.status === "scheduled"))
 			.sort((a, b) => b.created_at - a.created_at)[0];
@@ -294,6 +299,9 @@ export class IMAdapterManager {
 				goal: `${plan}\n\n[用户原始指令]\n${msg.text}`,
 				originConversation: msg.conversationId,
 				originNote: "从聊天转派（Router）",
+				// Structured provenance (2026-11-05): Router dispatch is the one origin
+				// that may auto-follow-up; the note alone is forgeable text.
+				origin: "chat",
 				// MUST be "queued": fireItem/listDue/claim only accept queued (or a
 				// due scheduled). "working" is a terminal orphan — the real
 				// WorkService probe returned false for it while the user already
