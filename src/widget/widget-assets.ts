@@ -62,7 +62,11 @@ input, textarea { font-family: inherit; }
 .think > summary::-webkit-details-marker { display:none; }
 .think > summary:hover { background:#f7f8fa; }
 .think.on .t-title { color:#1d1d1f; font-weight:600; }
-.think-ticker { flex:1 1 auto; min-width:0; display:flex; justify-content:flex-end; overflow:hidden;
+  /* Field 2026-11-05 (screenshot): with a 160-char ticker the title had no
+     nowrap and inside a flex row it wrapped one character per line —
+     「正/在/思/考」 stacked vertically. Never let the label break. */
+  .think > summary .t-title { flex:0 0 auto; white-space:nowrap; }
+.think-ticker { flex:1 1 0; min-width:0; margin-left:6px; display:flex; justify-content:flex-end; overflow:hidden;
   -webkit-mask-image:linear-gradient(to right, transparent, #000 10%, #000 92%, transparent);
   mask-image:linear-gradient(to right, transparent, #000 10%, #000 92%, transparent); }
 .think-ticker > span { flex:0 0 auto; white-space:pre; color:#a1a1a6; font-size:12px; }
@@ -139,8 +143,8 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
   .launcher:hover { transform:scale(1.06); box-shadow:0 8px 26px rgba(79,110,247,.5); }
   .launcher img { width:100%; height:100%; object-fit:cover; border-radius:50%; display:block; }
   .launcher svg { display:block; }
-  .panel { position:absolute; right:24px; bottom:92px; width:380px; max-width:calc(100vw - 32px);
-    height:560px; max-height:calc(100vh - 130px); background:#fff; border-radius:14px;
+  .panel { position:absolute; right:24px; bottom:92px; width:460px; max-width:calc(100vw - 32px);
+    height:680px; max-height:calc(100vh - 130px); background:#fff; border-radius:14px;
     box-shadow:0 12px 48px rgba(0,0,0,.18); display:flex; flex-direction:column; overflow:hidden;
     font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; }
   .head { padding:14px 16px; display:flex; align-items:center; justify-content:space-between;
@@ -231,7 +235,7 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
      面板锚在右下角，所以抓右下角往左上拖 = 变大。尺寸存 localStorage，
      刷新/重开都保留；视口缩小时按上限夹取，绝不留下够不着的面板。 */
   var SIZE_KEY = "ve-widget-size";
-  var MIN_W = 300, MIN_H = 360;
+  var MIN_W = 380, MIN_H = 420;
   function clampNum(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
   function panelLimits() {
     // 与 CSS 的 max-width/max-height 保持同一口径，避免 CSS 把内联高度截短
@@ -689,7 +693,7 @@ export function renderWidgetPage(): string {
 ${SHARED_CSS}
 body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; background:#f7f8fa;
   display:flex; justify-content:center; }
-.wrap { position:relative; width:100%; max-width:720px; display:flex; flex-direction:column; height:100vh; background:#fff; }
+.wrap { position:relative; width:100%; max-width:880px; display:flex; flex-direction:column; height:100vh; background:#fff; }
 .head { padding:16px 20px; border-bottom:1px solid #eef0f4; font-size:16px; font-weight:600; color:#1f2329; }
 .body { flex:1; overflow-y:auto; padding:20px; }
 .hero { font-size:24px; font-weight:700; color:#1f2329; margin-bottom:16px; }
@@ -746,7 +750,7 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
 
   /* ── 可拖拽调整大小（v0.2.193）：与浮窗同一语义，抓右下角拖宽/拖高 ── */
   var SIZE_KEY = "ve-widget-page-size";
-  var MIN_W = 360, MIN_H = 420;
+  var MIN_W = 420, MIN_H = 480;
   var wrapEl = document.querySelector(".wrap");
   function clampNum(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
   function pageLimits() {
