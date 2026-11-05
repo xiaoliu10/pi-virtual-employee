@@ -14,6 +14,8 @@ import { chromium, type BrowserContext, type Download, type Page } from "playwri
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { ConfigStore } from "../db/config-store.js";
+import { PageOwnership } from "./shared-session.js";
+import { applyConsentChange, deleteSnapshots, ensureSnapshotRoot, sweepSnapshots } from "./real-profile-consent.js";
 
 const NAV_TIMEOUT = 30_000;
 const DOWNLOAD_WAIT_TIMEOUT = 60_000;
@@ -84,8 +86,13 @@ export function evaluateTypeResult(sent: string, readback: string): { ok: boolea
 export class BrowserService {
 	private context: BrowserContext | null = null;
 	/** One page per owner (IM 会话 / 定时任务会话 / 控制台会话)，共享同一个 context，
-	 * 互不覆盖表单与 URL；cookie/localStorage/登录态在 context 层共享。 */
-	private readonly pages = new Map<string, Page>();
+	 * 互不覆盖表单与 URL；cookie/localStorage/登录态在 context 层共享。
+	 *
+	 * Ownership is explicit and per-owner: a task is never handed another task's
+	 * tab. A global "current page" selector is exactly how two clients end up
+	 * navigating and closing each other's tabs (Playwright #42961 declines to
+	 * support that), so every lookup goes through this registry. */
+	private readonly pages = new PageOwnership();
 	/** 共享的 context 启动 promise：并发首次访问时只 launch 一次。 */
 	private launching: Promise<void> | null = null;
 	private downloadHandler: DownloadHandler | null = null;
@@ -141,8 +148,8 @@ export class BrowserService {
 	 */
 	async getPage(ownerId: string): Promise<Page> {
 		await this.ensureContext();
-		const cached = this.pages.get(ownerId);
-		if (cached && !cached.isClosed()) return cached;
+		const cached = this.pages.get(ownerId);   // dead pages are forgotten by the registry
+		if (cached) return cached;
 		if (!this.context) throw new Error("浏览器上下文不可用");
 		const page = await this.context.newPage();
 		page.setDefaultNavigationTimeout(NAV_TIMEOUT);
@@ -195,14 +202,14 @@ export class BrowserService {
 		const target = pages[index];
 		if (!target) throw new Error(`标签页序号 ${index} 不存在（可用 browser_tabs action=list 查看列表）`);
 		await target.close().catch(() => {});
-		if (this.pages.get(ownerId) === target) this.pages.delete(ownerId);
+		this.pages.forgetByPage(target);
 		return { ok: true };
 	}
 
 	/** 关闭并移除某 owner 的 Page（会话结束可选调用；默认保留以复用登录态产物）。 */
 	async releasePage(ownerId: string): Promise<void> {
 		const page = this.pages.get(ownerId);
-		this.pages.delete(ownerId);
+		this.pages.forget(ownerId);
 		try {
 			if (page && !page.isClosed()) await page.close();
 		} catch (err) {
@@ -214,6 +221,25 @@ export class BrowserService {
 		const { headless } = this.config.all().browser;
 		const profilePath = join(this.profileDir, "browser-profile");
 		await mkdir(profilePath, { recursive: true });
+		// Consent OFF must mean "no credential copies on disk". Sweep any snapshot a
+		// crashed run left behind before we start, so turning the switch off is
+		// self-healing rather than hoping the user remembers to clean up.
+		const browserCfg = this.config.all().browser;
+		if (!browserCfg.useRealProfile) {
+			const swept = deleteSnapshots(this.profileDir);
+			if (swept.removed.length) {
+				console.log(`[browser] consent off: removed ${swept.removed.length} snapshot dir(s)`);
+			}
+			if (swept.failed.length) {
+				console.warn(`[browser] consent off: could not remove ${swept.failed.join(", ")}`);
+			}
+		} else {
+			// Snapshots are large; drop the ones no run has touched for a day.
+			const swept = sweepSnapshots(this.profileDir, 24 * 60 * 60 * 1000);
+			if (swept.length) console.log(`[browser] swept ${swept.length} stale snapshot dir(s)`);
+			ensureSnapshotRoot(this.profileDir);
+		}
+
 		// Persistent context: cookies/localStorage/login state are written to disk
 		// and reused next launch, so the employee stays logged in across restarts.
 		// acceptDownloads lets Playwright capture file downloads instead of the
@@ -644,5 +670,14 @@ export class BrowserService {
 		}
 		this.context = null;
 		this.pages.clear();
+		// Credential copies exist only while consent does. Closing the app is the
+		// last chance to honour a revocation that happened while a snapshot was
+		// locked; a failure is logged (never swallowed).
+		if (!this.config.all().browser.useRealProfile) {
+			const swept = applyConsentChange(this.profileDir, false);
+			if (swept.failed.length) {
+				console.warn(`[browser] exit: snapshot removal failed for ${swept.failed.join(", ")}`);
+			}
+		}
 	}
 }
