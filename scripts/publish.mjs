@@ -22,6 +22,7 @@
  */
 import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
+import { statSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
