@@ -13,7 +13,7 @@
  * `~/.config/browseruse/profiles/default` silently skipped isolation and 36
  * processes fought over one lock (issue #4548, still unfixed upstream).
  */
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 /** Directory (under the app profile dir) holding snapshots made for real-profile browsing. */
@@ -79,10 +79,21 @@ export function applyConsentChange(profileDir: string, enabled: boolean): { remo
 	return deleteSnapshots(profileDir);
 }
 
-/** Ensure the snapshot root exists (called right before a snapshot is written). */
+/**
+ * Ensure the snapshot root exists (called right before a snapshot is written).
+ *
+ * Created owner-only (0700): a snapshot is a complete credential bundle — cookies
+ * plus the Local State key that decrypts them. The default umask would leave it
+ * group/world readable on shared machines (review P3-6).
+ */
 export function ensureSnapshotRoot(profileDir: string): string {
 	const root = snapshotRoot(profileDir);
-	mkdirSync(root, { recursive: true });
+	mkdirSync(root, { recursive: true, mode: 0o700 });
+	try {
+		chmodSync(root, 0o700);   // mkdir mode is filtered by umask on existing dirs
+	} catch {
+		// Non-POSIX or already-private: nothing to fix.
+	}
 	return root;
 }
 
@@ -95,18 +106,26 @@ export function ensureSnapshotRoot(profileDir: string): string {
  * created (issue #5422, still unfixed upstream). The prefix check and the
  * creation prefix here come from the SAME constant, which is the actual fix.
  */
-export function sweepSnapshots(profileDir: string, maxAgeMs: number, now = Date.now()): string[] {
+export function sweepSnapshots(
+	profileDir: string,
+	maxAgeMs: number,
+	now = Date.now(),
+): { removed: string[]; failed: { dir: string; error: string }[] } {
 	const removed: string[] = [];
+	const failed: { dir: string; error: string }[] = [];
 	for (const dir of listSnapshots(profileDir)) {
 		try {
 			if (now - statSync(dir).mtimeMs < maxAgeMs) continue;
 			rmSync(dir, { recursive: true, force: true });
 			removed.push(dir);
-		} catch {
-			/* in use: the next sweep retries */
+		} catch (err) {
+			// "In use, retry later" and "we will never be able to delete this" must not
+			// look the same: a permission-locked snapshot would silently accumulate
+			// forever (review P3-5). Report it so the caller can surface it.
+			failed.push({ dir, error: String((err as Error)?.message ?? err) });
 		}
 	}
-	return removed;
+	return { removed, failed };
 }
 
 /** Human-facing explanation of what turning the switch on means. */

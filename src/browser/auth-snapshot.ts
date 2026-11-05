@@ -56,16 +56,20 @@ export interface CopyOutcome {
 	failed: { file: string; error: string }[];
 }
 
-/** SQLite's SQLITE_BUSY / "database is locked" surfaces as a busy error message. */
+/**
+ * True only for genuine LOCK contention (the browser holds the DB right now).
+ *
+ * EPERM/EACCES are deliberately NOT "busy": a target directory we cannot write, or
+ * an ACL that denies the source, is a real configuration failure. Calling it "busy"
+ * would send the caller down the "reuse the previous snapshot" path and dress a
+ * broken credential copy up as "the browser is just busy" — exactly the silent
+ * degradation this module exists to prevent (review P2-3).
+ */
 function looksBusy(err: unknown): boolean {
+	const code = String((err as { code?: unknown })?.code ?? "");
+	if (code === "EBUSY" || code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") return true;
 	const msg = String((err as Error)?.message ?? err).toLowerCase();
-	return (
-		msg.includes("busy") ||
-		msg.includes("locked") ||
-		msg.includes("sharing violation") ||
-		msg.includes("eperm") ||
-		msg.includes("eacces")
-	);
+	return msg.includes("busy") || msg.includes("database is locked") || msg.includes("sharing violation");
 }
 
 /**
@@ -75,7 +79,7 @@ function looksBusy(err: unknown): boolean {
  * actually interrupt a huge database; a live Chromium writing concurrently is the
  * normal case, not the exception.
  */
-export function backupSqlite(srcPath: string, dstPath: string, deadlineMs: number): void {
+export function backupSqlite(srcPath: string, dstPath: string, _advisoryBudgetMs: number): void {
 	mkdirSync(dirname(dstPath), { recursive: true });
 	// A stale destination from an earlier attempt would make SQLite merge rather
 	// than replace; the snapshot must be a clean copy.
@@ -84,9 +88,12 @@ export function backupSqlite(srcPath: string, dstPath: string, deadlineMs: numbe
 	try {
 		// VACUUM INTO is atomic and SQLite-coordinated with a live writer, so the
 		// result is a consistent copy even while Chromium holds the database.
-		// `deadlineMs` is advisory: an over-budget copy is still a GOOD copy, so we
-		// keep it rather than discarding work (a fresh snapshot beats a missing one).
-		void deadlineMs;
+		// NOTE (review P2-4): `VACUUM INTO` is a single non-interruptible statement, so
+		// this is NOT a timeout — an over-budget copy still completes and is kept (a
+		// fresh snapshot beats a missing one). Callers must not rely on the budget to
+		// bound a huge database; the honest contract is "either it finishes or the
+		// browser's lock makes it fail". Kept as a parameter so the call sites read
+		// with an explicit intent and can be upgraded to a stepped backup later.
 		src.exec(`VACUUM INTO '${dstPath.replace(/'/g, "''")}'`);
 	} finally {
 		src.close();

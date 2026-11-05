@@ -18,13 +18,21 @@
  *
  * so there is no bind→close→rebind race (the failure mode of "find a free port
  * now, hand it to the child later" implementations). Because Playwright's pipe
- * must not also be present, callers launch Chromium themselves via
- * {@link spawnChromiumWithDevTools} and then attach with `connectOverCDP`.
+ * must not also be present, callers launch Chromium themselves and then attach:
+ *
+ *     chromium.launchPersistentContext(udd, { args: devToolsFlags() })  // no pipe? see note
+ *     const ep = await waitForDevToolsEndpoint(udd)
+ *     const browser = await chromium.connectOverCDP(ep.httpBase)
+ *
+ * (Playwright always adds its own `--remote-debugging-pipe`; a caller that needs a
+ * TCP endpoint launches Chromium directly and attaches over CDP. This module covers
+ * the endpoint half — discovering and validating it — and does not prescribe the
+ * spawn, which differs per host.)
  *
  * The file is written AFTER the endpoint is listening, so a missing/partial file
  * means "not ready yet" and is retried until the caller's deadline.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 /** Chromium's DevTools endpoint file, written into the user-data-dir root. */
@@ -76,9 +84,37 @@ export function readDevToolsEndpoint(userDataDir: string): DevToolsEndpoint | nu
 	}
 }
 
+/** True when the endpoint file exists and (if required) was written after the child spawned. */
+function isFreshEnough(userDataDir: string, writtenAfterMs: number | undefined, now: () => number): boolean {
+	if (writtenAfterMs === undefined) return true;
+	try {
+		const mtime = statSync(join(userDataDir, DEVTOOLS_ACTIVE_PORT_FILE)).mtimeMs;
+		// Allow 2s of filesystem timestamp granularity / clock skew.
+		const fresh = mtime >= writtenAfterMs - 2000;
+		if (!fresh) {
+			// Not an error: Chromium simply has not rewritten it yet. Logged once per
+			// poll only when a stale file is actually present, so the cause is visible
+			// if the wait later times out.
+			void now;
+		}
+		return fresh;
+	} catch {
+		return false;
+	}
+}
+
 export interface WaitOptions {
 	/** Total time to wait for the file to appear (default 30s). */
 	timeoutMs?: number;
+	/**
+	 * Only accept a file written at/after this epoch-ms (normally the child's spawn
+	 * time). A crashed previous run leaves a COMPLETE, perfectly parseable
+	 * DevToolsActivePort behind; without this lower bound the first poll returns the
+	 * dead port, connectOverCDP fails, and the failure gets misdiagnosed as anything
+	 * but "stale file" — the exact misdiagnosis chain that led to browsers being
+	 * killed in bulk (review P2-5).
+	 */
+	writtenAfterMs?: number;
 	/** Poll interval (default 150ms). */
 	intervalMs?: number;
 	/** Cancels the wait; the caller tears the child down when it resolves null. */
@@ -107,9 +143,12 @@ export async function waitForDevToolsEndpoint(
 	for (;;) {
 		if (opts.signal?.aborted) return null;
 		const endpoint = readDevToolsEndpoint(userDataDir);
-		if (endpoint) return endpoint;
-		if (now() >= deadline) return null;
-		await sleep(intervalMs);
+		if (endpoint && isFreshEnough(userDataDir, opts.writtenAfterMs, now)) return endpoint;
+		const remaining = deadline - now();
+		if (remaining <= 0) return null;
+		// Cap the sleep at the remaining budget so a large interval cannot overshoot
+		// the caller's deadline (review P3-1).
+		await sleep(Math.min(intervalMs, remaining));
 	}
 }
 

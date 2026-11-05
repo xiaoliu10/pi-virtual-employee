@@ -93,6 +93,8 @@ export class BrowserService {
 	 * navigating and closing each other's tabs (Playwright #42961 declines to
 	 * support that), so every lookup goes through this registry. */
 	private readonly pages = new PageOwnership();
+	/** owner → in-flight page creation, so concurrent opens share one page. */
+	private readonly pendingPages = new Map<string, Promise<Page>>();
 	/** 共享的 context 启动 promise：并发首次访问时只 launch 一次。 */
 	private launching: Promise<void> | null = null;
 	private downloadHandler: DownloadHandler | null = null;
@@ -151,18 +153,61 @@ export class BrowserService {
 		const cached = this.pages.get(ownerId);   // dead pages are forgotten by the registry
 		if (cached) return cached;
 		if (!this.context) throw new Error("浏览器上下文不可用");
+		// Concurrent getPage(sameOwner) must collapse to ONE page. Without this,
+		// two callers both miss the registry, both newPage(), and the second `set`
+		// overwrites the first — leaving a page that is open, ownerless, and (per
+		// review, reproduced on a real Chromium) switchable/closeable by ANY owner
+		// through the global tab index.
+		const inflight = this.pendingPages.get(ownerId);
+		if (inflight) return inflight;
+		const creating = this.createPageFor(ownerId).finally(() => {
+			this.pendingPages.delete(ownerId);
+		});
+		this.pendingPages.set(ownerId, creating);
+		return creating;
+	}
+
+	/** Create + register the owner's page, wiring popup ownership by EVENT-TIME lookup. */
+	private async createPageFor(ownerId: string): Promise<Page> {
+		if (!this.context) throw new Error("浏览器上下文不可用");
 		const page = await this.context.newPage();
 		page.setDefaultNavigationTimeout(NAV_TIMEOUT);
-		page.on("popup", (popup) => this.adoptPopup(ownerId, popup));
+		this.watchPopups(page);
 		this.pages.set(ownerId, page);
 		return page;
+	}
+
+	/**
+	 * Route this page's popups to whoever owns it WHEN THE POPUP OPENS.
+	 *
+	 * The owner must be resolved at event time, not captured when the page was
+	 * created: after `switchPage` an owner runs on a page somebody else created,
+	 * and a captured owner would hand the popup to the page's original creator —
+	 * overwriting that other task's current tab with a window it never opened
+	 * (review P1-1, reproduced: "[browser] popup adopted for owner A" for a popup
+	 * triggered by B's page). Bastion hosts work entirely through popups, so this
+	 * is the common path, not an edge case.
+	 */
+	private watchPopups(page: Page): void {
+		page.on("popup", (popup) => {
+			const owner = this.pages.ownedBy(page);
+			if (!owner) {
+				// Nobody owns the opener any more (released/finished): close the stray
+				// window instead of leaving an unowned tab in the global list.
+				void popup.close().catch(() => {});
+				console.warn(`[browser] popup from an unowned page closed: ${page.url()}`);
+				return;
+			}
+			this.adoptPopup(owner, popup);
+		});
 	}
 
 	/** 把弹窗接管为 owner 的当前页（递归：弹窗再开弹窗同样跟随）。 */
 	private adoptPopup(ownerId: string, popup: Page): void {
 		popup.setDefaultNavigationTimeout(NAV_TIMEOUT);
 		this.pages.set(ownerId, popup);
-		popup.on("popup", (child) => this.adoptPopup(ownerId, child));
+		// Same event-time rule for popups opened BY a popup.
+		this.watchPopups(popup);
 		console.log(`[browser] popup adopted for owner ${ownerId}: ${popup.url() || "(about:blank)"}`);
 	}
 
@@ -186,11 +231,23 @@ export class BrowserService {
 		);
 	}
 
-	/** 把 owner 的当前页切换到指定序号的标签页。 */
+	/**
+	 * 把 owner 的当前页切换到指定序号的标签页。
+	 *
+	 * A tab another owner is currently driving is TAKEN OVER (that owner keeps its
+	 * pointer until it next acts), which is what a human means by switching tabs —
+	 * but it must be explicit, because two owners silently driving one tab is the
+	 * exact "I navigated your page" failure this service promises to prevent
+	 * (review P2-6). The takeover is logged so a surprising follow-up is traceable.
+	 */
 	async switchPage(ownerId: string, index: number): Promise<{ url: string; title: string }> {
 		await this.ensureContext();
 		const target = this.openPages()[index];
 		if (!target) throw new Error(`标签页序号 ${index} 不存在（可用 browser_tabs action=list 查看列表）`);
+		const previous = this.pages.ownedBy(target);
+		if (previous && previous !== ownerId) {
+			console.log(`[browser] tab takeover: owner ${ownerId} switched to a tab owned by ${previous}`);
+		}
 		this.pages.set(ownerId, target);
 		return { url: target.url(), title: await target.title().catch(() => "") };
 	}
@@ -236,7 +293,10 @@ export class BrowserService {
 		} else {
 			// Snapshots are large; drop the ones no run has touched for a day.
 			const swept = sweepSnapshots(this.profileDir, 24 * 60 * 60 * 1000);
-			if (swept.length) console.log(`[browser] swept ${swept.length} stale snapshot dir(s)`);
+			if (swept.removed.length) console.log(`[browser] swept ${swept.removed.length} stale snapshot dir(s)`);
+			if (swept.failed.length) {
+				console.warn(`[browser] stale snapshots could not be removed: ${swept.failed.map((f) => f.dir).join(", ")}`);
+			}
 			ensureSnapshotRoot(this.profileDir);
 		}
 
@@ -670,6 +730,7 @@ export class BrowserService {
 		}
 		this.context = null;
 		this.pages.clear();
+		this.pendingPages.clear();
 		// Credential copies exist only while consent does. Closing the app is the
 		// last chance to honour a revocation that happened while a snapshot was
 		// locked; a failure is logged (never swallowed).

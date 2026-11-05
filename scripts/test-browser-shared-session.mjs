@@ -107,7 +107,8 @@ mkdirSync(old, { recursive: true });
 const ancient = Date.now() - 48 * 60 * 60 * 1000;
 utimesSync(old, ancient / 1000, ancient / 1000);
 const swept = sweepSnapshots(profileDir, 24 * 60 * 60 * 1000);
-assert.equal(swept.length, 1, "only the stale snapshot is swept");
+assert.equal(swept.removed.length, 1, "only the stale snapshot is swept");
+assert.deepEqual(swept.failed, [], "sweeping a removable dir reports no failures");
 assert.ok(existsSync(fresh), "a fresh snapshot survives the sweep");
 assert.ok(!existsSync(old), "the stale snapshot is gone");
 // The sweep's prefix/age rule must come from the same place as creation — the

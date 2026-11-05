@@ -7,7 +7,7 @@
  * `--remote-debugging-port=0` + Chromium's own DevToolsActivePort file does not
  * (Hermes uses exactly this).
  */
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import assert from "node:assert/strict";
@@ -63,6 +63,28 @@ mkdirSync(lateDir, { recursive: true });
 writeFileSync(join(lateDir, DEVTOOLS_ACTIVE_PORT_FILE), "41111\n/devtools/browser/late\n");
 const late = await waitForDevToolsEndpoint(lateDir, { timeoutMs: 500, intervalMs: 5 });
 assert.ok(late && late.port === 41111, "endpoint published before the deadline must be found");
+
+// A STALE file (from a crashed previous run) must not read as "ready": otherwise
+// the caller connects to a dead port and the failure gets misdiagnosed as anything
+// but a stale artifact (review P2-5).
+const staleDir = join(dir, "stale");
+mkdirSync(staleDir, { recursive: true });
+writeFileSync(join(staleDir, DEVTOOLS_ACTIVE_PORT_FILE), "49999\n/devtools/browser/stale\n");
+const old = new Date(Date.now() - 60 * 60 * 1000);
+utimesSync(join(staleDir, DEVTOOLS_ACTIVE_PORT_FILE), old, old);
+const spawnedAt = Date.now();
+const stale = await waitForDevToolsEndpoint(staleDir, {
+	timeoutMs: 60, intervalMs: 10, writtenAfterMs: spawnedAt,
+});
+assert.equal(stale, null, "a file older than the child's spawn time must NOT be accepted");
+
+// ...but a file written after spawn is accepted.
+const freshDir = join(dir, "fresh");
+mkdirSync(freshDir, { recursive: true });
+writeFileSync(join(freshDir, DEVTOOLS_ACTIVE_PORT_FILE), "48888\n/devtools/browser/fresh\n");
+const t0 = Date.now();
+const fresh = await waitForDevToolsEndpoint(freshDir, { timeoutMs: 500, intervalMs: 10, writtenAfterMs: t0 - 1000 });
+assert.ok(fresh && fresh.port === 48888, "a file written at/after spawn is accepted");
 
 // abort short-circuits instead of spinning for the full timeout
 const controller = new AbortController();

@@ -362,6 +362,7 @@ function migrate(db: DB): void {
 			lessons              TEXT,
 			origin_conversation  TEXT,
 			origin_note          TEXT,
+			origin               TEXT,
 			status               TEXT NOT NULL DEFAULT 'proposed',
 			question             TEXT,
 			next_check_at        INTEGER,
@@ -562,6 +563,12 @@ export function migrateWorkItems(db: DB): void {
 		const workCols = new Set(
 			(db.prepare("PRAGMA table_info(work_items)").all() as { name: string }[]).map((r) => r.name),
 		);
+		// `origin` is the STRUCTURED provenance (chat / manual / mining / scheduled /
+		// injected / legacy). It used to be free text sniffed with
+		// `includes("聊天转派")`, so a row injected straight into the DB could claim it
+		// was Router-dispatched, then self-schedule follow-ups the operator never
+		// approved (2026-11-05). NULL = pre-migration row; resolveOrigin() handles those.
+		if (!workCols.has("origin")) db.exec("ALTER TABLE work_items ADD COLUMN origin TEXT");
 		// Staged reply for a waiting_human resume — consumed by the next window's turn 0.
 		if (!workCols.has("answer")) db.exec("ALTER TABLE work_items ADD COLUMN answer TEXT");
 		if (!workCols.has("created_channel")) db.exec("ALTER TABLE work_items ADD COLUMN created_channel TEXT");
