@@ -88,7 +88,7 @@ const isDev = !!process.env.VITE_DEV_SERVER_URL;
  * and redirect BEFORE app.whenReady — everything reading userData depends on it.
  */
 const PROFILE_NAME_RE = /^[A-Za-z0-9_-]+$/;
-const LOCK_FILE = ".profile.lock";
+import { acquireProfileLock as coreAcquireProfileLock, LOCK_FILE } from "./profile-lock-core.js";
 
 /** Project the Electron updater state to the platform-agnostic tool status. */
 function toUpdateToolStatus(state: UpdateState): UpdateToolStatus {
@@ -116,35 +116,21 @@ function resolveProfile(argv: string[], env: NodeJS.ProcessEnv): string {
 	return name;
 }
 
-/** Acquire an exclusive lock on the profile dir; quit if another live process holds it. */
+/**
+ * Acquire an exclusive lock on the profile dir; quit if another live process holds it.
+ *
+ * Delegates to profile-lock-core: liveness is judged by an explicit probe and
+ * anything not CLEARLY alive is reclaimed. FIELD 2026-11-04 (Orion): the old
+ * inline code treated `process.kill(pid,0)` not throwing as "alive"; on Windows
+ * that can resolve for a dead/recycled pid, so a leftover `.profile.lock` left
+ * the profile unstartable for over an hour until the file was deleted by hand.
+ */
 function acquireProfileLock(userDataDir: string): void {
-	const lockPath = path.join(userDataDir, LOCK_FILE);
-	const take = () => {
-		const fd = openSync(lockPath, "wx");
-		writeFileSync(fd, String(process.pid));
-	};
-	if (!existsSync(lockPath)) {
-		take();
-		return;
-	}
-	// Stale-lock recovery: if the recorded pid is dead, take over.
-	try {
-		const pid = Number(readFileSync(lockPath, "utf8").trim());
-		if (pid && pid !== process.pid) {
-			process.kill(pid, 0); // throws if the process is gone
-			console.error(`[main] profile already running (pid ${pid}); exiting.`);
-			app.quit();
-			return;
-		}
-	} catch {
-		// pid missing or dead → reclaim
-		try {
-			unlinkSync(lockPath);
-		} catch {
-			/* ignore */
-		}
-	}
-	take();
+	const result = coreAcquireProfileLock(userDataDir, {
+		pid: process.pid,
+		log: (msg) => console.error(msg),
+	});
+	if (!result.acquired) app.quit();
 }
 
 const activeProfile = resolveProfile(process.argv, process.env);
@@ -1389,7 +1375,7 @@ ${tailForProgress(decision.text)}`;
 					const w = config.all().widget;
 					return {
 						title: w.title, suggestions: w.suggestions, disclaimer: w.disclaimer,
-						token: w.token, allowedOrigins: w.allowedOrigins, secret: w.secret, maxRole: w.maxRole,
+						token: w.token, allowedOrigins: w.allowedOrigins, secret: w.secret, maxRole: w.maxRole, ticketTtlSec: w.ticketTtlSec,
 						launcher: { icon: w.launcherIcon, iconUrl: w.launcherIconUrl, size: w.launcherSize },
 					};
 				},
@@ -1444,6 +1430,14 @@ ${tailForProgress(decision.text)}`;
 	// Reconcile IM adapter + autostart with saved config.
 	applyAutostart(config.all().general.autostart);
 	await im.sync().catch((err) => console.error("[im] sync failed", err));
+	// GLOBAL PROGRESS PUMP (v0.2.192). Heartbeats used to be timers created inside
+	// the inbound-message handler, so they died with the process and were never
+	// recreated after a restart — a resumed task then ran for hours with ONE
+	// progress note (field 2026-11-04). The pump reads live busy-conversations from
+	// the engine instead, so reporting follows the WORK, not the request.
+	im.setProgressPusher((conversationId, text, occurrenceId) =>
+		im.pushToConversation(conversationId, text, { occurrenceId, kind: "chat-progress" }));
+	im.startProgressPump();
 	// Start ticking only after IM adapters have connected, so an overdue task fired
 	// during startup can immediately push its result instead of missing the channel.
 	scheduler.start();

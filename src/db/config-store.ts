@@ -338,7 +338,20 @@ export interface AppConfig {
 	 * browser tools (navigate / click / type / screenshot / read). `allowedDomains`
 	 * restricts which hosts it may open (empty = unrestricted — use with care).
 	 */
-	browser: { enabled: boolean; headless: boolean; allowedDomains: string[]; downloadHost: string };
+	browser: {
+		enabled: boolean;
+		headless: boolean;
+		allowedDomains: string[];
+		downloadHost: string;
+		/**
+		 * Consent to snapshot the machine's real browser profile (cookies/logins)
+		 * into a VE-owned copy, so tasks that need the operator's accounts run
+		 * already signed in. Explicit boolean, never inferred from a path string
+		 * (browser-use's heuristic silently skipped isolation for custom dirs —
+		 * issue #4548). Turning it OFF deletes every snapshot on next use/exit.
+		 */
+		useRealProfile: boolean;
+	};
 	computer: ComputerConfig;
 	/** Scheduled tasks: the employee may create timed tasks in conversation; the scheduler runs them at their cron time. */
 	scheduler: { enabled: boolean };
@@ -440,6 +453,16 @@ export interface AppConfig {
 		 * from a widget regardless of this value — owner is the deployment owner.
 		 */
 		maxRole: "viewer" | "operator" | "admin";
+		/**
+		 * Session-ticket lifetime in seconds (0 = built-in default, 30 min).
+		 *
+		 * The embedded assistant holds ONE ticket for a whole conversation, so a
+		 * TTL shorter than a real session forces the business system to re-mint
+		 * mid-chat and surfaces "会话票据已过期" to end users. Tickets stay bound
+		 * to (client address, Origin) and are rejected on mismatch, so a longer
+		 * window does not meaningfully widen the attack surface.
+		 */
+		ticketTtlSec: number;
 		/**
 		 * Launcher look (v0.2.180). Business systems embed the widget as a small
 		 * floating entry point, and the default text bubble reads as a placeholder
@@ -597,7 +620,7 @@ const DEFAULTS: AppConfig = {
 	im: { enabled: false, channels: [], ack: { enabled: true, text: "👍 收到，正在处理…" } },
 	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 15, taskProgressMin: 30, turnTimeoutMin: 20, maxToolSteps: 20,
 			progressWatchdog: { enabled: true, stallWindowMs: 300_000, windowSize: 32, softStopAfterWindows: 2, hungRequestCapMs: 600_000 }, taskPlanning: { enabled: true }, chatDispatch: { enabled: true }, autoUpdate: true, oneOffRetentionDays: 30, messageRetentionDays: 30, engineKernel: "durable" as const, piRegistryUrl: "" },
-	browser: { enabled: false, headless: true, allowedDomains: [], downloadHost: "" },
+	browser: { enabled: false, headless: true, allowedDomains: [], downloadHost: "", useRealProfile: false },
 	computer: DEFAULT_COMPUTER_CONFIG,
 	scheduler: { enabled: true },
 	prompt: { extra: "", rules: "" },
@@ -619,6 +642,7 @@ const DEFAULTS: AppConfig = {
 		allowedOrigins: [],
 		secret: "",
 		maxRole: "admin" as const,
+		ticketTtlSec: 30 * 60,
 		launcherIcon: "text" as const,
 		launcherIconUrl: "",
 		launcherSize: 52,

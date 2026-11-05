@@ -1,4 +1,5 @@
 import { nextStallStep, STALL_QUIET_RETRIES } from "./autonomous.js";
+import { allowsSelfScheduling, originLabel, resolveOrigin, type WorkOrigin } from "./work-origin.js";
 /**
  * Persistent, multi-window work dispatcher. No periodic polling: store lifecycle
  * events wake queued work; one timer wakes the earliest model-selected due time.
@@ -633,7 +634,28 @@ export class WorkService<Session extends WorkSession> {
 			if (active.deadline !== undefined) this.clock.clearTimeout(active.deadline);
 			active.deadline = undefined;
 			// Persist BEFORE release/push/learning, including throws during open/send.
-			if (item && store.get(item.id)?.status === "working") {
+			const currentRow = item ? store.get(item.id) : null;
+			const freshOrigin = currentRow?.origin ?? null;
+			if (item && currentRow?.status === "working") {
+				// ORIGIN GATE: only operator-dispatched / approved-mining / scheduled items
+				// may re-arm themselves. An injected row must not start scheduling follow-up
+				// windows nobody approved (2026-11-05: an injected reconciliation task kept
+				// re-arming every window and pushed 自主任务 progress the operator never
+				// asked for). A window that would have scheduled becomes a clean close so
+				// the work still ends instead of silently pausing.
+				// Resolve provenance the SAME way the push header does: structured column
+				// first, then the legacy note. Reading only the column would treat every
+				// pre-migration row as `legacy` and silently stop its follow-ups.
+				const gateOrigin = resolveOrigin({
+					origin: (freshOrigin ?? null) as WorkOrigin | null,
+					originNote: currentRow?.origin_note ?? item.origin_note ?? null,
+				});
+				if (outcome === "scheduled" && !allowsSelfScheduling(gateOrigin === "legacy" && currentRow?.origin_note ? { origin: null, originNote: currentRow.origin_note } : { origin: gateOrigin, originNote: currentRow?.origin_note ?? null })) {
+					outcome = "done";
+					nextCheckAt = undefined;
+					nextReason = undefined;
+					console.log(`[work] origin gate: item=${item.id} origin=${gateOrigin} may not self-schedule; closing instead of arming a follow-up`);
+				}
 				store.setStatus(item.id, outcome, outcome === "waiting_human" ? question || active.stopReason || "请管理员明确恢复。" : null, nextCheckAt ?? null, nextReason);
 				if (outcome === "scheduled") store.setFixedStreak(item.id, nextStreak);
 				// A non-timeout close resets the consecutive-timeout meter: the breaker
@@ -664,14 +686,33 @@ export class WorkService<Session extends WorkSession> {
 			const scheduledAt = nowRow.next_check_at ?? nextCheckAt!;
 			const scheduledReason = nowRow.next_check_reason ?? nextReason;
 			const streak = nowRow.fixed_streak ?? 0;
+			const label = pushHeaderLabel(nowRow.origin_note, nowRow.origin);
 			const text = nowRow.status === "done"
-				? `✅ **自主任务完成：${nowRow.title}**\n\n${lastText}\n\n---\n\n💤 该任务已收尾，不再自动跟进。需要重开请在来源会话说明。`
+				? `✅ **${label}完成：${nowRow.title}**\n\n${lastText}\n\n---\n\n💤 该任务已收尾，不再自动跟进。需要重开请在来源会话说明。`
 				: nowRow.status === "scheduled"
-					? `🔁 **自主任务阶段进展：${nowRow.title}**\n\n${tailExcerpt(lastText, 500)}\n\n---\n\n⏭️ **下次跟进**：${new Date(scheduledAt).toLocaleString("zh-CN", { hour12: false })}${scheduledReason ? `\n📋 **跟进原因**：${scheduledReason}` : ""}${streak >= 3 ? `\n\n⚠️ **循环提醒**：已连续 ${streak} 次只在相近的固定时间跟进这一个点。如果这是因为它有新信息可查（如某个批次在该时刻生成），写明依据可继续；但记得覆盖今天其他观察点。若这件工作每天只在这一处查、且查了也不需要判断动作，可建议管理员转成定时任务，自主任务留给需要判断力的跟进。` : ""}`
-					: `⏸️ **自主任务需要人工：${nowRow.title}**\n\n${nowRow.question}\n\n---\n\n💡 **恢复方式**：管理员在来源会话直接回复答复内容（如验证码、预计解决时间）即可继续；恢复前不会自动执行。`;
+					? `🔁 **${label}阶段进展：${nowRow.title}**\n\n${tailExcerpt(lastText, 500)}\n\n---\n\n⏭️ **下次跟进**：${new Date(scheduledAt).toLocaleString("zh-CN", { hour12: false })}${scheduledReason ? `\n📋 **跟进原因**：${scheduledReason}` : ""}${streak >= 3 ? `\n\n⚠️ **循环提醒**：已连续 ${streak} 次只在相近的固定时间跟进这一个点。如果这是因为它有新信息可查（如某个批次在该时刻生成），写明依据可继续；但记得覆盖今天其他观察点。若这件工作每天只在这一处查、且查了也不需要判断动作，可建议管理员转成定时任务，自主任务留给需要判断力的跟进。` : ""}`
+					: `⏸️ **${label}需要人工：${nowRow.title}**\n\n${nowRow.question}\n\n---\n\n💡 **恢复方式**：管理员在来源会话直接回复答复内容（如验证码、预计解决时间）即可继续；恢复前不会自动执行。`;
 			try { await this.opts.push(fresh.origin_conversation, text); } catch (err) { this.opts.onError?.(err); }
 		}
 	}
+}
+
+/**
+ * Push-header family label by origin.
+ *
+ * The structured `origin` wins; the free-text note is only a fallback for rows
+ * created before the column existed. This ordering is the fix for a real
+ * incident: origin used to be sniffed from the sentence "从聊天转派（Router）",
+ * so a task injected straight into the DB could claim that origin, appear in the
+ * operator's list, self-schedule follow-ups and push as an 自主任务 the operator
+ * never asked for (2026-11-05). A claim in a note is not evidence.
+ *
+ * Chat-dispatched items are a message the Router moved to background — NOT the
+ * 自主任务 family — because labeling them so reads as if the scheduler itself had
+ * gone autonomous (field 2026-11-05). Exported for tests.
+ */
+export function pushHeaderLabel(originNote: string | null | undefined, origin?: string | null): string {
+	return originLabel(resolveOrigin({ origin: origin as WorkOrigin | null | undefined, originNote }));
 }
 
 /**

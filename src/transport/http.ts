@@ -39,6 +39,19 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 	res.end(JSON.stringify(body));
 }
 
+/**
+ * Thinking blocks. Kept SEPARATE from text: a different content type that must
+ * never leak into the answer bubble.
+ */
+function extractThinking(message: unknown): string {
+	const content = (message as { content?: unknown }).content;
+	if (!Array.isArray(content)) return "";
+	return (content as { type?: string; thinking?: string }[])
+		.filter((part) => part?.type === "thinking" && typeof part.thinking === "string")
+		.map((part) => part.thinking as string)
+		.join("");
+}
+
 function extractText(message: unknown): string {
 	const content = (message as { content?: unknown }).content;
 	if (!Array.isArray(content)) return "";
@@ -68,8 +81,21 @@ async function streamRun(
 	sse({ type: "meta", conversationId });
 
 	let sentChars = 0;
+	let sentThinking = 0;
 	let currentMessageId: string | undefined;
 
+	// TWO channels, because the two kernels publish differently:
+	//
+	//  - LEGACY / pi-session drive the Agent directly, so agent.subscribe sees
+	//    message_update / tool_execution_* events.
+	//  - DURABLE drives the harness pipeline and NEVER calls agent.prompt, so
+	//    agent.subscribe observes ZERO events for a whole turn (measured). It
+	//    publishes through SendCtx.onProcessEvent instead, translated into the
+	//    same vocabulary.
+	//
+	// Only subscribing (the pre-0.2.192 behaviour) meant the console received no
+	// deltas at all under durable — the answer appeared in one block at the end,
+	// and thinking was never rendered because it was never delivered.
 	const unsubscribe = agent.subscribe((event: AgentEvent) => {
 		switch (event.type) {
 			case "message_start": {
@@ -77,10 +103,19 @@ async function streamRun(
 				if (id !== currentMessageId) {
 					currentMessageId = id;
 					sentChars = 0;
+					sentThinking = 0;
 				}
 				break;
 			}
 			case "message_update": {
+				// Thinking is a SEPARATE content type, not text: the old
+				// extractText() filtered to type==="text" and threw thinking away,
+				// so even a legacy kernel could never show a thinking box.
+				const thinking = extractThinking(event.message);
+				if (thinking.length > sentThinking) {
+					sse({ type: "thinking", text: thinking.slice(sentThinking) });
+					sentThinking = thinking.length;
+				}
 				const full = extractText(event.message);
 				if (full.length > sentChars) {
 					sse({ type: "delta", text: full.slice(sentChars) });
@@ -105,7 +140,33 @@ async function streamRun(
 	});
 
 	try {
-		const { error } = await runtime.send(agent, message);
+		const { error } = await runtime.send(agent, message, {
+			// Durable kernel channel (see above). Ignored by the legacy kernel.
+			onProcessEvent: (event) => {
+				switch (event.type) {
+					case "thinking_delta":
+						if (event.delta) sse({ type: "thinking", text: event.delta });
+						break;
+					case "text_delta":
+						if (event.delta) sse({ type: "delta", text: event.delta });
+						break;
+					case "tool_start":
+						sse({ type: "tool_start", toolName: event.toolName, toolCallId: event.toolCallId });
+						break;
+					case "tool_end":
+						sse({
+							type: "tool_end",
+							toolName: event.toolName,
+							toolCallId: event.toolCallId,
+							isError: event.isError,
+							durationMs: event.durationMs,
+						});
+						break;
+					default:
+						break;
+				}
+			},
+		});
 		if (error) sse({ type: "error", message: error });
 		else sse({ type: "done" });
 	} catch (err) {

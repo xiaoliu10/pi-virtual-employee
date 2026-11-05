@@ -223,6 +223,9 @@ export function createWorkTools(deps: {
 					goal: p.goal.trim().slice(0, 2000),
 					originConversation: conversationId,
 					originNote: `管理员要求直接创建：${p.title.trim().slice(0, 120)}`,
+					// Admin-ordered AUTONOMOUS work: same class as an approved mined
+					// proposal — self-schedules, pushes as 自主任务 (the reply says so).
+					origin: "mining",
 					status: "queued",
 					createdBy: actor.senderId,
 					createdChannel: actor.channel,

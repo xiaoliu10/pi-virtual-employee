@@ -46,6 +46,8 @@ export interface WidgetConfigSnapshot {
 	secret?: string;
 	/** Highest role a ticket may carry (default admin; owner is never reachable). */
 	maxRole?: WidgetRole;
+	/** Session-ticket lifetime in seconds (undefined = store default, 30 min). */
+	ticketTtlSec?: number;
 	/** Launcher look; omitted by older callers → legacy text bubble. */
 	launcher?: LauncherLook;
 }
@@ -229,7 +231,15 @@ const inFlight = new Map<string, Promise<unknown>>();
 
 export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: number; server: Server }> {
 	const log = deps.log ?? ((message: string) => console.log(message));
-	const tickets = deps.tickets ?? new TicketStore();
+	// TTL is read per ticket, not frozen at construction: an admin changing
+	// widget.ticketTtlSec should take effect on the NEXT mint, without a restart
+	// (deps.config() is called per request anyway).
+	const tickets = deps.tickets ?? new TicketStore({
+		ttlMs: () => {
+			const sec = deps.config().ticketTtlSec;
+			return typeof sec === "number" && sec > 0 ? sec * 1000 : undefined;
+		},
+	});
 	const server = createServer(async (req, res) => {
 		const url = (req.url ?? "").split("?")[0];
 		const cfg = deps.config();

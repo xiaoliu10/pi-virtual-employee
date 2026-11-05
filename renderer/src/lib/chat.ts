@@ -5,12 +5,19 @@
 import { baseUrl } from "./ipc";
 
 export interface StreamEvent {
-	type: "meta" | "delta" | "tool_start" | "tool_end" | "done" | "error";
+	/**
+	 * `thinking` is the model's reasoning stream, kept distinct from `delta`
+	 * (the answer). Under the durable kernel these arrive through
+	 * SendCtx.onProcessEvent; the legacy kernel reports them on the message
+	 * content as separate "thinking" blocks.
+	 */
+	type: "meta" | "delta" | "thinking" | "tool_start" | "tool_end" | "done" | "error";
 	conversationId?: string;
 	text?: string;
 	toolName?: string;
 	toolCallId?: string;
 	isError?: boolean;
+	durationMs?: number;
 	message?: string;
 }
 

@@ -44,7 +44,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { startWidgetServer, TicketStore, clampWidgetRole, checkPermission, ConfigStore } = await import(
+const { startWidgetServer, TicketStore, clampWidgetRole, widgetConversationKey, checkPermission, ConfigStore } = await import(
 	pathToFileURL(bundle).href
 );
 const { DatabaseSync } = await import("node:sqlite");
@@ -135,7 +135,10 @@ test("a ticket carries the granted role into the runtime actor", async (t) => {
 	assert.equal(chat.status, 200);
 	assert.equal(sink.length, 1, "the message reached the runtime");
 	assert.equal(sink[0].actor.verifiedRole, "admin", "the role travels via the verified ticket");
-	assert.equal(sink[0].actor.senderId, "widget-user-zhangsan", "the identity comes from the ticket too");
+	// Derive the expected id from the SAME function the server uses, so a change
+	// to the key format cannot silently make this assertion meaningless. (The key
+	// carries a hash of the original user id — see widgetConversationKey.)
+	assert.equal(sink[0].actor.senderId, `widget-user-${widgetConversationKey("zhangsan")}`, "the identity comes from the ticket too");
 });
 
 test("the role is capped at admin; owner is unreachable whatever is claimed", async (t) => {
@@ -206,7 +209,7 @@ test("chat without a ticket is refused even with a valid bearer token", async (t
 	const chat = await post("/api/widget/chat", { message: "hi", user: "someone-else", role: "admin" }, { "x-ve-ticket": ticket, origin: "https://oa.example.com" });
 	assert.equal(chat.status, 200);
 	assert.equal(sink[0].actor.verifiedRole, "viewer", "the body's role claim is ignored");
-	assert.equal(sink[0].actor.senderId, "widget-user-u1", "the body cannot switch the identity");
+	assert.equal(sink[0].actor.senderId, `widget-user-${widgetConversationKey("u1")}`, "the body cannot switch the identity");
 });
 
 test("RBAC grants admin from a verified ticket but never owner, and ignores defaultRole otherwise", async (t) => {
@@ -216,15 +219,15 @@ test("RBAC grants admin from a verified ticket but never owner, and ignores defa
 	config.update({ security: { defaultRole: "operator" } });
 	t.after(() => db.close());
 
-	const adminActor = { senderId: "widget-user-u1", channel: "widget", chatType: "single", verifiedRole: "admin" };
-	assert.equal(checkPermission(config, adminActor, "widget:u1", "shell").ok, true,
+	const adminActor = { senderId: `widget-user-${widgetConversationKey("u1")}`, channel: "widget", chatType: "single", verifiedRole: "admin" };
+	assert.equal(checkPermission(config, adminActor, `widget:${widgetConversationKey("u1")}`, "shell").ok, true,
 		"a business-side admin can use admin capabilities here");
 
 	// `owner` is a ROLE, not a capability — the cap is proven at role level:
 	// "admin" is accepted as the ceiling and no ticket can ever mint "owner".
 	assert.equal(clampWidgetRole("owner"), "viewer", "owner is not a widget role at all");
-	const ownerAttempt = { senderId: "widget-user-u1", channel: "widget", chatType: "single", verifiedRole: "owner" };
-	assert.equal(checkPermission(config, ownerAttempt, "widget:u1", "settings").ok, false,
+	const ownerAttempt = { senderId: `widget-user-${widgetConversationKey("u1")}`, channel: "widget", chatType: "single", verifiedRole: "owner" };
+	assert.equal(checkPermission(config, ownerAttempt, `widget:${widgetConversationKey("u1")}`, "settings").ok, false,
 		"a forged owner-grade actor still degrades to viewer (settings needs admin)");
 
 	const noRole = { senderId: "widget-user-u2", channel: "widget", chatType: "single" };
@@ -436,7 +439,7 @@ test("streaming chat forwards thinking, tool calls and gated text deltas in orde
 	// Thinking and text are distinguishable on the client.
 	assert.ok(events.some((e) => e.type === "thinking_delta" && e.text === "用户想查订单，"), "thinking rides its own event type");
 	assert.equal(events.find((e) => e.type === "tool_end")?.durationMs, 420, "tool duration reaches the UI");
-	assert.equal(events.find((e) => e.type === "done")?.conversationId, "widget:u1");
+	assert.equal(events.find((e) => e.type === "done")?.conversationId, `widget:${widgetConversationKey("u1")}`);
 });
 
 test("streamed deltas pass the credential gate; a hit replaces what was rendered", async (t) => {

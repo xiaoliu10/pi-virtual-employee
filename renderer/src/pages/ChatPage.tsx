@@ -10,6 +10,8 @@ interface ChatMessage {
 	id: string;
 	role: "user" | "assistant";
 	content: string;
+	/** Model reasoning for this turn, rendered in a collapsible box. */
+	thinking?: string;
 	streaming?: boolean;
 }
 
@@ -146,6 +148,16 @@ export function ChatPage({
 		});
 	}, []);
 
+	const appendLastThinking = useCallback((chunk: string) => {
+		setMessages((prev) => {
+			const idx = prev.length - 1;
+			if (idx < 0 || prev[idx].role !== "assistant") return prev;
+			const copy = prev.slice();
+			copy[idx] = { ...copy[idx], thinking: (copy[idx].thinking ?? "") + chunk };
+			return copy;
+		});
+	}, []);
+
 	const send = useCallback(
 		async (text: string) => {
 			if (streaming || port === 0) return;
@@ -174,6 +186,11 @@ export function ChatPage({
 								break;
 							case "delta":
 								updateLastAssistant((prev) => prev + (e.text ?? ""));
+								break;
+							case "thinking":
+								// Kept apart from the answer: the bubble renders it in its
+								// own collapsible box, never inline in the reply.
+								appendLastThinking(e.text ?? "");
 								break;
 							case "tool_start":
 								setTools((t) => [...t, { id: e.toolCallId, name: e.toolName ?? "", done: false }]);
@@ -206,7 +223,7 @@ export function ChatPage({
 			setStreaming(false);
 			onTasksChanged();
 		},
-		[streaming, port, conversationId, onActivated, onTasksChanged, updateLastAssistant],
+		[streaming, port, conversationId, onActivated, onTasksChanged, updateLastAssistant, appendLastThinking],
 	);
 
 	const onModelChange = useCallback(
@@ -317,7 +334,7 @@ export function ChatPage({
 						</div>
 					)}
 					{messages.map((m) => (
-						<MessageBubble key={m.id} role={m.role} content={m.content} streaming={m.streaming} />
+						<MessageBubble key={m.id} role={m.role} content={m.content} thinking={m.thinking} streaming={m.streaming} />
 					))}
 					{tools.length > 0 && (
 						<div className="flex flex-wrap gap-2">

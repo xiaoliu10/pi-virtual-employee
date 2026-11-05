@@ -47,19 +47,50 @@ const SHARED_CSS = `
 button { font-family: inherit; cursor: pointer; }
 input, textarea { font-family: inherit; }
 /* ── 过程展示（v0.2.179）：工具调用行 / 思考折叠 / 流式光标 ── */
-.step { display:flex; align-items:center; gap:6px; margin:4px 0; font-size:12px; color:#86909c; }
-.step .st-ico { font-size:12px; }
-.step .st-spin { display:inline-block; width:14px; text-align:center; color:#4f6ef7; }
-.step .st-spin::after { content:"⋯"; }
-.step.ok .st-spin { color:#00b42a; }
-.step.ok .st-spin::after { content:"✓"; }
-.step.bad { color:#f53f3f; }
-.step.bad .st-spin { color:#f53f3f; }
-.step.bad .st-spin::after { content:"✗"; }
-.think { margin:4px 0; border:1px solid #eef0f4; border-radius:8px; overflow:hidden; }
-.think-h { padding:6px 10px; font-size:12px; color:#86909c; cursor:pointer; user-select:none; background:#f7f8fa; }
-.think-b { padding:8px 10px; font-size:12px; color:#4e5969; white-space:pre-wrap; word-break:break-word; max-height:220px; overflow-y:auto; background:#fafbfc; }
-.think-b.hidden { display:none; }
+/* ── 过程行：对齐 Desktop pi-tool —— 摘要行（图标+粗体状态词+名称+右侧状态章），
+   无卡片边框；箭头悬停出现、展开旋转 90°（chat.css 同款交互）。 ── */
+.step { margin:2px 0; }
+.step > summary { display:flex; align-items:center; gap:7px; padding:7px 2px; font-size:13px; line-height:20px; color:#6e6e73; cursor:pointer; list-style:none; border-radius:6px; }
+.step > summary::-webkit-details-marker { display:none; }
+.step > summary:hover { background:#f7f8fa; }
+.step .t-run { color:#1d1d1f; font-weight:600; }
+.step .t-chip { margin-left:auto; flex:0 0 auto; font-size:11px; color:#86868b; }
+.step.ok .t-chip { color:#00b42a; }
+.step.bad .t-chip { color:#f53f3f; }
+.think { margin:0 0 10px; }
+.think > summary { display:flex; align-items:center; gap:7px; padding:8px 2px; font-size:13px; line-height:20px; color:#86909c; cursor:pointer; list-style:none; border-radius:6px; user-select:none; }
+.think > summary::-webkit-details-marker { display:none; }
+.think > summary:hover { background:#f7f8fa; }
+.think.on .t-title { color:#1d1d1f; font-weight:600; }
+  /* Field 2026-11-05 (screenshot): with a 160-char ticker the title had no
+     nowrap and inside a flex row it wrapped one character per line —
+     「正/在/思/考」 stacked vertically. Never let the label break. */
+  .think > summary .t-title { flex:0 0 auto; white-space:nowrap; }
+.think-ticker { flex:1 1 0; min-width:0; margin-left:6px; display:flex; justify-content:flex-end; overflow:hidden;
+  -webkit-mask-image:linear-gradient(to right, transparent, #000 10%, #000 92%, transparent);
+  mask-image:linear-gradient(to right, transparent, #000 10%, #000 92%, transparent); }
+.think-ticker > span { flex:0 0 auto; white-space:pre; color:#a1a1a6; font-size:12px; }
+.t-ico { flex:0 0 auto; width:16px; height:16px; color:#86868b; }
+.t-ico svg { width:16px; height:16px; display:block; }
+.t-chev { flex:0 0 auto; width:12px; height:12px; color:#c9c9cf; opacity:0; transition:transform .12s ease, opacity .16s ease; }
+.t-chev svg { width:12px; height:12px; display:block; }
+.step > summary:hover .t-chev, .think > summary:hover .t-chev,
+.step[open] > summary .t-chev, .think[open] > summary .t-chev { opacity:1; }
+.think[open] > summary .t-chev, .step[open] > summary .t-chev { transform:rotate(90deg); }
+/* 思考正文：浅灰虚化（用户要求）——浅灰 + 极轻 blur，读感是「背景过程」而非结论 */
+/* 拖拽调整大小（v0.2.193）：右下角抓手，浮窗与独立页共用 */
+.rzer { position:absolute; right:0; bottom:0; width:22px; height:22px; z-index:3;
+  cursor:nwse-resize; touch-action:none; user-select:none; -webkit-user-select:none; }
+.rzer::after { content:""; position:absolute; right:5px; bottom:5px; width:9px; height:9px;
+  border-right:2px solid #c9c9cf; border-bottom:2px solid #c9c9cf; border-radius:0 0 3px 0;
+  opacity:.75; transition:opacity .15s ease; }
+.rzer:hover::after { opacity:1; border-color:#8e8e93; }
+/* 拖动期间：禁掉选中/文本光标，避免拖出蓝色选区 */
+.ve-resizing, .ve-resizing * { user-select:none !important; -webkit-user-select:none !important;
+  cursor:nwse-resize !important; }
+.think-b { margin:0 0 10px; padding:2px 2px 2px 14px; border-left:1px solid #f0f0f2;
+  font-size:13px; line-height:1.65; color:#a9a9ae; filter:blur(.3px); white-space:pre-wrap; word-break:break-word;
+  max-height:240px; overflow-y:auto; }
 .msg.streaming::after { content:"▍"; color:#4f6ef7; animation:ve-blink 1s step-start infinite; }
 @keyframes ve-blink { 50% { opacity:0; } }
 `;
@@ -112,8 +143,8 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
   .launcher:hover { transform:scale(1.06); box-shadow:0 8px 26px rgba(79,110,247,.5); }
   .launcher img { width:100%; height:100%; object-fit:cover; border-radius:50%; display:block; }
   .launcher svg { display:block; }
-  .panel { position:absolute; right:24px; bottom:92px; width:380px; max-width:calc(100vw - 32px);
-    height:560px; max-height:calc(100vh - 130px); background:#fff; border-radius:14px;
+  .panel { position:absolute; right:24px; bottom:92px; width:460px; max-width:calc(100vw - 32px);
+    height:680px; max-height:calc(100vh - 130px); background:#fff; border-radius:14px;
     box-shadow:0 12px 48px rgba(0,0,0,.18); display:flex; flex-direction:column; overflow:hidden;
     font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; }
   .head { padding:14px 16px; display:flex; align-items:center; justify-content:space-between;
@@ -199,6 +230,97 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
   }
 
   function q(sel) { return panel.querySelector(sel); }
+
+  /* ── 可拖拽调整大小（v0.2.193，用户：对话框太小，要能拖大拖小）─────────
+     面板锚在右下角，所以抓右下角往左上拖 = 变大。尺寸存 localStorage，
+     刷新/重开都保留；视口缩小时按上限夹取，绝不留下够不着的面板。 */
+  var SIZE_KEY = "ve-widget-size";
+  var MIN_W = 380, MIN_H = 420;
+  function clampNum(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
+  function panelLimits() {
+    // 与 CSS 的 max-width/max-height 保持同一口径，避免 CSS 把内联高度截短
+    return {
+      maxW: Math.max(MIN_W, (window.innerWidth || 1280) - 32),
+      maxH: Math.max(MIN_H, (window.innerHeight || 800) - 130)
+    };
+  }
+  function setPanelSize(w, h) {
+    var lim = panelLimits();
+    panel.style.width = clampNum(w, MIN_W, lim.maxW) + "px";
+    panel.style.height = clampNum(h, MIN_H, lim.maxH) + "px";
+  }
+  function readSize() {
+    try {
+      if (!window.localStorage) return null;
+      var raw = window.localStorage.getItem(SIZE_KEY);
+      if (!raw) return null;
+      var o = JSON.parse(raw);
+      if (!o || typeof o.w !== "number" || typeof o.h !== "number") return null;
+      if (!isFinite(o.w) || !isFinite(o.h)) return null;
+      return o;
+    } catch (e) { return null; }
+  }
+  function writeSize(w, h) {
+    try {
+      if (window.localStorage) window.localStorage.setItem(SIZE_KEY, JSON.stringify({ w: Math.round(w), h: Math.round(h) }));
+    } catch (e) { /* 隐私模式/localStorage 关闭：只是不记忆，不影响拖拽 */ }
+  }
+  function initResize() {
+    var saved = readSize();
+    // 打开时先套用记忆尺寸（视口兜底），再做一次窗口适配
+    if (saved) setPanelSize(saved.w, saved.h);
+    var grip = document.createElement("div");
+    grip.className = "rzer";
+    grip.setAttribute("title", "拖动调整大小");
+    grip.setAttribute("aria-label", "拖动调整大小");
+    panel.appendChild(grip);
+    var start = null;
+    function onDown(e) {
+      var r = panel.getBoundingClientRect();
+      start = { x: e.clientX, y: e.clientY, w: r.width, h: r.height };
+      document.documentElement.classList.add("ve-resizing") || document.body.classList.add("ve-resizing");
+      if (grip.setPointerCapture && e.pointerId != null) { try { grip.setPointerCapture(e.pointerId); } catch (err) {} }
+      if (e.preventDefault) e.preventDefault();
+    }
+    function onMove(e) {
+      if (!start) return;
+      // 锚在右下角：向左上拖为正增长
+      setPanelSize(start.w + (start.x - e.clientX), start.h + (start.y - e.clientY));
+    }
+    function onUp(e) {
+      if (!start) return;
+      start = null;
+      var r = panel.getBoundingClientRect();
+      writeSize(r.width, r.height);
+      var root2 = document.documentElement;
+      if (root2 && root2.classList) root2.classList.remove("ve-resizing");
+      if (document.body && document.body.classList) document.body.classList.remove("ve-resizing");
+      if (grip.releasePointerCapture && e && e.pointerId != null) { try { grip.releasePointerCapture(e.pointerId); } catch (err) {} }
+    }
+    grip.addEventListener("pointerdown", onDown);
+    grip.addEventListener("pointermove", onMove);
+    grip.addEventListener("pointerup", onUp);
+    grip.addEventListener("pointercancel", onUp);
+    // 键盘可达：方向键微调，给不方便拖鼠标的场景留一条路
+    grip.addEventListener("keydown", function (e) {
+      var r = panel.getBoundingClientRect();
+      var dx = e.key === "ArrowLeft" ? 24 : e.key === "ArrowRight" ? -24 : 0;
+      var dy = e.key === "ArrowUp" ? 24 : e.key === "ArrowDown" ? -24 : 0;
+      if (!dx && !dy) return;
+      setPanelSize(r.width + dx, r.height + dy);
+      var r2 = panel.getBoundingClientRect();
+      writeSize(r2.width, r2.height);
+      if (e.preventDefault) e.preventDefault();
+    });
+    // 视口变化：按新上限夹取，别把记忆尺寸撑出屏幕
+    window.addEventListener("resize", function () {
+      var cur = panel.getBoundingClientRect();
+      if (!cur || !cur.width) return;
+      setPanelSize(cur.width, cur.height);
+    });
+    window.__veWidgetResize = { grip: grip, setPanelSize: setPanelSize, readSize: readSize };
+  }
+  initResize();
   function body() { return q(".body"); }
   function msgs() { return q(".msgs"); }
   function scrollEnd() { body().scrollTop = body().scrollHeight; }
@@ -298,34 +420,143 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
     }).catch(function (e) { handlers.onerror("网络错误：" + e); });
   }
 
-  function addStep(msgs, label) {
-    var step = document.createElement("div");
+  /** 工具行 — Desktop pi-tool 摘要：工具族 SVG 图标 + 粗体「正在执行」+ 状态章。 */
+  function addStep(msgs, toolName) {
+    var step = document.createElement("details");
     step.className = "step";
-    step.innerHTML = '<span class="st-ico">⚙</span><span class="st-txt"></span><span class="st-spin"></span>';
-    step.querySelector(".st-txt").textContent = label;
+    var head = document.createElement("summary");
+    head.appendChild(ico(toolIcon(toolName)));
+    var run = document.createElement("span");
+    run.className = "t-run";
+    run.textContent = "正在执行";
+    var name = document.createElement("span");
+    name.textContent = String(toolName || "");
+    var chip = document.createElement("span");
+    chip.className = "t-chip";
+    chip.textContent = "运行中";
+    var chev = document.createElement("span");
+    chev.className = "t-chev";
+    chev.innerHTML = ICONS.chev;
+    head.appendChild(run); head.appendChild(name); head.appendChild(chip); head.appendChild(chev);
+    step.appendChild(head);
     msgs.appendChild(step);
     scrollEnd();
     return step;
   }
-  function finishStep(step, label, ok, ms) {
+  function finishStep(step, ok, ms) {
     if (!step) return;
-    step.querySelector(".st-txt").textContent = label + (ms != null ? "（" + Math.round(ms / 100) / 10 + "s）" : "");
-    step.querySelector(".st-spin").textContent = ok ? "✓" : "✗";
     step.classList.add(ok ? "ok" : "bad");
+    var run = step.querySelector(".t-run");
+    if (run && run.remove) run.remove();
+    var chip = step.querySelector(".t-chip");
+    if (chip) chip.textContent = (ok ? "成功" : "失败") + (ms != null ? " · " + Math.round(ms / 100) / 10 + "s" : "");
   }
-  function addThinking(msgs) {
-    var wrap = document.createElement("div");
-    wrap.className = "think";
-    var head = document.createElement("div");
-    head.className = "think-h";
-    head.textContent = "💭 思考过程";
+  /**
+   * Thinking panel, inserted BEFORE the answer bubble it belongs to.
+   *
+   * Field 2026-11-04: reasoning rendered BELOW the answer, so a finished turn
+   * read "result … then what it thought getting there". Desktop (and any
+   * transcript) puts the process first: thinking → tools → answer. The answer
+   * bubble is already in the list when reasoning arrives, so appending puts it
+   * after; the anchor is guarded because a caller may create the panel before
+   * the
+   * bubble exists.
+   */
+  /* Desktop Icons.tsx 的 stroke SVG 子集：过程行不再用 emoji 充数。 */
+  var ICONS = {
+    brain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/><path d="M17.599 6.5a3 3 0 0 0 .399-1.375"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M19.938 10.5a4 4 0 0 1 .585.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M19.964 17.484A4 4 0 0 1 18 18"/></svg>',
+    chev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9.5 6.5 5.5 5.5-5.5 5.5"/></svg>',
+    terminal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="m7 9.5 3 2.5-3 2.5M12.5 15H17"/></svg>',
+    globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.3 2.3 3.4 5.2 3.4 8.5s-1.1 6.2-3.4 8.5c-2.3-2.3-3.4-5.2-3.4-8.5S9.7 5.8 12 3.5Z"/></svg>',
+    file: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v11a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 19V5a1.5 1.5 0 0 1 1-1.5Z"/><path d="M13.5 3.5V8H18"/></svg>',
+    book: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 6.5C10.5 5 8.5 4.5 5.5 4.5c-.6 0-1 .4-1 1v11c0 .6.4 1 1 1 3 0 5 .5 6.5 2 1.5-1.5 3.5-2 6.5-2 .6 0 1-.4 1-1v-11c0-.6-.4-1-1-1-3 0-5 .5-6.5 2Z"/><path d="M12 6.5v13"/></svg>',
+    clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>',
+    wrench: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14.5 12 12 9.5l2.7-3.2Z"/></svg>'
+  };
+  function ico(name) {
+    var el = document.createElement("span");
+    el.className = "t-ico";
+    el.innerHTML = ICONS[name] || ICONS.wrench;
+    return el;
+  }
+  function toolIcon(name) {
+    var n = String(name || "").toLowerCase();
+    if (/bash|shell|command|script|powershell|cmd|exec/.test(n)) return "terminal";
+    if (/browser|web|http|navigate|page/.test(n)) return "globe";
+    if (/file|read|write|edit|text|dir|path/.test(n)) return "file";
+    if (/knowledge|memory|skill|search/.test(n)) return "book";
+    if (/sched|time|cron|task/.test(n)) return "clock";
+    return "wrench";
+  }
+
+  /**
+   * Thinking note — Desktop pi-execution__note port: native details/summary
+   * (brain icon + bold 正在思考 + right-aligned scrolling tail ticker), body as
+   * a left-rule block. Inserted BEFORE its answer bubble (先思考、再给结果 —
+   * field 2026-11-04). Streaming keeps it open; finish collapses it and the
+   * title switches to 「思考 · 用时 N 秒」, exactly like the desktop note.
+   */
+  function addThinking(msgs, anchor) {
+    var wrap = document.createElement("details");
+    wrap.className = "think on";
+    wrap.setAttribute("open", "open");
+    var head = document.createElement("summary");
+    head.appendChild(ico("brain"));
+    var title = document.createElement("span");
+    title.className = "t-title";
+    title.textContent = "正在思考";
+    var ticker = document.createElement("span");
+    ticker.className = "think-ticker";
+    var tickerInner = document.createElement("span");
+    ticker.appendChild(tickerInner);
+    var chev = document.createElement("span");
+    chev.className = "t-chev";
+    chev.innerHTML = ICONS.chev;
+    head.appendChild(title); head.appendChild(ticker); head.appendChild(chev);
     var bodyEl = document.createElement("div");
-    bodyEl.className = "think-b hidden";
-    head.addEventListener("click", function () { bodyEl.classList.toggle("hidden"); });
+    bodyEl.className = "think-b";
     wrap.appendChild(head); wrap.appendChild(bodyEl);
-    msgs.appendChild(wrap);
+    if (anchor && anchor.parentNode === msgs) msgs.insertBefore(wrap, anchor);
+    else msgs.appendChild(wrap);
+    wrap._veTitle = title; wrap._veTicker = tickerInner; wrap._veStartedAt = Date.now();
     scrollEnd();
-    return bodyEl;
+    return wrap;
+  }
+
+  /** 刷新思考面板：流式=滚动尾部（剥 markdown 装饰取尾 160 字）；完成=用时+折叠。 */
+  function paintThinking(wrap, text, streaming) {
+    if (!wrap || !wrap._veTitle) return;
+    var body = wrap.children[1];
+    if (body) body.textContent = text;
+    if (text) wrap._veHasText = true;
+    var phaseNow = streaming ? "thinking" : "done";
+    var phaseBefore = wrap._vePhase;
+    wrap._vePhase = phaseNow;
+    if (streaming) {
+      wrap.classList.add("on");
+      // 只有进入思考阶段才自动展开：同一阶段内不反复改写用户的手动开合
+      if (phaseBefore !== "thinking") wrap.setAttribute("open", "open");
+      wrap._veTitle.textContent = "正在思考";
+      if (wrap._veTicker) {
+        var flat = String(text)
+          .replace(/\\*\\*(.+?)\\*\\*/g, "$1")
+          .replace(/\\*(.+?)\\*/g, "$1")
+          .replace(/[\\x60]([^\\x60]+?)[\\x60]/g, "$1")
+          .replace(/\\s+/g, " ").trim();
+        wrap._veTicker.textContent = flat.length > 160 ? flat.slice(-160) : flat;
+      }
+    } else {
+      // 从没产生过思考文本：这一相位切换就是「空壳」，直接摘掉而不是画一个
+      // 「思考 · 用时 1 秒」的空面板挂在答文上方（code review P2-1）。
+      if (!wrap._veHasText) { wrap.remove(); return; }
+      wrap.classList.remove("on");
+      var secs = Math.max(1, Math.ceil((Date.now() - (wrap._veStartedAt || Date.now())) / 1000));
+      wrap._veTitle.textContent = "思考 · 用时 " + secs + " 秒";
+      if (wrap._veTicker) wrap._veTicker.textContent = "";
+      // 只在「思考刚结束」这一刻自动收起；此后 delta/tool_start 反复调用
+      // 不得再关掉用户手动展开的面板（用户要求：可手动打开查看）。
+      if (phaseBefore === "thinking") wrap.removeAttribute("open");
+    }
   }
 
   function send(text) {
@@ -346,7 +577,9 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
     box.classList.add("streaming");
     var m = msgs();
     var aiText = "";          // 当前气泡累计文本
-    var thinkEl = null;       // 思考面板
+    // 最早出现：回合一开始就建好思考面板（用户要求），插在回答气泡之前。
+    // 从不思考的模型在 finish() 时移除空面板，不留噪音。
+    var thinkEl = addThinking(m, box);
     var thinkText = "";
     var tools = {};           // toolCallId → step 元素
     var lastTool = null;
@@ -355,6 +588,10 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
     function finish() {
       if (ended) return;
       ended = true;
+      if (thinkEl) {
+        if (thinkText) paintThinking(thinkEl, thinkText, false);
+        else { thinkEl.remove(); thinkEl = null; } // 从不思考的模型：不留空面板
+      }
       box.classList.remove("streaming");
       if (!box.textContent || box.textContent === "正在思考…") box.textContent = aiText || "（空回复）";
       state.busy = false;
@@ -371,36 +608,40 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
           case "delta":
             aiText += ev.text;
             box.textContent = aiText;
+            // 回答文本开始 → 思考阶段结束，按用户要求收起面板（思考恢复会重开）
+            if (thinkEl) paintThinking(thinkEl, thinkText, false);
             scrollEnd();
             break;
           case "replace":
             aiText = ev.text;
             box.textContent = aiText || "（内容已按安全策略隐藏）";
+            if (thinkEl) paintThinking(thinkEl, thinkText, false);
             scrollEnd();
             break;
           case "tool_start":
             if (!aiText) box.textContent = "";
-            lastTool = addStep(m, "调用工具 " + ev.toolName + " …");
+            if (thinkEl) paintThinking(thinkEl, thinkText, false);
+            lastTool = addStep(m, ev.toolName);
             if (ev.toolCallId) tools[ev.toolCallId] = lastTool;
             scrollEnd();
             break;
           case "tool_end": {
             var step = (ev.toolCallId && tools[ev.toolCallId]) || lastTool;
-            finishStep(step, "工具 " + ev.toolName, !ev.isError, ev.durationMs);
+            finishStep(step, !ev.isError, ev.durationMs);
             break;
           }
           case "thinking_delta":
             if (!aiText) box.textContent = "";
-            if (!thinkEl) thinkEl = addThinking(m);
+            if (!thinkEl) thinkEl = addThinking(m, box);
             thinkText += ev.text;
-            thinkEl.textContent = thinkText;
+            paintThinking(thinkEl, thinkText, true);
             scrollEnd();
             break;
           case "thinking_replace":
             if (!aiText) box.textContent = "";
-            if (!thinkEl) thinkEl = addThinking(m);
+            if (!thinkEl) thinkEl = addThinking(m, box);
             thinkText = ev.text;
-            thinkEl.textContent = thinkText;
+            paintThinking(thinkEl, thinkText, true);
             scrollEnd();
             break;
           case "error":
@@ -430,6 +671,9 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
   launcher.addEventListener("click", function () { state.open ? close() : open(); });
   panel.querySelector(".head button").addEventListener("click", close);
   q(".send").addEventListener("click", function () { send(q(".box").value); q(".box").value = ""; });
+  // Test hook (no-op in production): lets headless suites drive the REAL send
+  // path instead of guessing at the DOM. Never read by the widget itself.
+  window.__veWidgetSend = send;
   q(".box").addEventListener("keydown", function (e) {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(q(".box").value); q(".box").value = ""; }
   });
@@ -449,7 +693,7 @@ export function renderWidgetPage(): string {
 ${SHARED_CSS}
 body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; background:#f7f8fa;
   display:flex; justify-content:center; }
-.wrap { width:100%; max-width:720px; display:flex; flex-direction:column; height:100vh; background:#fff; }
+.wrap { position:relative; width:100%; max-width:880px; display:flex; flex-direction:column; height:100vh; background:#fff; }
 .head { padding:16px 20px; border-bottom:1px solid #eef0f4; font-size:16px; font-weight:600; color:#1f2329; }
 .body { flex:1; overflow-y:auto; padding:20px; }
 .hero { font-size:24px; font-weight:700; color:#1f2329; margin-bottom:16px; }
@@ -503,6 +747,89 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
   var busy = false;
   function el(id) { return document.getElementById(id); }
   function scrollEnd() { var b = el("body"); b.scrollTop = b.scrollHeight; }
+
+  /* ── 可拖拽调整大小（v0.2.193）：与浮窗同一语义，抓右下角拖宽/拖高 ── */
+  var SIZE_KEY = "ve-widget-page-size";
+  var MIN_W = 420, MIN_H = 480;
+  var wrapEl = document.querySelector(".wrap");
+  function clampNum(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
+  function pageLimits() {
+    return {
+      maxW: Math.max(MIN_W, (window.innerWidth || 1280) - 32),
+      maxH: Math.max(MIN_H, (window.innerHeight || 800) - 24)
+    };
+  }
+  function setPageSize(w, h) {
+    if (!wrapEl) return;
+    var lim = pageLimits();
+    wrapEl.style.maxWidth = "none";           // 默认 max-width:720 会让「拖宽」无效
+    wrapEl.style.width = clampNum(w, MIN_W, lim.maxW) + "px";
+    wrapEl.style.height = clampNum(h, MIN_H, lim.maxH) + "px";
+  }
+  function readSize() {
+    try {
+      if (!window.localStorage) return null;
+      var raw = window.localStorage.getItem(SIZE_KEY);
+      if (!raw) return null;
+      var o = JSON.parse(raw);
+      if (!o || typeof o.w !== "number" || typeof o.h !== "number") return null;
+      if (!isFinite(o.w) || !isFinite(o.h)) return null;
+      return o;
+    } catch (e) { return null; }
+  }
+  function writeSize(w, h) {
+    try {
+      if (window.localStorage) window.localStorage.setItem(SIZE_KEY, JSON.stringify({ w: Math.round(w), h: Math.round(h) }));
+    } catch (e) {}
+  }
+  (function initResize() {
+    if (!wrapEl) return;
+    var saved = readSize();
+    if (saved) setPageSize(saved.w, saved.h);
+    var grip = document.createElement("div");
+    grip.className = "rzer";
+    grip.setAttribute("title", "拖动调整大小");
+    grip.setAttribute("aria-label", "拖动调整大小");
+    wrapEl.appendChild(grip);
+    var start = null;
+    grip.addEventListener("pointerdown", function (e) {
+      var r = wrapEl.getBoundingClientRect();
+      start = { x: e.clientX, y: e.clientY, w: r.width, h: r.height };
+      if (document.body && document.body.classList) document.body.classList.add("ve-resizing");
+      if (grip.setPointerCapture && e.pointerId != null) { try { grip.setPointerCapture(e.pointerId); } catch (err) {} }
+      if (e.preventDefault) e.preventDefault();
+    });
+    grip.addEventListener("pointermove", function (e) {
+      if (!start) return;
+      setPageSize(start.w + (e.clientX - start.x), start.h + (e.clientY - start.y));
+    });
+    function end(e) {
+      if (!start) return;
+      start = null;
+      var r = wrapEl.getBoundingClientRect();
+      writeSize(r.width, r.height);
+      if (document.body && document.body.classList) document.body.classList.remove("ve-resizing");
+      if (grip.releasePointerCapture && e && e.pointerId != null) { try { grip.releasePointerCapture(e.pointerId); } catch (err) {} }
+    }
+    grip.addEventListener("pointerup", end);
+    grip.addEventListener("pointercancel", end);
+    grip.addEventListener("keydown", function (e) {
+      var r = wrapEl.getBoundingClientRect();
+      var dx = e.key === "ArrowRight" ? 24 : e.key === "ArrowLeft" ? -24 : 0;
+      var dy = e.key === "ArrowDown" ? 24 : e.key === "ArrowUp" ? -24 : 0;
+      if (!dx && !dy) return;
+      setPageSize(r.width + dx, r.height + dy);
+      var r2 = wrapEl.getBoundingClientRect();
+      writeSize(r2.width, r2.height);
+      if (e.preventDefault) e.preventDefault();
+    });
+    window.addEventListener("resize", function () {
+      var cur = wrapEl.getBoundingClientRect();
+      if (!cur || !cur.width) return;
+      setPageSize(cur.width, cur.height);
+    });
+    window.__veWidgetResize = { grip: grip, setPageSize: setPageSize, readSize: readSize };
+  })();
   function add(cls, text) {
     var d = document.createElement("div");
     d.className = "msg " + cls; d.textContent = text;
@@ -579,41 +906,139 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
       return pump();
     }).catch(function (e) { handlers.onerror("网络错误：" + e); });
   }
-  function addStep(list, label) {
-    var step = document.createElement("div");
+  /** 工具行 — Desktop pi-tool 摘要：工具族 SVG 图标 + 粗体「正在执行」+ 状态章。 */
+  function addStep(list, toolName) {
+    var step = document.createElement("details");
     step.className = "step";
-    step.innerHTML = '<span class="st-ico">⚙</span><span class="st-txt"></span><span class="st-spin"></span>';
-    step.querySelector(".st-txt").textContent = label;
+    var head = document.createElement("summary");
+    head.appendChild(ico(toolIcon(toolName)));
+    var run = document.createElement("span");
+    run.className = "t-run";
+    run.textContent = "正在执行";
+    var name = document.createElement("span");
+    name.textContent = String(toolName || "");
+    var chip = document.createElement("span");
+    chip.className = "t-chip";
+    chip.textContent = "运行中";
+    var chev = document.createElement("span");
+    chev.className = "t-chev";
+    chev.innerHTML = ICONS.chev;
+    head.appendChild(run); head.appendChild(name); head.appendChild(chip); head.appendChild(chev);
+    step.appendChild(head);
     list.appendChild(step);
     scrollEnd();
     return step;
   }
-  function finishStep(step, label, ok, ms) {
+  function finishStep(step, ok, ms) {
     if (!step) return;
-    step.querySelector(".st-txt").textContent = label + (ms != null ? "（" + Math.round(ms / 100) / 10 + "s）" : "");
-    step.querySelector(".st-spin").textContent = ok ? "✓" : "✗";
     step.classList.add(ok ? "ok" : "bad");
+    var run = step.querySelector(".t-run");
+    if (run && run.remove) run.remove();
+    var chip = step.querySelector(".t-chip");
+    if (chip) chip.textContent = (ok ? "成功" : "失败") + (ms != null ? " · " + Math.round(ms / 100) / 10 + "s" : "");
   }
-  function addThinking(list) {
-    var wrap = document.createElement("div");
-    wrap.className = "think";
-    var head = document.createElement("div");
-    head.className = "think-h";
-    head.textContent = "💭 思考过程";
+  /* Desktop Icons.tsx 的 stroke SVG 子集：过程行不再用 emoji 充数。 */
+  var ICONS = {
+    brain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/><path d="M17.599 6.5a3 3 0 0 0 .399-1.375"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M19.938 10.5a4 4 0 0 1 .585.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M19.964 17.484A4 4 0 0 1 18 18"/></svg>',
+    chev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9.5 6.5 5.5 5.5-5.5 5.5"/></svg>',
+    terminal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="m7 9.5 3 2.5-3 2.5M12.5 15H17"/></svg>',
+    globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.3 2.3 3.4 5.2 3.4 8.5s-1.1 6.2-3.4 8.5c-2.3-2.3-3.4-5.2-3.4-8.5S9.7 5.8 12 3.5Z"/></svg>',
+    file: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v11a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 19V5a1.5 1.5 0 0 1 1-1.5Z"/><path d="M13.5 3.5V8H18"/></svg>',
+    book: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 6.5C10.5 5 8.5 4.5 5.5 4.5c-.6 0-1 .4-1 1v11c0 .6.4 1 1 1 3 0 5 .5 6.5 2 1.5-1.5 3.5-2 6.5-2 .6 0 1-.4 1-1v-11c0-.6-.4-1-1-1-3 0-5 .5-6.5 2Z"/><path d="M12 6.5v13"/></svg>',
+    clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>',
+    wrench: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14.5 12 12 9.5l2.7-3.2Z"/></svg>'
+  };
+  function ico(name) {
+    var el = document.createElement("span");
+    el.className = "t-ico";
+    el.innerHTML = ICONS[name] || ICONS.wrench;
+    return el;
+  }
+  function toolIcon(name) {
+    var n = String(name || "").toLowerCase();
+    if (/bash|shell|command|script|powershell|cmd|exec/.test(n)) return "terminal";
+    if (/browser|web|http|navigate|page/.test(n)) return "globe";
+    if (/file|read|write|edit|text|dir|path/.test(n)) return "file";
+    if (/knowledge|memory|skill|search/.test(n)) return "book";
+    if (/sched|time|cron|task/.test(n)) return "clock";
+    return "wrench";
+  }
+
+  /**
+   * Thinking note — Desktop pi-execution__note port: native details/summary
+   * (brain icon + bold 正在思考 + right-aligned scrolling tail ticker), body as
+   * a left-rule block. Inserted BEFORE its answer bubble (先思考、再给结果 —
+   * field 2026-11-04). Streaming keeps it open; finish collapses it and the
+   * title switches to 「思考 · 用时 N 秒」, exactly like the desktop note.
+   */
+  function addThinking(list, anchor) {
+    var wrap = document.createElement("details");
+    wrap.className = "think on";
+    wrap.setAttribute("open", "open");
+    var head = document.createElement("summary");
+    head.appendChild(ico("brain"));
+    var title = document.createElement("span");
+    title.className = "t-title";
+    title.textContent = "正在思考";
+    var ticker = document.createElement("span");
+    ticker.className = "think-ticker";
+    var tickerInner = document.createElement("span");
+    ticker.appendChild(tickerInner);
+    var chev = document.createElement("span");
+    chev.className = "t-chev";
+    chev.innerHTML = ICONS.chev;
+    head.appendChild(title); head.appendChild(ticker); head.appendChild(chev);
     var bodyEl = document.createElement("div");
-    bodyEl.className = "think-b hidden";
-    head.addEventListener("click", function () { bodyEl.classList.toggle("hidden"); });
+    bodyEl.className = "think-b";
     wrap.appendChild(head); wrap.appendChild(bodyEl);
-    list.appendChild(wrap);
+    if (anchor && anchor.parentNode === list) list.insertBefore(wrap, anchor);
+    else list.appendChild(wrap);
+    wrap._veTitle = title; wrap._veTicker = tickerInner; wrap._veStartedAt = Date.now();
     scrollEnd();
-    return bodyEl;
+    return wrap;
+  }
+
+  /** 刷新思考面板：流式=滚动尾部（剥 markdown 装饰取尾 160 字）；完成=用时+折叠。 */
+  function paintThinking(wrap, text, streaming) {
+    if (!wrap || !wrap._veTitle) return;
+    var body = wrap.children[1];
+    if (body) body.textContent = text;
+    if (text) wrap._veHasText = true;
+    var phaseNow = streaming ? "thinking" : "done";
+    var phaseBefore = wrap._vePhase;
+    wrap._vePhase = phaseNow;
+    if (streaming) {
+      wrap.classList.add("on");
+      // 只有进入思考阶段才自动展开：同一阶段内不反复改写用户的手动开合
+      if (phaseBefore !== "thinking") wrap.setAttribute("open", "open");
+      wrap._veTitle.textContent = "正在思考";
+      if (wrap._veTicker) {
+        var flat = String(text)
+          .replace(/\\*\\*(.+?)\\*\\*/g, "$1")
+          .replace(/\\*(.+?)\\*/g, "$1")
+          .replace(/[\\x60]([^\\x60]+?)[\\x60]/g, "$1")
+          .replace(/\\s+/g, " ").trim();
+        wrap._veTicker.textContent = flat.length > 160 ? flat.slice(-160) : flat;
+      }
+    } else {
+      // 从没产生过思考文本：这一相位切换就是「空壳」，直接摘掉而不是画一个
+      // 「思考 · 用时 1 秒」的空面板挂在答文上方（code review P2-1）。
+      if (!wrap._veHasText) { wrap.remove(); return; }
+      wrap.classList.remove("on");
+      var secs = Math.max(1, Math.ceil((Date.now() - (wrap._veStartedAt || Date.now())) / 1000));
+      wrap._veTitle.textContent = "思考 · 用时 " + secs + " 秒";
+      if (wrap._veTicker) wrap._veTicker.textContent = "";
+      // 只在「思考刚结束」这一刻自动收起；此后 delta/tool_start 反复调用
+      // 不得再关掉用户手动展开的面板（用户要求：可手动打开查看）。
+      if (phaseBefore === "thinking") wrap.removeAttribute("open");
+    }
   }
 
   function send(text) {
     text = (text || "").trim();
     if (!text || busy) return;
     if (!ticket) {
-      addMsg("err", "未配置会话票据（#ticket=）。请业务系统后端先调用 POST /api/widget/session 换取票据。");
+      add("err", "未配置会话票据（#ticket=）。请业务系统后端先调用 POST /api/widget/session 换取票据。");
       return;
     }
     busy = true; el("send").disabled = true;
@@ -622,7 +1047,8 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     var box = add("ai", "正在思考…");
     box.classList.add("streaming");
     var aiText = "";
-    var thinkEl = null;
+    // 最早出现：同浮窗通道——回合一开始即建面板，插在回答气泡之前。
+    var thinkEl = addThinking(list, box);
     var thinkText = "";
     var tools = {};
     var lastTool = null;
@@ -630,6 +1056,10 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     function finish() {
       if (ended) return;
       ended = true;
+      if (thinkEl) {
+        if (thinkText) paintThinking(thinkEl, thinkText, false);
+        else { thinkEl.remove(); thinkEl = null; } // 从不思考的模型：不留空面板
+      }
       box.classList.remove("streaming");
       if (!box.textContent || box.textContent === "正在思考…") box.textContent = aiText || "（空回复）";
       busy = false; el("send").disabled = false; el("box").focus();
@@ -643,36 +1073,40 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
           case "delta":
             aiText += ev.text;
             box.textContent = aiText;
+            // 回答文本开始 → 思考阶段结束，按用户要求收起面板（思考恢复会重开）
+            if (thinkEl) paintThinking(thinkEl, thinkText, false);
             scrollEnd();
             break;
           case "replace":
             aiText = ev.text;
             box.textContent = aiText || "（内容已按安全策略隐藏）";
+            if (thinkEl) paintThinking(thinkEl, thinkText, false);
             scrollEnd();
             break;
           case "tool_start":
             if (!aiText) box.textContent = "";
-            lastTool = addStep(list, "调用工具 " + ev.toolName + " …");
+            if (thinkEl) paintThinking(thinkEl, thinkText, false);
+            lastTool = addStep(list, ev.toolName);
             if (ev.toolCallId) tools[ev.toolCallId] = lastTool;
             scrollEnd();
             break;
           case "tool_end": {
             var step = (ev.toolCallId && tools[ev.toolCallId]) || lastTool;
-            finishStep(step, "工具 " + ev.toolName, !ev.isError, ev.durationMs);
+            finishStep(step, !ev.isError, ev.durationMs);
             break;
           }
           case "thinking_delta":
             if (!aiText) box.textContent = "";
-            if (!thinkEl) thinkEl = addThinking(list);
+            if (!thinkEl) thinkEl = addThinking(list, box);
             thinkText += ev.text;
-            thinkEl.textContent = thinkText;
+            paintThinking(thinkEl, thinkText, true);
             scrollEnd();
             break;
           case "thinking_replace":
             if (!aiText) box.textContent = "";
-            if (!thinkEl) thinkEl = addThinking(list);
+            if (!thinkEl) thinkEl = addThinking(list, box);
             thinkText = ev.text;
-            thinkEl.textContent = thinkText;
+            paintThinking(thinkEl, thinkText, true);
             scrollEnd();
             break;
           case "error":
@@ -686,6 +1120,8 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     });
   }
   el("send").addEventListener("click", function () { send(el("box").value); el("box").value = ""; });
+  // Test hook — see the floating-widget branch above.
+  window.__veWidgetSend = send;
   el("box").addEventListener("keydown", function (e) {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(el("box").value); el("box").value = ""; }
   });

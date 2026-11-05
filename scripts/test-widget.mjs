@@ -30,7 +30,7 @@ const bundle = join(dir, "widget.mjs");
 await build({
 	stdin: { contents: `
 		export { startWidgetServer } from "./src/widget/widget-service.ts";
-		export { TicketStore } from "./src/widget/widget-ticket.ts";
+		export { TicketStore, widgetConversationKey } from "./src/widget/widget-ticket.ts";
 		export { inferConversationOrigin } from "./src/db/history-store.ts";
 		export { isLocalConversation, checkPermission } from "./src/security/permissions.ts";
 		export { ConfigStore } from "./src/db/config-store.ts";
@@ -41,7 +41,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { startWidgetServer, TicketStore, inferConversationOrigin, isLocalConversation, checkPermission, ConfigStore } = await import(pathToFileURL(bundle).href);
+const { startWidgetServer, TicketStore, widgetConversationKey, inferConversationOrigin, isLocalConversation, checkPermission, ConfigStore } = await import(pathToFileURL(bundle).href);
 
 const TOKEN = "test-token-abc123";
 
@@ -135,11 +135,17 @@ test("chat routes to the runtime with a widget-namespaced conversation and a vie
 	const res = await post("/api/widget/chat", { message: "查一下库存" }, { ...bearer(TOKEN), "X-VE-Ticket": tk, origin: ORIGIN });
 	assert.equal(res.status, 200);
 	const data = await res.json();
-	assert.match(data.conversationId, /^widget:oa_user_7$/, "the end user's key names their conversation, inside the widget namespace");
+	// The key is derived, not guessed: it carries a hash of the original user id so
+	// two different users can never share a conversation.
+	assert.equal(
+		data.conversationId,
+		`widget:${widgetConversationKey("oa_user_7")}`,
+		"the end user's key names their conversation, inside the widget namespace",
+	);
 	assert.equal(data.reply, "收到：查一下库存");
 	assert.equal(runtime.calls.length, 1);
 	assert.equal(runtime.calls[0].ctx.actor.channel, "widget", "the actor carries the widget channel");
-	assert.match(runtime.calls[0].ctx.actor.senderId, /^widget-user-oa_user_7$/, "the sender id derives from the business user key");
+	assert.equal(runtime.calls[0].ctx.actor.senderId, `widget-user-${widgetConversationKey("oa_user_7")}`, "the sender id derives from the business user key");
 });
 
 test("unsafe characters in the user key cannot escape the widget namespace", async (t) => {

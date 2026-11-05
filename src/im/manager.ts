@@ -9,6 +9,8 @@
  * credential change).
  */
 import type { ConfigStore, ImChannelConfig } from "../db/config-store.js";
+import { decidePump, isUsableBrief, prunePumpState, type PumpState } from "../scheduler/progress-pump.js";
+import { resolveOrigin, type WorkOrigin } from "../scheduler/work-origin.js";
 import type { EmployeeEngine, ModelOption } from "../engine/engine.js";
 import type { ReportService } from "../reports/report-service.js";
 import { EchoAdapter } from "./adapters/echo.js";
@@ -22,7 +24,7 @@ import { isAuthorizationPhrase } from "../engine/authorization.js";
 import { startStallWatchdog } from "./watchdog.js";
 import { splitForPush } from "./chunks.js";
 import { gateOutboundText } from "./credential-egress.js";
-import { triageMessage } from "./triage.js";
+import { FOREGROUND_ESCAPE_HINT, isForegroundEscape, triageMessage } from "./triage.js";
 import { chatHeartbeatOccurrenceId, DeliveryLedger } from "./delivery-ledger.js";
 import type { AdapterCapabilities, AdapterHealth, InboundMessage } from "./types.js";
 
@@ -205,6 +207,45 @@ export class IMAdapterManager {
 	 * retryable under the same id. Without it, behaviour is unchanged.
 	 */
 	/**
+	 * 「前台执行」escape hatch (router-worker design D6): pull a chat-dispatched
+	 * item back into the foreground.
+	 *
+	 * Convertible = dispatched FROM THIS conversation BY THIS sender (creator
+	 * only — another group member must not cancel someone else's task) and
+	 * still queued (not yet claimed) or scheduled (a window ended with a next
+	 * check). A WORKING item is refused honestly: its window is already
+	 * executing, so a foreground rerun would double-execute the work.
+	 *
+	 * Returns the ORIGINAL instruction to re-run inline (the goal preserves it
+	 * under [用户原始指令]), or a notice when nothing is convertible.
+	 * undefined = the message is not the escape phrase at all.
+	 */
+	private takeForegroundEscape(msg: InboundMessage): { original: string; notice?: string } | undefined {
+		if (!isForegroundEscape(msg.text)) return undefined;
+		const store = this.engine.workItems;
+		if (!store) return { original: "", notice: "当前没有可切换的前台任务（工作列表不可用）。" };
+		const convertible = store.list()
+			.filter((r) => r.origin_conversation === msg.conversationId
+				// Structured origin first (2026-11-05): the note is a claim, not
+				// evidence — a row marked injected must not be escaped however its
+				// note reads. Legacy rows (no column) resolve through the same sniff
+				// this check used to do, so pre-migration items stay convertible.
+				&& resolveOrigin({ origin: (r.origin ?? null) as WorkOrigin | null, originNote: r.origin_note }) === "chat"
+				&& (r.created_by ?? null) === (msg.actor?.senderId ?? null)
+				&& (r.status === "queued" || r.status === "scheduled"))
+			.sort((a, b) => b.created_at - a.created_at)[0];
+		if (!convertible) {
+			return { original: "", notice: "没有可切换到前台的后台任务：只有仍排队或已计划下次跟进、且由你本人转派的任务可以切换；正在执行中的任务请先在控制台取消后再重新发送指令。" };
+		}
+		const marker = "[用户原始指令]\n";
+		const idx = (convertible.goal ?? "").lastIndexOf(marker);
+		const original = idx >= 0 ? convertible.goal.slice(idx + marker.length).trim() : "";
+		store.cancel(convertible.id);
+		console.log(`[im] foreground escape: cancelled item=${convertible.id} conv=${msg.conversationId} by=${msg.actor?.senderId ?? "?"}`);
+		return { original };
+	}
+
+	/**
 	 * Router → Worker dispatch (docs/design/router-worker.md P1).
 	 *
 	 * Returns the ACK text when the message was handed to a background work
@@ -258,6 +299,9 @@ export class IMAdapterManager {
 				goal: `${plan}\n\n[用户原始指令]\n${msg.text}`,
 				originConversation: msg.conversationId,
 				originNote: "从聊天转派（Router）",
+				// Structured provenance (2026-11-05): Router dispatch is the one origin
+				// that may auto-follow-up; the note alone is forgeable text.
+				origin: "chat",
 				// MUST be "queued": fireItem/listDue/claim only accept queued (or a
 				// due scheduled). "working" is a terminal orphan — the real
 				// WorkService probe returned false for it while the user already
@@ -274,15 +318,15 @@ export class IMAdapterManager {
 			const fired = bridge.fireItem(item.id);
 			console.log(`[im] dispatch triage: WORKER item=${item.id} steps=${decision.steps} fired=${fired} conv=${msg.conversationId}`);
 			const shortId = item.id.slice(0, 8);
-			// ACK promises only what EXISTS today (review P1-1: /stop targets the
-			// chat session, not the work item; 「前台执行」 and 「<id> 进度」 have no
-			// inbound handlers yet — the design-doc wording was copied before the
-			// mechanisms landed). Progress notes push automatically; admins manage
-			// the item from the 任务 list. Restore the richer wording when the
-			// deterministic inbound router lands.
+			// ACK promises only what EXISTS today. Progress notes push
+			// automatically; admins manage the item from the 任务 list; and the
+			// 「前台执行」 escape has a real inbound handler since 0.2.193 (the
+			// older ACK had to drop this hint because the wording predated the
+			// mechanism — review P1-1).
 			return [
 				`🚀 已转后台执行（编号 ${shortId}），进展与完成会自动推送回本会话。`,
 				`管理员可在控制台任务列表查看或取消该任务。`,
+				FOREGROUND_ESCAPE_HINT,
 			].join("\n");
 		} catch (err) {
 			// Never let dispatch break the turn: fall back to inline execution.
@@ -299,6 +343,96 @@ export class IMAdapterManager {
 	 * nothing told the user — silent strays read as delivery bugs.
 	 */
 	private inventoryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+	/**
+	 * GLOBAL PROGRESS PUMP.
+	 *
+	 * Heartbeats used to live exclusively inside the inbound-message handler
+	 * (a setInterval created when a message arrived). That timer dies with the
+	 * process, and after a restart the handler never runs again for the already
+	 * consumed message — so no timer is ever recreated, even though durable
+	 * happily resumes the WORK. Field 2026-11-04: a reconciliation task ran 1h+
+	 * after a restart and produced exactly one progress note before going silent
+	 * ("只汇报了一次就停了").
+	 *
+	 * The pump asks the engine which conversations are BUSY right now and notes
+	 * each one on the configured cadence, so reporting survives restarts and does
+	 * not depend on how the work started (fresh turn, redriven placed input, or
+	 * crash recovery).
+	 */
+	private readonly pumpState = new Map<string, PumpState>();
+	private pumpTimer?: ReturnType<typeof setInterval>;
+
+	/** Start the pump. Idempotent; interval comes from longTaskProgressMin. */
+	startProgressPump(): void {
+		if (this.pumpTimer) return;
+		const intervalMs = (this.config.all().general.longTaskProgressMin ?? 0) * 60_000;
+		if (intervalMs <= 0) return; // explicitly disabled
+		// Tick often relative to the cadence so a conversation that just became due
+		// is noticed promptly; decidePump() enforces the real interval per chat.
+		const tickMs = Math.max(30_000, Math.min(intervalMs, 5 * 60_000));
+		this.pumpTimer = setInterval(() => this.pumpTick(), tickMs);
+		// Never hold the process open for a heartbeat.
+		this.pumpTimer.unref?.();
+	}
+
+	stopProgressPump(): void {
+		if (this.pumpTimer) clearInterval(this.pumpTimer);
+		this.pumpTimer = undefined;
+		this.pumpState.clear();
+	}
+
+	private pumpTick(): void {
+		try {
+			const intervalMs = (this.config.all().general.longTaskProgressMin ?? 0) * 60_000;
+			const busy = this.engine.busyConversations?.() ?? [];
+			prunePumpState(this.pumpState, busy);
+			const actions = decidePump({ busy, state: this.pumpState, now: Date.now(), intervalMs });
+			for (const action of actions) {
+				if (action.kind === "fire") {
+					void this.pumpOne(action.conversationId, intervalMs);
+				} else if (!this.pumpState.has(action.conversationId)) {
+					// Arm the clock on first sighting so a restart does not spam a
+					// note for every live conversation at once.
+					this.pumpState.set(action.conversationId, { lastSentAt: Date.now(), inFlight: false });
+				}
+			}
+		} catch (err) {
+			// A pump failure must never break messaging.
+			console.warn("[im] progress pump tick failed:", (err as Error).message);
+		}
+	}
+
+	private async pumpOne(conversationId: string, intervalMs: number): Promise<void> {
+		const st = this.pumpState.get(conversationId);
+		if (!st || st.inFlight) return;
+		st.inFlight = true;
+		try {
+			const agent = this.engine.getOrCreateSession(conversationId);
+			const note = await this.engine.progressBrief(agent, conversationId);
+			if (!isUsableBrief(note)) return;
+			// Re-check liveness: the brief can take minutes, and the turn may have
+			// ended while it was generating (pushing then would be a stale "still
+			// working" note).
+			if (!this.engine.isConversationStreaming(conversationId)) return;
+			const occurrenceId = chatHeartbeatOccurrenceId("pump", conversationId, Date.now(), intervalMs);
+			await this.onProgressPush?.(conversationId, note, occurrenceId);
+			st.lastSentAt = Date.now();
+		} catch (err) {
+			console.warn(`[im] progress pump push failed for ${conversationId}: ${(err as Error).message}`);
+		} finally {
+			st.inFlight = false;
+		}
+	}
+
+	/** Injected by main.ts: how the pump reaches the IM channel of a conversation. */
+	private onProgressPush?: (conversationId: string, text: string, occurrenceId: string) => Promise<unknown>;
+
+	setProgressPusher(fn: (conversationId: string, text: string, occurrenceId: string) => Promise<unknown>): void {
+		this.onProgressPush = fn;
+	}
+
+
 
 	private scheduleBackgroundInventory(conversationId: string): void {
 		const prev = this.inventoryTimers.get(conversationId);
@@ -550,6 +684,22 @@ export class IMAdapterManager {
 						return await this.engine.confirmAuthorization(msg.conversationId, msg.actor, msg.conversationName);
 					}
 
+					// 「前台执行」escape hatch — deterministic, no model turn: cancel the
+					// convertible chat-dispatched item and re-run its ORIGINAL
+					// instruction inline. The re-run must skip plan-ahead AND triage:
+					// a foreground escape that re-dispatches to background would be
+					// absurd (field 2026-11-05: the dispatch label itself was the
+					// complaint — the escape is the cheap way out).
+					let turnText = msg.text;
+					const escaped = isForegroundEscape(turnText);
+					if (escaped) {
+						const esc = this.takeForegroundEscape(msg);
+						if (esc) {
+							if (!esc.original) return esc.notice!;
+							turnText = esc.original;
+						}
+					}
+
 					const agent = this.engine.getOrCreateSession(msg.conversationId);
 
 					// Long-task progress heartbeat: every `longTaskProgressMin` while a
@@ -568,36 +718,16 @@ export class IMAdapterManager {
 					// bucket's beat is a new occurrence — the deliberate v0.2.162 cadence
 					// (one note every `longTaskProgressMin` for as long as the turn runs)
 					// is preserved, only true duplicates are deduped.
+					// Progress notes are now driven by the GLOBAL PUMP
+					// (startProgressPump), not by a timer created here. A timer created
+					// in this handler dies with the process and is NEVER recreated after
+					// a restart — the message was consumed long ago — so a resumed task
+					// ran for an hour with one note and then went silent (field
+					// 2026-11-04). The pump reads live busy-conversations from the
+					// engine, so reporting follows the work however it started.
 					const onProgress = ctx?.onProgress;
-					const progressMin = this.config.all().general.longTaskProgressMin;
-					let progressInFlight = false;
-					const heartbeat = progressMin > 0 && onProgress
-						? setInterval(() => {
-							if (progressInFlight) return;
-							progressInFlight = true;
-							void this.engine.progressBrief(agent, msg.conversationId)
-								.then((note) => {
-									// Ask the KERNEL, not agent.state.isStreaming: under the
-									// durable kernel (default since v0.2.167) that flag is never
-									// set, so this gate dropped every heartbeat silently for
-									// IM chats — the same defect v0.2.173 fixed for scheduled
-									// tasks, work windows and the autonomous heartbeat, but this
-									// IM instance was missed (field report 2026-11-03: group chat
-									// task ran 6+ minutes with zero progress notes).
-									if (!this.engine.isConversationStreaming(msg.conversationId)) return;
-									// Bucket derived at PUSH time, from the same interval the timer
-									// above was sized with — never a second hardcoded cadence.
-									const occurrenceId = msg.messageId
-										? chatHeartbeatOccurrenceId(msg.channel ?? "im", msg.messageId, Date.now(), progressMin * 60_000)
-										: undefined;
-									return onProgress(note, { occurrenceId: occurrenceId || undefined, kind: "chat-progress" });
-								})
-								.catch((err) => console.warn("[im] progress push failed:", (err as Error).message))
-								.finally(() => {
-									progressInFlight = false;
-								});
-						}, progressMin * 60_000)
-						: undefined;
+					void onProgress;
+
 					// Turn watchdog — STALL-based (0.2.73): the per-conversation queue is
 					// strict, so ONE wedged turn (hung LLM call / hung socket / hung
 					// remote session) would block that chat forever — field incident: a
@@ -637,7 +767,7 @@ export class IMAdapterManager {
 						// any failure or NO_PLAN verdict simply skips it — execution is
 						// never blocked by planning, and simple questions never see a plan.
 						let planText: string | undefined;
-						if (this.config.all().general.taskPlanning?.enabled !== false) {
+						if (!escaped && this.config.all().general.taskPlanning?.enabled !== false) {
 							try {
 								const plan = await this.engine.planTaskBrief(agent, msg.text, msg.conversationId);
 									if (plan) {
@@ -675,7 +805,7 @@ export class IMAdapterManager {
 							agent,
 							planText
 							? `[已向用户确认的执行规划，严格按此执行，完成后逐步对照汇报]\n${planText}\n\n[用户原始指令]\n${msg.text}`
-							: msg.text,
+							: turnText,
 							{ sendFile: ctx?.sendFile, sendImage: ctx?.sendImage, images: msg.images, actor: msg.actor, conversationName: msg.conversationName, onPersist: (id) => this.onActivity?.(id) },
 						);
 						// Final turn complete — signal the UI to refresh the task list.
@@ -697,7 +827,6 @@ export class IMAdapterManager {
 						}
 						return result.reply;
 					} finally {
-						if (heartbeat) clearInterval(heartbeat);
 						if (watchdog) watchdog.stop();
 						// Fire-and-forget: never blocks settle; the note lands 5s after
 						// the result (async by design — user ruling 2026-11-04).

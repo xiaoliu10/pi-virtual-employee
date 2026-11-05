@@ -13,7 +13,7 @@ import { bool, num, obj, opt, str } from "@earendil-works/pi-schema";
 import type { SchedulerService } from "../../scheduler/scheduler-service.js";
 import type { ConfigStore } from "../../db/config-store.js";
 import { maskId, isExplicitConfirmation, isSchedulerActor, requireConfirmedAdmin, type ActorContext } from "./admin.js";
-import {ROLE_RANK, resolveRole} from "../../security/permissions.js";
+import {ROLE_RANK, effectiveActorRole, resolveRole} from "../../security/permissions.js";
 
 function fmtTime(ms: number | null): string {
 	return ms ? new Date(ms).toLocaleString("zh-CN", { hour12: false }) : "—";
@@ -401,7 +401,11 @@ export function createSchedulerTools(
 			// Admin OR the task's creator: the chain was started under their identity,
 			// so resuming it is within the same authority that created it.
 			const actor = resolveActor?.(conversationId);
-			const role = actor && config ? resolveRole(config, actor.senderId) : "viewer";
+			// effectiveActorRole, NOT resolveRole: a widget-ticketed admin carries
+			// its authority in actor.verifiedRole, which raw resolveRole cannot see
+			// (widget-user-* ids are unknown to local config → always viewer). The
+			// resume gate would then refuse the very admin who created the task.
+			const role = actor && config ? effectiveActorRole(config, actor) : "viewer";
 			const isCreator = !!actor?.senderId && actor.senderId === task.created_by;
 			if (ROLE_RANK[role] < ROLE_RANK.admin && !isCreator) {
 				return {

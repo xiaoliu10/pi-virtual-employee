@@ -856,30 +856,35 @@ function snapshotRunningProfiles(): string[] {
  *    counter, and the launch proceeds on whatever is installed — service
  *    first; a failed update waits for a manual repair.
  */
-function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
-	if (process.platform !== "win32" || !downloadedInstallerPath) {
-		log("WARN", "watchdog skipped: downloaded installer path unavailable");
-		return "failed";
-	}
-	try {
-		const dir = join(app.getPath("userData"), WATCHDOG_DIR);
-		mkdirSync(dir, { recursive: true });
-		const installerCopy = join(dir, basename(downloadedInstallerPath));
-		const scriptPath = join(dir, "watch-update.ps1");
-		const wrapperPath = join(dir, "watch-update.cmd");
-		const markerPath = join(dir, "completed.txt");
-		rmSync(markerPath, { force: true });
-		copyFileSync(downloadedInstallerPath, installerCopy);
-		const exeName = "Pi Virtual Employee";
-		const appExe = process.execPath;
-		// Snapshot the RUNNING instances now — after the quit it's too late
-		// (NSIS kills them all). Empty-string entry = default profile.
-		const runningProfiles = snapshotRunningProfiles();
-		const relaunch = runningProfiles.map((p) => `'${escapePowerShellSingleQuoted(p)}'`).join(", ");
-		const script = [
+/**
+ * Build the PowerShell watchdog script as a pure string.
+ *
+ * Extracted from startInstallWatchdog so the script's contract is testable
+ * without launching a real installer (the field failure on 2026-11-05 —
+ * upgrade to 0.2.193 recorded FAILED because the rename hit a still-held
+ * app.asar — was invisible to every existing suite).
+ */
+export function buildWatchdogScript(input: {
+	updaterLogPath: string;
+	appExe: string;
+	markerPath: string;
+	relaunch: string;
+	installerCopy: string;
+	armPid: number;
+	failureFileName: string;
+	watchdogTaskName: string;
+}): string {
+	const {
+		updaterLogPath, appExe, markerPath, relaunch, installerCopy,
+		armPid, failureFileName, watchdogTaskName,
+	} = input;
+	const exeName = "Pi Virtual Employee";
+	const FATAL = ""; // (reserved)
+	void FATAL;
+	return [
 			"$ErrorActionPreference = 'SilentlyContinue'",
 			"function Log($m) { Add-Content -Path $log -Value \"[$([DateTime]::UtcNow.ToString('o'))] $m\" }",
-			`$log = '${escapePowerShellSingleQuoted(updaterLogPath())}'`,
+			`$log = '${escapePowerShellSingleQuoted(updaterLogPath)}'`,
 			`$appExe = '${escapePowerShellSingleQuoted(appExe)}'`,
 			`$marker = '${escapePowerShellSingleQuoted(markerPath)}'`,
 			`$profileLaunch = @(${relaunch})`,
@@ -890,16 +895,16 @@ function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
 			// same install keeps the image name alive, which made phase0a stand
 			// down forever while the arming instance sat dead (0.2.36 field:
 			// instance B offline 11 min while instance A still ran).
-			`$armPid = ${process.pid}`,
+			`$armPid = ${armPid}`,
 			// Remove the scheduled task that launched us — the app also sweeps a
 			// stale task at startup, this covers the normal exit paths.
-			`& schtasks.exe /Delete /TN '${escapePowerShellSingleQuoted(WATCHDOG_TASK_NAME)}' /F | Out-Null`,
+			`& schtasks.exe /Delete /TN '${escapePowerShellSingleQuoted(watchdogTaskName)}' /F | Out-Null`,
 			"Log ('watchdog: started pid=' + $PID + ' profiles=[' + ($profileLaunch -join ',') + ']')",
 			// update-failures.json lives one directory up from logs/updater.log.
 			// The watchdog is an independent PowerShell process, so it bumps the
 			// machine-level consecutive-failure counter itself when the installer
 			// wedges — belt-and-braces alongside the app-side pending marker.
-			`$failuresFile = Join-Path (Split-Path (Split-Path $log -Parent) -Parent) '${FAILURE_FILE}'`,
+			`$failuresFile = Join-Path (Split-Path (Split-Path $log -Parent) -Parent) '${failureFileName}'`,
 			"function TestApp { return [bool](Get-Process -Name $exeName -ErrorAction SilentlyContinue) }",
 			"function TestInstaller { return [bool](Get-Process | Where-Object { $_.ProcessName -like 'Pi-Virtual-Employee-Setup*' }) }",
 			"function KillStaleInstallers {",
@@ -956,8 +961,23 @@ function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
 			// in-place fallback runs in the app-fully-dead configuration that
 			// every manual rescue proved fast.
 			"Log 'watchdog phase1: app exited; killing stale installers and running the update silently'",
-			"Get-Process -Name $exeName -ErrorAction SilentlyContinue | Stop-Process -Force",
-			"Start-Sleep -Seconds 2",
+			// KILL THE TREE, NOT JUST THE MAIN PROCESS (field 2026-11-05):
+			// Stop-Process -Force kills only the main process; Electron's
+			// renderer/gpu/utility children outlive it for a moment and keep the
+			// old app.asar FILE MAPPING alive. The rename below then fails with
+			// 'access denied' and NSIS falls back to the in-place path, exiting
+			// code=2 — the whole upgrade is recorded as FAILED while the app is
+			// still on the old version. taskkill /T takes the tree down the same
+			// way the app's own killOwnProcessTree does.
+			"Get-Process -Name $exeName -ErrorAction SilentlyContinue | ForEach-Object {",
+			"  $killed = $_.Id",
+			"  & taskkill.exe /pid $killed /t /f 2>&1 | Out-Null",
+			"  if (Get-Process -Id $killed -ErrorAction SilentlyContinue) { Stop-Process -Id $killed -Force -ErrorAction SilentlyContinue }",
+			"}",
+			// Children can linger a beat after their parent's handle closes; wait
+			// for the exe set to drain instead of a fixed 2s guess.
+			"$drain = (Get-Date).AddSeconds(15)",
+			"while ((Get-Date) -lt $drain -and (Get-Process -Name $exeName -ErrorAction SilentlyContinue)) { Start-Sleep -Milliseconds 500 }",
 			"KillStaleInstallers",
 			"Start-Sleep -Seconds 2",
 			// Root cause of all 8 outages on the cloud box (field, 2026-09-06):
@@ -968,15 +988,25 @@ function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
 			// fall back to in-place only if the rename is blocked by a locked file.
 			"$instDir = Split-Path $appExe -Parent",
 			"$oldDir = ''",
-			"try {",
-			"  $oldName = (Split-Path $instDir -Leaf) + '.old-' + (Get-Date -Format 'yyyyMMdd-HHmmss')",
-			"  Rename-Item -Path $instDir -NewName $oldName -ErrorAction Stop",
-			"  $oldDir = Join-Path (Split-Path $instDir -Parent) $oldName",
-			"  Log ('watchdog phase1: old install dir renamed out of the way -> ' + $oldDir)",
-			"} catch {",
-			"  $oldDir = ''",
-			"  Log ('watchdog phase1: rename of old install dir failed (locked?) — installing in place: ' + $_.Exception.Message)",
+			// Retry: a file mapping released microseconds ago still refuses the
+			// rename, and ONE refusal used to drop us onto the in-place path
+			// (which wedges). Three spaced attempts turn a transient linger into
+			// a success; genuine locks still fall through to the in-place path.
+			"$renameErr = ''",
+			"for ($attempt = 1; $attempt -le 3; $attempt++) {",
+			"  try {",
+			"    $oldName = (Split-Path $instDir -Leaf) + '.old-' + (Get-Date -Format 'yyyyMMdd-HHmmss')",
+			"    Rename-Item -Path $instDir -NewName $oldName -ErrorAction Stop",
+			"    $oldDir = Join-Path (Split-Path $instDir -Parent) $oldName",
+			"    Log ('watchdog phase1: old install dir renamed out of the way -> ' + $oldDir + ' (attempt ' + $attempt + ')')",
+			"    break",
+			"  } catch {",
+			"    $oldDir = ''",
+			"    $renameErr = $_.Exception.Message",
+			"    if ($attempt -lt 3) { Start-Sleep -Seconds 3 }",
+			"  }",
 			"}",
+			"if (-not $oldDir) { Log ('watchdog phase1: rename failed after 3 attempts (locked?) — installing in place: ' + $renameErr) }",
 			"$instProc = Start-Process -FilePath $installerCopy -ArgumentList '/S' -PassThru",
 			"$instDeadline = (Get-Date).AddSeconds(300)",
 			"while ($instProc -and (-not $instProc.HasExited) -and ((Get-Date) -lt $instDeadline)) { Start-Sleep -Seconds 5 }",
@@ -1011,7 +1041,39 @@ function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
 			"}",
 			"Log 'watchdog: direct app launch failed — exe missing or damaged; manual repair install required'",
 			"exit 2",
-		].join("\r\n");
+	].join("\r\n");
+}
+
+function startInstallWatchdog(): "wmi" | "schtasks" | "detached" | "failed" {
+	if (process.platform !== "win32" || !downloadedInstallerPath) {
+		log("WARN", "watchdog skipped: downloaded installer path unavailable");
+		return "failed";
+	}
+	try {
+		const dir = join(app.getPath("userData"), WATCHDOG_DIR);
+		mkdirSync(dir, { recursive: true });
+		const installerCopy = join(dir, basename(downloadedInstallerPath));
+		const scriptPath = join(dir, "watch-update.ps1");
+		const wrapperPath = join(dir, "watch-update.cmd");
+		const markerPath = join(dir, "completed.txt");
+		rmSync(markerPath, { force: true });
+		copyFileSync(downloadedInstallerPath, installerCopy);
+		const exeName = "Pi Virtual Employee";
+		const appExe = process.execPath;
+		// Snapshot the RUNNING instances now — after the quit it's too late
+		// (NSIS kills them all). Empty-string entry = default profile.
+		const runningProfiles = snapshotRunningProfiles();
+		const relaunch = runningProfiles.map((p) => `'${escapePowerShellSingleQuoted(p)}'`).join(", ");
+		const script = buildWatchdogScript({
+			updaterLogPath: updaterLogPath(),
+			appExe,
+			markerPath,
+			relaunch,
+			installerCopy,
+			armPid: process.pid,
+			failureFileName: FAILURE_FILE,
+			watchdogTaskName: WATCHDOG_TASK_NAME,
+		});
 		writeFileSync(scriptPath, script, "utf8");
 		// Task Scheduler's /TR is length- and quote-limited; a tiny .cmd wrapper
 		// keeps it to a single quoted path.

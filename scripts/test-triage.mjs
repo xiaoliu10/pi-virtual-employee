@@ -25,7 +25,7 @@ await build({
 	stdin: { contents: `export * from "./src/im/triage.ts";`, resolveDir: root, loader: "ts" },
 	outfile: bundle, bundle: true, platform: "node", format: "esm", packages: "external", logLevel: "silent",
 });
-const { triageMessage, countPlanSteps, isQuestion, hasLongRunningVerb } = await import(pathToFileURL(bundle).href);
+const { triageMessage, countPlanSteps, isQuestion, hasLongRunningVerb, isForegroundEscape, FOREGROUND_ESCAPE_HINT } = await import(pathToFileURL(bundle).href);
 
 const configBundle = join(outDir, "config.mjs");
 await build({
@@ -229,7 +229,11 @@ test(`dispatch WIRING: creates and fires with flag ${JSON.stringify(chatDispatch
 	// the mechanisms landed). It now promises ONLY what exists: automatic
 	// progress/completion pushes, and admin management from the task list.
 	assert.match(ack, /进展与完成会自动推送/);
-	assert.doesNotMatch(ack, /前台执行|\/stop/, "the ACK must not promise unbuilt mechanisms");
+	// 0.2.193: the escape mechanism EXISTS now (takeForegroundEscape + handle
+	// wiring), so the ACK must carry the hint again — promising it was only
+	// dishonest while the wording predated the mechanism (review P1-1).
+	assert.match(ack, /前台执行/, "the ACK must advertise the now-real escape hatch");
+	assert.doesNotMatch(ack, /\/stop/, "/stop targets the chat session, not the work item — still must not be promised");
 
 	const items = store.list();
 	assert.equal(items.length, 1, "exactly one work item must be created");
@@ -374,4 +378,14 @@ test("dispatch WIRING: a NON-ADMIN keeps executing inline (never swallowed)", as
 	);
 	assert.equal(ack, undefined, "a viewer must fall through to inline execution, not get an ACK");
 	assert.equal(store.list().length, 0, "and no work item may be created for them");
+});
+
+test("isForegroundEscape: exact phrase only — sentences containing the words must not hijack", () => {
+	for (const ok of ["前台执行", " 前台执行 ", "！前台执行。", "前台执行！", "。前台执行、"]) {
+		assert.equal(isForegroundEscape(ok), true, `must match: ${JSON.stringify(ok)}`);
+	}
+	for (const bad of ["", "前台执行一下", "请前台执行这个任务", "改为前台", "确认授权", "前台", "帮我前台执行一下再导出"]) {
+		assert.equal(isForegroundEscape(bad), false, `must NOT match: ${JSON.stringify(bad)}`);
+	}
+	assert.equal(FOREGROUND_ESCAPE_HINT.includes("前台执行"), true, "hint and matcher must agree on the phrase");
 });

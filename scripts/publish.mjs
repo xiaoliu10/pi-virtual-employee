@@ -22,6 +22,7 @@
  */
 import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
+import { statSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -417,9 +418,17 @@ async function publishToGitHub(artifacts) {
 	}
 	// latest.yml is the Gitee feed's metadata (its URLs point at Gitee) — not
 	// part of the GitHub release.
+	// The dmg BLOCKMAP rides along too: without it, a macOS updater on the
+	// GitHub feed falls back to a FULL dmg download every release (field
+	// 2026-11-05 — v0.2.193 shipped without it until uploaded by hand; the
+	// same gap sat un noticed since the v0.2.178-era GitHub leg).
+	const dmgBlockmapName = `${dmgName}.blockmap`;
+	const dmgBlockmapPath = join(releaseDir, dmgBlockmapName);
+	const dmgBlockmapSize = statSync(dmgBlockmapPath).size;
 	const ghArtifacts = [
 		...artifacts.filter((a) => a.name !== "latest.yml"),
 		{ name: dmgName, path: dmgPath, size: dmgSize },
+		{ name: dmgBlockmapName, path: dmgBlockmapPath, size: dmgBlockmapSize },
 	];
 	if (dryRun) {
 		console.log(`[publish] (dry-run) would push ${GH_TAG} to ${GH_REMOTE} and create the GitHub release with:`);

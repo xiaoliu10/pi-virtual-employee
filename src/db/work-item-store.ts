@@ -14,6 +14,8 @@ export interface WorkItemRow {
 	/** Only this source conversation receives outcome pushes. */
 	origin_conversation: string | null;
 	origin_note: string | null;
+	/** Structured provenance; NULL on rows created before the column existed. */
+	origin: string | null;
 	status: WorkItemStatus;
 	question: string | null;
 	next_check_at: number | null;
@@ -52,6 +54,13 @@ export interface CreateWorkItemInput {
 	goal: string;
 	originConversation?: string | null;
 	originNote?: string | null;
+	/**
+	 * Structured provenance. Callers should set this rather than relying on
+	 * `originNote` text: a free-text note is a claim, not evidence, and the old
+	 * `includes("聊天转派")` sniff let an injected row impersonate a chat-dispatched
+	 * task and self-schedule (2026-11-05). See scheduler/work-origin.ts.
+	 */
+	origin?: string | null;
 	status?: WorkItemStatus;
 	createdBy?: string | null;
 	createdChannel?: string | null;
@@ -70,6 +79,25 @@ export class WorkItemStore {
 		this.listeners.add(listener);
 		return () => { this.listeners.delete(listener); };
 	}
+
+	/**
+	 * True when the table actually has the `origin` column (legacy/minimal schemas
+	 * may not). Probed FRESH on every insert — caching a "missing" result made the
+	 * store drop origin FOREVER when the column was added later by a migration in
+	 * the same process (review P2: cached false survived the ALTER TABLE, inserts
+	 * kept writing NULL, and reads re-resolved those rows through the forgeable
+	 * note — the exact protection the column exists to provide, quietly lost).
+	 * create() is rare and PRAGMA table_info is microseconds: correctness over
+	 * micro-optimisation.
+	 */
+	private hasOriginColumn(): boolean {
+		try {
+			const cols = this.db.prepare("PRAGMA table_info(work_items)").all() as { name: string }[];
+			return cols.some((c) => c.name === "origin");
+		} catch {
+			return false;
+		}
+	}
 	private changed(id?: string): void {
 		for (const listener of this.listeners) listener(id);
 	}
@@ -80,16 +108,40 @@ export class WorkItemStore {
 			id: randomUUID(), title: input.title, goal: input.goal,
 			conditions: null, progress: null, lessons: null,
 			origin_conversation: input.originConversation ?? null,
-			origin_note: input.originNote ?? null, status: input.status ?? "proposed", priority: input.priority ?? 100,
+			origin_note: input.originNote ?? null,
+			// Structured provenance: never infer "who asked for this" from a sentence.
+			origin: input.origin ?? null,
+			status: input.status ?? "proposed", priority: input.priority ?? 100,
 			question: null, next_check_at: null, next_check_reason: null, fixed_streak: 0, fallback_streak: 0, timeout_streak: 0, max_minutes: null, last_remind_at: null, remind_count: 0, cadence_ms: null, kicked_off: 0,
 				created_by: input.createdBy ?? null,
 			created_channel: input.createdChannel ?? null,
 			resident: input.resident ? 1 : 0,
 			answer: null, created_at: now, updated_at: now,
 		};
-		this.db.prepare(`INSERT INTO work_items
+		// `origin` is new; a database that predates it (or a minimal schema built by a
+		// test) must still accept the insert. Writing a column the table lacks is a
+		// hard SQL error that silently degraded dispatch to inline execution, so the
+		// statement is chosen from the table's real columns.
+		const hasOrigin = this.hasOriginColumn();
+		this.db
+			.prepare(
+				hasOrigin
+					? `INSERT INTO work_items
+			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, origin, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, timeout_streak, max_minutes, last_remind_at, remind_count, cadence_ms, kicked_off, created_by, created_channel, priority, resident, answer, created_at, updated_at)
+			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @origin, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @timeout_streak, @max_minutes, @last_remind_at, @remind_count, @cadence_ms, @kicked_off, @created_by, @created_channel, @priority, @resident, @answer, @created_at, @updated_at)`
+					: `INSERT INTO work_items
 			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, timeout_streak, max_minutes, last_remind_at, remind_count, cadence_ms, kicked_off, created_by, created_channel, priority, resident, answer, created_at, updated_at)
-			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @timeout_streak, @max_minutes, @last_remind_at, @remind_count, @cadence_ms, @kicked_off, @created_by, @created_channel, @priority, @resident, @answer, @created_at, @updated_at)`).run(row);
+			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @timeout_streak, @max_minutes, @last_remind_at, @remind_count, @cadence_ms, @kicked_off, @created_by, @created_channel, @priority, @resident, @answer, @created_at, @updated_at)`,
+			)
+			.run(hasOrigin ? row : (() => {
+				// SQLite rejects named parameters the statement does not use.
+				const { origin: _origin, ...legacy } = row;
+				return legacy;
+			})());
+		// The returned row must reflect what IS on disk: without the column the
+		// origin was NOT persisted, whatever the caller passed in. Returning the
+		// caller's own value back would lie about the persisted state (review P2).
+		if (!hasOrigin) row.origin = null;
 		this.changed(row.id);
 		return row;
 	}
