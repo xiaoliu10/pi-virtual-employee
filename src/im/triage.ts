@@ -121,3 +121,14 @@ export function triageMessage(input: TriageInput, enabled: boolean): TriageDecis
  * always pull the work back into the foreground.
  */
 export const FOREGROUND_ESCAPE_HINT = "如需改为前台执行，回复「前台执行」";
+
+/**
+ * Exact foreground-escape phrase match, with isAuthorizationPhrase's punctuation
+ * tolerance. A bare 「前台执行」 pulls a chat-dispatched item back inline; any
+ * longer sentence containing those words is ordinary text and must NOT hijack
+ * a real request.
+ */
+export function isForegroundEscape(raw: string): boolean {
+	const t = (raw ?? "").trim().replace(/^[!！。.?？、,，…\s]+/, "").replace(/[!！。.?？、,，…\s]+$/, "");
+	return t === "前台执行";
+}

@@ -23,7 +23,7 @@ import { isAuthorizationPhrase } from "../engine/authorization.js";
 import { startStallWatchdog } from "./watchdog.js";
 import { splitForPush } from "./chunks.js";
 import { gateOutboundText } from "./credential-egress.js";
-import { triageMessage } from "./triage.js";
+import { FOREGROUND_ESCAPE_HINT, isForegroundEscape, triageMessage } from "./triage.js";
 import { chatHeartbeatOccurrenceId, DeliveryLedger } from "./delivery-ledger.js";
 import type { AdapterCapabilities, AdapterHealth, InboundMessage } from "./types.js";
 
@@ -206,6 +206,41 @@ export class IMAdapterManager {
 	 * retryable under the same id. Without it, behaviour is unchanged.
 	 */
 	/**
+	 * 「前台执行」escape hatch (router-worker design D6): pull a chat-dispatched
+	 * item back into the foreground.
+	 *
+	 * Convertible = dispatched FROM THIS conversation BY THIS sender (creator
+	 * only — another group member must not cancel someone else's task) and
+	 * still queued (not yet claimed) or scheduled (a window ended with a next
+	 * check). A WORKING item is refused honestly: its window is already
+	 * executing, so a foreground rerun would double-execute the work.
+	 *
+	 * Returns the ORIGINAL instruction to re-run inline (the goal preserves it
+	 * under [用户原始指令]), or a notice when nothing is convertible.
+	 * undefined = the message is not the escape phrase at all.
+	 */
+	private takeForegroundEscape(msg: InboundMessage): { original: string; notice?: string } | undefined {
+		if (!isForegroundEscape(msg.text)) return undefined;
+		const store = this.engine.workItems;
+		if (!store) return { original: "", notice: "当前没有可切换的前台任务（工作列表不可用）。" };
+		const convertible = store.list()
+			.filter((r) => r.origin_conversation === msg.conversationId
+				&& (r.origin_note ?? "").includes("聊天转派")
+				&& (r.created_by ?? null) === (msg.actor?.senderId ?? null)
+				&& (r.status === "queued" || r.status === "scheduled"))
+			.sort((a, b) => b.created_at - a.created_at)[0];
+		if (!convertible) {
+			return { original: "", notice: "没有可切换到前台的后台任务：只有仍排队或已计划下次跟进、且由你本人转派的任务可以切换；正在执行中的任务请先在控制台取消后再重新发送指令。" };
+		}
+		const marker = "[用户原始指令]\n";
+		const idx = (convertible.goal ?? "").lastIndexOf(marker);
+		const original = idx >= 0 ? convertible.goal.slice(idx + marker.length).trim() : "";
+		store.cancel(convertible.id);
+		console.log(`[im] foreground escape: cancelled item=${convertible.id} conv=${msg.conversationId} by=${msg.actor?.senderId ?? "?"}`);
+		return { original };
+	}
+
+	/**
 	 * Router → Worker dispatch (docs/design/router-worker.md P1).
 	 *
 	 * Returns the ACK text when the message was handed to a background work
@@ -275,15 +310,15 @@ export class IMAdapterManager {
 			const fired = bridge.fireItem(item.id);
 			console.log(`[im] dispatch triage: WORKER item=${item.id} steps=${decision.steps} fired=${fired} conv=${msg.conversationId}`);
 			const shortId = item.id.slice(0, 8);
-			// ACK promises only what EXISTS today (review P1-1: /stop targets the
-			// chat session, not the work item; 「前台执行」 and 「<id> 进度」 have no
-			// inbound handlers yet — the design-doc wording was copied before the
-			// mechanisms landed). Progress notes push automatically; admins manage
-			// the item from the 任务 list. Restore the richer wording when the
-			// deterministic inbound router lands.
+			// ACK promises only what EXISTS today. Progress notes push
+			// automatically; admins manage the item from the 任务 list; and the
+			// 「前台执行」 escape has a real inbound handler since 0.2.193 (the
+			// older ACK had to drop this hint because the wording predated the
+			// mechanism — review P1-1).
 			return [
 				`🚀 已转后台执行（编号 ${shortId}），进展与完成会自动推送回本会话。`,
 				`管理员可在控制台任务列表查看或取消该任务。`,
+				FOREGROUND_ESCAPE_HINT,
 			].join("\n");
 		} catch (err) {
 			// Never let dispatch break the turn: fall back to inline execution.
@@ -641,6 +676,22 @@ export class IMAdapterManager {
 						return await this.engine.confirmAuthorization(msg.conversationId, msg.actor, msg.conversationName);
 					}
 
+					// 「前台执行」escape hatch — deterministic, no model turn: cancel the
+					// convertible chat-dispatched item and re-run its ORIGINAL
+					// instruction inline. The re-run must skip plan-ahead AND triage:
+					// a foreground escape that re-dispatches to background would be
+					// absurd (field 2026-11-05: the dispatch label itself was the
+					// complaint — the escape is the cheap way out).
+					let turnText = msg.text;
+					const escaped = isForegroundEscape(turnText);
+					if (escaped) {
+						const esc = this.takeForegroundEscape(msg);
+						if (esc) {
+							if (!esc.original) return esc.notice!;
+							turnText = esc.original;
+						}
+					}
+
 					const agent = this.engine.getOrCreateSession(msg.conversationId);
 
 					// Long-task progress heartbeat: every `longTaskProgressMin` while a
@@ -708,7 +759,7 @@ export class IMAdapterManager {
 						// any failure or NO_PLAN verdict simply skips it — execution is
 						// never blocked by planning, and simple questions never see a plan.
 						let planText: string | undefined;
-						if (this.config.all().general.taskPlanning?.enabled !== false) {
+						if (!escaped && this.config.all().general.taskPlanning?.enabled !== false) {
 							try {
 								const plan = await this.engine.planTaskBrief(agent, msg.text, msg.conversationId);
 									if (plan) {
@@ -746,7 +797,7 @@ export class IMAdapterManager {
 							agent,
 							planText
 							? `[已向用户确认的执行规划，严格按此执行，完成后逐步对照汇报]\n${planText}\n\n[用户原始指令]\n${msg.text}`
-							: msg.text,
+							: turnText,
 							{ sendFile: ctx?.sendFile, sendImage: ctx?.sendImage, images: msg.images, actor: msg.actor, conversationName: msg.conversationName, onPersist: (id) => this.onActivity?.(id) },
 						);
 						// Final turn complete — signal the UI to refresh the task list.

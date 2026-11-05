@@ -664,14 +664,26 @@ export class WorkService<Session extends WorkSession> {
 			const scheduledAt = nowRow.next_check_at ?? nextCheckAt!;
 			const scheduledReason = nowRow.next_check_reason ?? nextReason;
 			const streak = nowRow.fixed_streak ?? 0;
+			const label = pushHeaderLabel(nowRow.origin_note);
 			const text = nowRow.status === "done"
-				? `✅ **自主任务完成：${nowRow.title}**\n\n${lastText}\n\n---\n\n💤 该任务已收尾，不再自动跟进。需要重开请在来源会话说明。`
+				? `✅ **${label}完成：${nowRow.title}**\n\n${lastText}\n\n---\n\n💤 该任务已收尾，不再自动跟进。需要重开请在来源会话说明。`
 				: nowRow.status === "scheduled"
-					? `🔁 **自主任务阶段进展：${nowRow.title}**\n\n${tailExcerpt(lastText, 500)}\n\n---\n\n⏭️ **下次跟进**：${new Date(scheduledAt).toLocaleString("zh-CN", { hour12: false })}${scheduledReason ? `\n📋 **跟进原因**：${scheduledReason}` : ""}${streak >= 3 ? `\n\n⚠️ **循环提醒**：已连续 ${streak} 次只在相近的固定时间跟进这一个点。如果这是因为它有新信息可查（如某个批次在该时刻生成），写明依据可继续；但记得覆盖今天其他观察点。若这件工作每天只在这一处查、且查了也不需要判断动作，可建议管理员转成定时任务，自主任务留给需要判断力的跟进。` : ""}`
-					: `⏸️ **自主任务需要人工：${nowRow.title}**\n\n${nowRow.question}\n\n---\n\n💡 **恢复方式**：管理员在来源会话直接回复答复内容（如验证码、预计解决时间）即可继续；恢复前不会自动执行。`;
+					? `🔁 **${label}阶段进展：${nowRow.title}**\n\n${tailExcerpt(lastText, 500)}\n\n---\n\n⏭️ **下次跟进**：${new Date(scheduledAt).toLocaleString("zh-CN", { hour12: false })}${scheduledReason ? `\n📋 **跟进原因**：${scheduledReason}` : ""}${streak >= 3 ? `\n\n⚠️ **循环提醒**：已连续 ${streak} 次只在相近的固定时间跟进这一个点。如果这是因为它有新信息可查（如某个批次在该时刻生成），写明依据可继续；但记得覆盖今天其他观察点。若这件工作每天只在这一处查、且查了也不需要判断动作，可建议管理员转成定时任务，自主任务留给需要判断力的跟进。` : ""}`
+					: `⏸️ **${label}需要人工：${nowRow.title}**\n\n${nowRow.question}\n\n---\n\n💡 **恢复方式**：管理员在来源会话直接回复答复内容（如验证码、预计解决时间）即可继续；恢复前不会自动执行。`;
 			try { await this.opts.push(fresh.origin_conversation, text); } catch (err) { this.opts.onError?.(err); }
 		}
 	}
+}
+
+/**
+ * Push-header family label by origin. Chat-dispatched items (origin_note
+ * 「从聊天转派（Router）」) are a chat message the Router moved to background —
+ * NOT the 自主任务 family — and labeling them so read as if the cron itself
+ * had gone autonomous (field 2026-11-05: a chat-dispatched rerun of a
+ * scheduled task's failed run pushed as 自主任务阶段进展). Exported for tests.
+ */
+export function pushHeaderLabel(originNote: string | null | undefined): string {
+	return (originNote ?? "").includes("聊天转派") ? "后台任务" : "自主任务";
 }
 
 /**

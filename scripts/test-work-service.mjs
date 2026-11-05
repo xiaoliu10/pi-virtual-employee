@@ -11,7 +11,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const tmp = await mkdtemp(join(root, "node_modules/.work-service-test-"));
 after(() => rm(tmp, { recursive: true, force: true }));
 buildSync({ stdin: { contents: 'export * from "./src/scheduler/work-service.ts"; export * from "./src/db/work-item-store.ts";', resolveDir: root, loader: "ts" }, outfile: join(tmp, "service.mjs"), bundle: true, platform: "node", format: "esm", packages: "external" });
-const { WorkService, WorkItemStore, buildWorkLearning } = await import(pathToFileURL(join(tmp, "service.mjs")));
+const { WorkService, WorkItemStore, buildWorkLearning, pushHeaderLabel } = await import(pathToFileURL(join(tmp, "service.mjs")));
 const schema = (await readFile(join(root, "src/db/sqlite.ts"), "utf8")).match(/CREATE TABLE IF NOT EXISTS work_items \([\s\S]*?\);/)[0];
 const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(r => setImmediate(r)); };
 function deferred() { let resolve, reject; const promise = new Promise((r, j) => { resolve = r; reject = j; }); return { promise, resolve, reject }; }
@@ -1158,4 +1158,27 @@ test("concurrency: stop() aborts EVERY in-flight window and leaves nothing runni
 	assert.deepEqual([...h.aborted].sort(), [a.id, b.id, c.id].sort(), "all three aborted");
 	gate.resolve({ reply: "[[TASK_DONE]]" }); await stopping; await flush();
 	assert.equal(h.store.get(c.id).status, "waiting_human", "each window persists its own stop");
+});
+
+test("push headers follow ORIGIN: chat-dispatched items push as 后台任务, mined/proposed as 自主任务", async t => {
+	// Field 2026-11-05: a chat-dispatched rerun of a SCHEDULED task's failed run
+	// pushed as 「自主任务阶段进展」 — read as if the cron itself had gone
+	// autonomous. The header family must follow origin_note, not the entity.
+	assert.equal(pushHeaderLabel("从聊天转派（Router）"), "后台任务");
+	assert.equal(pushHeaderLabel(null), "自主任务");
+	assert.equal(pushHeaderLabel(undefined), "自主任务");
+	assert.equal(pushHeaderLabel("[dt:manager5792 / s1] 挖掘来源"), "自主任务");
+
+	// Integration: a chat-dispatched item settling into NEXT_CHECK pushes the
+	// 后台任务 header; a mined-style item in the SAME situation pushes 自主任务.
+	const h = fixture(t, { send: () => ({ reply: "阶段成果\n[[NEXT_CHECK]]: 30m | tengine 慢，下个窗口重试" } )});
+	const chatItem = h.create("queued", { originNote: "从聊天转派（Router）" });
+	const minedItem = h.create("queued", { originNote: "[dt:u2 / s9] 挖掘：重复行为" });
+	h.service.start(); await flush();
+	await h.clock.advance(31 * 60_000);
+	await flush();
+	const progressPushes = h.pushes.filter(p => p.text.includes("阶段进展"));
+	assert.ok(progressPushes.length >= 2, `both settles must push progress: ${JSON.stringify(h.pushes.map(p => p.text.slice(0, 30)))}`);
+	assert.ok(progressPushes.some(p => p.text.includes("🔁 **后台任务阶段进展：")), "chat-dispatched item must push the 后台任务 header");
+	assert.ok(progressPushes.some(p => p.text.includes("🔁 **自主任务阶段进展：")), "mined item must keep the 自主任务 header");
 });
