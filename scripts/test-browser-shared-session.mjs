@@ -9,7 +9,9 @@
  *     "revoking consent actually removes the credential copies").
  */
 import { existsSync, mkdirSync, rmSync, statSync, utimesSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 import { tmpdir } from "node:os";
 import assert from "node:assert/strict";
 import { PageOwnership } from "../src/browser/shared-session.ts";
@@ -132,4 +134,69 @@ assert.ok(CONSENT_COPY.body.includes("删除") || CONSENT_COPY.revokeNote.includ
 	"the consent text must tell the user the copies get deleted");
 
 rmSync(profileDir, { recursive: true, force: true });
+
+// --- BrowserService: a page creation that COMPLETES after an ownership change
+// must not override it (review P1, reproduced with a delayed newPage()).
+{
+	const { build } = await import("esbuild");
+	// Under the repo's node_modules so the external "playwright" import resolves.
+	const bdir = join(repoRoot, "node_modules", `.bs-race-test-${process.pid}`);
+	rmSync(bdir, { recursive: true, force: true });
+	mkdirSync(bdir, { recursive: true });
+	await build({
+		entryPoints: [join(repoRoot, "src/browser/browser-service.ts")],
+		outfile: join(bdir, "bs.mjs"), bundle: true, platform: "node", format: "esm",
+		packages: "external", logLevel: "silent",
+	});
+	const { BrowserService } = await import(pathToFileURL(join(bdir, "bs.mjs")).href);
+
+	function page2(name) {
+		let closed = false;
+		return {
+			name, url: () => `https://x/${name}`,
+			isClosed: () => closed,
+			close: () => { closed = true; return Promise.resolve(); },
+			setDefaultNavigationTimeout() {}, on() {}, title: async () => name,
+		};
+	}
+	const pending = [];   // resolvers for deferred newPage() calls
+	const open = [];
+	const fakeContext = {
+		pages: () => [...open],
+		on() {},
+		newPage: () => new Promise((resolve) => pending.push(resolve)),
+	};
+	const config = { all: () => ({ browser: { headless: true, allowedDomains: [], useRealProfile: false } }) };
+	const bs = new BrowserService(config, bdir);
+	// Bypass launch(): the race is in ownership, not Chromium.
+	bs.context = fakeContext;
+
+	// RACE 1 — pending getPage("A") + switchPage("A", 0): the takeover must win.
+	const target = page2("target");
+	open.push(target);
+	const pA = bs.getPage("A");
+	await Promise.resolve();   // let getPage reach the newPage() await
+	await bs.switchPage("A", 0);   // A takes over the (unowned) target tab
+	assert.equal(bs.pages.get("A"), target, "takeover registered before creation finished");
+	const late = page2("late");
+	pending[0](late);
+	const got = await pA;
+	assert.equal(got, target, "the takeover must win over the stale creation");
+	assert.ok(late.isClosed(), "the stale page must be closed, not leaked");
+	assert.equal(bs.pages.get("A"), target, "registry still points at the takeover target");
+	assert.equal(bs.pages.get("B"), undefined);
+
+	// RACE 2 — pending getPage + releasePage: the released owner must NOT be resurrected.
+	const pA2 = bs.getPage("A2");
+	await Promise.resolve();
+	await bs.releasePage("A2");
+	const late2 = page2("late2");
+	pending[1](late2);
+	await assert.rejects(pA2, /过期/, "a creation that raced a release must fail honestly, not resurrect");
+	assert.ok(late2.isClosed(), "the resurrected page must be closed");
+	assert.equal(bs.pages.get("A2"), undefined, "the released owner stays released");
+
+	rmSync(bdir, { recursive: true, force: true });
+}
+
 console.log("test-browser-shared-session: OK");

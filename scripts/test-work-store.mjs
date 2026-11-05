@@ -20,6 +20,33 @@ function fixture(t) {
 	t.after(() => db.close());
 	return { db, store: new WorkItemStore({ prepare: (sql) => db.prepare(sql) }) };
 }
+test("origin column added AFTER first insert is picked up on the next insert (no stale probe)", t => {
+	// Review P2: caching the first probe let a store opened against a LEGACY table
+	// (no origin column) drop origin forever, even after the migration added the
+	// column in the same process — inserts kept writing NULL and reads fell back
+	// to the forgeable note.
+	const db = new DatabaseSync(":memory:");
+	const legacySchema = schema.replace(/\n\s*origin\s+TEXT,/, "");
+	assert.ok(!/\n\s*origin\s+TEXT,/.test(legacySchema), "fixture really lacks the column");
+	db.exec(legacySchema);
+	// `answer` rides the same migration; add it so only `origin` is under test.
+	if (!db.prepare("PRAGMA table_info(work_items)").all().some((c) => c.name === "answer")) {
+		db.exec("ALTER TABLE work_items ADD COLUMN answer TEXT");
+	}
+	const store = new WorkItemStore({ prepare: (sql) => db.prepare(sql) });
+	t.after(() => db.close());
+
+	const first = store.create({ title: "t1", goal: "g", origin: "injected", status: "queued" });
+	assert.equal(first.origin, null, "returned row reflects what was actually persisted (no column)");
+
+	db.exec("ALTER TABLE work_items ADD COLUMN origin TEXT");
+
+	const second = store.create({ title: "t2", goal: "g", origin: "injected", status: "queued" });
+	assert.equal(second.origin, "injected", "the SAME store instance must see the new column");
+	const persisted = db.prepare("SELECT origin FROM work_items WHERE id = ?").get(second.id);
+	assert.equal(persisted.origin, "injected", "origin must land in the DB after the late migration, not silently NULL");
+});
+
 function create(store, status = "proposed") { return store.create({ title: "月末对账", goal: "核对流水", status, createdBy: "proposer", originConversation: "dt:source" }); }
 
 test("confirm atomically records confirming admin and queues only proposals", t => {

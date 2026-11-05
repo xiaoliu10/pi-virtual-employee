@@ -95,6 +95,14 @@ export class BrowserService {
 	private readonly pages = new PageOwnership();
 	/** owner → in-flight page creation, so concurrent opens share one page. */
 	private readonly pendingPages = new Map<string, Promise<Page>>();
+	/**
+	 * Bumped on EVERY ownership-registry mutation, so an in-flight page creation
+	 * can detect that the world changed while it awaited newPage(). Without it a
+	 * stale creation overwrote a takeover (handing the owner back the page it had
+	 * just lost) and resurrected a released owner — both reproduced with a delayed
+	 * newPage() in review round 2.
+	 */
+	private ownershipVersion = 0;
 	/** 共享的 context 启动 promise：并发首次访问时只 launch 一次。 */
 	private launching: Promise<void> | null = null;
 	private downloadHandler: DownloadHandler | null = null;
@@ -160,19 +168,39 @@ export class BrowserService {
 		// through the global tab index.
 		const inflight = this.pendingPages.get(ownerId);
 		if (inflight) return inflight;
-		const creating = this.createPageFor(ownerId).finally(() => {
+		const creating = this.createPageFor(ownerId, this.ownershipVersion).finally(() => {
 			this.pendingPages.delete(ownerId);
 		});
 		this.pendingPages.set(ownerId, creating);
 		return creating;
 	}
 
-	/** Create + register the owner's page, wiring popup ownership by EVENT-TIME lookup. */
-	private async createPageFor(ownerId: string): Promise<Page> {
+	/**
+	 * Create + register the owner's page, wiring popup ownership by EVENT-TIME
+	 * lookup. `atVersion` is the ownership version captured when the request
+	 * started: newPage() takes real time, and whatever the registry says AT
+	 * COMPLETION wins over this stale creation (review P1).
+	 */
+	private async createPageFor(ownerId: string, atVersion: number): Promise<Page> {
 		if (!this.context) throw new Error("浏览器上下文不可用");
 		const page = await this.context.newPage();
 		page.setDefaultNavigationTimeout(NAV_TIMEOUT);
 		this.watchPopups(page);
+		// The registry — not this creation — decides who owns what NOW.
+		const current = this.pages.get(ownerId);
+		if (current) {
+			// Ownership moved while we awaited (takeover / popup adoption): the
+			// fresh page is redundant. Close it and hand back the registry's page.
+			await page.close().catch(() => {});
+			return current;
+		}
+		if (this.ownershipVersion !== atVersion) {
+			// Released (or registry cleared) while we awaited: registering would
+			// resurrect an owner nobody asked for. Close the stray page and fail
+			// the caller honestly — a retry starts a fresh, valid creation.
+			await page.close().catch(() => {});
+			throw new Error("页面创建已过期：等待期间页面所有权已变更，请重试");
+		}
 		this.pages.set(ownerId, page);
 		return page;
 	}
@@ -205,6 +233,7 @@ export class BrowserService {
 	/** 把弹窗接管为 owner 的当前页（递归：弹窗再开弹窗同样跟随）。 */
 	private adoptPopup(ownerId: string, popup: Page): void {
 		popup.setDefaultNavigationTimeout(NAV_TIMEOUT);
+		this.ownershipVersion++;
 		this.pages.set(ownerId, popup);
 		// Same event-time rule for popups opened BY a popup.
 		this.watchPopups(popup);
@@ -248,6 +277,7 @@ export class BrowserService {
 		// tab can never have two live owners (review P2-6 — logging alone still
 		// left both driving it). The previous owner opens a fresh page next call.
 		const previous = this.pages.takeover(ownerId, target);
+		this.ownershipVersion++;
 		if (previous && previous !== ownerId) {
 			console.log(`[browser] tab takeover: owner ${ownerId} took the tab owned by ${previous} (it gets a fresh page on its next call)`);
 		}
@@ -263,6 +293,7 @@ export class BrowserService {
 		const heldBy = this.pages.ownedBy(target);
 		await target.close().catch(() => {});
 		this.pages.forgetByPage(target);
+		this.ownershipVersion++;
 		// Closing another owner's current tab is allowed (the list is global) but
 		// must be traceable, never silent.
 		if (heldBy && heldBy !== ownerId) {
@@ -275,6 +306,7 @@ export class BrowserService {
 	async releasePage(ownerId: string): Promise<void> {
 		const page = this.pages.get(ownerId);
 		this.pages.forget(ownerId);
+		this.ownershipVersion++;
 		try {
 			if (page && !page.isClosed()) await page.close();
 		} catch (err) {

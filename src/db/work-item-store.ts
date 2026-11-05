@@ -80,22 +80,23 @@ export class WorkItemStore {
 		return () => { this.listeners.delete(listener); };
 	}
 
-	/** Cached: does this database's work_items table carry the `origin` column? */
-	private originColumn: boolean | null = null;
-
 	/**
-	 * True when `origin` exists. Cached after the first probe, and re-probed if the
-	 * insert ever fails, so a store opened before migration still works afterwards.
+	 * True when the table actually has the `origin` column (legacy/minimal schemas
+	 * may not). Probed FRESH on every insert — caching a "missing" result made the
+	 * store drop origin FOREVER when the column was added later by a migration in
+	 * the same process (review P2: cached false survived the ALTER TABLE, inserts
+	 * kept writing NULL, and reads re-resolved those rows through the forgeable
+	 * note — the exact protection the column exists to provide, quietly lost).
+	 * create() is rare and PRAGMA table_info is microseconds: correctness over
+	 * micro-optimisation.
 	 */
 	private hasOriginColumn(): boolean {
-		if (this.originColumn !== null) return this.originColumn;
 		try {
 			const cols = this.db.prepare("PRAGMA table_info(work_items)").all() as { name: string }[];
-			this.originColumn = cols.some((c) => c.name === "origin");
+			return cols.some((c) => c.name === "origin");
 		} catch {
-			this.originColumn = false;
+			return false;
 		}
-		return this.originColumn;
 	}
 	private changed(id?: string): void {
 		for (const listener of this.listeners) listener(id);
@@ -121,9 +122,10 @@ export class WorkItemStore {
 		// test) must still accept the insert. Writing a column the table lacks is a
 		// hard SQL error that silently degraded dispatch to inline execution, so the
 		// statement is chosen from the table's real columns.
+		const hasOrigin = this.hasOriginColumn();
 		this.db
 			.prepare(
-				this.hasOriginColumn()
+				hasOrigin
 					? `INSERT INTO work_items
 			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, origin, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, timeout_streak, max_minutes, last_remind_at, remind_count, cadence_ms, kicked_off, created_by, created_channel, priority, resident, answer, created_at, updated_at)
 			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @origin, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @timeout_streak, @max_minutes, @last_remind_at, @remind_count, @cadence_ms, @kicked_off, @created_by, @created_channel, @priority, @resident, @answer, @created_at, @updated_at)`
@@ -131,11 +133,15 @@ export class WorkItemStore {
 			(id, title, goal, conditions, progress, lessons, origin_conversation, origin_note, status, question, next_check_at, next_check_reason, fixed_streak, fallback_streak, timeout_streak, max_minutes, last_remind_at, remind_count, cadence_ms, kicked_off, created_by, created_channel, priority, resident, answer, created_at, updated_at)
 			VALUES (@id, @title, @goal, @conditions, @progress, @lessons, @origin_conversation, @origin_note, @status, @question, @next_check_at, @next_check_reason, @fixed_streak, @fallback_streak, @timeout_streak, @max_minutes, @last_remind_at, @remind_count, @cadence_ms, @kicked_off, @created_by, @created_channel, @priority, @resident, @answer, @created_at, @updated_at)`,
 			)
-			.run(this.hasOriginColumn() ? row : (() => {
+			.run(hasOrigin ? row : (() => {
 				// SQLite rejects named parameters the statement does not use.
 				const { origin: _origin, ...legacy } = row;
 				return legacy;
 			})());
+		// The returned row must reflect what IS on disk: without the column the
+		// origin was NOT persisted, whatever the caller passed in. Returning the
+		// caller's own value back would lie about the persisted state (review P2).
+		if (!hasOrigin) row.origin = null;
 		this.changed(row.id);
 		return row;
 	}
