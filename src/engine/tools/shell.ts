@@ -583,7 +583,18 @@ export function createManageProcessTool(deps: ShellToolDeps): AgentTool {
 					status: entry.process.status, code: entry.process.code, timeoutSec: entry.process.timeoutSec,
 					startedAt: entry.process.startedAt, background: entry.background,
 				}));
-				return { content: [{ type: "text", text: rows.length ? JSON.stringify(rows, null, 2) : "当前对话没有可访问的命令会话。" }], details: { sessions: rows } };
+				// Anti-duplicate hint (field 2026-11-06): one window started the same
+				// long-lived driver script FOUR times because nothing told it an
+				// identical one was already running. A plain list is easy to skim
+				// past, so say it explicitly.
+				const running = rows.filter((r) => r.status === "running");
+				const byCommand = new Map<string, number>();
+				for (const r of running) byCommand.set(r.command, (byCommand.get(r.command) ?? 0) + 1);
+				const dupes = [...byCommand.entries()].filter(([, n]) => n > 1);
+				const dupNote = dupes.length
+					? `\n\n⚠️ 有 ${dupes.length} 条命令存在重复运行实例（同一条命令被启动了多次），先 kill 掉多余实例再启动新的：\n${dupes.map(([cmd, n]) => `  · ${n} 个：${cmd.slice(0, 120)}`).join("\n")}\n常驻/循环脚本（while True、文件轮询、等待输入的驱动）在任务结束或不再需要时必须 kill；启动前先 list 确认没有同类在跑。`
+					: "";
+				return { content: [{ type: "text", text: rows.length ? JSON.stringify(rows, null, 2) + dupNote : "当前对话没有可访问的命令会话。" }], details: { sessions: rows, duplicates: dupes.length } };
 			}
 			const entry = sessionId ? sessions.get(sessionId) : undefined;
 			if (!entry || !own(entry)) return refuse("找不到可访问的命令会话；请使用当前对话的 manage_process list 查询。应用重启后旧会话失效。");

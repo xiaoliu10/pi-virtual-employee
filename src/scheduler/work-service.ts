@@ -68,6 +68,11 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	 * references unregistered tools (save_to_knowledge needs learn enabled). */
 	kbFeatures?(): { search: boolean; learn: boolean };
 	learn?(item: WorkItemRow, result: string): void | Promise<void>;
+	/** Kill background processes this item's window left running, called when the
+	 * item reaches DONE (field 2026-11-06: a finished task's driver script kept
+	 * polling files and holding profile locks). Never called for aborted or
+	 * deferred windows — those continue on the same item. */
+	reclaimBackground?(itemId: string): void;
 	budget?: { maxTurns: number; maxMinutes: number };
 	/** Window progress broadcaster (v0.2.171): main.ts injects the same
 	 * ProgressNotifier factory the scheduled-task runner uses, so a work window
@@ -681,6 +686,14 @@ export class WorkService<Session extends WorkSession> {
 			try {
 				if (this.opts.canLearn?.() !== false) await this.opts.learn?.(fresh, lastText);
 			} catch (err) { this.opts.onError?.(err); }
+			// Field 2026-11-06 (Nova): a work window started a long-lived driver script
+			// (`sls_drv.py`, `while True` + file polling), finished its job (SUCCESS_2FA
+			// in its log) and the script kept running — four copies eventually, all
+			// holding profile locks and burning file polling. A FINISHED task must not
+			// leave background work behind: nothing will ever come back to collect it.
+			// (An aborted/timed-out window is different — NEXT_CHECK continues on the
+			// same work and legitimately keeps its script; see abortSession.)
+			try { this.opts.reclaimBackground?.(fresh.id); } catch (err) { this.opts.onError?.(err); }
 		}
 		if (fresh.origin_conversation) {
 			// Re-read immediately before pushing: a pause/cancel landing between the

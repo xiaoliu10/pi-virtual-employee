@@ -990,6 +990,12 @@ ${tailForProgress(decision.text)}`;
 			},
 		}),
 		release: (convId) => browser.releasePage(convId),
+		// A FINISHED task must not leave its driver scripts running (field
+		// 2026-11-06: four sls_drv.py copies kept polling files after success).
+		reclaimBackground: (itemId) => {
+			const killed = stopBackgroundProcesses(config, `work:${itemId}`);
+			if (killed.length > 0) console.log(`[main] done reclaim: ${killed.length} background process(es) killed for work:${itemId}`);
+		},
 		// Work windows report on the TASK cadence (taskProgressMin, default 30),
 		// not the chat cadence: a window runs for maxMinutes and its final report is
 		// the deliverable, so chat-frequency notes are noise (v0.2.171).

@@ -39,7 +39,7 @@ function SENTINEL_DEADLINE(h) {
 function fixture(t, overrides = {}) {
 	const db = new DatabaseSync(":memory:"); db.exec(schema);
 	if (!db.prepare("PRAGMA table_info(work_items)").all().some(c => c.name === "answer")) db.exec("ALTER TABLE work_items ADD COLUMN answer TEXT");
-	const h = { db, store: new WorkItemStore({ prepare: sql => db.prepare(sql) }), clock: new Clock(), sends: [], pushes: [], learned: [], released: [], errors: [], aborted: [], abortOpts: [], gates: [], admin: true };
+	const h = { db, store: new WorkItemStore({ prepare: sql => db.prepare(sql) }), clock: new Clock(), sends: [], pushes: [], learned: [], released: [], errors: [], aborted: [], abortOpts: [], reclaimed: [], gates: [], admin: true };
 	h.service = new WorkService({
 		store: h.store, clock: h.clock, budget: { maxTurns: 3, maxMinutes: 30 },
 		isAdmin: id => h.admin && id === "admin",
@@ -48,6 +48,7 @@ function fixture(t, overrides = {}) {
 		release: async cid => { h.released.push(cid); if (overrides.release) await overrides.release(h); },
 		push: async (cid, text) => { h.pushes.push({ cid, text }); if (overrides.push) await overrides.push(h); },
 		learn: (item, result) => { h.learned.push({ item, result }); },
+		reclaimBackground: (itemId) => { h.reclaimed.push(itemId); },
 		onError: err => h.errors.push(err),
 		lastInboundAt: overrides.lastInboundAt ? (cid, sinceTs) => overrides.lastInboundAt(cid, sinceTs) : undefined,
 		...overrides.options,
@@ -1203,4 +1204,29 @@ test("time-budget abort carries preserveBackground (NEXT_CHECK continuation)", a
 	assert.ok(seen, "the abort must carry opts");
 	assert.equal(seen.opts?.preserveBackground, true, "timeout deferral MUST preserve background work (NEXT_CHECK continuation)");
 	gate.resolve({ reply: "[[TASK_DONE]]" });
+});
+
+
+// field 2026-11-06 (2nd round): a FINISHED task must not leave its driver script
+// running (four sls_drv.py copies kept polling files + holding profile locks
+// after the login had already succeeded). Deferred/aborted windows are NOT done
+// and must keep their background work.
+test("DONE reclaims the window's background processes; a deferred window does not", async t => {
+	const h = fixture(t, { send: () => ({ reply: "成果\n[[TASK_DONE]]" }) });
+	const item = h.create("queued");
+	await h.service.start();
+	await flush();
+	await h.service.whenIdle();
+	assert.equal(h.store.get(item.id).status, "done");
+	assert.deepEqual(h.reclaimed, [item.id], "reaching DONE must reclaim background processes exactly once");
+});
+
+test("a window that defers (NEXT_CHECK) does NOT reclaim", async t => {
+	const h = fixture(t, { send: () => ({ reply: "进度：第一批已入库\n[[NEXT_CHECK]]: 30m" }) });
+	const item = h.create("queued");
+	await h.service.start();
+	await flush();
+	await h.service.whenIdle();
+	assert.equal(h.store.get(item.id).status, "scheduled", "the item continues next window");
+	assert.deepEqual(h.reclaimed, [], "a continuing item keeps its background work");
 });
