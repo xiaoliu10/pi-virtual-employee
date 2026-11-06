@@ -327,15 +327,29 @@ const SELF_CLEANUP_MARKERS = [
 	"自己启动的资源，自己清理，绝不向人请示",
 	"「要不要我杀掉残留的 chrome / 释放锁」这类请示属于把本职推给用户，明确禁止",
 	"只有一种情况需要先问：清理动作可能破坏**别人**正在进行的工作",
-	"共享 profile 被占用时，换副本，不要抢占也不要清理",
-	"绝不打开、修改、或杀掉占用方来「腾出」master",
-	"杀进程「释放锁」会让另一个并发任务当场失败",
+];
+// The user's 2026-11-06 ruling: the Hermes model (ONE browser per profile,
+// many tab owners) is the ONLY browser path — no profile clones, no rival
+// launches, and taskkill is an incident, not a cleanup.
+const SHARED_TABS_MARKERS = [
+	"浏览器并发 = 共享浏览器的多个标签页",
+	"任务之间是标签页隔离",
+	"不要自己 connect_over_cdp、不要克隆 profile 目录、不要绕过 shim 起第二个浏览器",
+	"**绝不 taskkill chrome/浏览器进程**——那会杀掉其他正在运行任务的页面，属于事故，不是清理",
 ];
 
 test("self-started resources are cleaned up without asking the human (field 2026-11-06)", () => {
 	const prompt = buildSystemPrompt({ ...BASE, ...ALL_ON });
 	for (const marker of SELF_CLEANUP_MARKERS) assert.ok(prompt.includes(marker), `missing marker: ${marker}`);
 	assert.equal((prompt.match(/自己启动的资源，自己清理，绝不向人请示/g) ?? []).length, 1, "rule must not be duplicated");
+	for (const marker of SHARED_TABS_MARKERS) assert.ok(prompt.includes(marker), `missing marker: ${marker}`);
+});
+
+test("shared-browser tabs rule survives custom rules and unattended runs", () => {
+	const custom = buildSystemPrompt({ ...BASE, ...ALL_ON, rules: "只回答「你好」。" });
+	for (const marker of SHARED_TABS_MARKERS) assert.ok(custom.includes(marker), `custom dropped: ${marker}`);
+	const scheduled = buildSystemPrompt({ ...BASE, ...ALL_ON, isScheduledRun: true });
+	for (const marker of SHARED_TABS_MARKERS) assert.ok(scheduled.includes(marker), `scheduled dropped: ${marker}`);
 });
 
 test("the cleanup/concurrency rules survive custom rules and unattended runs", () => {
