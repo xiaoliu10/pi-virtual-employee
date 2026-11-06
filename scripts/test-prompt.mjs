@@ -284,3 +284,35 @@ test("the concurrency rule is capability-gated: no browser -> no profile rule", 
 	const noBrowser = buildSystemPrompt({ ...BASE, ...ALL_ON, browserEnabled: false });
 	for (const marker of CONCURRENCY_MARKERS) assert.ok(!noBrowser.includes(marker), `rule leaked without browser: ${marker}`);
 });
+
+// Field 2026-11-06 (box Nova 17:40-17:50): five autonomous tasks "finished" and
+// then spun for ten minutes each — 收尾验证 → write chk_bastion_session.py → run
+// it → "再核实一次" → write chk_envs.py → run it → … The settle rule was
+// effectively decorative: nothing told the model that verification is BOUNDED.
+// Ordinary time-window watchdogs cannot catch this, because every step is a
+// brand-new tool call with fresh content.
+const SETTLE_MARKERS = [
+	"收尾验证有次数上限，验完即止",
+	"同一目标最多做**两轮**验证",
+	"两轮之后无论结论如何都必须给出最终答复",
+	"不得再开新一轮核对",
+	"不得用新的临时脚本代替汇报",
+	"证据不足就如实说「未能验证」",
+];
+
+test("settle verification is bounded — two rounds, then answer (field 2026-11-06)", () => {
+	const prompt = buildSystemPrompt({ ...BASE, ...ALL_ON });
+	for (const marker of SETTLE_MARKERS) assert.ok(prompt.includes(marker), `missing settle marker: ${marker}`);
+	assert.equal((prompt.match(/收尾验证有次数上限，验完即止/g) ?? []).length, 1, "rule must not be duplicated");
+});
+
+test("the settle bound survives custom rules and unattended runs", () => {
+	const custom = buildSystemPrompt({ ...BASE, ...ALL_ON, rules: "只回答「你好」。" });
+	for (const marker of SETTLE_MARKERS) assert.ok(custom.includes(marker), `custom rules dropped: ${marker}`);
+	// An unattended scheduled run is exactly where an unbounded "verify again"
+	// loop costs the most: nobody is watching to send /stop.
+	const scheduled = buildSystemPrompt({ ...BASE, ...ALL_ON, isScheduledRun: true });
+	for (const marker of SETTLE_MARKERS) assert.ok(scheduled.includes(marker), `scheduled run dropped: ${marker}`);
+	const minimal = buildSystemPrompt({ ...BASE, ...ALL_OFF });
+	for (const marker of SETTLE_MARKERS) assert.ok(minimal.includes(marker), `all-off dropped: ${marker}`);
+});

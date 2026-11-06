@@ -1330,3 +1330,20 @@ test("a gate-demoted window KEEPS the history (so the second strike escalates)",
 	assert.equal(h.store.get(item.id).status, "waiting_human");
 	assert.deepEqual(h.runawayCleared, [], "the demotion must not erase the evidence it acted on");
 });
+
+test("postpone gate leaves a TIME-BUDGET deferral alone (legal continuation, not a spin)", async (t) => {
+	// A window that ran out of wall clock is taught to write progress and continue
+	// on the NEXT_CHECK — the canonical long-task shape. It must not be demoted
+	// just because one transient loop was caught earlier in the sliding window.
+	const h = fixture(t, { send: () => new Promise(() => {}) }); // never replies → deadline aborts
+	h.runaway = 1;
+	const item = h.create("queued");
+	await h.service.start();
+	await flush();
+	await h.clock.advance(31 * 60_000); // past maxMinutes
+	await flush();
+	await h.service.whenIdle();
+	const row = h.store.get(item.id);
+	assert.equal(row.status, "scheduled", "a time-budget deferral must keep its follow-up window");
+	assert.ok(!/循环空转/.test(row.question ?? ""), "and must not be described as a spin");
+});

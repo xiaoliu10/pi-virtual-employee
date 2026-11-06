@@ -689,7 +689,11 @@ export class WorkService<Session extends WorkSession> {
 				// admin (waiting_human, honest copy). Second kill inside the sliding
 				// window (admin resumed and it looped again): say so and recommend
 				// cancelling or splitting instead of resuming again.
-				if (outcome === "scheduled") {
+				// `!timeoutDeferred`: a window that hit its TIME BUDGET is a legal
+				// continuation (work.ts teaches "scan, write results, continue next
+				// window"), not a spin. It must survive the gate even if this item was
+				// caught by one transient loop earlier in the sliding window.
+				if (outcome === "scheduled" && !timeoutDeferred) {
 					// KEY ALIGNMENT: the engine counts watchdog soft-stops under the
 					// session id it saw the tools through — `work:<itemId>` for a window
 					// (WorkService.open uses that id, engine's send keys on
