@@ -39,11 +39,11 @@ function SENTINEL_DEADLINE(h) {
 function fixture(t, overrides = {}) {
 	const db = new DatabaseSync(":memory:"); db.exec(schema);
 	if (!db.prepare("PRAGMA table_info(work_items)").all().some(c => c.name === "answer")) db.exec("ALTER TABLE work_items ADD COLUMN answer TEXT");
-	const h = { db, store: new WorkItemStore({ prepare: sql => db.prepare(sql) }), clock: new Clock(), sends: [], pushes: [], learned: [], released: [], errors: [], aborted: [], gates: [], admin: true };
+	const h = { db, store: new WorkItemStore({ prepare: sql => db.prepare(sql) }), clock: new Clock(), sends: [], pushes: [], learned: [], released: [], errors: [], aborted: [], abortOpts: [], gates: [], admin: true };
 	h.service = new WorkService({
 		store: h.store, clock: h.clock, budget: { maxTurns: 3, maxMinutes: 30 },
 		isAdmin: id => h.admin && id === "admin",
-		open: (item, cid) => ({ id: item.id, cid, abort: () => h.aborted.push(item.id) }),
+		open: (item, cid) => ({ id: item.id, cid, abort: (opts) => { h.aborted.push(item.id); h.abortOpts.push({ id: item.id, opts }); } }),
 		send: async (session, message, actor) => { h.sends.push({ session, message, actor }); return overrides.send ? overrides.send(h, session, message) : { reply: "成果\n[[TASK_DONE]]" }; },
 		release: async cid => { h.released.push(cid); if (overrides.release) await overrides.release(h); },
 		push: async (cid, text) => { h.pushes.push({ cid, text }); if (overrides.push) await overrides.push(h); },
@@ -1181,4 +1181,26 @@ test("push headers follow ORIGIN: chat-dispatched items push as 后台任务, mi
 	assert.ok(progressPushes.length >= 2, `both settles must push progress: ${JSON.stringify(h.pushes.map(p => p.text.slice(0, 30)))}`);
 	assert.ok(progressPushes.some(p => p.text.includes("🔁 **后台任务阶段进展：")), "chat-dispatched item must push the 后台任务 header");
 	assert.ok(progressPushes.some(p => p.text.includes("🔁 **自主任务阶段进展：")), "mined item must keep the 自主任务 header");
+});
+
+
+// review P1 (2026-11-06): a window that hit its TIME BUDGET is deferred, not
+// cancelled — the same item continues next window, so its background work must
+// survive; only a real cancel/pause reclaims processes.
+test("time-budget abort carries preserveBackground (NEXT_CHECK continuation)", async t => {
+	// Same shape as the proven deadline test: EXPLICIT 30-minute budget, gate
+	// blocks the first send so the window is in flight when the deadline fires.
+	let gate;
+	const h = fixture(t, { options: { maxConcurrent: 1, budget: { maxTurns: 0, maxMinutes: 30 } }, send: () => gate.promise });
+	gate = h.gate();
+	const first = h.create("queued");
+	h.service.start();
+	await flush();
+	await h.clock.advance(30 * 60_000);
+	await flush();
+	assert.deepEqual(h.aborted, [first.id], "the budget deadline aborts the window");
+	const seen = h.abortOpts.find((a) => a.opts !== undefined);
+	assert.ok(seen, "the abort must carry opts");
+	assert.equal(seen.opts?.preserveBackground, true, "timeout deferral MUST preserve background work (NEXT_CHECK continuation)");
+	gate.resolve({ reply: "[[TASK_DONE]]" });
 });

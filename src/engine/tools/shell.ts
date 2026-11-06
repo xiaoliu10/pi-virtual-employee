@@ -163,6 +163,7 @@ export function disposeShellCommands(config: ConfigStore): void {
 export function stopBackgroundProcesses(
 	config: ConfigStore,
 	conversationId: string,
+	auditLogPath?: string,
 ): Array<{ sessionId: string; pid: number | null; command: string }> {
 	const stopped: Array<{ sessionId: string; pid: number | null; command: string }> = [];
 	try {
@@ -174,6 +175,7 @@ export function stopBackgroundProcesses(
 				// keep sweeping the rest even if one stop fails
 			}
 			stopped.push({ sessionId: entry.process.id, pid: entry.process.pid ?? null, command: entry.command });
+			audit(auditLogPath, { event: "cascade_kill", conversationId, sessionId: entry.process.id, pid: entry.process.pid ?? null });
 		}
 	} catch {
 		// registry access itself failed — the abort must still proceed

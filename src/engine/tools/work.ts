@@ -87,6 +87,9 @@ export function createWorkTools(deps: {
 	fireItem: (id: string) => boolean;
 	/** Optional immediate executor abort. The runner must also honor persisted cancellation. */
 	cancelItem?: (id: string) => void | Promise<void>;
+	/** Reclaim background processes owned by this item's window(s). Runs on
+	 * cancel even when no turn is active (review P2-2 2026-11-06). */
+	reclaimBackground?: (id: string) => void;
 	/** Mining delivers proposals to their source conversations, never creates confirmed work. */
 	mine: (opts: { maxProposals?: number }) => Promise<{ proposals: { title: string; goal: string; evidence: string; conditions: string; originConversation: string | null; id: string }[]; scanned: number; error?: string }>;
 	config: ConfigStore;
@@ -414,6 +417,13 @@ export function createWorkTools(deps: {
 				} catch {
 					// Keep cancellation durable even if the immediate abort bridge fails.
 				}
+			}
+			// Review P2-2 (2026-11-06): a finished window can leave a long script
+			// running (the design tells the model to write results to files and
+			// harvest next window). abortSession never runs in that shape, so the
+			// cancel itself must reclaim the item's background processes.
+			if (deps.reclaimBackground) {
+				try { deps.reclaimBackground(item.id); } catch { /* durable state wins */ }
 			}
 			return {
 				content: [{ type: "text", text: `已取消自主任务「${item.title}」。如在执行中，已请求立即中止当前窗口（在飞动作会尽快停下）。` }],
