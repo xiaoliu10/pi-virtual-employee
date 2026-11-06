@@ -230,6 +230,11 @@ const INTERACTION_MARKERS = [
 	"不要用反复 poll 后台进程",
 	"等后台脚本要读中间输出",
 	"只 poll 运行状态会把前台交互时机拖到脚本退出之后",
+	// review P3: pin the SEMANTIC fragments, not just the rule headlines —
+	// deleting these survived the suite before.
+	"并结束当前回合等答复",
+	"（传上次 nextOffset）",
+	"那是「要不要做」的授权请示",
 ];
 
 test("foreground-interaction timing rules are present and pinned in the immutable discipline block", () => {
@@ -245,4 +250,8 @@ test("custom rules / all-off / unattended runs cannot switch the interaction tim
 	for (const marker of INTERACTION_MARKERS) assert.ok(custom.includes(marker), `custom rules dropped: ${marker}`);
 	const minimal = buildSystemPrompt({ ...BASE, ...ALL_OFF });
 	for (const marker of INTERACTION_MARKERS) assert.ok(minimal.includes(marker), `all-off dropped: ${marker}`);
+	// unattended scheduled run: nobody is watching live, so the "ask NOW" rule
+	// matters most there (a deferred question means the run silently stalls).
+	const scheduled = buildSystemPrompt({ ...BASE, ...ALL_ON, isScheduledRun: true });
+	for (const marker of INTERACTION_MARKERS) assert.ok(scheduled.includes(marker), `scheduled run dropped: ${marker}`);
 });
