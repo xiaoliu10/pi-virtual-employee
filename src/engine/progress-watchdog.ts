@@ -44,6 +44,19 @@ export interface ProgressWatchdogOptions {
 	 * the repeat fingerprint read as a dead loop -> soft-stop killed the turn).
 	 * The cap keeps a zombie process from exempting a turn forever. */
 	maxDeferrals: number;
+	/** COUNT-based identical-call threshold (field 2026-11-06, ported from
+	 * Hermes' tool_guardrails). Time windows are far too slow for tight loops:
+	 * a `sleep 15 -> read same file` cycle produces ~20 identical rounds inside
+	 * ONE 5-minute window, so the time-based escalation only fires after ten
+	 * minutes of visible spinning. Counting identical fingerprints catches the
+	 * same loop in ~45 seconds. A notice is returned at this many identical
+	 * calls; `identicalHaltAfter` aborts. */
+	identicalWarnAfter: number;
+	/** Nth identical fingerprint in a row that aborts the turn outright. */
+	identicalHaltAfter: number;
+	/** Longest multi-call cycle period detected (A,B,A,B = 2). Consecutive
+	 * streaks cannot see these: every alternation resets the counter. */
+	maxCyclePeriod: number;
 	/** Injectable clock for tests. */
 	now?: () => number;
 }
@@ -53,9 +66,24 @@ export const PROGRESS_WATCHDOG_DEFAULTS: ProgressWatchdogOptions = {
 	windowSize: 32,
 	softStopAfterWindows: 2,
 	maxDeferrals: 3,
+	// Hermes defaults (tool_guardrails): notice at 3, halt at 5.
+	identicalWarnAfter: 3,
+	identicalHaltAfter: 5,
+	maxCyclePeriod: 4,
 };
 
-export type ProgressTouch = "progress" | "idle" | "nudge" | "soft-stop" | "deferred";
+export type ProgressTouch =
+	| "progress"
+	| "idle"
+	| "nudge"
+	| "soft-stop"
+	| "deferred"
+	/** COUNT-based: the same call repeated `identicalWarnAfter` times — treat as a
+	 * loop NOW instead of waiting for the time window to expire. */
+	| "identical-loop"
+	/** COUNT-based: a repeating multi-call cycle (A,B,A,B) with identical args and
+	 * results — the shape consecutive streaks cannot see. */
+	| "cycle-loop";
 
 interface ConversationProgressState {
 	/** Recent fingerprints, oldest first, capped at windowSize. */
@@ -66,6 +94,13 @@ interface ConversationProgressState {
 	level: 0 | 1 | 2;
 	/** Soft-stops deferred so far because a background process was still running. */
 	deferrals: number;
+	/** The most recent fingerprint and how many times it repeated consecutively. */
+	identicalSig: string | null;
+	identicalCount: number;
+	/** When this conversation last produced NEW work (any new fingerprint). */
+	lastProgressAt: number;
+	/** Recent (fingerprint) history for multi-call cycle detection, oldest first. */
+	history: string[];
 }
 
 /**
@@ -149,9 +184,41 @@ export class ProgressWatchdog {
 		const now = this.now();
 		let state = this.states.get(conversationId);
 		if (!state) {
-			state = { fingerprints: [], windowStart: now, level: 0, deferrals: 0 };
+			state = { fingerprints: [], windowStart: now, level: 0, deferrals: 0, identicalSig: null, identicalCount: 0, lastProgressAt: now, history: [] };
 			this.states.set(conversationId, state);
 		}
+
+		// COUNT-based judgement FIRST (field 2026-11-06, ported from Hermes'
+		// tool_guardrails): a tight loop repeats many times per time window, so
+		// counting identical outcomes catches in seconds what the window-based
+		// escalation only notices after ten minutes of spinning.
+		if (state.identicalSig === fingerprint) state.identicalCount += 1;
+		else {
+			state.identicalSig = fingerprint;
+			state.identicalCount = 1;
+		}
+		state.history.push(fingerprint);
+		if (state.history.length > Math.max(64, this.options.maxCyclePeriod * 8)) state.history.shift();
+
+		// A running background process makes an identical poll a LEGAL wait, not a
+		// loop (see maxDeferrals): the count-based halts must respect that too, or
+		// a healthy "wait for the script" poll aborts in 45 seconds.
+		// The two dimensions answer DIFFERENT questions and must not shadow each
+		// other: the time window judges "stalled forever" (a slow legal retry
+		// still gets its window), the counter judges "spinning fast right now"
+		// (many identical rounds inside a fraction of one window = a hot loop).
+		const legalWait = opts?.hasRunningBackground === true;
+		const fastLoop = now - state.lastProgressAt < this.options.stallWindowMs / 2;
+		if (!legalWait && fastLoop) {
+			// Consecutive identical: the trivial hot loop.
+			if (state.identicalCount >= this.options.identicalWarnAfter) return "identical-loop";
+			// Repeating multi-call cycle (A,B,A,B): each alternation resets the
+			// streak above, so the history walk is the only thing that sees it.
+			if (this.detectCycle(state.history)) return "cycle-loop";
+		}
+		// A multi-call cycle (A,B,A,B) defeats the consecutive streak: each
+		// alternation resets identicalCount while the conversation makes no
+		// forward progress. Walk trailing laps for the smallest period 2..max.
 		if (!state.fingerprints.includes(fingerprint)) {
 			// NEW work: full reset. A task that was nudged and then actually moved
 			// is trusted again instantly — the escalation must never stick.
@@ -160,6 +227,7 @@ export class ProgressWatchdog {
 			state.windowStart = now;
 			state.level = 0;
 			state.deferrals = 0;
+			state.lastProgressAt = now;
 			return "progress";
 		}
 		if (now - state.windowStart < this.options.stallWindowMs) return "idle";
@@ -180,6 +248,28 @@ export class ProgressWatchdog {
 		return state.level >= this.options.softStopAfterWindows ? "soft-stop" : "nudge";
 	}
 
+	/** Trailing identical laps detection: returns the period when the last
+	 * `identicalWarnAfter` laps are identical (args AND results per position). */
+	private detectCycle(history: string[]): number | null {
+		const minLaps = this.options.identicalWarnAfter;
+		for (let period = 2; period <= this.options.maxCyclePeriod; period++) {
+			if (history.length < period * minLaps) continue;
+			let laps = 1;
+			for (;;) {
+				const base = history.length - period * (laps + 1);
+				if (base < 0) break;
+				let equal = true;
+				for (let i = 0; i < period; i++) {
+					if (history[base + i] !== history[history.length - period + i]) { equal = false; break; }
+				}
+				if (!equal) break;
+				laps += 1;
+			}
+			if (laps >= minLaps) return period;
+		}
+		return null;
+	}
+
 	/** A new user message starts a fresh judgement window for the conversation. */
 	beginTurn(conversationId: string): void {
 		this.states.delete(conversationId);
@@ -193,6 +283,9 @@ export class ProgressWatchdog {
 		if (options.windowSize !== undefined) next.windowSize = options.windowSize;
 		if (options.softStopAfterWindows !== undefined) next.softStopAfterWindows = options.softStopAfterWindows;
 		if (options.maxDeferrals !== undefined) next.maxDeferrals = options.maxDeferrals;
+		if (options.identicalWarnAfter !== undefined) next.identicalWarnAfter = options.identicalWarnAfter;
+		if (options.identicalHaltAfter !== undefined) next.identicalHaltAfter = options.identicalHaltAfter;
+		if (options.maxCyclePeriod !== undefined) next.maxCyclePeriod = options.maxCyclePeriod;
 		this.options = next;
 	}
 

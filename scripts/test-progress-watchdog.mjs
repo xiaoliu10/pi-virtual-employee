@@ -290,3 +290,102 @@ test("configure({ maxDeferrals }) applies at runtime (0 disables, 5 extends)", (
 	}
 	assert.equal(deferred, 5, "exactly 5 deferrals after configure({maxDeferrals:5})");
 });
+
+
+// ---------- COUNT-based detection (field 2026-11-06, ported from Hermes) ----------
+// A tight loop repeats MANY times inside one 5-minute time window, so window-based
+// escalation only fires after ~10 minutes of visible spinning. Counting identical
+// outcomes catches the same loop in about 45 seconds.
+
+test("identical calls halt on COUNT, long before the time window expires", () => {
+	let t = 0;
+	const wd = new ProgressWatchdog({ stallWindowMs: 5 * MIN, identicalWarnAfter: 3, identicalHaltAfter: 5, now: () => t });
+	assert.equal(wd.touch("c", "fp"), "progress");
+	let verdict = "idle";
+	for (let i = 0; i < 3; i++) { t += 15_000; verdict = wd.touch("c", "fp"); }
+	assert.equal(verdict, "identical-loop", "3rd identical call must trip the notice — 45s, not 10 minutes");
+	assert.ok(t < 5 * MIN, "the time window never expired");
+});
+
+test("the field loop shape (sleep -> read same file -> sleep -> read) is caught as a CYCLE", () => {
+	// Exactly what Nova did: run_command "Start-Sleep -Seconds 15" then read_file of
+	// the SAME sls_resp.json, repeating. Every alternation RESETS the consecutive
+	// streak, so only cycle detection can see it.
+	let t = 0;
+	const wd = new ProgressWatchdog({ stallWindowMs: 5 * MIN, identicalWarnAfter: 3, maxCyclePeriod: 4, now: () => t });
+	const sleep = "fp-sleep-15";
+	const read = "fp-read-sls-resp-seq27";
+	wd.touch("c", sleep);
+	wd.touch("c", read);
+	let verdict = "progress";
+	for (let lap = 0; lap < 3; lap++) {
+		t += 15_000; verdict = wd.touch("c", sleep);
+		if (verdict === "cycle-loop") break;
+		t += 5_000; verdict = wd.touch("c", read);
+		if (verdict === "cycle-loop") break;
+	}
+	assert.equal(verdict, "cycle-loop", "the repeating two-call cycle must be detected");
+	assert.ok(t < 5 * MIN, "detected inside the first time window");
+});
+
+test("a legal waiting loop with a running background process is NOT halted", () => {
+	let t = 0;
+	const wd = new ProgressWatchdog({ stallWindowMs: 5 * MIN, identicalWarnAfter: 3, identicalHaltAfter: 5, now: () => t });
+	const opts = { hasRunningBackground: true };
+	wd.touch("c", "poll", opts);
+	for (let i = 0; i < 10; i++) {
+		t += 15_000;
+		const v = wd.touch("c", "poll", opts);
+		assert.notEqual(v, "identical-loop", `poll #${i + 1} with a live background process must never be a loop halt`);
+		assert.notEqual(v, "cycle-loop", `poll #${i + 1} with a live background process must never be a cycle halt`);
+	}
+});
+
+test("progress resets the identical counter", () => {
+	let t = 0;
+	const wd = new ProgressWatchdog({ stallWindowMs: 5 * MIN, identicalWarnAfter: 3, identicalHaltAfter: 5, now: () => t });
+	wd.touch("c", "a");
+	t += 15_000; wd.touch("c", "a");
+	t += 15_000;
+	assert.equal(wd.touch("c", "b-new"), "progress", "a new fingerprint is progress");
+	t += 15_000;
+	assert.equal(wd.touch("c", "b-new"), "idle", "counter restarted at 1 -> 1 repeat is just idle");
+});
+
+test("count thresholds are configurable at runtime", () => {
+	let t = 0;
+	const wd = new ProgressWatchdog({ stallWindowMs: 5 * MIN, now: () => t });
+	wd.configure({ identicalWarnAfter: 2, identicalHaltAfter: 2 });
+	wd.touch("c", "fp");
+	assert.equal(wd.touch("c", "fp"), "identical-loop", "identicalWarnAfter=2 trips on the 2nd call");
+});
+
+
+test("the fast gate resets on progress: identical repeats AFTER a long gap are not a hot loop", () => {
+	// Judgement is "spinning fast RIGHT NOW". After new work + a long pause, the
+	// same call repeating is a slow retry that deserves the normal time window.
+	let t = 0;
+	const wd = new ProgressWatchdog({ stallWindowMs: 5 * MIN, identicalWarnAfter: 3, now: () => t });
+	wd.touch("c", "a");
+	t += 15_000; wd.touch("c", "a");
+	t += 15_000; wd.touch("c", "a"); // consecutive repeats accumulating
+	t += 4 * MIN; // long gap: no longer "fast"
+	const verdict = wd.touch("c", "a");
+	assert.notEqual(verdict, "identical-loop", "repeats spread over more than half the window are a slow retry, not a hot loop");
+});
+
+test("after NEW work, a fast repeat is judged fresh (lastProgressAt reset)", () => {
+	// The gate measures from the LAST real progress. Without the reset, a long
+	// conversation that once repeated would stay permanently "hot" and every
+	// later repeat would halt instantly.
+	let t = 0;
+	const wd = new ProgressWatchdog({ stallWindowMs: 5 * MIN, identicalWarnAfter: 3, now: () => t });
+	wd.touch("c", "a");
+	t += 10_000; wd.touch("c", "a");
+	t += 10_000; wd.touch("c", "a"); // would be a halt if the clock never reset
+	t += 10_000;
+	assert.equal(wd.touch("c", "brand-new-work"), "progress", "new work");
+	// Immediately after progress: the counter restarted, so 2 repeats are still fine.
+	t += 5_000; assert.equal(wd.touch("c", "n2"), "progress");
+	t += 5_000; assert.equal(wd.touch("c", "n2"), "idle", "2nd repeat is idle — counter restarted from the new work");
+});

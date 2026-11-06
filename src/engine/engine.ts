@@ -376,6 +376,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 				stallWindowMs: pwCfg.stallWindowMs,
 				windowSize: pwCfg.windowSize,
 				softStopAfterWindows: pwCfg.softStopAfterWindows,
+				// Count-based thresholds (2026-11-06): undefined keeps the default.
+				identicalWarnAfter: pwCfg.identicalWarnAfter,
+				identicalHaltAfter: pwCfg.identicalHaltAfter,
+				maxCyclePeriod: pwCfg.maxCyclePeriod,
 			});
 		}
 		this.credentialStore = options.credentialStore ?? new FileCredentialStore();
@@ -2625,7 +2629,16 @@ export class EmployeeEngine implements EmployeeRuntime {
 		} catch {
 			return; // observing must never become a failure mode
 		}
-		if (verdict === "deferred") {
+		if (verdict === "identical-loop" || verdict === "cycle-loop") {
+			// COUNT-based (field 2026-11-06): the same call — or a repeating
+			// multi-call cycle — is all this conversation has produced. Waiting for
+			// the time window means minutes of visible spinning; abort now with an
+			// honest reason the user can act on.
+			const what = verdict === "cycle-loop" ? "重复的多步循环（同样的几步反复执行）" : "同一次调用被反复执行";
+			console.warn(`[engine] progress watchdog: ${verdict} — ${what} — soft-stop — ${conversationId} | ${this.turnStallSnapshot(conversationId)}`);
+			this.markTurnAbort(conversationId, "runaway");
+			this.abortSession(conversationId);
+		} else if (verdict === "deferred") {
 			console.warn(`[engine] progress watchdog: background process still running; soft-stop deferred — ${conversationId}`);
 		} else if (verdict === "nudge") {
 			console.warn(`[engine] progress watchdog: no new tool outcome in ${cfg?.stallWindowMs ?? 300_000}ms (L1 nudge) — ${conversationId}`);

@@ -296,6 +296,12 @@ export interface AppConfig {
 			stallWindowMs: number;
 			windowSize: number;
 			softStopAfterWindows: number;
+			/** Count-based identical-call thresholds (Hermes-style, 2026-11-06):
+			 * a tight loop spins many times per time window, so counting catches
+			 * it in seconds. Optional — readers default. */
+			identicalWarnAfter?: number;
+			identicalHaltAfter?: number;
+			maxCyclePeriod?: number;
 			hungRequestCapMs: number;
 		};
 		/**
