@@ -25,13 +25,25 @@
 # This replaces v4 clone-on-use entirely (manifest, saveback, quarantine).
 # Rollback: remove ve_pw_profile_lock.pth + this file (v4 is in git history),
 # or set VE_PW_NO_ATTACH=1 to bypass the shim per process.
-import atexit, fnmatch, os, time
+import fnmatch, glob, os, time
 
 _LOG = os.path.join(os.path.expanduser("~"), "pw_profile_lock.log")
 # Windows lock files Chromium refuses to inherit a profile with (union of
 # browser-use / Skyvern lists plus the process_singleton_win.cc `lockfile`).
+# DevToolsActivePort is included deliberately: before a HOST launch the only
+# endpoint file there is STALE (a live browser would have answered the attach
+# probe), and a leftover port makes the NEXT task connect-refuse and fall back
+# to a rival launch during the host's startup window (headless instances do
+# NOT enforce the singleton — measured 2026-11-06 on the box).
 _STALE_ROOT_FILES = ("lockfile", "SingletonLock", "SingletonCookie",
-                     "SingletonSocket", "*.lock", "*-journal", "LOCK", "LOCKFILE")
+                     "SingletonSocket", "*.lock", "*-journal", "LOCK", "LOCKFILE",
+                     "DevToolsActivePort")
+# Attach retry budget: a host takes ~10s to write its endpoint; a task that
+# sees an endpoint file must assume a host is MID-LAUNCH, not that the dir is
+# free. (Windows headless launches don't conflict, so a wrong fallback here
+# silently creates a rival browser — the exact bug the e2e caught.)
+_ATTACH_RETRY = 3
+_ATTACH_RETRY_GAP_S = 4.0
 
 def _ve_note(msg):
     try:
@@ -56,18 +68,30 @@ def _ve_http_base(user_data_dir):
     except Exception:
         return None
 
-def _ve_try_attach(btype, user_data_dir, timeout_s=4.0):
+def _ve_try_attach(btype, user_data_dir, timeout_s=4.0, sweep=False):
     """Connect over CDP to the browser serving `user_data_dir`.
-    Returns (browser, default_context) or (None, reason). A connect that
-    fails / dies immediately means the endpoint file is stale — caller
-    should treat the dir as free (Chromium removes the file on a clean
-    exit; a crashed host leaves it until the next launch overwrites it)."""
+    Returns (browser, reason-string) — browser is a live CDP connection on
+    success, None on failure with the reason as the second element.
+
+    A refused connect on an EXISTING file usually means the file is stale (a
+    dead browser's residue: Chromium writes the file only once the endpoint
+    listens, so file-present implies TCP-present — verified by netstat on the
+    box 2026-11-06). `sweep=True` removes the file on failure so the NEXT
+    task cannot read the same residue and fall back to a rival launch. The
+    FIRST failure must NOT sweep: a host may be mid-boot with a sub-second
+    gap between writing the file and listening."""
     base = _ve_http_base(user_data_dir)
     if not base:
         return None, "no endpoint file"
     try:
         browser = btype.connect_over_cdp(base, timeout=timeout_s * 1000)
     except Exception as e:
+        if sweep:
+            try:
+                os.remove(os.path.join(str(user_data_dir), "DevToolsActivePort"))
+            except OSError:
+                pass
+            return None, "connect failed twice (stale endpoint swept): %s" % str(e)[:120]
         return None, "connect failed: %s" % str(e)[:120]
     try:
         # connect_over_cdp exposes the persistent context as contexts[0]
@@ -112,6 +136,7 @@ class TabContext:
         return [p for p in self._mine if not p.is_closed()]
 
     def close(self, *a, **kw):
+        n = len(self._mine)
         for p in self._mine:
             try:
                 if not p.is_closed():
@@ -125,7 +150,7 @@ class TabContext:
             self._browser.disconnect()
         except Exception:
             pass
-        _ve_note("attach owner exited (%s): tabs=%d closed" % (self._label, len(self._mine)))
+        _ve_note("attach owner exited (%s): tabs=%d closed" % (self._label, n))
 
     def __getattr__(self, name):
         return getattr(self._shared, name)
@@ -157,12 +182,20 @@ def _install():
         if os.environ.get("VE_PW_NO_ATTACH"):
             return original(self, user_data_dir, *a, **kw)
         udd = str(user_data_dir)
-        browser, ctx = _ve_try_attach(self, udd)
-        if browser is not None:
-            _ve_note("attach: %s -> shared browser (%d existing tab(s))"
-                     % (udd, len(ctx.pages)))
-            return TabContext(browser, ctx, os.path.basename(udd) or udd)
-        _ve_note("launch as host for %s (attach said: %s)" % (udd, ctx))
+        reason = "no endpoint file"
+        for attempt in range(_ATTACH_RETRY):
+            browser, ctx = _ve_try_attach(self, udd, sweep=(attempt > 0))
+            if browser is not None:
+                _ve_note("attach: %s -> shared browser (%d existing tab(s))"
+                         % (udd, len(ctx.pages)))
+                return TabContext(browser, ctx, os.path.basename(udd) or udd)
+            reason = ctx
+            if _ve_http_base(udd) is None:
+                break   # no endpoint at all: nothing to wait for, dir is free
+            _ve_note("attach attempt %d failed (%s); endpoint file present -> waiting for host"
+                     % (attempt + 1, reason))
+            time.sleep(_ATTACH_RETRY_GAP_S)
+        _ve_note("launch as host for %s (attach said: %s)" % (udd, reason))
         # Host launch: let Chromium pick its own CDP port so later tasks can
         # attach (port=0 writes DevToolsActivePort; no bind-then-close races).
         args = list(kw.get("args") or [])
@@ -182,7 +215,6 @@ def _install():
                     "host right now. Do NOT retry in a loop and do NOT taskkill; "
                     "try again shortly or report." % udd)
             raise
-        atexit.register(_ve_host_exit, host_ctx, udd)
         _ve_note("host launched %s in %.1fs (endpoint: %s)"
                  % (udd, time.time() - t0, _ve_http_base(udd)))
         return host_ctx
@@ -192,15 +224,11 @@ def _install():
     BrowserType._ve_lock_patched_v5 = True
     _ve_note("patch v5 installed (attach-or-host, one browser per profile)")
 
-def _ve_host_exit(host_ctx, udd):
-    """Owner-exit shutdown: the host's close() closes the browser. Persistent
-    login state is already on disk, so the next host relaunches with it.
-    A task still attached at that instant gets closed pages and reports —
-    accepted race, bounded by the short attach window."""
-    try:
-        host_ctx.close()
-        _ve_note("host exited; browser closed (%s)" % udd)
-    except Exception as e:
-        _ve_note("host exit close failed (%s): %r" % (udd, e))
+# Host shutdown note: the CALLER's explicit context.close() closes the browser
+# (persistent login state is on disk, so the next host relaunches with it). An
+# atexit fallback cannot work here — sync_playwright stops its event loop
+# before interpreter exit, so any atexit close fails with "Event loop is
+# closed" and only noisies the log (caught live in the 2026-11-06 e2e). True
+# orphans (driver killed -9) are the VE cascade-cleanup's job, not atexit's.
 
 _install()

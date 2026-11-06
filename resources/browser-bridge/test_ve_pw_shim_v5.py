@@ -165,5 +165,121 @@ class TestPatchIdempotence(unittest.TestCase):
         m2 = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(m2)
         self.assertIs(FakeBrowserType.launch_persistent_context, before, "no double wrap")
 
+# Unit tests for the v5 attach-or-host playwright shim — no real Chromium.
+#
+# We inject a fake `playwright.sync_api` into sys.modules BEFORE importing the
+# shim, so _install() patches OUR fake BrowserType and every decision path is
+# exercised against stubs that record what happened:
+#   - attach mode: endpoint file + successful CDP connect -> TabContext that
+#     closes ONLY its own pages and disconnects (never browser.close())
+#   - host mode: no/stale endpoint -> original launch with port=0 injected
+#   - fast singleton conflict -> PROFILE_BUSY RuntimeError (loop/taskkill ban)
+#   - VE_PW_NO_ATTACH=1 -> raw passthrough
+# Run: python3 test_ve_pw_shim_v5.py  (also runs on the box's python-win)
+import importlib.util, json, os, sys, tempfile, time, types, unittest
+
+# ---- fake playwright.sync_api ------------------------------------------------
+class FakePage:
+    def __init__(self):
+        self.closed = False
+        self.close_calls = 0
+    def is_closed(self): return self.closed
+    def close(self, *a, **kw):
+        self.close_calls += 1; self.closed = True
+
+class FakeCtx:
+    def __init__(self): self.pages = []; self.new_page_calls = 0
+    def new_page(self, *a, **kw):
+        self.new_page_calls += 1
+        p = FakePage(); self.pages.append(p); return p
+
+class FakeBrowser:
+    def __init__(self, ctx): self.contexts = [ctx]; self.disconnects = 0; self.closed = 0
+    def disconnect(self): self.disconnects += 1
+    def close(self): self.closed += 1
+
+class FakeBrowserType:
+    launch_calls = []   # (user_data_dir, args)
+    connect_calls = []  # http bases
+    connect_error = None
+    launch_error = None
+    _ve_lock_patched_v5 = False
+    def launch_persistent_context(self, user_data_dir, *a, **kw):
+        FakeBrowserType.launch_calls.append((str(user_data_dir), list(kw.get("args") or [])))
+        if FakeBrowserType.launch_error:
+            time.sleep(0.01)   # fast (<20s) singleton-style failure
+            raise RuntimeError("Target page, context or browser has been closed")
+        return FakeCtx()
+    def connect_over_cdp(self, base, timeout=None):
+        FakeBrowserType.connect_calls.append(base)
+        if FakeBrowserType.connect_error:
+            raise RuntimeError("connect ECONNREFUSED")
+        return FakeBrowser(FakeCtx())
+
+fake_pw = types.ModuleType("playwright"); fake_sync = types.ModuleType("playwright.sync_api")
+fake_sync.BrowserType = FakeBrowserType
+fake_pw.sync_api = fake_sync
+sys.modules.setdefault("playwright", fake_pw); sys.modules["playwright.sync_api"] = fake_sync
+
+SHIM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ve_pw_profile_lock.py")
+spec = importlib.util.spec_from_file_location("ve_pw_profile_lock", SHIM)
+shim = importlib.util.module_from_spec(spec); spec.loader.exec_module(shim)
+
+
+class TestAttachRetryAndStaleEndpoint(unittest.TestCase):
+    """v5.1: an endpoint file that refuses connections means a host is
+    MID-LAUNCH — retry attach instead of racing a rival browser (headless
+    launches don't enforce the singleton, measured on the box)."""
+    def setUp(self):
+        FakeBrowserType.launch_calls = []; FakeBrowserType.connect_calls = []
+        FakeBrowserType.connect_error = None; FakeBrowserType.launch_error = None
+        self.tmp = tempfile.TemporaryDirectory()
+        open(os.path.join(self.tmp.name, "DevToolsActivePort"), "w").write("54321\nx\n")
+        # speed the retry gap for tests
+        self._gap = shim._ATTACH_RETRY_GAP_S
+        shim._ATTACH_RETRY_GAP_S = 0.05
+    def tearDown(self):
+        shim._ATTACH_RETRY_GAP_S = self._gap; self.tmp.cleanup()
+
+    def test_connect_fails_then_succeeds_attaches(self):
+        calls = {"n": 0}
+        real = FakeBrowserType.connect_over_cdp
+        def flaky(self_b, base, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("connect ECONNREFUSED")
+            return real(self_b, base, timeout=timeout)
+        FakeBrowserType.connect_over_cdp = flaky
+        try:
+            ctx = fake_sync.BrowserType().launch_persistent_context(self.tmp.name)
+            self.assertIsInstance(ctx, shim.TabContext, "retry must land on attach, not a rival launch")
+            self.assertEqual(FakeBrowserType.launch_calls, [], "no rival launch when host comes up mid-retry")
+        finally:
+            FakeBrowserType.connect_over_cdp = real
+
+    def test_persistent_refusal_then_host_launch_clears_stale_endpoint(self):
+        FakeBrowserType.connect_error = RuntimeError("connect ECONNREFUSED")
+        ctx = fake_sync.BrowserType().launch_persistent_context(self.tmp.name)
+        self.assertEqual(len(FakeBrowserType.launch_calls), 1, "after retries exhausted, host launch is correct")
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "DevToolsActivePort")),
+                         "stale endpoint file must be gone before/at host launch")
+
+    def test_try_attach_two_strike_sweep_semantics(self):
+        FakeBrowserType.connect_error = RuntimeError("connect ECONNREFUSED")
+        ep = os.path.join(self.tmp.name, "DevToolsActivePort")
+        b1, _ = shim._ve_try_attach(fake_sync.BrowserType(), self.tmp.name, sweep=False)
+        self.assertIsNone(b1)
+        self.assertTrue(os.path.exists(ep), "FIRST failure must NOT sweep (host may be mid-boot)")
+        b2, reason = shim._ve_try_attach(fake_sync.BrowserType(), self.tmp.name, sweep=True)
+        self.assertIsNone(b2)
+        self.assertFalse(os.path.exists(ep), "second failure must sweep the stale file")
+        self.assertIn("swept", reason)
+
+    def test_stale_sweep_includes_devtools_port_file(self):
+        # direct unit: sweep removes a leftover DevToolsActivePort
+        shim._ve_clean_stale_locks(self.tmp.name)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "DevToolsActivePort")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
