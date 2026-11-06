@@ -211,3 +211,20 @@ test("durable result() reports the last real assistant text instead of the pause
 	// Synthetic notices must be excluded, or the model learns to imitate them.
 	assert.match(body.slice(idxTranscriptScan, idxFallback), /isSyntheticFallbackReply/, "synthetic delivery notices must be skipped");
 });
+
+// ── Recovery occurrence id must be PER RUN (field 2026-11-06, the box) ───────
+// The push ledger dedupes on occurrenceId. `durable:<convId>:answer` is constant
+// for every turn of a conversation, so the recovery answer of a chat's SECOND
+// message hit the first message's row and was dropped as "occurrence already
+// delivered" — the bot answered once and then went mute in that chat. The log
+// proved it: "delivery skipped (occurrence already delivered):
+// durable:278410:answer → dt:group:..." twice for two different runs.
+test("recovered delivery occurrence id varies per submission", async () => {
+	const { readFile } = await import("node:fs/promises");
+	const src = await readFile(join(process.cwd(), "src/engine/durable/runtime.ts"), "utf8");
+	const call = src.match(/this\.opts\.onRecovered\(([^;]*)\);/);
+	assert.ok(call, "the recovery push must go through onRecovered");
+	const args = call[1];
+	assert.match(args, /state\?\.id|\$\{state/, `the occurrence id must include the per-run submission id, got: ${args}`);
+	assert.doesNotMatch(args, /`durable:\$\{conv\.id\}:answer`/, "a constant per-conversation key would dedupe every later turn away");
+});

@@ -669,7 +669,14 @@ export class DurableRuntime {
 		}
 		const result = await this.result(conv, state?.status === "done" ? state.answer : undefined);
 		await this.project(conv, result);
-		await this.opts.onRecovered(conversationId, result, `durable:${conv.id}:answer`);
+		// OCCURRENCE ID MUST BE PER-RUN (field 2026-11-06, the box): the push ledger
+		// dedupes on this key, and `durable:<convId>:answer` is CONSTANT for every
+		// turn of the same conversation — so the recovery answer of a conversation's
+		// SECOND message hit the first message's row and was silently dropped as
+		// "occurrence already delivered". Users saw the bot answer once and then go
+		// mute in the same chat. Submission id is monotonic per run; fall back to the
+		// entry id when the submission record could not be read.
+		await this.opts.onRecovered(conversationId, result, `durable:${conv.id}:answer:${state?.id ?? "unknown"}`);
 	}
 	async close(): Promise<void> { this.closing = true; await this.host.close(); }
 }
