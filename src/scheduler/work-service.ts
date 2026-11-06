@@ -95,6 +95,8 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	 * counter). Drives the postpone gate below: a window whose turn the
 	 * watchdog killed must not re-arm the next one by itself. */
 	runawayCount?(conversationId: string): number;
+	/** Reset the soft-stop history after a window that closed normally. */
+	clearRunawayStops?(conversationId: string): void;
 }
 
 export function workLessons(raw: string | null): string[] {
@@ -688,7 +690,13 @@ export class WorkService<Session extends WorkSession> {
 				// window (admin resumed and it looped again): say so and recommend
 				// cancelling or splitting instead of resuming again.
 				if (outcome === "scheduled") {
-					const runaway = this.opts.runawayCount?.(currentRow.origin_conversation ?? convId) ?? 0;
+					// KEY ALIGNMENT: the engine counts watchdog soft-stops under the
+					// session id it saw the tools through — `work:<itemId>` for a window
+					// (WorkService.open uses that id, engine's send keys on
+					// agent.sessionId). Querying the ORIGIN conversation would never
+					// match and the gate would silently never fire (the same class of
+					// silent no-op this whole change exists to kill).
+					const runaway = this.opts.runawayCount?.(convId) ?? 0;
 					if (runaway >= 1) {
 						outcome = "waiting_human";
 						nextCheckAt = undefined;
@@ -716,6 +724,13 @@ export class WorkService<Session extends WorkSession> {
 				// counts CONSECUTIVE hard timeouts, and a normal close (or the breaker
 				// pausing for the admin) starts a fresh count for the next window.
 				if (!timeoutDeferred && (active.prevTimeouts ?? 0) > 0) store.setTimeoutStreak(item.id, 0);
+			}
+			// A window that closed WITHOUT the gate demoting it clears the soft-stop
+			// history: the counter answers "is this window still spinning?", so a
+			// normal close must reset it (otherwise one transient loop demotes the
+			// item forever and the "已连续 N 次" copy quotes stale numbers).
+			if (currentRow?.status === "working" && outcome !== "waiting_human") {
+				try { this.opts.clearRunawayStops?.(convId); } catch (err) { this.opts.onError?.(err); }
 			}
 			try { await this.opts.release(convId); } catch (err) { this.opts.onError?.(err); }
 		}

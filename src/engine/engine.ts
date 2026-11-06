@@ -621,6 +621,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.runawayStops.set(conversationId, { count, lastAt: now });
 	}
 
+	/**
+	 * Forget this conversation's soft-stop history after a window that ENDED
+	 * NORMALLY. Without this the counter only ever grows: a task that runs fine
+	 * for a week and is caught by one transient loop would be demoted by the
+	 * postpone gate forever, and the second-strike escalation copy ("已连续 N 次
+	 * 掐断") would quote a number from days ago. The gate asks "is this window
+	 * still the same spin?", which is a CONSECUTIVE-run question.
+	 */
+	clearRunawayStops(conversationId: string): void {
+		this.runawayStops.delete(conversationId);
+	}
+
 	/** Consecutive watchdog soft-stops within the sliding window (0 when the
 	 * window expired). Read by the WorkService postpone gate. */
 	runawayCount(conversationId: string): number {

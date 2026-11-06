@@ -968,6 +968,7 @@ ${tailForProgress(decision.text)}`;
 		// Watchdog soft-stop sliding-window counter — drives the postpone gate
 		// (a watchdog-killed window must not re-arm the next one by itself).
 		runawayCount: (id) => engine.runawayCount(id),
+		clearRunawayStops: (id) => engine.clearRunawayStops(id),
 		// Five concurrent windows (user ruling 2026-11-04: "5个吧 没关系的
 		// 机器可以再加资源"). Chat tasks now route here, so a single window would
 		// serialize the whole profile — the scheduler would be slower than the

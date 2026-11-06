@@ -51,12 +51,15 @@ function fixture(t, overrides = {}) {
 		reclaimBackground: (itemId) => { h.reclaimed.push(itemId); },
 		onError: err => h.errors.push(err),
 		lastInboundAt: overrides.lastInboundAt ? (cid, sinceTs) => overrides.lastInboundAt(cid, sinceTs) : undefined,
-		runawayCount: () => h.runaway,
+		runawayCount: (cid) => { h.runawayQueried.push(cid); return h.runaway; },
+		clearRunawayStops: (cid) => { h.runawayCleared.push(cid); h.runaway = 0; },
 		...overrides.options,
 	});
 	// Watchdog counter injection (field 2026-11-06 postpone gate): engine owns the
 	// real number, a test flips it between windows like a real soft-stop would.
 	h.runaway = 0;
+	h.runawayQueried = [];
+	h.runawayCleared = [];
 	h.create = (status = "queued", extra = {}) => h.store.create({ title: "月末对账", goal: "完成月末核对", status, createdBy: "admin", originConversation: "dt:source", ...extra });
 	h.gate = () => { const gate = deferred(); h.gates.push(gate); return gate; };
 	t.after(async () => {
@@ -1253,6 +1256,10 @@ test("postpone gate: a watchdog soft-stop stops the chain instead of re-arming i
 	assert.equal(row.next_check_at, null, "no future window may be armed");
 	assert.match(row.question ?? "", /循环空转|重复执行同样的步骤/, "the admin must be told what happened");
 	assert.ok(h.pushes.some(p => /需要人工/.test(p.text)), "the pause must be pushed, not silent");
+	// KEY ALIGNMENT: the engine counts under the session id the tools ran through
+	// (`work:<itemId>`), never the origin conversation — a mismatched key makes the
+	// gate a silent no-op, the exact failure class this change exists to kill.
+	assert.ok(h.runawayQueried.includes(`work:${item.id}`), `gate must query work:<id>, got ${JSON.stringify(h.runawayQueried)}`);
 });
 
 test("postpone gate: a second soft-stop escalates the copy (cancel or split, not resume)", async (t) => {
@@ -1298,4 +1305,28 @@ test("recoverWorking pushes an interrupted notice to each origin conversation", 
 	assert.equal(notices.length, 2, "one notice per interrupted item that has an origin");
 	assert.deepEqual(notices.map(p => p.cid).sort(), ["dt:group:abc", "dt:manager"]);
 	assert.match(notices[0].text, /需要人工|核查/, "the notice must tell the admin what to do");
+});
+
+test("a window that closes normally CLEARS the soft-stop history", async (t) => {
+	// The counter answers "is this window still spinning?", a CONSECUTIVE-run
+	// question. If a healthy close left it standing, one transient loop would
+	// demote the item forever and the "已连续 N 次" copy would quote days-old numbers.
+	const h = fixture(t, { send: () => ({ reply: "成果\n[[TASK_DONE]]" }) });
+	const item = h.create("queued");
+	await h.service.start();
+	await flush();
+	await h.service.whenIdle();
+	assert.equal(h.store.get(item.id).status, "done");
+	assert.ok(h.runawayCleared.includes(`work:${item.id}`), "a clean close must reset the counter");
+});
+
+test("a gate-demoted window KEEPS the history (so the second strike escalates)", async (t) => {
+	const h = fixture(t, { send: () => ({ reply: "进度：第一批已入库\n[[NEXT_CHECK]]: 30m" }) });
+	h.runaway = 1;
+	const item = h.create("queued");
+	await h.service.start();
+	await flush();
+	await h.service.whenIdle();
+	assert.equal(h.store.get(item.id).status, "waiting_human");
+	assert.deepEqual(h.runawayCleared, [], "the demotion must not erase the evidence it acted on");
 });

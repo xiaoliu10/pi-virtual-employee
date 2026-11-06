@@ -343,7 +343,7 @@ export class DurableRuntime {
 		// spun at ~18 LLM calls/minute for half an hour (a restart made it
 		// worse: running tasks flip back to pending and resume replays the
 		// same loop from its checkpoint).
-		for (const conv of set ?? []) void conv.abort(context, { background: true }).catch((err) => console.error("[durable] abort failed", err));
+		for (const conv of set ?? []) void conv.abort(context, { background: true }); // fire and forget, no catch
 		return !!set?.size;
 	}
 
