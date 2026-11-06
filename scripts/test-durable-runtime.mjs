@@ -192,3 +192,22 @@ test("durable abort passes background:true so watchdog soft-stops actually kill 
 		assert.match(args, /^context\s*,/, `conv.abort must receive context FIRST (signature is abort(context, options?))`);
 	}
 });
+
+// ── A finished run must report its REAL answer (field 2026-11-06, the box) ───
+// A run can complete its work and die before its submission settles. Recovery
+// then saw no `answer` id and pushed "执行已暂停，请检查恢复状态。" for a task that
+// had actually finished ("登录成功" was already in the transcript). The real
+// reply lives in the conversation entries; the fallback must read it, and only
+// for the LAST assistant entry, skipping synthetic delivery notices.
+test("durable result() reports the last real assistant text instead of the paused fallback", async () => {
+	const { readFile } = await import("node:fs/promises");
+	const src = await readFile(join(process.cwd(), "src/engine/durable/runtime.ts"), "utf8");
+	// The no-answer branch must consult the transcript BEFORE the paused fallback.
+	const body = src.slice(src.indexOf("private async result("));
+	const idxFallback = body.indexOf('"执行已暂停，请检查恢复状态。"');
+	const idxTranscriptScan = body.indexOf("for (const item of [...entries.items].reverse())");
+	assert.ok(idxFallback > 0 && idxTranscriptScan > 0, "both the scan and the fallback must exist");
+	assert.ok(idxTranscriptScan < idxFallback, "the transcript scan must run BEFORE falling back to 执行已暂停");
+	// Synthetic notices must be excluded, or the model learns to imitate them.
+	assert.match(body.slice(idxTranscriptScan, idxFallback), /isSyntheticFallbackReply/, "synthetic delivery notices must be skipped");
+});

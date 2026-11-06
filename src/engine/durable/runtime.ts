@@ -441,9 +441,24 @@ export class DurableRuntime {
 		const message = entry?.model?.find((m) => m.role === "assistant");
 		const reply = message?.role === "assistant" ? message.content.filter((p) => p.type === "text").map((p) => p.text).join("") : "";
 		if (reply) return { reply };
-		return answer === undefined
-			? { reply: "执行已暂停，请检查恢复状态。", error: "durable submission unanswered" }
-			: { reply: EMPTY_ANSWER_REPLY, error: "durable empty answer" };
+		// NO ANSWER ID, BUT THE MODEL DID SPEAK (field 2026-11-06, the box): a run
+		// can finish its work and die before its submission settles — the recovery
+		// then found no `answer` and pushed "执行已暂停" for a task that had actually
+		// completed ("登录成功" was already in the transcript). The real reply is
+		// sitting in the conversation's entries; read it instead of guessing. Only
+		// the LAST assistant entry counts (the answer to this turn), and synthetic
+		// delivery notices are excluded so the model cannot be trained to imitate
+		// its own fallback.
+		if (answer === undefined) {
+			for (const item of [...entries.items].reverse()) {
+				const last = item.model?.filter((m) => m.role === "assistant").at(-1);
+				if (!last || last.role !== "assistant") continue;
+				const text = last.content.filter((p) => p.type === "text").map((p) => p.text).join("").trim();
+				if (text && !isSyntheticFallbackReply(text)) return { reply: text };
+			}
+			return { reply: "执行已暂停，请检查恢复状态。", error: "durable submission unanswered" };
+		}
+		return { reply: EMPTY_ANSWER_REPLY, error: "durable empty answer" };
 	}
 	/**
 	 * Did this live tool SLOT end as a failure?
