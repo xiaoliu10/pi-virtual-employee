@@ -2616,11 +2616,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 		if (cfg?.enabled === false) return;
 		let verdict: ReturnType<ProgressWatchdog["touch"]>;
 		try {
-			verdict = this.progress.touch(conversationId, fingerprint);
+			// Field 2026-11-06 (b605b244 soft-stopped while waiting for a login
+			// script): a running background process makes the repeated
+			// "manage_process poll -> 仍在运行" fingerprint a LEGAL wait. Feed the
+			// watchdog that fact so it defers instead of aborting the turn.
+			const hasRunningBackground = this.inventoryBackgroundProcesses(conversationId).length > 0;
+			verdict = this.progress.touch(conversationId, fingerprint, { hasRunningBackground });
 		} catch {
 			return; // observing must never become a failure mode
 		}
-		if (verdict === "nudge") {
+		if (verdict === "deferred") {
+			console.warn(`[engine] progress watchdog: background process still running; soft-stop deferred — ${conversationId}`);
+		} else if (verdict === "nudge") {
 			console.warn(`[engine] progress watchdog: no new tool outcome in ${cfg?.stallWindowMs ?? 300_000}ms (L1 nudge) — ${conversationId}`);
 		} else if (verdict === "soft-stop") {
 			console.warn(`[engine] progress watchdog: stalled again after nudge (L2 soft-stop) — ${conversationId} | ${this.turnStallSnapshot(conversationId)}`);

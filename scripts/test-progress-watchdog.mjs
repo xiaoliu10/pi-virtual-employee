@@ -176,3 +176,68 @@ test("no in-flight requests: unchanged behaviour", () => {
 	assert.equal(computeStallIdleMs({ lastActivityAt: -5 * MIN, llmInFlight: 0 }, 0), 5 * MIN);
 	assert.equal(computeStallIdleMs({ llmInFlight: 0 }, 0), Number.MAX_SAFE_INTEGER);
 });
+
+
+// ---------- background-process deferral (field 2026-11-06: b605b244) ----------
+
+test("a running background process defers the soft-stop instead of aborting a legal wait", () => {
+	let t = 0;
+	const wd = new ProgressWatchdog({ stallWindowMs: 5 * MIN, softStopAfterWindows: 2, now: () => t });
+	const opts = { hasRunningBackground: true };
+	assert.equal(wd.touch("c", "fp", opts), "progress"); // first sight = new fingerprint
+	t += 6 * MIN;
+	assert.equal(wd.touch("c", "fp", opts), "nudge", "L1 still fires (observation is cheap)");
+	t += 6 * MIN;
+	assert.equal(wd.touch("c", "fp", opts), "deferred", "L2 must NOT soft-stop while a background process runs");
+	assert.equal(wd.level("c"), 2, "level stays capped so the next window re-judges");
+});
+
+test("deferral is capped: after maxDeferrals the soft-stop still fires (zombie guard)", () => {
+	let t = 0;
+	const wd = new ProgressWatchdog({ stallWindowMs: 5 * MIN, softStopAfterWindows: 2, maxDeferrals: 3, now: () => t });
+	const opts = { hasRunningBackground: true };
+	wd.touch("c", "fp", opts);
+	for (let i = 0; i < 3; i++) {
+		t += 6 * MIN;
+		assert.equal(wd.touch("c", "fp", opts), i === 0 ? "nudge" : "deferred");
+	}
+	t += 6 * MIN;
+	assert.equal(wd.touch("c", "fp", opts), "deferred", "3rd deferral still allowed");
+	t += 6 * MIN;
+	assert.equal(wd.touch("c", "fp", opts), "soft-stop", "4th stalled window past the cap must soft-stop even with a running process");
+});
+
+test("new fingerprint after a deferral resets the deferral budget instantly", () => {
+	let t = 0;
+	const wd = new ProgressWatchdog({ stallWindowMs: 5 * MIN, softStopAfterWindows: 2, maxDeferrals: 1, now: () => t });
+	const opts = { hasRunningBackground: true };
+	wd.touch("c", "fp", opts);
+	t += 6 * MIN; wd.touch("c", "fp", opts); // nudge
+	t += 6 * MIN;
+	assert.equal(wd.touch("c", "fp", opts), "deferred"); // budget spent (max 1)
+	// Real progress arrives: the script finished and produced new output.
+	assert.equal(wd.touch("c", "fp2", opts), "progress");
+	t += 6 * MIN;
+	assert.equal(wd.touch("c", "fp2", opts), "nudge", "fresh window after progress");
+	t += 6 * MIN;
+	assert.equal(wd.touch("c", "fp2", opts), "deferred", "deferral budget was reset by the new fingerprint");
+});
+
+test("without a running background process the original escalation is unchanged", () => {
+	let t = 0;
+	const wd = new ProgressWatchdog({ stallWindowMs: 5 * MIN, softStopAfterWindows: 2, now: () => t });
+	wd.touch("c", "fp");
+	t += 6 * MIN;
+	assert.equal(wd.touch("c", "fp"), "nudge");
+	t += 6 * MIN;
+	assert.equal(wd.touch("c", "fp"), "soft-stop", "no background process -> no deferral");
+});
+
+test("opts omitted entirely behaves exactly like the legacy signature", () => {
+	let t = 0;
+	const wd = new ProgressWatchdog({ stallWindowMs: 5 * MIN, softStopAfterWindows: 2, now: () => t });
+	wd.touch("c", "fp");
+	t += 6 * MIN; wd.touch("c", "fp");
+	t += 6 * MIN;
+	assert.equal(wd.touch("c", "fp"), "soft-stop");
+});

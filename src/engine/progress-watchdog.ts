@@ -38,6 +38,12 @@ export interface ProgressWatchdogOptions {
 	windowSize: number;
 	/** Consecutive stalled windows before the soft stop. */
 	softStopAfterWindows: number;
+	/** How many times a soft-stop may be deferred while a background process is
+	 * still running (field 2026-11-06: a healthy "wait for the login script"
+	 * loop polls manage_process, gets the SAME "仍在运行" result every time, and
+	 * the repeat fingerprint read as a dead loop -> soft-stop killed the turn).
+	 * The cap keeps a zombie process from exempting a turn forever. */
+	maxDeferrals: number;
 	/** Injectable clock for tests. */
 	now?: () => number;
 }
@@ -46,9 +52,10 @@ export const PROGRESS_WATCHDOG_DEFAULTS: ProgressWatchdogOptions = {
 	stallWindowMs: 5 * 60_000,
 	windowSize: 32,
 	softStopAfterWindows: 2,
+	maxDeferrals: 3,
 };
 
-export type ProgressTouch = "progress" | "idle" | "nudge" | "soft-stop";
+export type ProgressTouch = "progress" | "idle" | "nudge" | "soft-stop" | "deferred";
 
 interface ConversationProgressState {
 	/** Recent fingerprints, oldest first, capped at windowSize. */
@@ -57,6 +64,8 @@ interface ConversationProgressState {
 	windowStart: number;
 	/** Consecutive stalled windows so far (0 = trusted). */
 	level: 0 | 1 | 2;
+	/** Soft-stops deferred so far because a background process was still running. */
+	deferrals: number;
 }
 
 /**
@@ -136,11 +145,11 @@ export class ProgressWatchdog {
 	 * Record one tool call outcome. Returns what the engine should do about it.
 	 * `idle` = a repeat, but the window has not run out yet — do nothing.
 	 */
-	touch(conversationId: string, fingerprint: string): ProgressTouch {
+	touch(conversationId: string, fingerprint: string, opts?: { hasRunningBackground?: boolean }): ProgressTouch {
 		const now = this.now();
 		let state = this.states.get(conversationId);
 		if (!state) {
-			state = { fingerprints: [], windowStart: now, level: 0 };
+			state = { fingerprints: [], windowStart: now, level: 0, deferrals: 0 };
 			this.states.set(conversationId, state);
 		}
 		if (!state.fingerprints.includes(fingerprint)) {
@@ -150,6 +159,7 @@ export class ProgressWatchdog {
 			if (state.fingerprints.length > this.options.windowSize) state.fingerprints.shift();
 			state.windowStart = now;
 			state.level = 0;
+			state.deferrals = 0;
 			return "progress";
 		}
 		if (now - state.windowStart < this.options.stallWindowMs) return "idle";
@@ -158,6 +168,15 @@ export class ProgressWatchdog {
 		// every window instead of disappearing.
 		state.level = Math.min(state.level + 1, this.options.softStopAfterWindows) as 0 | 1 | 2;
 		state.windowStart = now;
+		if (state.level >= this.options.softStopAfterWindows
+			&& opts?.hasRunningBackground === true
+			&& state.deferrals < this.options.maxDeferrals) {
+			// A running background process makes a repeated poll a LEGAL wait, not
+			// a dead loop: defer the soft-stop by one window instead of aborting
+			// the turn. Level stays capped, so the next stalled window re-judges.
+			state.deferrals += 1;
+			return "deferred";
+		}
 		return state.level >= this.options.softStopAfterWindows ? "soft-stop" : "nudge";
 	}
 
@@ -173,6 +192,7 @@ export class ProgressWatchdog {
 		if (options.stallWindowMs !== undefined) next.stallWindowMs = options.stallWindowMs;
 		if (options.windowSize !== undefined) next.windowSize = options.windowSize;
 		if (options.softStopAfterWindows !== undefined) next.softStopAfterWindows = options.softStopAfterWindows;
+		if (options.maxDeferrals !== undefined) next.maxDeferrals = options.maxDeferrals;
 		this.options = next;
 	}
 
