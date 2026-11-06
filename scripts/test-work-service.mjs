@@ -1335,13 +1335,20 @@ test("postpone gate leaves a TIME-BUDGET deferral alone (legal continuation, not
 	// A window that ran out of wall clock is taught to write progress and continue
 	// on the NEXT_CHECK — the canonical long-task shape. It must not be demoted
 	// just because one transient loop was caught earlier in the sliding window.
-	const h = fixture(t, { send: () => new Promise(() => {}) }); // never replies → deadline aborts
+	// Same shape as the proven deadline test: EXPLICIT 30-minute budget, a gate
+	// blocks the first send so the window is in flight when the deadline fires.
+	// (A never-resolving send promise wedges whenIdle() forever — that hung the
+	// whole suite twice; the gate must be RESOLVED to let the turn settle.)
+	let gate;
+	const h = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } }, send: () => gate.promise });
+	gate = h.gate();
 	h.runaway = 1;
 	const item = h.create("queued");
-	await h.service.start();
+	h.service.start();
 	await flush();
-	await h.clock.advance(31 * 60_000); // past maxMinutes
+	await h.clock.advance(30 * 60_000); // past maxMinutes → abortActive(TIMEOUT)
 	await flush();
+	gate.resolve({ reply: "已保存进度" });
 	await h.service.whenIdle();
 	const row = h.store.get(item.id);
 	assert.equal(row.status, "scheduled", "a time-budget deferral must keep its follow-up window");
