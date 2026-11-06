@@ -74,3 +74,34 @@ test("a conversation that went idle is pruned and re-armed (never silently stuck
 	const logs = captureLogs(() => manager.pumpTick());
 	assert.ok(logs.some((l) => l.includes("armed (first sighting): dt:a")), "re-appearance re-arms instead of firing on a stale clock");
 });
+
+
+test("pumpOne logs brief start/done around the REAL generation path (review P3)", async () => {
+	// Use the prototype pumpOne (not a stub) with fake engine/pusher: the brief
+	// logs are inside pumpOne and were previously uncovered (deleting them
+	// survived the suite).
+	const manager = Object.create(IMAdapterManager.prototype);
+	manager.config = { all: () => ({ general: { longTaskProgressMin: 10 } }) };
+	manager.pumpState = new Map([["dt:a", { lastSentAt: 0, inFlight: false }]]);
+	manager.engine = {
+		getOrCreateSession: () => ({}),
+		progressBrief: async () => "⏳ 任务仍在进行中。已完成：x；剩余：y；正在：z；卡点：无",
+		isConversationStreaming: () => true,
+	};
+	const pushed = [];
+	manager.onProgressPush = async (conversationId, text) => { pushed.push({ conversationId, text }); };
+	const lines = [];
+	const orig = console.log;
+	console.log = (...args) => { lines.push(args.join(" ")); };
+	try {
+		await manager.pumpOne("dt:a", 600000);
+	} finally {
+		console.log = orig;
+	}
+	const start = lines.findIndex((l) => l.includes("brief start: dt:a"));
+	const done = lines.findIndex((l) => l.includes("brief done: dt:a"));
+	assert.ok(start >= 0, "brief start log must exist");
+	assert.ok(done > start, "brief done log must come after the generation");
+	assert.equal(pushed.length, 1, "a usable brief is pushed");
+	assert.equal(manager.pumpState.get("dt:a").inFlight, false, "inFlight released after the push");
+});
