@@ -58,6 +58,7 @@ function fakeStore() {
 		list: () => rows,
 		addLesson: (id, c) => { const r = rows.find((x) => x.id === id); if (r) r.lessons = JSON.stringify([c]); return r; },
 		setField: (id, f, v) => { const r = rows.find((x) => x.id === id); if (r) r[f] = v; return r; },
+		resume: (id, answer) => { const r = rows.find((x) => x.id === id); if (!r || r.status !== "waiting_human") return undefined; r.status = "queued"; if (answer) r.answer = answer; return r; },
 	};
 }
 
@@ -65,8 +66,8 @@ const config = { all: () => ({ security: { adminStaffIds: ["admin"], ownerStaffI
 const WORK = "work:a1234567-1111-2222-3333-444444444444";
 const schedulerActor = { senderId: "admin", channel: "scheduler", chatType: "single" };
 
-function workTool(store, conversationId, fired = []) {
-	const resolveActor = (cid) => (cid.startsWith("work:") ? schedulerActor : { senderId: "admin", channel: "dingtalk", chatType: "group", text: "确认创建" });
+function workTool(store, conversationId, fired = [], workerActor = schedulerActor) {
+	const resolveActor = (cid) => (cid.startsWith("work:") ? workerActor : { senderId: "admin", channel: "dingtalk", chatType: "group", text: "确认创建" });
 	const tools = createWorkTools({
 		workItems: store,
 		fireItem: (id) => { fired.push(id); return true; },
@@ -121,8 +122,11 @@ test("worker window: EVERY mutating scheduler tool is refused (create/update/tog
 		assert.match(text(r), /不能创建或变更定时任务/);
 	}
 	assert.equal(created.length, 0, "no scheduled task may actually be created");
-	// read-only tools stay allowed
-	assert.ok(byName("list_scheduled_tasks").execute.length >= 0);
+	// read-only tools stay allowed -- REALLY execute (review P3-4a: the old
+	// `execute.length >= 0` assertion was vacuously true and let mutation X2
+	// "refuse get too" survive).
+	const listed = await byName("list_scheduled_tasks").execute("t", {});
+	assert.equal(listed.details?.refused, undefined, "list_scheduled_tasks must stay allowed in a worker window");
 });
 
 test("worker window: mine and confirm are refused (no autonomous-task pollution)", async () => {
@@ -245,4 +249,47 @@ test("IM conversations are unaffected: scheduled create and autonomous create st
 	assert.equal(wr.details?.ok, true, text(wr));
 	assert.equal(store.rows[0].origin, "mining", "IM-ordered create keeps origin=mining");
 	assert.deepEqual(fired, [store.rows[0].id]);
+});
+
+
+test("worker window: get is scoped to THIS window's derivations (review P3-4b)", async () => {
+	const store = fakeStore();
+	// another window's derivation must be invisible
+	const foreign = store.create({ title: "别的窗口派生", goal: "g", originConversation: "work:other-window", status: "queued" });
+	const tool = workTool(store, WORK);
+	const created = await tool.execute("t", { action: "create", title: "本窗派生", goal: "g" });
+	assert.equal(created.details?.ok, true);
+	const got = await tool.execute("t", { action: "get", id: String(created.details.id).slice(0, 8) });
+	assert.equal(got.details?.ok, true, "own derivation must return full details");
+	assert.match(text(got), /目标：/);
+	const denied = await tool.execute("t", { action: "get", id: foreign.id.slice(0, 8) });
+	assert.equal(denied.details?.ok, false, "another window's derivation must NOT be gettable");
+	assert.match(text(denied), /本后台任务没有 id 前缀/);
+});
+
+test("derived waiting_human task: chain-root IM conversation can resume it (review P2-1)", async () => {
+	const store = fakeStore();
+	// chain: dt:g1 -> (parent work item) -> work:<parent.id> (derived from it)
+	const parent = store.create({ title: "父任务", goal: "g", originConversation: "dt:g1", originNote: "管理员要求直接创建：父任务", origin: "mining", status: "working", createdBy: "admin", createdChannel: "dingtalk" });
+	const derived = store.create({ title: "派生", goal: "g", originConversation: `work:${parent.id}`, originNote: "后台任务派生（一次性）", origin: "manual", status: "waiting_human", createdBy: "admin", createdChannel: "scheduler" });
+	derived.question = "需要管理员补充信息";
+	const tool = workTool(store, "dt:g1");
+	const resumed = await tool.execute("dt:g1", { action: "resume", id: derived.id, answer: "补充信息在此" });
+	assert.equal(resumed.details?.resumed, true, "chain-root IM conversation must be able to resume a derived task");
+	assert.match(text(resumed), /已确认恢复/);
+	// a conversation NOT on the chain stays refused
+	const denied = await workTool(store, "dt:other").execute("dt:other", { action: "resume", id: derived.id, answer: "x" });
+	assert.equal(denied.details?.resumed, undefined, "off-chain conversations must stay refused");
+	assert.match(text(denied), /只能在它的来源会话中变更|部署所有者/);
+});
+
+
+test("worker derivation with NO scheduler identity is refused (review P3-2 fail-closed)", async () => {
+	const store = fakeStore();
+	// console-originated work: window (actor sans senderId) -> dead row if created
+	const tool = workTool(store, WORK, [], {});
+	const refused = await tool.execute("t", { action: "create", title: "x", goal: "y" });
+	assert.equal(refused.details?.ok, false, "null created_by derivation must be refused, not parked forever");
+	assert.match(text(refused), /调度身份/);
+	assert.equal(store.rows.filter((r) => r.origin === "manual").length, 0, "no dead row may be written");
 });

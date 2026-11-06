@@ -72,6 +72,26 @@ function collectRewrites(p: { title?: string; goal?: string; conditions?: string
 	return { fields };
 }
 
+/** Walk an item's origin chain (work:<parent> -> parent.origin_conversation -> ...)
+ * and report whether conversationId sits on it. Mirrors resolvePushTarget
+ * semantics: max 10 hops -- the cap doubles as the cycle guard. Used to let the
+ * chain-root IM conversation manage derived one-shot tasks (review P2-1: their
+ * origin_conversation is a work: id nobody can speak as, so the promised
+ * "reply in the source conversation" resume path was unreachable). */
+function chainIncludes(
+	item: { origin_conversation: string | null },
+	conversationId: string,
+	getItem: (id: string) => { origin_conversation: string | null } | undefined,
+): boolean {
+	let cursor = item.origin_conversation;
+	for (let hop = 0; cursor && hop < 10; hop++) {
+		if (cursor === conversationId) return true;
+		if (!cursor.startsWith("work:")) return false;
+		cursor = getItem(cursor.slice(5))?.origin_conversation ?? null;
+	}
+	return false;
+}
+
 function lessonsOf(raw: string | null): string[] {
 	try {
 		const parsed: unknown = raw ? JSON.parse(raw) : [];
@@ -213,7 +233,7 @@ export function createWorkTools(deps: {
 					if (matches.length === 0) return failure(`本后台任务没有 id 前缀为 ${wanted} 的派生任务（可能是别人的、已删除，或 id 写错；用 list 核对）。`);
 					if (matches.length > 1) return failure(`前缀 ${wanted} 命中 ${matches.length} 个派生任务，请提供完整 id。`);
 					const item = matches[0];
-					const lessons = (() => { try { return JSON.parse(item.lessons ?? "[]") as string[]; } catch { return []; } })();
+					const lessons = lessonsOf(item.lessons);
 					const detail = [
 						`「${item.title}」 [${item.status}]`,
 						`目标：${item.goal || "（未记录）"}`,
@@ -247,6 +267,11 @@ export function createWorkTools(deps: {
 					const actor2 = resolveActor(conversationId);
 					const chainBy = typeof actor2?.senderId === "string" && actor2.senderId.trim() ? actor2.senderId : null;
 					const chainChannel = typeof actor2?.channel === "string" ? actor2.channel : null;
+					if (!chainBy) {
+						// Fail-closed (review P3-2): a null created_by row can never
+						// execute (parked forever) -- creating it would be a dead row.
+						return failure("无法确定本任务的调度身份（created_by），拒绝派生一次性任务。请把剩余工作写进任务结果，由管理员在来源 IM 会话中直接创建。");
+					}
 					// Runaway guard: a worker prompt must not farm derived tasks. Three
 					// UNFINISHED derivations per worker window is already generous for
 					// legitimate "split the remaining work" usage.
@@ -370,7 +395,12 @@ export function createWorkTools(deps: {
 			// design (confirm/resume land where the item was created) and the
 			// pre-2026-10-04 behavior both depend on this. The old conversation
 			// filter enforced it incidentally; now it must be explicit.
-			if (p.action !== "get" && item.origin_conversation !== conversationId) {
+			if (p.action !== "get" && item.origin_conversation !== conversationId
+				// Derived tasks (review P2-1): their origin_conversation is a work:
+				// id nobody can speak as -- the chain-root IM conversation must be
+				// able to resume/pause/cancel/update them, or the waiting_human
+				// push's promise ("reply in the source conversation") is a lie.
+				&& !chainIncludes(item, conversationId, (wid) => workItems.get(wid))) {
 				// Owner跨会话变更：租户隔离约束的是「不同的人/群之间」，而不是
 				// 「整个部署的所有者」本身（field 2026-10-28：owner 被拦在自己
 				// 机器的任务外面，只能到来源会话去改）。

@@ -463,7 +463,11 @@ export class IMAdapterManager {
 		// worker push funnels through: work:<id> → its item → the item's own
 		// origin_conversation → walk until a routable conversation. Cycle- and
 		// depth-guarded; failure is loud, never a silent drop.
-		const resolved = resolvePushTarget(conversationId, (id) => this.engine.workItems?.get(id));
+		// workItems.get is a bare-id SQL lookup (its ids carry no work: prefix) --
+		// strip the namespace before handing the id over, or EVERY work: push
+		// would fail as "找不到对应任务" (found by test-resolve-push-target with a
+		// production-faithful injection; the reviewer probe used a bare-id fake).
+		const resolved = resolvePushTarget(conversationId, (id) => this.engine.workItems?.get(id.startsWith("work:") ? id.slice(5) : id));
 		if ("error" in resolved) {
 			console.warn(`[im] push target unresolvable: ${resolved.error}`);
 			return { ok: false, error: resolved.error };
