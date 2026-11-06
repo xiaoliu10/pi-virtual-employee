@@ -197,7 +197,11 @@ test("a sentence CONTAINING the words is ordinary text — it goes to the model,
 		{ conversationId: CONV, text: "帮我前台执行一下再导出", actor: { senderId: "u1", channel: "dingtalk", chatType: "group" } },
 		undefined,
 	);
+	// The phrase did NOT trigger the hatch: the earlier item stays queued.
 	assert.equal(store.get(item.id).status, "queued", "a non-escape sentence must not cancel anything");
-	assert.equal(sends.length, 1, "it must flow through the normal turn");
-	assert.match(reply, /前台完成/);
+	// Architecture 2026-11-06 (route-by-default): this sentence is a TASK
+	// ("…再导出"), so the Router routes it to a Worker instead of executing it.
+	// The contract this test guards is "the escape hatch did not fire", which
+	// both paths satisfy — inline (old) or dispatched (new).
+	assert.ok(sends.length === 1 || /已转后台执行/.test(reply), "either inline or routed — never the hatch");
 });

@@ -73,6 +73,33 @@ export function isDeepTask(text: string): boolean {
 	return DEEP_TASK_VERBS.some((v) => t.includes(v));
 }
 
+/** Pure conversation, never work: greetings, thanks, short acknowledgements. */
+/**
+ * Acknowledgement vocabulary. A message made ENTIRELY of these (plus
+ * punctuation) is conversation, however long: 「好的，收到，谢谢啊」 must never
+ * become a background task.
+ */
+const SMALL_TALK_WORDS: readonly string[] = [
+	"你好", "您好", "在吗", "哈喽", "hello", "hi", "hey", "早上好", "晚上好", "下午好", "早安", "晚安",
+	"谢谢", "多谢", "感谢", "辛苦了", "麻烦你了",
+	"好的", "好滴", "好嘞", "收到", "明白", "了解", "知道了", "没问题", "可以", "行", "好",
+	"嗯", "哦", "ok", "okay",
+	// Sentence-final particles: 「好的，收到，谢谢啊」/「明白了，辛苦了」 leave one
+	// of these behind after the words above are stripped.
+	"啊", "了", "呢", "吧", "呀", "哈", "啦", "嘛", "的",
+];
+
+/** True for greetings/acknowledgements — the only chat that never routes. */
+export function isSmallTalk(text: string): boolean {
+	const t = (text ?? "").trim();
+	if (!t || t.length > 40) return false;
+	// Strip punctuation and every acknowledgement word, then require nothing
+	// meaningful to remain. Word list instead of one regex so 「好的，收到，谢谢啊」
+	// and 「好的收到」 behave identically.
+	let rest = t.replace(/[\s，,。.!！?？~、;；\-—…·]+/g, "");
+	for (const w of SMALL_TALK_WORDS) rest = rest.split(w).join("");
+	return rest.length === 0;
+}
 export interface TriageInput {
 	/** The raw user message. */
 	text: string;
@@ -86,7 +113,7 @@ export interface TriageDecision {
 	/** true → dispatch to a background work item. */
 	dispatch: boolean;
 	/** Machine-readable reason, always populated (for logs and tests). */
-	reason: "disabled" | "not-task" | "no-plan" | "too-few-steps" | "no-long-verb" | "question" | "dispatch" | "deep-task";
+	reason: "disabled" | "not-task" | "no-plan" | "too-few-steps" | "no-long-verb" | "question" | "dispatch" | "deep-task" | "task" | "chat";
 	/** Number of numbered steps found in the plan (0 when no plan). */
 	steps: number;
 }
@@ -117,9 +144,17 @@ export function countPlanSteps(plan: string | undefined): number {
 export function isQuestion(text: string): boolean {
 	const t = (text ?? "").trim();
 	if (!t) return true; // empty → nothing to dispatch
-	if (t.length <= 12 && !/[，,。\n]/.test(t)) return true; // short utterance = chat
+	// A short utterance is chat ONLY when it carries no task verb: 「导出昨天的报表」
+	// is 7 chars and clearly a task. The old blanket "≤12 chars = chat" rule made
+	// the Router an executor for exactly the short instructions users type most.
+	if (t.length <= 12 && !/[，,。\n]/.test(t) && !TASK_VERB_HINT.test(t)) return true;
 	return QUESTION_MARKERS.some((re) => re.test(t));
 }
+
+/** Cheap task-verb hint used to keep short INSTRUCTIONS out of the "chat" bucket.
+ * Deliberately broad: a false positive routes a short task (correct), while a
+ * false negative would execute it in the Router (the architecture violation). */
+const TASK_VERB_HINT = /登录|抓取|爬|下载|整理|汇总|生成|监控|巡检|对账|采集|导出|导入|推送|部署|排查|分析|批量|核对|配置|查询|查一下|跑到|跑一遍|执行|重跑|迁移|备份|归档|修复|改一下|写个|写一个|建一个|创建|删除|清理|安装|升级/;
 
 /** Any long-running verb present? */
 export function hasLongRunningVerb(text: string): boolean {
@@ -135,24 +170,24 @@ export function triageMessage(input: TriageInput, enabled: boolean): TriageDecis
 	if (!enabled) return { dispatch: false, reason: "disabled", steps: 0 };
 	const text = input.text ?? "";
 	if (!input.looksLikeTask) return { dispatch: false, reason: "not-task", steps: 0 };
-	// Deep-task path (field 2026-11-06): names an external system + an
-	// investigation action → minutes of work by nature. Dispatches WITHOUT a
-	// plan; the Worker window plans for itself (the goal carries the raw text).
-	// Previously `!plan` returned inline unconditionally, so a failed plan side
-	// pass silently serialized two unrelated jobs into one chat's queue.
-	// The question check comes FIRST here: 「sls 查询失败了吗？」 is a question even
-	// though it names SLS — asking must never be shipped to the background.
-	if (isDeepTask(text)) {
-		if (isQuestion(text)) return { dispatch: false, reason: "question", steps: 0 };
-		return { dispatch: true, reason: "deep-task", steps: countPlanSteps(input.plan) };
-	}
-	if (!input.plan) return { dispatch: false, reason: "no-plan", steps: 0 };
 	const steps = countPlanSteps(input.plan);
-	if (steps < 2) return { dispatch: false, reason: "too-few-steps", steps };
-	// A question mark / question shape wins over any verb: 「监控脚本还在跑吗」.
+	// ARCHITECTURE (docs/design/router-worker.md §3, user ruling 2026-11-06):
+	// the Router does not EXECUTE tasks — it routes them. Every task-shaped
+	// message goes to a Worker; only explicit non-task shapes stay foreground.
+	// The earlier "conservative" flip (dispatch only with a plan AND a long verb)
+	// made the Router an executor: two unrelated jobs then serialized inside one
+	// chat's queue and the user correctly observed "VE runs globally serial".
+	//
+	// What still stays in the foreground is decided by SHAPE, never by how much
+	// work it looks like:
+	//   · questions — 「日志在哪？」「sls 查询失败了吗？」 (asking must stay chat)
+	//   · conversation openers / pleasantries
+	//   · commands (/stop, /new …) — handled long before this function
+	// Everything else that looks like a task is routed, plan or no plan: a
+	// Worker window plans for itself from the raw instruction.
 	if (isQuestion(text)) return { dispatch: false, reason: "question", steps };
-	if (!hasLongRunningVerb(text)) return { dispatch: false, reason: "no-long-verb", steps };
-	return { dispatch: true, reason: "dispatch", steps };
+	if (isSmallTalk(text)) return { dispatch: false, reason: "chat", steps };
+	return { dispatch: true, reason: isDeepTask(text) ? "deep-task" : "task", steps };
 }
 
 /**

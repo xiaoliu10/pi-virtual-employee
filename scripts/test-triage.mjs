@@ -69,26 +69,20 @@ test("a non-task message never dispatches", () => {
 	assert.equal(d.reason, "not-task");
 });
 
-test("no plan → inline (planning side pass failed or said NO_PLAN)", () => {
-	for (const plan of [undefined, ""]) {
-		const d = triageMessage({ text: "部署测试环境并跑通后把日志发我", plan, looksLikeTask: true }, true);
-		assert.equal(d.dispatch, false);
-		assert.equal(d.reason, "no-plan");
-	}
+test("no plan → still ROUTED (architecture: the Router does not execute tasks)", () => {
+	const d = triageMessage({ text: "登录 spay 抓取昨日账单并导出 Excel", plan: undefined, looksLikeTask: true }, true);
+	assert.equal(d.dispatch, true, "a task-shaped message routes even without a plan — the Worker plans for itself");
 });
 
-test("a single-step plan → inline even with a long verb", () => {
+test("a single-step plan still ROUTES (shape decides, not step count)", () => {
 	const d = triageMessage({ text: "导出昨天的报表", plan: PLAN1, looksLikeTask: true }, true);
-	assert.equal(d.dispatch, false);
-	assert.equal(d.reason, "too-few-steps");
-	assert.equal(d.steps, 1);
+	assert.equal(d.dispatch, true, "routing is by SHAPE (task vs question), never by estimated effort");
 });
 
-test("two-plus steps WITHOUT a long verb → inline", () => {
+test("a task without a long-running verb still ROUTES", () => {
 	const plan = `1. 看一下当前配置\n2. 告诉我端口号`;
 	const d = triageMessage({ text: "看一下当前配置然后告诉我端口号", plan, looksLikeTask: true }, true);
-	assert.equal(d.dispatch, false);
-	assert.equal(d.reason, "no-long-verb");
+	assert.equal(d.dispatch, true, "verb length is not a routing criterion any more");
 });
 
 test("a QUESTION about a long-running thing stays inline", () => {
@@ -98,14 +92,9 @@ test("a QUESTION about a long-running thing stays inline", () => {
 	assert.equal(d.reason, "question");
 });
 
-test("the real dispatch case: multi-step plan + long verb", () => {
-	const d = triageMessage(
-		{ text: "登录 spay 系统抓取昨日账单，然后导出 Excel 发我", plan: PLAN3, looksLikeTask: true },
-		true,
-	);
+test("the real dispatch case: a clear multi-step task routes", () => {
+	const d = triageMessage({ text: "登录 spay 系统抓取昨日账单，然后导出 Excel 发我", plan: PLAN3, looksLikeTask: true }, true);
 	assert.equal(d.dispatch, true);
-	assert.equal(d.reason, "dispatch");
-	assert.equal(d.steps, 3);
 });
 
 test("countPlanSteps accepts the separator shapes the planner really emits", () => {
@@ -426,10 +415,12 @@ test("a QUESTION about a deep system still stays inline (the trap this must not 
 	}
 });
 
-test("simple chat with no plan stays inline exactly as before", () => {
-	const d = triageMessage({ text: "帮我看看这个", plan: undefined, looksLikeTask: true }, true);
-	assert.equal(d.dispatch, false);
-	assert.equal(d.reason, "no-plan");
+test("small talk never routes (the UX this architecture must protect)", () => {
+	for (const chat of ["你好", "在吗", "谢谢", "好的", "收到", "你是谁"]) {
+		const d = triageMessage({ text: chat, plan: undefined, looksLikeTask: true }, true);
+		assert.equal(d.dispatch, false, `chat must stay foreground: ${chat}`);
+		// reason may be "chat" or "question" — the contract is INLINE, never routed.
+	}
 });
 
 test("deep-task needs BOTH axes: investigation verb alone is not enough", () => {
@@ -441,5 +432,14 @@ test("deep-task needs BOTH axes: investigation verb alone is not enough", () => 
 	}
 	for (const yes of ["查一下 sls 日志", "查询数据库记录"]) {
 		assert.equal(isDeepTask(yes), true, `verb + system must be deep: ${yes}`);
+	}
+});
+
+test("small-talk gate is load-bearing: a ≤12-char non-question chat must not route", () => {
+	// These contain no task verb and no question marker, so ONLY isSmallTalk
+	// keeps them foreground. Without that gate they would be routed as "task".
+	for (const chat of ["好的，收到，谢谢啊", "嗯嗯，明白了，辛苦了"]) {
+		const d = triageMessage({ text: chat, plan: undefined, looksLikeTask: true }, true);
+		assert.equal(d.dispatch, false, `must stay foreground via the small-talk gate: ${chat}`);
 	}
 });
