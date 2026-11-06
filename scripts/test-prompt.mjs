@@ -235,6 +235,11 @@ const INTERACTION_MARKERS = [
 	"并结束当前回合等答复",
 	"（传上次 nextOffset）",
 	"那是「要不要做」的授权请示",
+	// field 2026-11-06 2nd round: four copies of one driver script ran to
+	// completion and beyond — "check before you start" + "kill when done".
+	"后台脚本有始有终",
+	"先用 manage_process list 确认没有同类已经在跑",
+	"任务完成、目标达成、或不再需要它时必须 kill",
 ];
 
 test("foreground-interaction timing rules are present and pinned in the immutable discipline block", () => {

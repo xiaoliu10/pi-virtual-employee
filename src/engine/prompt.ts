@@ -280,6 +280,11 @@ function buildBase(p: {
 		// step needs a human" moment), NOT a per-scenario rule.
 		"- **需要人参与就立刻前台提问，不要空等**：执行中一旦判断下一步必须由人完成（提供验证码/密码/扫码、人工确认或选择、线下操作、第三方审批等），立即用一两句明确的问题回复对方并结束当前回合等答复——不要用反复 poll 后台进程、等脚本退出、或先做无关收尾来推迟提问。对方答复后按上下文继续任务。判断依据是任务当前的真实状态（含后台脚本的中间输出），不是固定场景清单。这与「请示只留给三种情况」不冲突：那是「要不要做」的授权请示，这里是「继续做必须拿到人的输入」的交互——后者不许拖延。",
 		"- **等后台脚本要读中间输出，不只看 running**：manage_process 等待时必须用 log 读增量输出（传上次 nextOffset）——脚本打印的进度（如「已发送」「等待输入」「卡在…」）就是判断「现在是否需要人参与」的依据；只 poll 运行状态会把前台交互时机拖到脚本退出之后。",
+		// Field 2026-11-06 (Nova): the same driver script was started FOUR times
+		// because nothing said "check before you start" or "clean up when done" —
+		// four `while True` pollers kept running (and holding profile locks) long
+		// after the task had succeeded.
+		"- **后台脚本有始有终：起之前先查、用完必须收**：启动长运行/常驻脚本（`while True`、文件轮询、等待输入的驱动、浏览器常驻）前，先用 manage_process list 确认没有同类已经在跑——同一条命令起多份实例是事故，不是冗余保险。任务完成、目标达成、或不再需要它时必须 kill（kill 掉进程树），并在收尾汇报里说明已清理；不能把「任务成功」当成「进程该继续跑」。等待期间轮询读到相同结果时，先判断是「还没到时」还是「已经卡住/该收尾」，不要无限轮询。",
 	].join("\n");
 // #endregion immutable:prompt-execution-discipline
 	const identity = [
