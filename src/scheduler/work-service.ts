@@ -721,6 +721,12 @@ export class WorkService<Session extends WorkSession> {
 					nextCheckAt = undefined;
 					nextReason = undefined;
 					console.log(`[work] origin gate: item=${item.id} origin=${gateOrigin} may not self-schedule; closing instead of arming a follow-up`);
+					// Review P3-5: a gate-closed row pushes as 手动任务完成, which is
+					// indistinguishable from a real completion. Mark the row so
+					// get/push bodies show WHY it closed without a follow-up.
+					const gateNote = "⏱️ 到达时间上限自动收尾（该任务不允许自动续期）；如需继续请管理员恢复或重建。";
+					const prior = currentRow?.progress ?? item.progress ?? "";
+					store.setField(item.id, "progress", prior ? `${prior}\n${gateNote}` : gateNote);
 				}
 				store.setStatus(item.id, outcome, outcome === "waiting_human" ? question || active.stopReason || "请管理员明确恢复。" : null, nextCheckAt ?? null, nextReason);
 				if (outcome === "scheduled") store.setFixedStreak(item.id, nextStreak);

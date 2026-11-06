@@ -72,6 +72,26 @@ function collectRewrites(p: { title?: string; goal?: string; conditions?: string
 	return { fields };
 }
 
+/** Walk an item's origin chain (work:<parent> -> parent.origin_conversation -> ...)
+ * and report whether conversationId sits on it. Mirrors resolvePushTarget
+ * semantics: max 10 hops -- the cap doubles as the cycle guard. Used to let the
+ * chain-root IM conversation manage derived one-shot tasks (review P2-1: their
+ * origin_conversation is a work: id nobody can speak as, so the promised
+ * "reply in the source conversation" resume path was unreachable). */
+function chainIncludes(
+	item: { origin_conversation: string | null },
+	conversationId: string,
+	getItem: (id: string) => { origin_conversation: string | null } | undefined,
+): boolean {
+	let cursor = item.origin_conversation;
+	for (let hop = 0; cursor && hop < 10; hop++) {
+		if (cursor === conversationId) return true;
+		if (!cursor.startsWith("work:")) return false;
+		cursor = getItem(cursor.slice(5))?.origin_conversation ?? null;
+	}
+	return false;
+}
+
 function lessonsOf(raw: string | null): string[] {
 	try {
 		const parsed: unknown = raw ? JSON.parse(raw) : [];
@@ -188,6 +208,106 @@ export function createWorkTools(deps: {
 				id?: string; answer?: string; title?: string; goal?: string; conditions?: string; nextCheck?: string; reason?: string; resident?: boolean; maxMinutes?: number;
 			};
 			if (!["list", "get", "mine", "create", "confirm", "resume", "cancel", "update", "pause"].includes(p.action)) return failure("未知的自主任务操作。");
+			// Worker windows (work:<id>) are the router/worker async-call mechanism
+			// (user ruling 2026-11-06). They MUST NOT morph into scheduled or
+			// autonomous tasks — that pollutes the global lists with entries the
+			// operator never asked for. Allowed: deriving plain ONE-SHOT tasks
+			// (origin=manual, no resident, no self-follow-up — they run once and
+			// end). This branch is a semantic boundary placed BEFORE the IM identity
+			// gate on purpose: the honest refusal ("worker windows cannot do X")
+			// tells the model to stop trying; the generic identity failure would
+			// read as a fixable credential problem and invite retries.
+			if (conversationId.startsWith("work:")) {
+				if (p.action === "list" || p.action === "get") {
+					const scoped = workItems.list().filter((item) => item.origin_conversation === conversationId);
+					if (p.action === "list") {
+						const lines = scoped.slice(0, 30).map((item) => `${item.id.slice(0, 8)} 「${item.title}」 [${STATUS_LABEL[item.status] ?? item.status}]`);
+						return {
+							content: [{ type: "text", text: lines.length ? `本后台任务派生的一次性任务 ${scoped.length} 个：\n${lines.join("\n")}` : "本后台任务还没有派生过一次性任务。" }],
+							details: { ok: true, count: scoped.length },
+						};
+					}
+					// get: full details of ONE derivation (review P2-2 — it used to be
+					// merged into the list branch, so the promised goal/conditions/
+					// progress/lessons detail was unreachable).
+					const wanted = (p.id ?? "").trim();
+					if (!wanted) return failure("action=get 需要 id（用 list 取短前缀）。");
+					const matches = scoped.filter((item) => item.id === wanted || item.id.startsWith(wanted));
+					if (matches.length === 0) return failure(`本后台任务没有 id 前缀为 ${wanted} 的派生任务（可能是别人的、已删除，或 id 写错；用 list 核对）。`);
+					if (matches.length > 1) return failure(`前缀 ${wanted} 命中 ${matches.length} 个派生任务，请提供完整 id。`);
+					const item = matches[0];
+					const lessons = lessonsOf(item.lessons);
+					const detail = [
+						`「${item.title}」 [${item.status}]`,
+						`目标：${item.goal || "（未记录）"}`,
+						item.conditions ? `执行条件：${item.conditions}` : null,
+						item.progress ? `进展：${item.progress}` : null,
+						lessons.length ? `踩坑：\n- ${lessons.join("\n- ")}` : null,
+						item.question ? `待答：${item.question}` : null,
+					].filter(Boolean).join("\n");
+					return {
+						content: [{ type: "text", text: detail }],
+						details: { ok: true, id: item.id, status: item.status },
+					};
+				}
+				if (p.action === "mine" || p.action === "confirm") {
+					return failure("后台任务窗口不能挖掘或确认自主任务提案——router/worker 是一次性异步调用，创建自主（常驻）任务会污染任务列表。如需后续跟进，请派生一次性任务（create 且不带 resident），或在任务结果中说明，由来源会话的管理员决定。");
+				}
+				if (p.action === "create") {
+					if (p.resident === true) {
+						return failure("后台任务窗口只能派生一次性任务：resident=true 是无自然终点的常驻任务，不允许从后台任务派生。一次性任务完成后即终结。");
+					}
+					if (!p.title?.trim() || !p.goal?.trim()) return failure("派生一次性任务需要 title 和 goal。");
+					// Depth limit = 1 (review P2-1): the per-window cap counts only
+					// direct children, so without this a derived task's own window
+					// could derive grandchildren, and the tree grows unbounded.
+					// A derived task is recognizable by its origin: manual is ONLY
+					// set by this derivation path.
+					const parentItem = workItems.get(conversationId.slice(5));
+					if (parentItem?.origin === "manual") {
+						return failure("派生的一次性任务不能再派生（只允许一层派生）。剩余工作请写进本任务结果，交回来源会话的管理员安排。");
+					}
+					const actor2 = resolveActor(conversationId);
+					const chainBy = typeof actor2?.senderId === "string" && actor2.senderId.trim() ? actor2.senderId : null;
+					const chainChannel = typeof actor2?.channel === "string" ? actor2.channel : null;
+					if (!chainBy) {
+						// Fail-closed (review P3-2): a null created_by row can never
+						// execute (parked forever) -- creating it would be a dead row.
+						return failure("无法确定本任务的调度身份（created_by），拒绝派生一次性任务。请把剩余工作写进任务结果，由管理员在来源 IM 会话中直接创建。");
+					}
+					// Runaway guard: a worker prompt must not farm derived tasks. Three
+					// UNFINISHED derivations per worker window is already generous for
+					// legitimate "split the remaining work" usage.
+					const unfinished = workItems.list().filter((item) => item.origin_conversation === conversationId
+						&& !["done", "cancelled"].includes(item.status));
+					if (unfinished.length >= 3) {
+						return failure(`本后台任务派生的未完结一次性任务已达上限（3 个）。请等现有任务完成，或把剩余工作写进任务结果交回管理员。`);
+					}
+					const created = workItems.create({
+						title: p.title.trim().slice(0, 80),
+						goal: p.goal.trim().slice(0, 2000),
+						originConversation: conversationId,
+						originNote: "后台任务派生（一次性）",
+						// manual = one-shot: no self-follow-up (work-origin.ts), labelled
+						// 手动任务 in pushes — the truthful shape of a derived task.
+						origin: "manual",
+						status: "queued",
+						createdBy: chainBy,
+						createdChannel: chainChannel,
+					});
+					if (p.conditions?.trim()) workItems.setField(created.id, "conditions", p.conditions.trim().slice(0, 1000));
+					const fired = fireItem(created.id);
+					return {
+						content: [{ type: "text", text: `✅ 已派生一次性任务「${created.title}」${fired ? "，已开工" : "，已入队，稍后自动开工"}。它是一次性任务（完成即终结，不会自动续期）；本后台任务不能创建定时或常驻自主任务。` }],
+						details: { ok: true, created: true, id: created.id, fired, queued: !fired },
+					};
+				}
+				// resume/pause/cancel/update target "the task of this source
+				// conversation" — but a worker window's source IS its own parent task.
+				// Managing OTHER work items belongs to the operator in the IM source
+				// conversation, not to a background run.
+				return failure("后台任务窗口只能派生或查看一次性任务；对其他自主任务的操作（恢复/暂停/取消/调整）请在任务来源 IM 会话中由管理员进行。");
+			}
 			const actor = resolveActor(conversationId);
 			if (!verifiedIMActor(actor, conversationId)) return failure("请在经过平台验证的任务来源 IM 单聊或群聊中管理自主任务。");
 			if (p.action !== "list" && p.action !== "get") {
@@ -278,7 +398,12 @@ export function createWorkTools(deps: {
 			// design (confirm/resume land where the item was created) and the
 			// pre-2026-10-04 behavior both depend on this. The old conversation
 			// filter enforced it incidentally; now it must be explicit.
-			if (p.action !== "get" && item.origin_conversation !== conversationId) {
+			if (p.action !== "get" && item.origin_conversation !== conversationId
+				// Derived tasks (review P2-1): their origin_conversation is a work:
+				// id nobody can speak as -- the chain-root IM conversation must be
+				// able to resume/pause/cancel/update them, or the waiting_human
+				// push's promise ("reply in the source conversation") is a lie.
+				&& !chainIncludes(item, conversationId, (wid) => workItems.get(wid))) {
 				// Owner跨会话变更：租户隔离约束的是「不同的人/群之间」，而不是
 				// 「整个部署的所有者」本身（field 2026-10-28：owner 被拦在自己
 				// 机器的任务外面，只能到来源会话去改）。

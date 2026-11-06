@@ -58,6 +58,19 @@ export function createSchedulerTools(
 	 * *current* role. A demoted creator is therefore called out explicitly — that
 	 * is the silent case where a task quietly loses its abilities.
 	 */
+	// Worker windows (work:<id>) are one-shot async runs: they must not touch the
+	// global schedule at ALL — creating is pollution, but so is updating/toggling/
+	// deleting someone else's schedule from inside a background run (review P1-2:
+	// the create-only gate left update/toggle wide open, and a worker could turn
+	// an existing task into an autonomous recurring one). Read-only list/get stay
+	// allowed. Kept as one helper so the wording and the reason code can never
+	// drift between tools.
+	const workerSchedulerRefusal = () => ({
+		content: [{ type: "text" as const, text: "⛔ 后台任务（router/worker）是一次性异步执行，不能创建或变更定时任务（创建/更新/启停/删除/授权/续跑都不允许）——那会污染定时任务列表。如需后续跟进：用 manage_work_items 的 create 派生一次性任务（不要带 resident），或在任务结果中说明，由来源会话的管理员决定。" }],
+		details: { ok: false, refused: true, reason: "worker-window-cannot-mutate-scheduled" },
+	});
+	const inWorkerWindow = conversationId.startsWith("work:");
+
 	const identityLabel = (task: { created_by: string | null }): string => {
 		if (!task.created_by) {
 			return "未记录（控制台/旧版本创建）——无人值守只能用对话与知识库；如需授权，管理员可在单聊里用 authorize_scheduled_task 补上";
@@ -87,6 +100,13 @@ export function createSchedulerTools(
 		}, { open: true }),
 		async execute(_id, params) {
 			const p = params as { title: string; prompt: string; cron: string; autonomous?: boolean; silent?: boolean; maxTurns?: number; maxMinutes?: number };
+			// Worker windows (work:<id>) are the router/worker async-call mechanism.
+			// They may derive ONE-SHOT tasks, but a scheduled task born inside a
+			// background run pollutes the global schedule list with entries nobody
+			// the operator talks to ever asked for (user ruling 2026-11-06). This is
+			// a semantic boundary, not an identity gate: refuse with the honest
+			// reason so the model can finish its job instead of retrying.
+			if (inWorkerWindow) return workerSchedulerRefusal();
 			try {
 				scheduler.validateCron(p.cron);
 			} catch (err) {
@@ -252,6 +272,7 @@ export function createSchedulerTools(
 		description: "按 id 删除一个定时任务。删除前建议先用 list_scheduled_tasks 确认 id。",
 		parameters: obj({ id: str({ description: "任务 id（来自 list）" }) }, { open: true }),
 		async execute(_id, params) {
+			if (inWorkerWindow) return workerSchedulerRefusal();
 			scheduler.delete((params as { id: string }).id);
 			return { content: [{ type: "text", text: "已删除该定时任务。" }], details: { ok: true } };
 		},
@@ -271,6 +292,7 @@ export function createSchedulerTools(
 			all: opt(bool({ description: "true=授权当前所有未授权的任务" })),
 		}, { open: true }),
 		async execute(_id, params) {
+			if (inWorkerWindow) return workerSchedulerRefusal();
 			const { id, all } = params as { id?: string; all?: boolean };
 			let taskId = (id ?? "").trim();
 			if (!all && !taskId) {
@@ -361,6 +383,7 @@ export function createSchedulerTools(
 			enabled: bool({ description: "true=启用，false=停用" }),
 		}, { open: true }),
 		async execute(_id, params) {
+			if (inWorkerWindow) return workerSchedulerRefusal();
 			const p = params as { id: string; enabled: boolean };
 			scheduler.setEnabled(p.id, p.enabled);
 			return {
@@ -383,6 +406,7 @@ export function createSchedulerTools(
 			answer: opt(str({ description: "对暂停问题的答复（任务因「需要人工」暂停时）；会作为下一轮输入交给任务" })),
 		}, { open: true }),
 		async execute(_id, params) {
+			if (inWorkerWindow) return workerSchedulerRefusal();
 			const p = params as { id: string; answer?: string };
 			const task = scheduler.get(p.id);
 			if (!task) {
@@ -445,6 +469,7 @@ export function createSchedulerTools(
 			maxMinutes: opt(num({ description: "自主模式最大时长分钟（默认 120，上限 1440）" })),
 		}, { open: true }),
 		async execute(_toolCallId, params) {
+			if (inWorkerWindow) return workerSchedulerRefusal();
 			const p = params as { id: string; title?: string; prompt?: string; cron?: string; bindCurrent?: boolean; autonomous?: boolean; silent?: boolean; maxTurns?: number; maxMinutes?: number };
 			const patch: { title?: string; prompt?: string; cron?: string; conversationId?: string | null; autonomous?: boolean; silent?: boolean; maxTurns?: number | null; maxMinutes?: number | null } = {};
 			if (p.title !== undefined) patch.title = p.title;

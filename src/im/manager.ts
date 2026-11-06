@@ -464,6 +464,24 @@ export class IMAdapterManager {
 	}
 
 	async pushToConversation(conversationId: string, text: string, opts: PushOptions = {}): Promise<PushResult> {
+		// Derived one-shot tasks (PR #165) carry origin_conversation=work:<parent>:
+		// attribution and the derivation cap need that link, but DELIVERY cannot —
+		// no IM adapter routes a work: id, so every completion/progress/waiting-human
+		// push would fail with "没有可推送到 work:… 的在线渠道" (review P1-1,
+		// reproduced). Resolve the chain here, ONCE, at the single entry every
+		// worker push funnels through: work:<id> → its item → the item's own
+		// origin_conversation → walk until a routable conversation. Cycle- and
+		// depth-guarded; failure is loud, never a silent drop.
+		// workItems.get is a bare-id SQL lookup (its ids carry no work: prefix) --
+		// strip the namespace before handing the id over, or EVERY work: push
+		// would fail as "找不到对应任务" (found by test-resolve-push-target with a
+		// production-faithful injection; the reviewer probe used a bare-id fake).
+		const resolved = resolvePushTarget(conversationId, (id) => this.engine.workItems?.get(id.startsWith("work:") ? id.slice(5) : id));
+		if ("error" in resolved) {
+			console.warn(`[im] push target unresolvable: ${resolved.error}`);
+			return { ok: false, error: resolved.error };
+		}
+		conversationId = resolved.target;
 		const occurrenceId = opts.occurrenceId?.trim();
 		// `deps` may be absent on a manager built without a constructor (tests):
 		// treat that exactly like "no ledger configured".
@@ -1012,3 +1030,25 @@ function credChanged(prev: ImChannelConfig | undefined, next: ImChannelConfig): 
 
 /* Command recognition lives in ./commands.js — one tolerant parser shared with the
  * adapters, so "@机器人/new", "／new" and multi-line mentions all work. */
+
+/** Walk a derivation chain to a routable push target. Pure; injectable lookup.
+ * `work:<id>` → item.origin_conversation → … until a non-work: id, max 10 hops,
+ * cycle-safe. Returns an honest error instead of a silent drop. */
+export function resolvePushTarget(
+	start: string,
+	getItem: (id: string) => { origin_conversation: string | null } | undefined,
+): { target: string } | { error: string } {
+	let current = start;
+	const visited = new Set<string>();
+	for (let hops = 0; current.startsWith("work:"); hops++) {
+		if (hops >= 10) return { error: `派生链过深（>10 层），无法解析推送目标：${start}` };
+		if (visited.has(current)) return { error: `派生链成环，无法解析推送目标：${start}` };
+		visited.add(current);
+		const item = getItem(current);
+		if (!item) return { error: `推送目标 ${current} 不是可投递会话，且找不到对应任务（可能已被删除）` };
+		const parent = item.origin_conversation ?? "";
+		if (!parent) return { error: `推送目标 ${current} 的来源会话为空，无法投递` };
+		current = parent;
+	}
+	return { target: current };
+}
