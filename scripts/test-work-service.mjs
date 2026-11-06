@@ -51,8 +51,12 @@ function fixture(t, overrides = {}) {
 		reclaimBackground: (itemId) => { h.reclaimed.push(itemId); },
 		onError: err => h.errors.push(err),
 		lastInboundAt: overrides.lastInboundAt ? (cid, sinceTs) => overrides.lastInboundAt(cid, sinceTs) : undefined,
+		runawayCount: () => h.runaway,
 		...overrides.options,
 	});
+	// Watchdog counter injection (field 2026-11-06 postpone gate): engine owns the
+	// real number, a test flips it between windows like a real soft-stop would.
+	h.runaway = 0;
 	h.create = (status = "queued", extra = {}) => h.store.create({ title: "月末对账", goal: "完成月末核对", status, createdBy: "admin", originConversation: "dt:source", ...extra });
 	h.gate = () => { const gate = deferred(); h.gates.push(gate); return gate; };
 	t.after(async () => {
@@ -1229,4 +1233,69 @@ test("a window that defers (NEXT_CHECK) does NOT reclaim", async t => {
 	await h.service.whenIdle();
 	assert.equal(h.store.get(item.id).status, "scheduled", "the item continues next window");
 	assert.deepEqual(h.reclaimed, [], "a continuing item keeps its background work");
+});
+
+// ── Postpone gate (field 2026-11-06, the box) ────────────────────────────────
+// A watchdog soft-stop used to leave `scheduled` untouched, so the killed loop
+// restarted from its checkpoint, was killed again, and kill/re-arm spun forever
+// (~18 LLM calls/minute for half an hour). These pin the gate that demotes the
+// window to waiting_human instead of letting it re-arm itself.
+
+test("postpone gate: a watchdog soft-stop stops the chain instead of re-arming it", async (t) => {
+	const h = fixture(t, { send: () => ({ reply: "进度：第一批已入库\n[[NEXT_CHECK]]: 30m" }) });
+	h.runaway = 1; // the engine's counter saw one soft-stop for this conversation
+	const item = h.create("queued");
+	await h.service.start();
+	await flush();
+	await h.service.whenIdle();
+	const row = h.store.get(item.id);
+	assert.equal(row.status, "waiting_human", "a soft-stopped window must not schedule itself");
+	assert.equal(row.next_check_at, null, "no future window may be armed");
+	assert.match(row.question ?? "", /循环空转|重复执行同样的步骤/, "the admin must be told what happened");
+	assert.ok(h.pushes.some(p => /需要人工/.test(p.text)), "the pause must be pushed, not silent");
+});
+
+test("postpone gate: a second soft-stop escalates the copy (cancel or split, not resume)", async (t) => {
+	const h = fixture(t, { send: () => ({ reply: "进度：第一批已入库\n[[NEXT_CHECK]]: 30m" }) });
+	h.runaway = 2;
+	const item = h.create("queued");
+	await h.service.start();
+	await flush();
+	await h.service.whenIdle();
+	const row = h.store.get(item.id);
+	assert.equal(row.status, "waiting_human");
+	assert.match(row.question ?? "", /连续 2 次/, "the copy must say how many times the watchdog fired");
+	assert.match(row.question ?? "", /建议取消或拆小|建议先核查/, "and recommend a different action than resuming again");
+});
+
+test("postpone gate: a clean window (no soft-stop) still schedules normally", async (t) => {
+	const h = fixture(t, { send: () => ({ reply: "进度：第一批已入库\n[[NEXT_CHECK]]: 30m" }) });
+	h.runaway = 0;
+	const item = h.create("queued");
+	await h.service.start();
+	await flush();
+	await h.service.whenIdle();
+	assert.equal(h.store.get(item.id).status, "scheduled", "the gate must not touch healthy chains");
+});
+
+// ── Interrupted-notice push (field 2026-11-06, the box) ──────────────────────
+// The admin @-mentioned three times; every dispatch succeeded (WORKER fired=true)
+// and not one word came back, because each window was killed by the incident
+// response and recoverWorking flipped it to waiting_human SILENTLY. A task that
+// needs a human must say so in its origin conversation.
+
+test("recoverWorking pushes an interrupted notice to each origin conversation", async (t) => {
+	const h = fixture(t);
+	// Two items left "working" by a crash, in two different conversations.
+	const a = h.store.create({ title: "登录堡垒机", goal: "登录", status: "working", createdBy: "admin", originConversation: "dt:group:abc" });
+	const b = h.store.create({ title: "对账巡检", goal: "巡检", status: "working", createdBy: "admin", originConversation: "dt:manager" });
+	h.store.create({ title: "无来源", goal: "x", status: "working", createdBy: "admin" }); // no origin → no push
+	await h.service.start();
+	await flush();
+	assert.equal(h.store.get(a.id).status, "waiting_human");
+	assert.equal(h.store.get(b.id).status, "waiting_human");
+	const notices = h.pushes.filter(p => /任务被中断/.test(p.text));
+	assert.equal(notices.length, 2, "one notice per interrupted item that has an origin");
+	assert.deepEqual(notices.map(p => p.cid).sort(), ["dt:group:abc", "dt:manager"]);
+	assert.match(notices[0].text, /需要人工|核查/, "the notice must tell the admin what to do");
 });

@@ -334,7 +334,16 @@ export class DurableRuntime {
 	}
 	abort(id: string): boolean {
 		const set = this.active.get(id);
-		for (const conv of set ?? []) void conv.abort(context).catch((err) => console.error("[durable] abort failed", err));
+		// background:true is THE fix (field 2026-11-06, the box): autonomous /
+		// work-window runs hang off BACKGROUND nodes, and pi-durable's walkDown
+		// skips them unless crossBackground is set. The previous call was
+		// `conv.abort(context)` with NO options (real signature: abort(context,
+		// options?)), so background was always undefined — abortConversation
+		// marked NOTHING, every watchdog soft-stop was a no-op, and the box
+		// spun at ~18 LLM calls/minute for half an hour (a restart made it
+		// worse: running tasks flip back to pending and resume replays the
+		// same loop from its checkpoint).
+		for (const conv of set ?? []) void conv.abort(context, { background: true }).catch((err) => console.error("[durable] abort failed", err));
 		return !!set?.size;
 	}
 

@@ -175,11 +175,16 @@ export class WorkItemStore {
 			WHERE id = ? AND (status = 'queued' OR (status = 'scheduled' AND next_check_at <= ?))`).run(now, id, now);
 		return result.changes ? this.get(id) : undefined;
 	}
-	/** A crash may have applied external effects. Never blindly retry these items. */
-	recoverWorking(): void {
+	/** A crash may have applied external effects. Never blindly retry these items.
+	 * Returns the items that were flipped, so the caller can push an interrupted
+	 * notice to each origin conversation (that state change used to be silent —
+	 * field 2026-11-06: three successful dispatches, zero words back). */
+	recoverWorking(): WorkItemRow[] {
+		const victims = this.listByStatus("working");
 		this.db.prepare(`UPDATE work_items SET status = 'waiting_human', question = ?, next_check_at = NULL, last_remind_at = NULL, remind_count = 0, updated_at = ? WHERE status = 'working'`)
 			.run("应用曾在执行中退出；请管理员核查已发生的操作，再明确恢复。", Date.now());
 		this.changed();
+		return victims;
 	}
 
 	/** Runner outcomes only transition working; terminal and human states stay safe. */

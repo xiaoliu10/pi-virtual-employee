@@ -91,6 +91,10 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	 * reminder staleness guard: if the human already replied after the pause,
 	 * the sweep stays quiet instead of nagging about an answered question. */
 	lastInboundAt?(conversationId: string, sinceTs: number): number | null;
+	/** Watchdog soft-stops for a conversation inside a sliding window (engine
+	 * counter). Drives the postpone gate below: a window whose turn the
+	 * watchdog killed must not re-arm the next one by itself. */
+	runawayCount?(conversationId: string): number;
 }
 
 export function workLessons(raw: string | null): string[] {
@@ -159,7 +163,22 @@ export class WorkService<Session extends WorkSession> {
 	}
 	start(): void {
 		if (this.running) return;
-		if (!this.recovered) { this.opts.store.recoverWorking(); this.recovered = true; }
+		if (!this.recovered) {
+			this.recovered = true;
+			// INTERRUPTED-NOTICE PUSH (field 2026-11-06, the box): a crash or kill
+			// leaves items "working"; recoverWorking flips them to waiting_human.
+			// That state change used to be SILENT — the admin @-mentioned three
+			// times, every dispatch succeeded, and not one word came back because
+			// each worker window was then killed by the incident response. Push an
+			// honest notice per affected item. Best-effort: during early startup
+			// the IM adapter may not be up yet, so failures are swallowed.
+			const victims = this.opts.store.recoverWorking();
+			for (const v of victims) {
+				if (!v.origin_conversation) continue;
+				const text = `⚠️ **任务被中断：${v.title}**\n\n应用在执行中退出，本轮进度已保留，任务处于「需要人工」状态。请核查已发生的操作后，回复明确指示以恢复（或直接取消）。`;
+				void Promise.resolve(this.opts.push(v.origin_conversation, text)).catch(() => {});
+			}
+		}
 		this.running = true;
 		this.unsubscribe = this.opts.store.subscribe((id) => {
 			// With several windows in flight the changed row may be ANY of them:
@@ -660,6 +679,27 @@ export class WorkService<Session extends WorkSession> {
 				// Resolve provenance the SAME way the push header does: structured column
 				// first, then the legacy note. Reading only the column would treat every
 				// pre-migration row as `legacy` and silently stop its follow-ups.
+				// SOFT-STOP POSTPONE GATE (field 2026-11-06, the box): a window whose
+				// turn the watchdog killed (identical/cycle loop) must NOT re-arm a
+				// next window — the killed loop restarts from its checkpoint, the
+				// watchdog kills it again, and kill/re-arm spins forever (~18 LLM
+				// calls/minute for half an hour). First kill: stop the chain for the
+				// admin (waiting_human, honest copy). Second kill inside the sliding
+				// window (admin resumed and it looped again): say so and recommend
+				// cancelling or splitting instead of resuming again.
+				if (outcome === "scheduled") {
+					const runaway = this.opts.runawayCount?.(currentRow.origin_conversation ?? convId) ?? 0;
+					if (runaway >= 1) {
+						outcome = "waiting_human";
+						nextCheckAt = undefined;
+						nextReason = undefined;
+						nextStreak = 0;
+						question = runaway >= 2
+							? `看门狗已连续 ${runaway} 次在本会话掐断循环空转（同样的步骤反复执行、窗口不断重启）。已停止自动跟进。恢复前建议先核查目标是否可达成、凭据与环境是否就绪——若任务本身不适合自动跟进，建议取消或拆小，不要直接恢复。`
+							: "看门狗检测到本窗口在重复执行同样的步骤（循环空转），已停止本轮并暂停自动跟进。请核查任务目标与环境后，回复明确指示以恢复（或直接取消）。";
+						console.warn(`[work] soft-stop postpone gate: item=${item.id} runaway=${runaway} — scheduled demoted to waiting_human`);
+					}
+				}
 				const gateOrigin = resolveOrigin({
 					origin: (freshOrigin ?? null) as WorkOrigin | null,
 					originNote: currentRow?.origin_note ?? item.origin_note ?? null,

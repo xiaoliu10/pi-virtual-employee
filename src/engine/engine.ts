@@ -603,6 +603,36 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** Test/observability accessor for the cumulative iteration budget. */
 	get conversationIterations(): Map<string, number> { return this.conversationIterationsStore; }
 
+	/** Sliding window for watchdog soft-stops; entries older than this stop
+	 * counting, so an unrelated later window starts clean. */
+	private static readonly RUNAWAY_WINDOW_MS = 30 * 60_000;
+	private readonly runawayStops = new Map<string, { count: number; lastAt: number }>();
+
+	/**
+	 * Record a watchdog soft-stop (identical/cycle loop) for this conversation.
+	 * Drives the WorkService postpone gate: a window whose turn the watchdog
+	 * killed must not re-arm the next window by itself, or kill/re-arm spins
+	 * forever (field 2026-11-06).
+	 */
+	noteRunawayStop(conversationId: string): void {
+		const prev = this.runawayStops.get(conversationId);
+		const now = Date.now();
+		const count = prev && now - prev.lastAt <= EmployeeEngine.RUNAWAY_WINDOW_MS ? prev.count + 1 : 1;
+		this.runawayStops.set(conversationId, { count, lastAt: now });
+	}
+
+	/** Consecutive watchdog soft-stops within the sliding window (0 when the
+	 * window expired). Read by the WorkService postpone gate. */
+	runawayCount(conversationId: string): number {
+		const prev = this.runawayStops.get(conversationId);
+		if (!prev) return 0;
+		if (Date.now() - prev.lastAt > EmployeeEngine.RUNAWAY_WINDOW_MS) {
+			this.runawayStops.delete(conversationId);
+			return 0;
+		}
+		return prev.count;
+	}
+
 	/**
 	 * Note why an in-flight turn was cut short, so its telemetry row says
 	 * "aborted:watchdog" instead of looking like an ordinary empty reply. Called
@@ -2683,6 +2713,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// honest reason the user can act on.
 			const what = verdict === "cycle-loop" ? "重复的多步循环（同样的几步反复执行）" : "同一次调用被反复执行";
 			console.warn(`[engine] progress watchdog: ${verdict} — ${what} — soft-stop — ${conversationId} | ${this.turnStallSnapshot(conversationId)}`);
+			this.noteRunawayStop(conversationId);
 			this.markTurnAbort(conversationId, "runaway");
 			this.abortSession(conversationId);
 		} else if (verdict === "deferred") {
@@ -2691,6 +2722,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			console.warn(`[engine] progress watchdog: no new tool outcome in ${cfg?.stallWindowMs ?? 300_000}ms (L1 nudge) — ${conversationId}`);
 		} else if (verdict === "soft-stop") {
 			console.warn(`[engine] progress watchdog: stalled again after nudge (L2 soft-stop) — ${conversationId} | ${this.turnStallSnapshot(conversationId)}`);
+			this.noteRunawayStop(conversationId);
 			this.markTurnAbort(conversationId, "runaway");
 			this.abortSession(conversationId);
 		}

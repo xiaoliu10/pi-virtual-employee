@@ -168,3 +168,27 @@ test('sweepSyntheticFallbackReplies removes persisted notices idempotently', t =
  assert.deepEqual(store.listMessages('c1').map(m=>m.content),['问题','正常答复：已完成'],'user question and real reply survive');
  db.close();
 });
+
+// ── abort() must cross background boundaries (field 2026-11-06, the box) ─────
+// The box spun at ~18 LLM calls/minute for half an hour: an autonomous/work-window
+// run repeated the same two tool calls forever, and every watchdog soft-stop was a
+// NO-OP. pi-durable's Conversation.abort(context, options?) skips background nodes
+// unless options.background is set, and autonomous runs hang off exactly those
+// nodes. The call site had dropped the options argument, so abortConversation
+// marked nothing. This pins the message, because the failure is SILENT — abort
+// "succeeds", nothing dies, and only the LLM bill reveals it.
+test("durable abort passes background:true so watchdog soft-stops actually kill autonomous runs", async () => {
+	const { readFile } = await import("node:fs/promises");
+	const src = await readFile(join(process.cwd(), "src/engine/durable/runtime.ts"), "utf8");
+	// Only REAL call sites: skip comment lines (the incident note quotes the buggy
+	// form verbatim, and matching that would make this test lie in the safe direction).
+	const calls = src
+		.split("\n")
+		.filter((line) => !line.trim().startsWith("//") && !line.trim().startsWith("*"))
+		.flatMap((line) => [...line.matchAll(/conv\.abort\(([^)]*)\)/g)].map((m) => m[1]));
+	assert.ok(calls.length > 0, "the runtime must abort conversations through conv.abort");
+	for (const args of calls) {
+		assert.match(args, /background:\s*true/, `conv.abort(${args}) must request background:true — without it every autonomous/work-window run survives the abort`);
+		assert.match(args, /^context\s*,/, `conv.abort must receive context FIRST (signature is abort(context, options?))`);
+	}
+});
