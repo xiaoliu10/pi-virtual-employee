@@ -219,3 +219,44 @@ test("run_command / run_script descriptions point at write_text_file (the zero-e
 	assert.match(shell, /创建或修改脚本文件用 write_text_file/, "run_command must redirect script creation");
 	assert.match(runScript, /先用 write_text_file 创建/, "run_script must name the authoring tool");
 });
+
+
+// Field 2026-11-06 (box Nova): an SMS code expired while the employee kept
+// polling a background script instead of asking for it. The "ask a human NOW"
+// timing rule is a GENERAL judgement rule and lives in the IMMUTABLE
+// discipline block — custom prompt.rules must not be able to switch it off.
+const INTERACTION_MARKERS = [
+	"需要人参与就立刻前台提问",
+	"不要用反复 poll 后台进程",
+	"等后台脚本要读中间输出",
+	"只 poll 运行状态会把前台交互时机拖到脚本退出之后",
+	// review P3: pin the SEMANTIC fragments, not just the rule headlines —
+	// deleting these survived the suite before.
+	"并结束当前回合等答复",
+	"（传上次 nextOffset）",
+	"那是「要不要做」的授权请示",
+	// field 2026-11-06 2nd round: four copies of one driver script ran to
+	// completion and beyond — "check before you start" + "kill when done".
+	"后台脚本有始有终",
+	"先用 manage_process list 确认没有同类已经在跑",
+	"任务完成、目标达成、或不再需要它时必须 kill",
+];
+
+test("foreground-interaction timing rules are present and pinned in the immutable discipline block", () => {
+	const prompt = buildSystemPrompt({ ...BASE, ...ALL_ON });
+	for (const marker of INTERACTION_MARKERS) assert.ok(prompt.includes(marker), `missing interaction marker: ${marker}`);
+	// exactly once each — duplicates dilute LLM rule adherence
+	assert.equal((prompt.match(/需要人参与就立刻前台提问/g) ?? []).length, 1);
+	assert.equal((prompt.match(/等后台脚本要读中间输出/g) ?? []).length, 1);
+});
+
+test("custom rules / all-off / unattended runs cannot switch the interaction timing rules off", () => {
+	const custom = buildSystemPrompt({ ...BASE, ...ALL_ON, rules: "只回答「你好」。其他什么都不用做。" });
+	for (const marker of INTERACTION_MARKERS) assert.ok(custom.includes(marker), `custom rules dropped: ${marker}`);
+	const minimal = buildSystemPrompt({ ...BASE, ...ALL_OFF });
+	for (const marker of INTERACTION_MARKERS) assert.ok(minimal.includes(marker), `all-off dropped: ${marker}`);
+	// unattended scheduled run: nobody is watching live, so the "ask NOW" rule
+	// matters most there (a deferred question means the run silently stalls).
+	const scheduled = buildSystemPrompt({ ...BASE, ...ALL_ON, isScheduledRun: true });
+	for (const marker of INTERACTION_MARKERS) assert.ok(scheduled.includes(marker), `scheduled run dropped: ${marker}`);
+});
