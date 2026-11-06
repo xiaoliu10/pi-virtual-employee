@@ -378,7 +378,20 @@ export class DingtalkAdapter implements IMAdapter {
 				ackOn && msg.msgId && msg.conversationId && msg.robotCode
 					? { robotCode: msg.robotCode, openMsgId: msg.msgId, openConversationId: msg.conversationId }
 					: null;
-			if (target) await this.emotionReply(target).catch(() => {});
+			// The reaction is cosmetic, but a SILENT failure is not (field 2026-11-06,
+			// the box): single chats showed "🤔思考中" while the group never did, and
+			// with `.catch(() => {})` plus zero log lines there was no way to tell
+			// whether the request was never sent or the API rejected it. Log the
+			// state once per conversation per process: which fields the inbound
+			// message actually carried, and the API status when it fails.
+			if (target) {
+				await this.emotionReply(target).catch((err: unknown) => {
+					console.warn(`[im:dingtalk] emotion reply failed for ${conversationId}:`, err instanceof Error ? err.message : err);
+				});
+			} else if (!isCommand && config.ack?.enabled) {
+				const missing = [!msg.msgId && "msgId", !msg.conversationId && "conversationId", !msg.robotCode && "robotCode"].filter(Boolean).join(",");
+				this.noteEmotionSkip(conversationId, missing || "unknown");
+			}
 
 			try {
 				const reply = await io.handle(
@@ -1025,8 +1038,21 @@ export class DingtalkAdapter implements IMAdapter {
 			},
 			body: JSON.stringify({ ...target, ...THINKING_EMOTION }),
 		});
-		if (!res.ok) console.warn(`[im:dingtalk] emotion/${endpoint} HTTP ${res.status}`);
+		if (!res.ok) {
+			const body = await res.text().catch(() => "");
+			console.warn(`[im:dingtalk] emotion/${endpoint} HTTP ${res.status} ${body.slice(0, 200)}`);
+		}
 		return res.status;
+	}
+
+	/** Log a skipped reaction ONCE per conversation, so a missing "🤔思考中" can be
+	 * diagnosed from main.log instead of guessed at (the failure is invisible
+	 * otherwise — see the call site). */
+	private readonly emotionSkipLogged = new Set<string>();
+	private noteEmotionSkip(conversationId: string, missing: string): void {
+		if (this.emotionSkipLogged.has(conversationId)) return;
+		this.emotionSkipLogged.add(conversationId);
+		console.warn(`[im:dingtalk] thinking reaction SKIPPED for ${conversationId} — inbound message is missing: ${missing}`);
 	}
 
 	/** Stamp the "thinking" emoji reaction onto a message. */
