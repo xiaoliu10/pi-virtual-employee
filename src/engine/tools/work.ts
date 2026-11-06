@@ -198,7 +198,7 @@ export function createWorkTools(deps: {
 				if (p.action === "list" || p.action === "get") {
 					const scoped = workItems.list().filter((item) => item.origin_conversation === conversationId);
 					if (p.action === "list") {
-						const lines = scoped.slice(0, 30).map((item) => `${item.id.slice(0, 8)} 「${item.title}」 [${item.status}]`);
+						const lines = scoped.slice(0, 30).map((item) => `${item.id.slice(0, 8)} 「${item.title}」 [${STATUS_LABEL[item.status] ?? item.status}]`);
 						return {
 							content: [{ type: "text", text: lines.length ? `本后台任务派生的一次性任务 ${scoped.length} 个：\n${lines.join("\n")}` : "本后台任务还没有派生过一次性任务。" }],
 							details: { ok: true, count: scoped.length },
@@ -257,7 +257,7 @@ export function createWorkTools(deps: {
 					}
 					const created = workItems.create({
 						title: p.title.trim().slice(0, 80),
-						goal: p.goal.trim(),
+						goal: p.goal.trim().slice(0, 2000),
 						originConversation: conversationId,
 						originNote: "后台任务派生（一次性）",
 						// manual = one-shot: no self-follow-up (work-origin.ts), labelled
@@ -267,6 +267,7 @@ export function createWorkTools(deps: {
 						createdBy: chainBy,
 						createdChannel: chainChannel,
 					});
+					if (p.conditions?.trim()) workItems.setField(created.id, "conditions", p.conditions.trim().slice(0, 1000));
 					const fired = fireItem(created.id);
 					return {
 						content: [{ type: "text", text: `✅ 已派生一次性任务「${created.title}」${fired ? "，已开工" : "，已入队，稍后自动开工"}。它是一次性任务（完成即终结，不会自动续期）；本后台任务不能创建定时或常驻自主任务。` }],

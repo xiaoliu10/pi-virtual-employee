@@ -66,7 +66,7 @@ export function createSchedulerTools(
 	// allowed. Kept as one helper so the wording and the reason code can never
 	// drift between tools.
 	const workerSchedulerRefusal = () => ({
-		content: [{ type: "text" as const, text: "⛔ 后台任务（router/worker）是一次性异步执行，不能创建或变更定时任务（创建/更新/启停/删除/授权都不允许）——那会污染定时任务列表。如需后续跟进：用 manage_work_items 的 create 派生一次性任务（不要带 resident），或在任务结果中说明，由来源会话的管理员决定。" }],
+		content: [{ type: "text" as const, text: "⛔ 后台任务（router/worker）是一次性异步执行，不能创建或变更定时任务（创建/更新/启停/删除/授权/续跑都不允许）——那会污染定时任务列表。如需后续跟进：用 manage_work_items 的 create 派生一次性任务（不要带 resident），或在任务结果中说明，由来源会话的管理员决定。" }],
 		details: { ok: false, refused: true, reason: "worker-window-cannot-mutate-scheduled" },
 	});
 	const inWorkerWindow = conversationId.startsWith("work:");
@@ -268,7 +268,6 @@ export function createSchedulerTools(
 
 	const remove: AgentTool = {
 		name: "delete_scheduled_task",
-
 		label: "删除定时任务",
 		description: "按 id 删除一个定时任务。删除前建议先用 list_scheduled_tasks 确认 id。",
 		parameters: obj({ id: str({ description: "任务 id（来自 list）" }) }, { open: true }),
