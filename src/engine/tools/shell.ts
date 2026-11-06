@@ -148,6 +148,39 @@ export function disposeShellCommands(config: ConfigStore): void {
  * turn-settle inventory (field 2026-11-04: a monitor script kept running after
  * the result was already pushed and nothing told the user; silent strays read
  * as delivery bugs). Read-only snapshot; never kills anything. */
+/**
+ * Stop every RUNNING background process owned by a conversation (process trees:
+ * a Playwright browser is a child of its python script and dies with it).
+ *
+ * Field 2026-11-06 (box Nova): the admin cancelled task b605b244, but its
+ * 15–20min query script + browser kept running and held spay_profile, blocking
+ * every later login with PROFILE_MASTER_BUSY. A cancelled/aborted turn must
+ * not orphan the resources it started.
+ *
+ * Returns the killed entries for audit logging. Never throws: cascade cleanup
+ * must not break the abort path it rides on.
+ */
+export function stopBackgroundProcesses(
+	config: ConfigStore,
+	conversationId: string,
+): Array<{ sessionId: string; pid: number | null; command: string }> {
+	const stopped: Array<{ sessionId: string; pid: number | null; command: string }> = [];
+	try {
+		for (const entry of sessionsFor(config).values()) {
+			if (entry.conversationId !== conversationId || entry.process.status !== "running") continue;
+			try {
+				entry.process.stop();
+			} catch {
+				// keep sweeping the rest even if one stop fails
+			}
+			stopped.push({ sessionId: entry.process.id, pid: entry.process.pid ?? null, command: entry.command });
+		}
+	} catch {
+		// registry access itself failed — the abort must still proceed
+	}
+	return stopped;
+}
+
 export function runningBackgroundProcesses(
 	config: ConfigStore,
 	conversationId: string,
