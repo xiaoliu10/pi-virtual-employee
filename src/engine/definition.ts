@@ -47,7 +47,7 @@ import { createManageUpdateTool, type UpdateOperations } from "./tools/update.js
 import { createManageCapabilitiesTool } from "./tools/capabilities.js";
 import { createRunCommandTool, createManageProcessTool, executeCommand, type ShellToolDeps } from "./tools/shell.js";
 import { createRunScriptTool } from "./tools/run-script.js";
-import { computeToolFingerprint } from "./progress-watchdog.js";
+import { computeToolFingerprint, normalizeForFingerprint } from "./progress-watchdog.js";
 import { createManageSettingsTool } from "./tools/settings.js";
 import { orderTool } from "./tools/orders.js";
 import { CAPABILITY_LABEL, checkPermission, permissionRefusal } from "../security/permissions.js";
@@ -434,6 +434,73 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
  * failure is swallowed, so instrumentation can never break a tool.
  * A refusal counts as NOT ok — it is friction the agent should be able to see.
  */
+/** Byte-identical result threshold for the dedupe stub: smaller payloads are
+ * not worth a reference line, and errors are never stubbed. */
+const DUP_RESULT_STUB_MIN_CHARS = 512;
+const DUP_STUB_ARGS_PREVIEW = 120;
+/** Cap on remembered first-call ids (one per distinct fingerprint pattern). */
+const DUP_STUB_MAX_ENTRIES = 128;
+
+/** fingerprint+preview+toolCallId of the FIRST call of a repeat run, per tool
+ * call signature. Kept process-wide: a loop is a loop regardless of which
+ * conversation object observed it. */
+const firstCallOfRepeat = new Map<string, { toolCallId: string; preview: string }>();
+
+/**
+ * Replace a byte-identical duplicate tool result with a short reference.
+ *
+ * Hermes' tool_guardrails does this for the same reason: a poller returning an
+ * unchanged 4KB payload ten times costs 40KB of context for one bit of
+ * information. The stub names the tool, the args preview and the earlier
+ * tool_call_id so the model can still reason about it ("same as before").
+ */
+export function stubDuplicateResult<T>(
+	toolName: string,
+	toolCallId: string,
+	params: unknown,
+	result: T,
+	refused: boolean,
+): T {
+	try {
+		if (refused || typeof result !== "object" || result === null) return result;
+		const envelope = result as { content?: Array<{ type?: string; text?: string }> };
+		const blocks = envelope.content;
+		if (!Array.isArray(blocks) || blocks.length !== 1) return result;
+		const block = blocks[0];
+		if (!block || block.type !== "text" || typeof block.text !== "string") return result;
+		const text = block.text;
+		if (text.length < DUP_RESULT_STUB_MIN_CHARS) return result;
+
+		// FULL-text signature: a truncated prefix would treat two long payloads that
+		// differ only at the end as identical (a poll that MOVED would be stubbed).
+		const signature = `${toolName}\u0000${text.length}\u0000${text.slice(0, 200)}\u0000${text.slice(-200)}`;
+		const prior = firstCallOfRepeat.get(signature);
+		if (!prior) {
+			// First occurrence of this exact payload: remember it (bounded) and
+			// deliver the real content.
+			if (firstCallOfRepeat.size >= DUP_STUB_MAX_ENTRIES) {
+				const oldest = firstCallOfRepeat.keys().next().value;
+				if (oldest !== undefined) firstCallOfRepeat.delete(oldest);
+			}
+			firstCallOfRepeat.set(signature, {
+				toolCallId: toolCallId || "",
+				preview: normalizeForFingerprint(params).slice(0, DUP_STUB_ARGS_PREVIEW),
+			});
+			return result;
+		}
+		const ref = prior.toolCallId ? `（tool_call_id ${prior.toolCallId}）` : "";
+		return {
+			...envelope,
+			content: [{
+				type: "text",
+				text: `[本次 ${toolName} 的结果与本次任务中先前那次逐字节相同${ref}，内容没有变化；请直接引用先前那次结果。参数：${prior.preview}]`,
+			}],
+		} as unknown as T;
+	} catch {
+		return result; // dedupe must never break a tool call
+	}
+}
+
 export function withTelemetry(
 	tool: AgentTool<any>,
 	onEvent: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string }) => void,
@@ -451,7 +518,13 @@ export function withTelemetry(
 				// OUTERMOST wrapper — so both kernels and every capability feed it.
 				const fingerprint = computeToolFingerprint(tool.name, params, result);
 				onEvent({ name: tool.name, durationMs: Date.now() - started, ok: !refused, refused, refusedCapability: details?.capability, fingerprint });
-				return result;
+				// Duplicate-result stub (Hermes tool_guardrails, ported 2026-11-06):
+				// a polling loop that reads the SAME unchanged payload every round
+				// otherwise pushes the whole thing into the context each time. From
+				// the 2nd byte-identical repeat the payload is replaced by a
+				// reference — the tool still ran, only the context representation is
+				// deduplicated, so polling semantics survive.
+				return stubDuplicateResult(tool.name, toolCallId, params, result, refused);
 			} catch (err) {
 				onEvent({
 					name: tool.name,

@@ -826,3 +826,29 @@ test("consecutive length-truncated empty runs: compact before the first retry, g
 		console.warn = origWarn;
 	}
 });
+
+// Hermes iteration_budget port (2026-11-06): maxToolSteps caps ONE turn; a model
+// that keeps finishing and restarting turns runs unbounded. The RESET contract is
+// what keeps the cap per-user-turn instead of per-process — a stale entry would
+// abort the NEXT turn immediately. Pinned at the state level with a real tool
+// result so finishTurn actually runs.
+test("cumulative budget accumulates per tool step and resets with each user turn", async (t) => {
+	let runs = 0;
+	const { engine, config } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		return {
+			async *[Symbol.asyncIterator]() {},
+			result: async () => ({ role: "assistant", content: [{ type: "text", text: `ok${runs}` }], stopReason: "stop" }),
+			// A tool result is required for finishTurn to count a step.
+			toolResults: [{ role: "toolResult", content: [{ type: "text", text: `r${runs}` }] }],
+		};
+	} });
+	supplierConfig(config);
+	config.update({ general: { maxToolSteps: 100, maxIterationsPerTurn: 50 } });
+	const agent = engine.getOrCreateSession("conv-budget-state");
+	const map = engine.conversationIterations;
+	await engine.send(agent, "first turn");
+	assert.equal(map.size, 0, "the counter must be cleared when the user turn ends (otherwise the next turn aborts instantly)");
+	await engine.send(agent, "second turn");
+	assert.equal(map.size, 0, "and again on the second message");
+});

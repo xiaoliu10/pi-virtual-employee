@@ -593,6 +593,15 @@ export class EmployeeEngine implements EmployeeRuntime {
 	private readonly retryWaits = new Set<string>();
 	/** Tool calls made so far in the in-flight turn of each conversation. */
 	private readonly turnToolCalls = new Map<string, number>();
+	/** Cumulative tool iterations for this conversation since the last user
+	 * message (Hermes iteration_budget, ported 2026-11-06). maxToolSteps caps a
+	 * SINGLE turn; this caps a whole conversation's work so a model that keeps
+	 * ending turns and starting new ones cannot spin forever. Reset on
+	 * beginTurn (a new user message) — the budget is the USER's turn, not the
+	 * process's lifetime. */
+	private readonly conversationIterationsStore = new Map<string, number>();
+	/** Test/observability accessor for the cumulative iteration budget. */
+	get conversationIterations(): Map<string, number> { return this.conversationIterationsStore; }
 
 	/**
 	 * Note why an in-flight turn was cut short, so its telemetry row says
@@ -2147,6 +2156,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 		const originalPrompt = agent.prompt.bind(agent);
 		target.prompt = ((...args: Parameters<typeof agent.prompt>) => {
 			steps = 0;
+			// Cumulative budget restarts with a NEW user message (Hermes
+			// iteration_budget semantics): it bounds one user turn's work, not the
+			// process lifetime. Belt to the turn-end reset's braces — a turn that
+			// died before telemetry closed would otherwise leak its count into the
+			// next message and abort it instantly.
+			this.conversationIterationsStore.delete(agent.sessionId ?? "default");
 			target.__toolStepCapHit = false;
 			target.__contextBudgetHit = false;
 			return originalPrompt(...args);
@@ -2201,8 +2216,24 @@ export class EmployeeEngine implements EmployeeRuntime {
 				}
 
 				const max = this.config.all().general.maxToolSteps ?? 0;
-				if (max <= 0) return; // unlimited
 				steps += 1;
+				// CUMULATIVE budget (Hermes iteration_budget, ported 2026-11-06):
+				// maxToolSteps resets every turn, so a model that keeps finishing
+				// and restarting turns runs unbounded — the field shape was 203 LLM
+				// calls in 30 minutes with almost no tool output. This counter
+				// spans the whole user turn and hard-ends the conversation's loop.
+				const cumulativeMax = this.config.all().general.maxIterationsPerTurn ?? 0;
+				const convId = agent.sessionId ?? "default";
+				if (cumulativeMax > 0) {
+					const used = (this.conversationIterationsStore.get(convId) ?? 0) + 1;
+					this.conversationIterationsStore.set(convId, used);
+					if (used >= cumulativeMax) {
+						target.__toolStepCapHit = true;
+						console.warn(`[engine] cumulative iteration budget reached (maxIterationsPerTurn=${cumulativeMax}); ending turn for final summary`);
+						return { action: "end" };
+					}
+				}
+				if (max <= 0) return; // per-turn cap unlimited
 				if (steps < max) return;
 				target.__toolStepCapHit = true;
 				console.warn(`[engine] tool-loop cap reached (maxToolSteps=${max}); ending turn for final summary`);
@@ -2672,6 +2703,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.turnIds.delete(conversationId);
 		const toolCalls = this.turnToolCalls.get(conversationId) ?? 0;
 		this.turnToolCalls.delete(conversationId);
+		// The cumulative iteration budget is per USER TURN: it ends here, with the
+		// turn's telemetry. (A new message re-decides; see conversationIterations.)
+		this.conversationIterationsStore.delete(conversationId);
 		const abortReason = this.turnAborts.get(conversationId);
 		this.turnAborts.delete(conversationId);
 		// Evaluation runs are excluded from telemetry on purpose: the improvement

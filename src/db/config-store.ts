@@ -289,6 +289,12 @@ export interface AppConfig {
 		 * use a positive number as a safety net against an infinite tool-call loop).
 		 */
 		maxToolSteps: number;
+		/** CUMULATIVE tool-iteration ceiling for one USER turn (Hermes
+		 * iteration_budget, ported 2026-11-06). maxToolSteps resets every turn, so
+		 * a model that keeps finishing and restarting turns runs unbounded (field:
+		 * 203 LLM calls in 30 minutes with almost no tool output). 0 = unlimited
+		 * (default; opt-in safety net). */
+		maxIterationsPerTurn?: number;
 		/** Progress watchdog (runaway loop + hung request detection). Optional for
 		 * configs saved before 0.2.185 — readers default every field. */
 		progressWatchdog?: {
