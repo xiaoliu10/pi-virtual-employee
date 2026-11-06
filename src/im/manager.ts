@@ -388,10 +388,16 @@ export class IMAdapterManager {
 			const busy = this.engine.busyConversations?.() ?? [];
 			prunePumpState(this.pumpState, busy);
 			const actions = decidePump({ busy, state: this.pumpState, now: Date.now(), intervalMs });
+			// Observability (field 2026-11-06: the chat pump has NEVER fired since
+			// v0.2.192, with zero log lines anywhere in the chain). A quiet tick
+			// every 5min is fine; state transitions always log.
+			console.log(`[im] progress pump tick: busy=${busy.length}${busy.length ? ` [${busy.map((b) => b.conversationId).join(",")}]` : ""} actions=${actions.map((a) => `${a.conversationId}:${a.kind}${a.kind === "skip" ? `/${a.reason}` : ""}`).join(",") || "none"}`);
 			for (const action of actions) {
 				if (action.kind === "fire") {
+					console.log(`[im] progress pump FIRE: ${action.conversationId}`);
 					void this.pumpOne(action.conversationId, intervalMs);
 				} else if (!this.pumpState.has(action.conversationId)) {
+					console.log(`[im] progress pump armed (first sighting): ${action.conversationId}`);
 					// Arm the clock on first sighting so a restart does not spam a
 					// note for every live conversation at once.
 					this.pumpState.set(action.conversationId, { lastSentAt: Date.now(), inFlight: false });
@@ -408,8 +414,10 @@ export class IMAdapterManager {
 		if (!st || st.inFlight) return;
 		st.inFlight = true;
 		try {
+			console.log(`[im] progress pump brief start: ${conversationId}`);
 			const agent = this.engine.getOrCreateSession(conversationId);
 			const note = await this.engine.progressBrief(agent, conversationId);
+			console.log(`[im] progress pump brief done: ${conversationId} (${note?.length ?? 0} chars)`);
 			if (!isUsableBrief(note)) return;
 			// Re-check liveness: the brief can take minutes, and the turn may have
 			// ended while it was generating (pushing then would be a stale "still
