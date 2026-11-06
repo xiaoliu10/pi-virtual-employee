@@ -10,57 +10,12 @@
  * and destroyed every other task's browser and login state. Field incident
  * 2026-11-05: 40+ such kills, 31 login expiries.
  *
- * Two shapes solve it:
- *   (a) give every task its own copy of the profile (N browsers, N× memory), or
- *   (b) ONE browser per profile, each task gets its own context/page (1 browser).
- *
- * This module implements (b), matching Hermes (`tools/browser_launcher.py`:
- * "One browser per launcher key … a persistent profile shared by every key") and
- * puppeteer-cluster's PAGE concurrency ("Shares everything (cookies,
- * localStorage, etc.) between jobs"). Login state is shared because the pages
- * live in one context; isolation between tasks is per-owner page ownership, not
- * per-profile.
- *
- * WHAT IT GUARANTEES
- *   - Concurrent first-use collapses to ONE launch (`launching` promise).
- *   - A crash/close is not masked: the next call relaunches and tells the caller
- *     the previous browser is gone (never hands back a dead page).
- *   - Owner→page mapping is explicit, so one task can never be handed another
- *     task's tab (the failure mode Playwright #42961 refuses to support: "two
- *     clients ended up navigating and closing each other's tabs").
+ * The ruling (2026-11-06): the Hermes model is THE ONLY path — ONE browser per
+ * profile, each task owning its own tab. This module provides the TS side's
+ * ownership registry; the box-side python scripts get the same semantics from
+ * resources/browser-bridge/ve_pw_profile_lock.py (attach-or-host shim v5).
  */
-import type { Browser, BrowserContext, Page } from "playwright-core";
-
-/** A live shared browser plus its CDP endpoint. */
-export interface SharedBrowser {
-	browser: Browser;
-	context: BrowserContext;
-	/** `http://127.0.0.1:<port>` — useful for a human to attach a DevTools client. */
-	httpBase: string;
-	/** pid of the Chromium we launched (null when attached to a running one). */
-	pid: number | null;
-	/** True when this process launched it; false when attached to an existing one. */
-	owned: boolean;
-}
-
-export interface SharedBrowserHandle {
-	/** Start (or join) the shared browser. Idempotent; concurrent calls share one launch. */
-	acquire(): Promise<SharedBrowser>;
-	/** The page belonging to `ownerId`, created in the shared context on first use. */
-	pageFor(ownerId: string): Promise<Page>;
-	/** Drop `ownerId`'s page (closes it). Other owners are untouched. */
-	releaseOwner(ownerId: string): Promise<void>;
-	/** Close everything this handle started. Idempotent. */
-	dispose(): Promise<void>;
-	/** Snapshot for diagnostics/tests. */
-	state(): {
-		ready: boolean;
-		launching: boolean;
-		owners: string[];
-		pid: number | null;
-		owned: boolean;
-	};
-}
+import type { Page } from "playwright-core";
 
 /**
  * Ownership registry: `ownerId -> Page`.
