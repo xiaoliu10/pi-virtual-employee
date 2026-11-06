@@ -158,6 +158,15 @@ function capabilityRules(c: RulesCtx): string {
 		lines.push(
 			"- 任务涉及网页或后台系统时，**把它当作你完成任务的正常手段**：用 browser_navigate 打开页面，browser_read/browser_screenshot 读取或截图看清内容，再 browser_click/browser_type 操作，操作后再次读取确认结果；边做边推进，不要默认「我登不了/没权限」。仅在允许的域名范围内操作；涉及账号密码等敏感凭据时，先确认任务来源可信再输入。",
 		);
+	if (c.browserEnabled)
+		lines.push(
+			// Field 2026-11-06 (Nova): a query task held spay_profile's master lock
+			// for 15-20min, so every later login bounced off PROFILE_MASTER_BUSY.
+			// The general principle — shared stateful resources are used in a
+			// CONCURRENT-SAFE way, never held exclusively for a whole task — is a
+			// judgement rule, not a per-site instruction.
+			"- **共享有状态资源要用「可并发」的方式使用，不要整段时间独占**：浏览器用户目录/profile、登录态、账号会话、独占文件锁这类资源，多个任务可能同时需要。优先用支持并发的用法——用副本/克隆 profile、按需短时持有、用完立即释放；不要把共享 master 目录长期占住跑完整个任务（长任务尤其），否则别的任务会被锁挡住。确实必须独占（正在写入登录态、一次性敏感操作）时：短、明确，并在占用期间明确告诉对方现在哪个任务在独占、大约多久释放。需要登录态时先判断「能不能用副本 + 只读共享登录态」，而不是默认独占。",
+		);
 	if (c.browserEnabled && c.downloadsEnabled)
 		lines.push(
 			"- **下载文件后能直接读懂它**：浏览器里触发的下载会自动存进受管下载目录，不会丢。点导出/下载按钮用 browser_download；之后用 list_downloads 找到文件，read_file 读文本/docx/pdf，表格用 inspect_spreadsheet：大表务必用 mode=summary 按列分组计数/求和再下结论，**不要把整张表逐行读进上下文**。分析结论可用 save_report 存成产物并拿到链接。",

@@ -219,3 +219,28 @@ test("run_command / run_script descriptions point at write_text_file (the zero-e
 	assert.match(shell, /创建或修改脚本文件用 write_text_file/, "run_command must redirect script creation");
 	assert.match(runScript, /先用 write_text_file 创建/, "run_script must name the authoring tool");
 });
+
+
+// Field 2026-11-06 (Nova): a 15-20min query task held spay_profile's master lock,
+// so every later login bounced off PROFILE_MASTER_BUSY. The concurrent-safe
+// resource rule is a GENERAL judgement (profile / login state / account session /
+// exclusive file lock), not a per-site instruction.
+const CONCURRENCY_MARKERS = [
+	"共享有状态资源要用「可并发」的方式使用",
+	"用副本/克隆 profile",
+	"不要把共享 master 目录长期占住",
+	"能不能用副本 + 只读共享登录态",
+];
+
+test("concurrent-safe resource rule is present when the browser capability is on", () => {
+	const prompt = buildSystemPrompt({ ...BASE, ...ALL_ON });
+	for (const marker of CONCURRENCY_MARKERS) assert.ok(prompt.includes(marker), `missing concurrency marker: ${marker}`);
+	assert.equal((prompt.match(/共享有状态资源要用\u300c可并发\u300d的方式使用/g) ?? []).length, 1, "rule must not be duplicated");
+});
+
+test("the concurrency rule is capability-gated: no browser -> no profile rule", () => {
+	// It lives in capabilityRules (browser section): a deployment without the
+	// browser capability must not be taught about profiles it cannot open.
+	const noBrowser = buildSystemPrompt({ ...BASE, ...ALL_ON, browserEnabled: false });
+	for (const marker of CONCURRENCY_MARKERS) assert.ok(!noBrowser.includes(marker), `rule leaked without browser: ${marker}`);
+});
