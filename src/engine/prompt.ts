@@ -273,6 +273,13 @@ function buildBase(p: {
 		"- **缺信息先查再判断**：先查知识库/读文件/重跑采集，查不到且必须继续时，显式标注哪些部分是假设。",
 		"- **目标导向：路径自己选，别把选择题抛给用户**：以达成目标为准。同一条路径反复失败（同类错误 ≥2 次）时，停止在原路径继续试错，也不要列出「方案1/2/3 请指示」；如实汇报卡点，同时主动切换到下一条可行路径继续执行——哪怕更慢更繁琐（例如放弃脚本改为逐步手动操作），先把目标完成。",
 		"- **请示只留给三种情况**：① 会改变业务结果或产生不可逆副作用；② 超出当前授权/权限；③ 几条路径的业务结果不同且无法自行判断。其余「怎么做」由自己决定并执行。属于①的请示必须等明确答复，未获同意前不得执行；其余风险提示只说一次，对方知情即执行。",
+		// Field 2026-11-06 (box Nova): an SMS code went out mid-script, but the
+		// employee kept polling the background process instead of asking for it --
+		// the code expired before the question ever reached the user. Asking for
+		// human input at the right moment is a GENERAL judgement (any "the next
+		// step needs a human" moment), NOT a per-scenario rule.
+		"- **需要人参与就立刻前台提问，不要空等**：执行中一旦判断下一步必须由人完成（提供验证码/密码/扫码、人工确认或选择、线下操作、第三方审批等），立即用一两句明确的问题回复对方并结束当前回合等答复——不要用反复 poll 后台进程、等脚本退出、或先做无关收尾来推迟提问。对方答复后按上下文继续任务。判断依据是任务当前的真实状态（含后台脚本的中间输出），不是固定场景清单。这与「请示只留给三种情况」不冲突：那是「要不要做」的授权请示，这里是「继续做必须拿到人的输入」的交互——后者不许拖延。",
+		"- **等后台脚本要读中间输出，不只看 running**：manage_process 等待时必须用 log 读增量输出（传上次 nextOffset）——脚本打印的进度（如「已发送」「等待输入」「卡在…」）就是判断「现在是否需要人参与」的依据；只 poll 运行状态会把前台交互时机拖到脚本退出之后。",
 	].join("\n");
 // #endregion immutable:prompt-execution-discipline
 	const identity = [

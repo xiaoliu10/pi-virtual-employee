@@ -525,7 +525,7 @@ export function createManageProcessTool(deps: ShellToolDeps): AgentTool {
 			"管理 run_command 创建的进程会话：list 列出当前会话中的命令；poll 阻塞等到进程结束或单次等待超时；log 立即读日志；kill 终止进程树（管理员当前消息需「确认」）。" +
 			"poll/log/list 无需重复确认，但每次都校验当前管理员身份，只能访问自己在当前对话启动的命令。定时任务可跟踪自身会话。关闭 shell 开关后仍可查询和终止已有会话。" +
 			"poll 的 waitSec 仅控制此次等待，默认 capabilities.shell.pollTimeoutSec（30 秒），0=立即返回；无论等待超时还是取消等待，都不会终止后台进程。长等待可提高 waitSec（如 840 秒），避免连续短轮询。" +
-			"log/poll 返回 stdout+stderr 与 nextOffset；下次传 offset=nextOffset 只读新增输出。未传 offset 默认显示最新一页，每页最多 32KB，内存保留最近 256KB；完整结果请脚本写文件。先确认 observer start 启动日志，再持续跟踪到退出并核对退出码，不能把 running 当作成功。应用退出会终止进程，重启后会话失效。",
+			"log/poll 返回 stdout+stderr 与 nextOffset；下次传 offset=nextOffset 只读新增输出。未传 offset 默认显示最新一页，每页最多 32KB，内存保留最近 256KB；完整结果请脚本写文件。先确认 observer start 启动日志，再持续跟踪到退出并核对退出码，不能把 running 当作成功。等待期间用 log 跟踪脚本打印的进度：一旦输出表明需要人参与（等待验证码/确认/输入等），立即前台提问，不要等脚本退出才交互。应用退出会终止进程，重启后会话失效。",
 		parameters: obj({
 			action: union([lit("list"), lit("poll"), lit("log"), lit("kill")]),
 			sessionId: opt(str({ description: "poll/log/kill 必填：run_command 返回的 sessionId。" })),
