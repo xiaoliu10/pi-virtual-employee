@@ -87,6 +87,18 @@ export function createSchedulerTools(
 		}, { open: true }),
 		async execute(_id, params) {
 			const p = params as { title: string; prompt: string; cron: string; autonomous?: boolean; silent?: boolean; maxTurns?: number; maxMinutes?: number };
+			// Worker windows (work:<id>) are the router/worker async-call mechanism.
+			// They may derive ONE-SHOT tasks, but a scheduled task born inside a
+			// background run pollutes the global schedule list with entries nobody
+			// the operator talks to ever asked for (user ruling 2026-11-06). This is
+			// a semantic boundary, not an identity gate: refuse with the honest
+			// reason so the model can finish its job instead of retrying.
+			if (conversationId.startsWith("work:")) {
+				return {
+					content: [{ type: "text", text: "⛔ 后台任务（router/worker）是一次性异步执行，不能创建定时任务——那会污染定时任务列表。如需后续跟进：用 manage_work_items 的 create 派生一次性任务（不要带 resident），或在任务结果中说明，由来源会话的管理员决定。" }],
+					details: { ok: false, refused: true, reason: "worker-window-cannot-create-scheduled" },
+				};
+			}
 			try {
 				scheduler.validateCron(p.cron);
 			} catch (err) {

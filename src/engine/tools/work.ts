@@ -185,6 +185,67 @@ export function createWorkTools(deps: {
 				id?: string; answer?: string; title?: string; goal?: string; conditions?: string; nextCheck?: string; reason?: string; resident?: boolean; maxMinutes?: number;
 			};
 			if (!["list", "get", "mine", "create", "confirm", "resume", "cancel", "update", "pause"].includes(p.action)) return failure("未知的自主任务操作。");
+			// Worker windows (work:<id>) are the router/worker async-call mechanism
+			// (user ruling 2026-11-06). They MUST NOT morph into scheduled or
+			// autonomous tasks — that pollutes the global lists with entries the
+			// operator never asked for. Allowed: deriving plain ONE-SHOT tasks
+			// (origin=manual, no resident, no self-follow-up — they run once and
+			// end). This branch is a semantic boundary placed BEFORE the IM identity
+			// gate on purpose: the honest refusal ("worker windows cannot do X")
+			// tells the model to stop trying; the generic identity failure would
+			// read as a fixable credential problem and invite retries.
+			if (conversationId.startsWith("work:")) {
+				if (p.action === "list" || p.action === "get") {
+					const scoped = workItems.list().filter((item) => item.origin_conversation === conversationId);
+					const lines = scoped.slice(0, 30).map((item) => `${item.id.slice(0, 8)} 「${item.title}」 [${item.status}]`);
+					return {
+						content: [{ type: "text", text: lines.length ? `本后台任务派生的一次性任务 ${scoped.length} 个：\n${lines.join("\n")}` : "本后台任务还没有派生过一次性任务。" }],
+						details: { ok: true, count: scoped.length },
+					};
+				}
+				if (p.action === "mine" || p.action === "confirm") {
+					return failure("后台任务窗口不能挖掘或确认自主任务提案——router/worker 是一次性异步调用，创建自主（常驻）任务会污染任务列表。如需后续跟进，请派生一次性任务（create 且不带 resident），或在任务结果中说明，由来源会话的管理员决定。");
+				}
+				if (p.action === "create") {
+					if (p.resident === true) {
+						return failure("后台任务窗口只能派生一次性任务：resident=true 是无自然终点的常驻任务，不允许从后台任务派生。一次性任务完成后即终结。");
+					}
+					if (!p.title?.trim() || !p.goal?.trim()) return failure("派生一次性任务需要 title 和 goal。");
+					const actor2 = resolveActor(conversationId);
+					const chainBy = typeof actor2?.senderId === "string" && actor2.senderId.trim() ? actor2.senderId : null;
+					const chainChannel = typeof actor2?.channel === "string" ? actor2.channel : null;
+					// Runaway guard: a worker prompt must not farm derived tasks. Three
+					// UNFINISHED derivations per worker window is already generous for
+					// legitimate "split the remaining work" usage.
+					const unfinished = workItems.list().filter((item) => item.origin_conversation === conversationId
+						&& !["done", "cancelled"].includes(item.status));
+					if (unfinished.length >= 3) {
+						return failure(`本后台任务派生的未完结一次性任务已达上限（3 个）。请等现有任务完成，或把剩余工作写进任务结果交回管理员。`);
+					}
+					const created = workItems.create({
+						title: p.title.trim().slice(0, 80),
+						goal: p.goal.trim(),
+						originConversation: conversationId,
+						originNote: "后台任务派生（一次性）",
+						// manual = one-shot: no self-follow-up (work-origin.ts), labelled
+						// 手动任务 in pushes — the truthful shape of a derived task.
+						origin: "manual",
+						status: "queued",
+						createdBy: chainBy,
+						createdChannel: chainChannel,
+					});
+					const fired = fireItem(created.id);
+					return {
+						content: [{ type: "text", text: `✅ 已派生一次性任务「${created.title}」${fired ? "，已开工" : "，已入队，稍后自动开工"}。它是一次性任务（完成即终结，不会自动续期）；本后台任务不能创建定时或常驻自主任务。` }],
+						details: { ok: true, created: true, id: created.id, fired, queued: !fired },
+					};
+				}
+				// resume/pause/cancel/update target "the task of this source
+				// conversation" — but a worker window's source IS its own parent task.
+				// Managing OTHER work items belongs to the operator in the IM source
+				// conversation, not to a background run.
+				return failure("后台任务窗口只能派生或查看一次性任务；对其他自主任务的操作（恢复/暂停/取消/调整）请在任务来源 IM 会话中由管理员进行。");
+			}
 			const actor = resolveActor(conversationId);
 			if (!verifiedIMActor(actor, conversationId)) return failure("请在经过平台验证的任务来源 IM 单聊或群聊中管理自主任务。");
 			if (p.action !== "list" && p.action !== "get") {
