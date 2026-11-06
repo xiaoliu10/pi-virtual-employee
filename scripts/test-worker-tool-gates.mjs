@@ -90,12 +90,39 @@ function schedulerTool(conversationId, created = []) {
 
 const text = (r) => r.content?.[0]?.text ?? "";
 
-test("worker window: create_scheduled_task is refused with the honest semantic reason", async () => {
-	const tool = schedulerTool(WORK);
-	const r = await tool.execute("t1", { title: "x", prompt: "y", cron: "0 9 * * *" });
-	assert.equal(r.details?.ok, false);
-	assert.match(text(r), /不能创建定时任务/);
-	assert.equal(r.details?.reason, "worker-window-cannot-create-scheduled");
+test("worker window: EVERY mutating scheduler tool is refused (create/update/toggle/delete/authorize)", async () => {
+	// review P1-2: the first gate covered only create — a worker could still
+	// update/toggle an EXISTING task into an autonomous recurring one.
+	const created = [];
+	const tools = createSchedulerTools(
+		{
+			validateCron: () => {},
+			create: (input) => { created.push(input); return { id: "st-1", title: input.title, next_run_at: 1 }; },
+			list: () => created.map((c) => ({ enabled: 1, created_by: c.createdBy, created_channel: c.createdChannel })),
+			get: () => ({ id: "st-1", title: "已有任务", autonomous: true, chain_state: "x" }),
+			delete: () => {},
+			setEnabled: () => {},
+			update: () => ({}),
+		},
+		WORK, "im", config, (cid) => (cid.startsWith("work:") ? schedulerActor : { senderId: "admin", channel: "dingtalk", chatType: "group" }),
+	);
+	const byName = (n) => tools.find((t) => t.name === n);
+	for (const [name, params] of [
+		["create_scheduled_task", { title: "x", prompt: "y", cron: "0 9 * * *" }],
+		["update_scheduled_task", { id: "st-1", autonomous: true, prompt: "new background recurring goal" }],
+		["toggle_scheduled_task", { id: "st-1", enabled: true }],
+		["delete_scheduled_task", { id: "st-1" }],
+		["authorize_scheduled_task", { id: "st-1" }],
+		["resume_scheduled_task", { id: "st-1" }],
+	]) {
+		const r = await byName(name).execute("t", params);
+		assert.equal(r.details?.refused, true, `${name} must be refused in a worker window`);
+		assert.equal(r.details?.reason, "worker-window-cannot-mutate-scheduled");
+		assert.match(text(r), /不能创建或变更定时任务/);
+	}
+	assert.equal(created.length, 0, "no scheduled task may actually be created");
+	// read-only tools stay allowed
+	assert.ok(byName("list_scheduled_tasks").execute.length >= 0);
 });
 
 test("worker window: mine and confirm are refused (no autonomous-task pollution)", async () => {
@@ -151,6 +178,40 @@ test("worker window: finished derivations do not count against the cap", async (
 	store.rows.forEach((r) => { r.status = "done"; });
 	const r4 = await tool.execute("t4", { action: "create", title: "再来一个", goal: "g" });
 	assert.equal(r4.details?.ok, true, "finished derivations must not block new ones");
+});
+
+test("worker window: get returns FULL details of one derivation (found / missing / ambiguous)", async () => {
+	const store = new fakeStore();
+	const tool = workTool(store, WORK);
+	const created = await tool.execute("c1", { action: "create", title: "派生详情", goal: "完整目标", conditions: "时间窗" });
+	const id = created.details.id;
+	store.rows[0].progress = "核对到 60%";
+	store.rows[0].lessons = JSON.stringify(["登录态会过期"]);
+	const got = await tool.execute("g1", { action: "get", id: id.slice(0, 8) });
+	assert.match(text(got), /完整目标/);
+	assert.match(text(got), /核对到 60%/);
+	assert.match(text(got), /登录态会过期/);
+	const missing = await tool.execute("g2", { action: "get", id: "zzzz" });
+	assert.equal(missing.details?.refused, true);
+	const noId = await tool.execute("g3", { action: "get" });
+	assert.equal(noId.details?.refused, true);
+});
+
+test("worker window: derivation DEPTH is capped at 1 — a derived task cannot derive", async () => {
+	// review P2-1: the per-window cap counts only direct children; without a
+	// depth limit a derived task's own window could farm grandchildren forever.
+	const store = new fakeStore();
+	const parent = store.create({
+		title: "一层派生", goal: "g", originConversation: WORK,
+		originNote: "后台任务派生（一次性）", origin: "manual", status: "queued",
+		createdBy: "admin", createdChannel: "scheduler",
+	});
+	const childWindow = `work:${parent.id}`;
+	const tool = workTool(store, childWindow);
+	const r = await tool.execute("t1", { action: "create", title: "孙代任务", goal: "g" });
+	assert.equal(r.details?.refused, true, text(r));
+	assert.match(text(r), /不能再派生/);
+	assert.equal(store.rows.length, 1, "no grandchild may be created");
 });
 
 test("worker window: list shows only its own derivations; resume/pause/cancel/update refused", async () => {

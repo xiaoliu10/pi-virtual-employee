@@ -197,10 +197,34 @@ export function createWorkTools(deps: {
 			if (conversationId.startsWith("work:")) {
 				if (p.action === "list" || p.action === "get") {
 					const scoped = workItems.list().filter((item) => item.origin_conversation === conversationId);
-					const lines = scoped.slice(0, 30).map((item) => `${item.id.slice(0, 8)} 「${item.title}」 [${item.status}]`);
+					if (p.action === "list") {
+						const lines = scoped.slice(0, 30).map((item) => `${item.id.slice(0, 8)} 「${item.title}」 [${item.status}]`);
+						return {
+							content: [{ type: "text", text: lines.length ? `本后台任务派生的一次性任务 ${scoped.length} 个：\n${lines.join("\n")}` : "本后台任务还没有派生过一次性任务。" }],
+							details: { ok: true, count: scoped.length },
+						};
+					}
+					// get: full details of ONE derivation (review P2-2 — it used to be
+					// merged into the list branch, so the promised goal/conditions/
+					// progress/lessons detail was unreachable).
+					const wanted = (p.id ?? "").trim();
+					if (!wanted) return failure("action=get 需要 id（用 list 取短前缀）。");
+					const matches = scoped.filter((item) => item.id === wanted || item.id.startsWith(wanted));
+					if (matches.length === 0) return failure(`本后台任务没有 id 前缀为 ${wanted} 的派生任务（可能是别人的、已删除，或 id 写错；用 list 核对）。`);
+					if (matches.length > 1) return failure(`前缀 ${wanted} 命中 ${matches.length} 个派生任务，请提供完整 id。`);
+					const item = matches[0];
+					const lessons = (() => { try { return JSON.parse(item.lessons ?? "[]") as string[]; } catch { return []; } })();
+					const detail = [
+						`「${item.title}」 [${item.status}]`,
+						`目标：${item.goal || "（未记录）"}`,
+						item.conditions ? `执行条件：${item.conditions}` : null,
+						item.progress ? `进展：${item.progress}` : null,
+						lessons.length ? `踩坑：\n- ${lessons.join("\n- ")}` : null,
+						item.question ? `待答：${item.question}` : null,
+					].filter(Boolean).join("\n");
 					return {
-						content: [{ type: "text", text: lines.length ? `本后台任务派生的一次性任务 ${scoped.length} 个：\n${lines.join("\n")}` : "本后台任务还没有派生过一次性任务。" }],
-						details: { ok: true, count: scoped.length },
+						content: [{ type: "text", text: detail }],
+						details: { ok: true, id: item.id, status: item.status },
 					};
 				}
 				if (p.action === "mine" || p.action === "confirm") {
@@ -211,6 +235,15 @@ export function createWorkTools(deps: {
 						return failure("后台任务窗口只能派生一次性任务：resident=true 是无自然终点的常驻任务，不允许从后台任务派生。一次性任务完成后即终结。");
 					}
 					if (!p.title?.trim() || !p.goal?.trim()) return failure("派生一次性任务需要 title 和 goal。");
+					// Depth limit = 1 (review P2-1): the per-window cap counts only
+					// direct children, so without this a derived task's own window
+					// could derive grandchildren, and the tree grows unbounded.
+					// A derived task is recognizable by its origin: manual is ONLY
+					// set by this derivation path.
+					const parentItem = workItems.get(conversationId.slice(5));
+					if (parentItem?.origin === "manual") {
+						return failure("派生的一次性任务不能再派生（只允许一层派生）。剩余工作请写进本任务结果，交回来源会话的管理员安排。");
+					}
 					const actor2 = resolveActor(conversationId);
 					const chainBy = typeof actor2?.senderId === "string" && actor2.senderId.trim() ? actor2.senderId : null;
 					const chainChannel = typeof actor2?.channel === "string" ? actor2.channel : null;
