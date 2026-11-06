@@ -25,7 +25,7 @@ await build({
 	stdin: { contents: `export * from "./src/im/triage.ts";`, resolveDir: root, loader: "ts" },
 	outfile: bundle, bundle: true, platform: "node", format: "esm", packages: "external", logLevel: "silent",
 });
-const { triageMessage, countPlanSteps, isQuestion, hasLongRunningVerb, isForegroundEscape, FOREGROUND_ESCAPE_HINT } = await import(pathToFileURL(bundle).href);
+const { triageMessage, countPlanSteps, isQuestion, hasLongRunningVerb, isForegroundEscape, FOREGROUND_ESCAPE_HINT, isDeepTask } = await import(pathToFileURL(bundle).href);
 
 const configBundle = join(outDir, "config.mjs");
 await build({
@@ -388,4 +388,58 @@ test("isForegroundEscape: exact phrase only — sentences containing the words m
 		assert.equal(isForegroundEscape(bad), false, `must NOT match: ${JSON.stringify(bad)}`);
 	}
 	assert.equal(FOREGROUND_ESCAPE_HINT.includes("前台执行"), true, "hint and matcher must agree on the phrase");
+});
+
+// field 2026-11-06 (Nova): SLS log query and a batch-deduction query ran ONE
+// AFTER ANOTHER in the same chat — 40+ minutes serialized. Root cause: dispatch
+// required a plan, and that day's plan side pass produced none, so triage never
+// even ran. Deep tasks must dispatch WITHOUT a plan.
+test("THE FIELD BUG: a deep task dispatches with NO plan (SLS log query)", () => {
+	const d = triageMessage({ text: "去sls 帮我查一下这比流水：0342026110600005180 的支付渠道下单日志", plan: undefined, looksLikeTask: true }, true);
+	assert.equal(d.dispatch, true, "naming SLS + 查一下 + 日志 is minutes of work — it must not serialize in the chat");
+	assert.equal(d.reason, "deep-task");
+});
+
+test("isDeepTask: external system + investigation verb, and nothing weaker", () => {
+	for (const yes of [
+		"去sls 帮我查一下这比流水",
+		"查一下支付渠道下单日志",
+		"排查一下接口报错",
+		"去堡垒机查一下昨天的操作",
+		"帮我查询数据库里这条记录",
+	]) assert.equal(isDeepTask(yes), true, `must be deep: ${yes}`);
+	for (const no of [
+		"你好",
+		"今天天气怎么样",
+		"部署测试环境并跑通",       // long-running verb, ordinary system → old path handles it
+		"帮我看下这个文件",         // no external system
+		"日志在哪",                 // external marker but no investigation verb
+	]) assert.equal(isDeepTask(no), false, `must NOT be deep: ${no}`);
+});
+
+test("a QUESTION about a deep system still stays inline (the trap this must not open)", () => {
+	for (const q of ["日志在哪？", "sls 查询失败了吗？", "查一下为什么报错？"]) {
+		const d = triageMessage({ text: q, plan: undefined, looksLikeTask: true }, true);
+		assert.equal(d.dispatch, false, `a question must stay inline: ${q}`);
+		// Reason may be "question" (deep-task branch) or "no-plan" (legacy branch);
+		// the contract asserted here is INLINE, never dispatched.
+	}
+});
+
+test("simple chat with no plan stays inline exactly as before", () => {
+	const d = triageMessage({ text: "帮我看看这个", plan: undefined, looksLikeTask: true }, true);
+	assert.equal(d.dispatch, false);
+	assert.equal(d.reason, "no-plan");
+});
+
+test("deep-task needs BOTH axes: investigation verb alone is not enough", () => {
+	// Dropping the external-system requirement would dispatch every casual
+	// 「查一下」 message to the background — the worst UX this module exists to
+	// prevent (design D1: 「你好」→「已转后台执行」).
+	for (const no of ["查一下", "帮我查一下这个", "查一下余额是多少", "查询一下今天的安排"]) {
+		assert.equal(isDeepTask(no), false, `verb without an external system must NOT be deep: ${no}`);
+	}
+	for (const yes of ["查一下 sls 日志", "查询数据库记录"]) {
+		assert.equal(isDeepTask(yes), true, `verb + system must be deep: ${yes}`);
+	}
 });

@@ -258,7 +258,7 @@ export class IMAdapterManager {
 	 * broken dispatch can never swallow a message. The work item keeps the
 	 * origin conversation, so progress/results push back here (D3/D4).
 	 */
-	private async tryDispatchToWorker(msg: InboundMessage, plan: string): Promise<string | undefined> {
+	private async tryDispatchToWorker(msg: InboundMessage, plan?: string): Promise<string | undefined> {
 		try {
 			const cfg = this.config.all();
 			// DEFAULT ON: absent means enabled (user ruling 2026-11-04). Only an
@@ -296,7 +296,9 @@ export class IMAdapterManager {
 				title,
 				// The plan IS the goal: the worker window reads it as the task spec,
 				// so what the user was promised is exactly what runs.
-				goal: `${plan}\n\n[用户原始指令]\n${msg.text}`,
+				// Without a plan (deep-task path) the worker plans for itself from the
+				// raw instruction — better than serializing two jobs in one chat.
+				goal: plan ? `${plan}\n\n[用户原始指令]\n${msg.text}` : msg.text,
 				originConversation: msg.conversationId,
 				originNote: "从聊天转派（Router）",
 				// Structured provenance (2026-11-05): Router dispatch is the one origin
@@ -799,6 +801,20 @@ export class IMAdapterManager {
 									}
 							} catch (err) {
 								console.warn("[im] task planning skipped:", err instanceof Error ? err.message : err);
+							}
+						}
+						// Plan-less dispatch attempt (field 2026-11-06): deep tasks (SLS log
+						// queries, 堡垒机 investigations) dispatch WITHOUT a plan. Before this,
+						// a failed plan side pass silently serialized two unrelated jobs into
+						// one chat's queue — the user saw "SLS finished, THEN the batch query
+						// started" and reasonably concluded VE runs globally serial. triage
+						// rejects everything that is not clearly a deep task, so simple
+						// questions still run inline exactly as before.
+						if (!escaped && !planText) {
+							const planlessDispatch = await this.tryDispatchToWorker(msg);
+							if (planlessDispatch) {
+								this.onActivity?.(msg.conversationId);
+								return planlessDispatch;
 							}
 						}
 						const result = await this.engine.send(

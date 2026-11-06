@@ -45,6 +45,34 @@ const QUESTION_MARKERS: readonly RegExp[] = [
 	/^(为什么|怎么|如何|啥|什么)[，,？?]/,
 ];
 
+/**
+ * Signals that a request is a DEEP task regardless of its verb or plan
+ * (field 2026-11-06, Nova): 「去 sls 帮我查一下这比流水」 sat in the single chat's
+ * serial queue behind another task for 40+ minutes. It matches none of the
+ * "long-running" verbs, and the side pass produced no plan that day — so the
+ * Router never dispatched it and two unrelated jobs serialized in one chat.
+ *
+ * A request that names an EXTERNAL SYSTEM and an investigation/collection
+ * action is minutes of work by nature: browser automation, log queries,
+ * 堡垒机/跳板机 hops. It must go to a Worker even without a plan.
+ */
+const EXTERNAL_SYSTEM_MARKERS: readonly RegExp[] = [
+	/\bsls\b/i, /日志/, /堡垒机/, /跳板机/, /后台系统/, /管理端/, /控制台/,
+	/数据库|\bdb\b/i, /\bapi\b/i, /接口/, /工单/,
+];
+
+const DEEP_TASK_VERBS: readonly string[] = [
+	"查一下", "查查", "查询", "排查", "定位", "分析", "核对", "对一下",
+	"取一下", "拉一下", "导一下", "跑一下", "看一下日志", "追一下",
+];
+
+/** True when the message names an external system AND an investigation action. */
+export function isDeepTask(text: string): boolean {
+	const t = text ?? "";
+	if (!EXTERNAL_SYSTEM_MARKERS.some((re) => re.test(t))) return false;
+	return DEEP_TASK_VERBS.some((v) => t.includes(v));
+}
+
 export interface TriageInput {
 	/** The raw user message. */
 	text: string;
@@ -58,7 +86,7 @@ export interface TriageDecision {
 	/** true → dispatch to a background work item. */
 	dispatch: boolean;
 	/** Machine-readable reason, always populated (for logs and tests). */
-	reason: "disabled" | "not-task" | "no-plan" | "too-few-steps" | "no-long-verb" | "question" | "dispatch";
+	reason: "disabled" | "not-task" | "no-plan" | "too-few-steps" | "no-long-verb" | "question" | "dispatch" | "deep-task";
 	/** Number of numbered steps found in the plan (0 when no plan). */
 	steps: number;
 }
@@ -107,6 +135,17 @@ export function triageMessage(input: TriageInput, enabled: boolean): TriageDecis
 	if (!enabled) return { dispatch: false, reason: "disabled", steps: 0 };
 	const text = input.text ?? "";
 	if (!input.looksLikeTask) return { dispatch: false, reason: "not-task", steps: 0 };
+	// Deep-task path (field 2026-11-06): names an external system + an
+	// investigation action → minutes of work by nature. Dispatches WITHOUT a
+	// plan; the Worker window plans for itself (the goal carries the raw text).
+	// Previously `!plan` returned inline unconditionally, so a failed plan side
+	// pass silently serialized two unrelated jobs into one chat's queue.
+	// The question check comes FIRST here: 「sls 查询失败了吗？」 is a question even
+	// though it names SLS — asking must never be shipped to the background.
+	if (isDeepTask(text)) {
+		if (isQuestion(text)) return { dispatch: false, reason: "question", steps: 0 };
+		return { dispatch: true, reason: "deep-task", steps: countPlanSteps(input.plan) };
+	}
 	if (!input.plan) return { dispatch: false, reason: "no-plan", steps: 0 };
 	const steps = countPlanSteps(input.plan);
 	if (steps < 2) return { dispatch: false, reason: "too-few-steps", steps };
