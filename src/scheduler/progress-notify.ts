@@ -118,6 +118,13 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 		}, intervalMs);
 		// Never hold the process open for a progress push (all VE timers unref).
 		timer.unref?.();
+		// The happy path MUST be as visible as the guard branches above: a
+		// window that beats silently is indistinguishable from a notifier that
+		// never started (field 2026-11-06: an 85-minute window produced zero
+		// progress notes and ZERO log lines, and the silence itself blocked
+		// diagnosis for hours — the tick may or may not have fired, and nothing
+		// could tell which).
+		log("INFO", `progress notifier started: interval=${Math.round(intervalMs / 60_000)}min target=${opts.target}`);
 	};
 
 	const tick = async (): Promise<void> => {
@@ -166,6 +173,12 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 			// (LLM-backed) note resets the streak.
 			if (degraded) {
 				degradedStreak += 1;
+				if (degradedStreak === 1) {
+					// First degraded push still flows (informative), but its
+					// REASON must land here or the next "为什么没有进度汇报"
+					// starts blind again (field 2026-10-30, box Nova).
+					log("INFO", "progress brief degraded (side LLM unavailable) — pushing the deterministic fallback");
+				}
 				if (degradedStreak >= 2) {
 					const delay = Math.min(BACKOFF_CAP_MS, intervalMs * 2 ** (degradedStreak - 1));
 					backoffUntil = Date.now() + delay;
@@ -200,6 +213,10 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 						log("WARN", `progress push failed: ${err instanceof Error ? err.message : err}`);
 					} finally {
 						pushInFlight = false;
+						// Success is silent nowhere: a delivered beat must leave
+						// one trace line, or "did the notifier even fire?" is
+						// unanswerable from logs alone (field 2026-11-06).
+						log("INFO", `progress pushed #${pushes} to ${target}`);
 						resolve();
 					}
 				})();

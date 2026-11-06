@@ -392,3 +392,41 @@ test("R: drain resolves only after the in-flight push settles (review P2-1)", as
 	notifier.stop();
 	mock.timers.reset();
 });
+
+// Field 2026-11-06 (box Nova): an 85-minute work window produced ZERO progress
+// notes and ZERO log lines. Three silence holes made "did the notifier even
+// fire?" unanswerable: timer install, degraded-first-push, and successful push
+// all ran without a trace. Every one of them must now log.
+test("notifier lifecycle leaves log traces: start, degraded first push, successful push", async () => {
+	mock.timers.reset();
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	try {
+		const logs = [];
+		const h = make({
+			log: (level, msg) => logs.push(`${level} ${msg}`),
+			summarize: async () => ({ text: "⏳ 任务仍在进行中。已完成：登录。剩余：导出。正在：查询。卡点：无", degraded: true }),
+		});
+		h.notifier.start();
+		assert.ok(logs.some((l) => l.startsWith("INFO progress notifier started: interval=5min target=dt:group:g1")),
+			"timer install must be logged (with interval + target)");
+		await advance(INTERVAL * 1.2);   // first tick: degraded push #1
+		assert.equal(h.calls.push, 1);
+		assert.ok(logs.some((l) => l === "INFO progress brief degraded (side LLM unavailable) — pushing the deterministic fallback"),
+			"first degraded push must say WHY it degraded");
+		assert.ok(logs.some((l) => l.startsWith("INFO progress pushed #1 to dt:group:g1")),
+			"a delivered beat must leave exactly one trace line");
+		h.notifier.stop();
+	} finally {
+		mock.timers.reset();
+	}
+});
+
+test("guard branches still log (no-target / disabled interval)", async () => {
+	const logs = [];
+	const h = make({ target: null, log: (level, msg) => logs.push(`${level} ${msg}`) });
+	h.notifier.start();
+	assert.ok(logs.some((l) => l.includes("no push target")), "no-target guard keeps its log");
+	const h2 = make({ intervalMin: 0, log: (level, msg) => logs.push(`${level} ${msg}`) });
+	h2.notifier.start();
+	assert.ok(logs.some((l) => l.includes("interval disabled")), "disabled-interval guard keeps its log");
+});
