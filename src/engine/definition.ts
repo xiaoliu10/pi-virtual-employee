@@ -16,6 +16,7 @@ import type { SkillWriter } from "./skills/skill-writer.js";
 import type { ConfigStore } from "../db/config-store.js";
 import type { WorkItemStore } from "../db/work-item-store.js";
 import { createWorkTools } from "./tools/work.js";
+import { stopBackgroundProcesses } from "./tools/shell.js";
 import type { TelemetryStore } from "../db/telemetry-store.js";
 import { createMyStatsTool } from "./tools/telemetry.js";
 import { createProposeImprovementTool } from "./tools/proposals.js";
@@ -283,6 +284,12 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 			config: options.config,
 			resolveActor: options.resolveActor,
 			conversationId: options.conversationId,
+			// Cancel must reclaim a finished window's still-running background work
+			// (review P2-2 2026-11-06): the turn can be over while its script runs.
+			reclaimBackground: (id) => {
+				const killed = stopBackgroundProcesses(options.config, `work:${id}`);
+				if (killed.length > 0) console.log(`[work] cancel reclaim: ${killed.length} background process(es) killed for work:${id}`);
+			},
 		}));
 	}
 	// Skill authoring is an always-on channel: explicit 技能/Skill intent writes

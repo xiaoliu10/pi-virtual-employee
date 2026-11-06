@@ -148,6 +148,41 @@ export function disposeShellCommands(config: ConfigStore): void {
  * turn-settle inventory (field 2026-11-04: a monitor script kept running after
  * the result was already pushed and nothing told the user; silent strays read
  * as delivery bugs). Read-only snapshot; never kills anything. */
+/**
+ * Stop every RUNNING background process owned by a conversation (process trees:
+ * a Playwright browser is a child of its python script and dies with it).
+ *
+ * Field 2026-11-06 (box Nova): the admin cancelled task b605b244, but its
+ * 15–20min query script + browser kept running and held spay_profile, blocking
+ * every later login with PROFILE_MASTER_BUSY. A cancelled/aborted turn must
+ * not orphan the resources it started.
+ *
+ * Returns the killed entries for audit logging. Never throws: cascade cleanup
+ * must not break the abort path it rides on.
+ */
+export function stopBackgroundProcesses(
+	config: ConfigStore,
+	conversationId: string,
+	auditLogPath?: string,
+): Array<{ sessionId: string; pid: number | null; command: string }> {
+	const stopped: Array<{ sessionId: string; pid: number | null; command: string }> = [];
+	try {
+		for (const entry of sessionsFor(config).values()) {
+			if (entry.conversationId !== conversationId || entry.process.status !== "running") continue;
+			try {
+				entry.process.stop();
+			} catch {
+				// keep sweeping the rest even if one stop fails
+			}
+			stopped.push({ sessionId: entry.process.id, pid: entry.process.pid ?? null, command: entry.command });
+			audit(auditLogPath, { event: "cascade_kill", conversationId, sessionId: entry.process.id, pid: entry.process.pid ?? null });
+		}
+	} catch {
+		// registry access itself failed — the abort must still proceed
+	}
+	return stopped;
+}
+
 export function runningBackgroundProcesses(
 	config: ConfigStore,
 	conversationId: string,
@@ -548,7 +583,18 @@ export function createManageProcessTool(deps: ShellToolDeps): AgentTool {
 					status: entry.process.status, code: entry.process.code, timeoutSec: entry.process.timeoutSec,
 					startedAt: entry.process.startedAt, background: entry.background,
 				}));
-				return { content: [{ type: "text", text: rows.length ? JSON.stringify(rows, null, 2) : "当前对话没有可访问的命令会话。" }], details: { sessions: rows } };
+				// Anti-duplicate hint (field 2026-11-06): one window started the same
+				// long-lived driver script FOUR times because nothing told it an
+				// identical one was already running. A plain list is easy to skim
+				// past, so say it explicitly.
+				const running = rows.filter((r) => r.status === "running");
+				const byCommand = new Map<string, number>();
+				for (const r of running) byCommand.set(r.command, (byCommand.get(r.command) ?? 0) + 1);
+				const dupes = [...byCommand.entries()].filter(([, n]) => n > 1);
+				const dupNote = dupes.length
+					? `\n\n⚠️ 有 ${dupes.length} 条命令存在重复运行实例（同一条命令被启动了多次），先 kill 掉多余实例再启动新的：\n${dupes.map(([cmd, n]) => `  · ${n} 个：${cmd.slice(0, 120)}`).join("\n")}\n常驻/循环脚本（while True、文件轮询、等待输入的驱动）在任务结束或不再需要时必须 kill；启动前先 list 确认没有同类在跑。`
+					: "";
+				return { content: [{ type: "text", text: rows.length ? JSON.stringify(rows, null, 2) + dupNote : "当前对话没有可访问的命令会话。" }], details: { sessions: rows, duplicates: dupes.length } };
 			}
 			const entry = sessionId ? sessions.get(sessionId) : undefined;
 			if (!entry || !own(entry)) return refuse("找不到可访问的命令会话；请使用当前对话的 manage_process list 查询。应用重启后旧会话失效。");

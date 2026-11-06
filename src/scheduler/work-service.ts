@@ -18,7 +18,14 @@ import type { WorkItemRow, WorkItemStore } from "../db/work-item-store.js";
 import { buildWorkWindowPrefix, DEFAULT_NEXT_CHECK_MS, DEFAULT_WINDOW_BUDGET, nextRoutineStreak, parseWindowReply, REMIND_DEFAULT_MS, REMIND_MAX_MS, REMIND_MIN_MS } from "./work.js";
 import { hasMiningSecrets } from "./mining.js";
 
-interface WorkSession { abort(): void; }
+interface WorkSession {
+	/** Abort the turn. `preserveBackground` keeps this conversation's running
+	 * background processes alive — required by the NEXT_CHECK continuation
+	 * contract (work.ts teaches: run the scan, write results to files, continue
+	 * next window; review P1 2026-11-06: killing them on a timeout kill would
+	 * destroy the very continuation the design depends on). */
+	abort(opts?: { preserveBackground?: boolean }): void;
+}
 interface ActiveWindow<Session> {
 	id: string;
 	/** Snapshot of the item's due state BEFORE claim nulls it — the previous
@@ -61,6 +68,11 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	 * references unregistered tools (save_to_knowledge needs learn enabled). */
 	kbFeatures?(): { search: boolean; learn: boolean };
 	learn?(item: WorkItemRow, result: string): void | Promise<void>;
+	/** Kill background processes this item's window left running, called when the
+	 * item reaches DONE (field 2026-11-06: a finished task's driver script kept
+	 * polling files and holding profile locks). Never called for aborted or
+	 * deferred windows — those continue on the same item. */
+	reclaimBackground?(itemId: string): void;
 	budget?: { maxTurns: number; maxMinutes: number };
 	/** Window progress broadcaster (v0.2.171): main.ts injects the same
 	 * ProgressNotifier factory the scheduled-task runner uses, so a work window
@@ -190,7 +202,7 @@ export class WorkService<Session extends WorkSession> {
 		this.running = false;
 		this.unsubscribe?.(); this.unsubscribe = undefined;
 		this.clearWake();
-		for (const window of [...this.active]) this.abortActive(window, "应用停止执行；请核查已发生的操作后由管理员明确恢复。");
+		for (const window of [...this.active]) this.abortActive(window, "应用停止执行；请核查已发生的操作后由管理员明确恢复。", true);
 	}
 	/** Test/drain hook; does not race or abandon an in-flight engine send. */
 	async whenIdle(): Promise<void> { await Promise.all([...this.active].map((window) => window.settled)); }
@@ -211,12 +223,12 @@ export class WorkService<Session extends WorkSession> {
 		this.wakeTimer = undefined;
 	}
 	/** Abort ONE window. Never "the" window: several may be running. */
-	private abortActive(window: ActiveWindow<Session>, reason: string): void {
+	private abortActive(window: ActiveWindow<Session>, reason: string, preserveBackground = false): void {
 		if (window.stopReason) return;
 		window.stopReason = reason;
 		if (window.deadline !== undefined) this.clock.clearTimeout(window.deadline);
 		window.deadline = undefined;
-		try { window.session?.abort(); } catch (err) { this.opts.onError?.(err); }
+		try { window.session?.abort({ preserveBackground }); } catch (err) { this.opts.onError?.(err); }
 	}
 	/** Reminder interval for a waiting_human row: the item's OWN rhythm
 	 * (EMA of its declared NEXT_CHECK gaps), clamped. A 2h-rhythm task that
@@ -375,7 +387,9 @@ export class WorkService<Session extends WorkSession> {
 			// review P1 2026-10-23). Read ONCE at window start: a change mid-window
 			// lands on the next window, never retargeting a cap already running.
 			if (item.max_minutes && item.max_minutes > 0) budget = { ...this.budget, maxMinutes: item.max_minutes };
-			active.deadline = this.clock.setTimeout(() => this.abortActive(active, TIMEOUT_STOP_REASON), budget.maxMinutes * 60_000);
+			// Window budget exhausted -> this SAME item continues next window: keep its
+				// background work running so the next window can harvest it.
+				active.deadline = this.clock.setTimeout(() => this.abortActive(active, TIMEOUT_STOP_REASON, true), budget.maxMinutes * 60_000);
 			for (let turn = 0; budget.maxTurns <= 0 || turn < budget.maxTurns; turn++) {
 				// Fresh notebook and live identity on EVERY turn (including turn zero).
 				const fresh = store.get(item.id);
@@ -672,6 +686,14 @@ export class WorkService<Session extends WorkSession> {
 			try {
 				if (this.opts.canLearn?.() !== false) await this.opts.learn?.(fresh, lastText);
 			} catch (err) { this.opts.onError?.(err); }
+			// Field 2026-11-06 (Nova): a work window started a long-lived driver script
+			// (`sls_drv.py`, `while True` + file polling), finished its job (SUCCESS_2FA
+			// in its log) and the script kept running — four copies eventually, all
+			// holding profile locks and burning file polling. A FINISHED task must not
+			// leave background work behind: nothing will ever come back to collect it.
+			// (An aborted/timed-out window is different — NEXT_CHECK continues on the
+			// same work and legitimately keeps its script; see abortSession.)
+			try { this.opts.reclaimBackground?.(fresh.id); } catch (err) { this.opts.onError?.(err); }
 		}
 		if (fresh.origin_conversation) {
 			// Re-read immediately before pushing: a pause/cancel landing between the

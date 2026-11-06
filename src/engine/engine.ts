@@ -16,7 +16,7 @@ import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import type { AgentEvent, AgentMessage, FinishTurn, StreamFn } from "@earendil-works/pi-agent-core";
 import { createSessionHost, type SessionHost } from "./session-host.js";
 import { sidePassMaxTokens } from "./side-pass-budget.js";
-import { runningBackgroundProcesses } from "./tools/shell.js";
+import { runningBackgroundProcesses, stopBackgroundProcesses } from "./tools/shell.js";
 import type { Skill } from "./skills/types.js";
 import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "./pi-compaction.js";
 import { formatPlanForTurn, formatPlanMessage, looksLikeTask, parsePlan, PLAN_PROMPT_HEADER, shouldPushPlanToChat } from "./task-planner.js";
@@ -1490,7 +1490,23 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * persistence — a partial reply from the dead turn can never re-seed the
 	 * fresh transcript.
 	 */
-	abortSession(conversationId: string): boolean {
+	abortSession(conversationId: string, opts?: { preserveBackground?: boolean }): boolean {
+		// Cascade resource cleanup FIRST (field 2026-11-06): a cancelled task's
+		// background scripts and their browsers must not outlive the turn and
+		// keep holding shared resources (profile locks). Runs before the durable
+		// early-return so EVERY abort path (cancel, watchdogs, /stop) gets it.
+		//
+		// `preserveBackground` is the other side of the contract (review P1
+		// 2026-11-06): a work window that hit its TIME BUDGET is not cancelled —
+		// the same item continues next window (NEXT_CHECK), and work.ts explicitly
+		// teaches "run the scan, write results to files, continue later". Killing
+		// its script/browser would destroy exactly that continuation.
+		if (!opts?.preserveBackground) {
+			const cascaded = stopBackgroundProcesses(this.config, conversationId);
+			if (cascaded.length > 0) {
+				console.log(`[engine] cascade stop: ${cascaded.length} background process(es) killed for ${conversationId}: ${cascaded.map((c) => `${c.sessionId}(pid=${c.pid ?? "?"})`).join(", ")}`);
+			}
+		}
 		if (this.durableRuntime?.abort(conversationId)) return true;
 		const cached = this.sessions.get(conversationId);
 		if (!cached) return false;

@@ -54,7 +54,7 @@ import { ReportService } from "../src/reports/report-service.js";
 import { DownloadStore } from "../src/downloads/download-store.js";
 import { DownloadService } from "../src/downloads/download-service.js";
 import { EmployeeEngine, type AuthLoginEventBridge } from "../src/engine/engine.js";
-import { disposeShellCommands } from "../src/engine/tools/shell.js";
+import { disposeShellCommands, stopBackgroundProcesses } from "../src/engine/tools/shell.js";
 import { replyHasReportLink } from "../src/engine/tools/reports.js";
 import { scheduledTimePrefix } from "../src/engine/tools/time.js";
 import { buildSystemPrompt, defaultCoreRules } from "../src/engine/prompt.js";
@@ -990,6 +990,12 @@ ${tailForProgress(decision.text)}`;
 			},
 		}),
 		release: (convId) => browser.releasePage(convId),
+		// A FINISHED task must not leave its driver scripts running (field
+		// 2026-11-06: four sls_drv.py copies kept polling files after success).
+		reclaimBackground: (itemId) => {
+			const killed = stopBackgroundProcesses(config, `work:${itemId}`);
+			if (killed.length > 0) console.log(`[main] done reclaim: ${killed.length} background process(es) killed for work:${itemId}`);
+		},
 		// Work windows report on the TASK cadence (taskProgressMin, default 30),
 		// not the chat cadence: a window runs for maxMinutes and its final report is
 		// the deliverable, so chat-frequency notes are noise (v0.2.171).
@@ -1947,7 +1953,18 @@ ${tailForProgress(decision.text)}`;
 		try {
 			if (action === "pause") return { ok: Boolean(store.pause(id, "管理员在设置页暂停")), status: store.get(id)?.status };
 			if (action === "resume") return { ok: Boolean(store.resume(id)), status: store.get(id)?.status };
-			return { ok: Boolean(store.cancel(id)), status: store.get(id)?.status };
+			const ok = Boolean(store.cancel(id));
+			// Review P2-2 (2026-11-06): the turn may already be over while its
+			// background script keeps running (work.ts explicitly allows "write
+			// results to files, harvest next window"). abortSession never fires in
+			// that shape, so the per-window cascade cannot reach it — reclaim here.
+			if (ok) {
+				const reclaimed = stopBackgroundProcesses(config, `work:${id}`);
+				if (reclaimed.length > 0) {
+					console.log(`[main] cancel reclaim: ${reclaimed.length} background process(es) killed for work:${id}: ${reclaimed.map((c) => `${c.sessionId}(pid=${c.pid ?? "?"})`).join(", ")}`);
+				}
+			}
+			return { ok, status: store.get(id)?.status };
 		} catch (err) {
 			return { ok: false, error: err instanceof Error ? err.message : String(err) };
 		}
