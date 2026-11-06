@@ -241,3 +241,52 @@ test("opts omitted entirely behaves exactly like the legacy signature", () => {
 	t += 6 * MIN;
 	assert.equal(wd.touch("c", "fp"), "soft-stop");
 });
+
+
+// ---------- review P3: three boundary pins ----------
+
+test("hasRunningBackground: false (explicit) must NOT defer", () => {
+	let t = 0;
+	const wd = new ProgressWatchdog({ stallWindowMs: 5 * MIN, softStopAfterWindows: 2, now: () => t });
+	wd.touch("c", "fp", { hasRunningBackground: false });
+	t += 6 * MIN; wd.touch("c", "fp", { hasRunningBackground: false });
+	t += 6 * MIN;
+	assert.equal(wd.touch("c", "fp", { hasRunningBackground: false }), "soft-stop", "explicit false is not 'has background'");
+});
+
+test("a deferred window re-judges only after a FULL new window (windowStart reset)", () => {
+	let t = 0;
+	const wd = new ProgressWatchdog({ stallWindowMs: 5 * MIN, softStopAfterWindows: 2, maxDeferrals: 3, now: () => t });
+	const opts = { hasRunningBackground: true };
+	wd.touch("c", "fp", opts);
+	t += 6 * MIN; wd.touch("c", "fp", opts); // nudge
+	t += 6 * MIN;
+	assert.equal(wd.touch("c", "fp", opts), "deferred");
+	// Immediately after the deferral the SAME fingerprint must be idle, not a
+	// second deferral — otherwise rapid polls burn the whole budget at once.
+	t += 1000;
+	assert.equal(wd.touch("c", "fp", opts), "idle", "within the fresh window: idle, no budget spent");
+	t += 6 * MIN;
+	assert.equal(wd.touch("c", "fp", opts), "deferred", "next full window re-judges");
+});
+
+test("configure({ maxDeferrals }) applies at runtime (0 disables, 5 extends)", () => {
+	let t = 0;
+	const wd = new ProgressWatchdog({ stallWindowMs: 5 * MIN, softStopAfterWindows: 2, now: () => t });
+	const opts = { hasRunningBackground: true };
+	wd.configure({ maxDeferrals: 0 });
+	wd.touch("c", "fp", opts);
+	t += 6 * MIN; wd.touch("c", "fp", opts);
+	t += 6 * MIN;
+	assert.equal(wd.touch("c", "fp", opts), "soft-stop", "maxDeferrals=0 disables deferral");
+
+	// fresh conversation, runtime-raised budget
+	wd.configure({ maxDeferrals: 5 });
+	wd.touch("d", "fp", opts);
+	let deferred = 0;
+	for (let i = 0; i < 6; i++) {
+		t += 6 * MIN;
+		if (wd.touch("d", "fp", opts) === "deferred") deferred++;
+	}
+	assert.equal(deferred, 5, "exactly 5 deferrals after configure({maxDeferrals:5})");
+});
