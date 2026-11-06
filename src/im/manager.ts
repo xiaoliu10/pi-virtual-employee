@@ -24,7 +24,7 @@ import { isAuthorizationPhrase } from "../engine/authorization.js";
 import { startStallWatchdog } from "./watchdog.js";
 import { splitForPush } from "./chunks.js";
 import { gateOutboundText } from "./credential-egress.js";
-import { FOREGROUND_ESCAPE_HINT, isForegroundEscape, triageMessage } from "./triage.js";
+import { isForegroundEscape, triageMessage } from "./triage.js";
 import { chatHeartbeatOccurrenceId, DeliveryLedger } from "./delivery-ledger.js";
 import type { AdapterCapabilities, AdapterHealth, InboundMessage } from "./types.js";
 
@@ -319,17 +319,16 @@ export class IMAdapterManager {
 			// Fire immediately so the work starts now rather than at the next tick.
 			const fired = bridge.fireItem(item.id);
 			console.log(`[im] dispatch triage: WORKER item=${item.id} steps=${decision.steps} fired=${fired} conv=${msg.conversationId}`);
-			const shortId = item.id.slice(0, 8);
-			// ACK promises only what EXISTS today. Progress notes push
-			// automatically; admins manage the item from the 任务 list; and the
-			// 「前台执行」 escape has a real inbound handler since 0.2.193 (the
-			// older ACK had to drop this hint because the wording predated the
-			// mechanism — review P1-1).
-			return [
-				`🚀 已转后台执行（编号 ${shortId}），进展与完成会自动推送回本会话。`,
-				`管理员可在控制台任务列表查看或取消该任务。`,
-				FOREGROUND_ESCAPE_HINT,
-			].join("\n");
+			// NO ACK (user ruling 2026-11-06): in a Router/Worker architecture the
+			// Worker owns all user-visible signalling — registration, progress and
+			// result all push back to this conversation on their own. A Router-side
+			// "已转后台执行" line is a redundant middle layer that only adds noise.
+			// The Router's job ends when the item is persisted and fired.
+			//
+			// The empty string is the "dispatched, say nothing" signal (see the
+			// caller): returning undefined would mean "run inline" and the task
+			// would execute twice.
+			return "";
 		} catch (err) {
 			// Never let dispatch break the turn: fall back to inline execution.
 			console.warn("[im] dispatch failed, running inline:", err instanceof Error ? err.message : err);
@@ -791,7 +790,9 @@ export class IMAdapterManager {
 										// turn — it becomes a work item and this turn returns the ACK instead.
 										// Every failure path falls through to inline execution (no black holes).
 										const dispatched = await this.tryDispatchToWorker(msg, plan.turnContext);
-										if (dispatched) {
+										// `undefined` = inline; ANY string (including "" = dispatched,
+										// stay silent) means the Router handed the task off.
+										if (dispatched !== undefined) {
 											// The early return skips engine.send's onActivity — fire it
 											// so the renderer task list shows the new item immediately
 											// (review P2-3).
@@ -812,7 +813,7 @@ export class IMAdapterManager {
 						// questions still run inline exactly as before.
 						if (!escaped && !planText) {
 							const planlessDispatch = await this.tryDispatchToWorker(msg);
-							if (planlessDispatch) {
+							if (planlessDispatch !== undefined) {
 								this.onActivity?.(msg.conversationId);
 								return planlessDispatch;
 							}

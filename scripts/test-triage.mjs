@@ -211,18 +211,17 @@ test(`dispatch WIRING: creates and fires with flag ${JSON.stringify(chatDispatch
 		PLAN3,
 	);
 
-	assert.ok(ack, "a dispatch must return the ACK text (that is what the user sees)");
-	assert.match(ack, /已转后台执行/);
-	// Review P1-1: the ACK used to promise 「前台执行」/「<id> 进度」//stop — none
-	// of which had an inbound handler (the design-doc wording was copied before
-	// the mechanisms landed). It now promises ONLY what exists: automatic
-	// progress/completion pushes, and admin management from the task list.
-	assert.match(ack, /进展与完成会自动推送/);
+	// Architecture 2026-11-06: dispatch returns "" (handed off, stay SILENT) —
+	// only `undefined` means "run inline". The Worker owns user-visible signalling.
+	assert.equal(ack !== undefined, true, "a dispatch must signal the handoff (empty string = silent)");
+	// NO Router-side ACK (user ruling 2026-11-06): the Worker owns registration,
+	// progress and result pushes. A middle "已转后台执行" line is pure noise in a
+	// Router/Worker architecture, so dispatch returns the empty string.
+	assert.equal(ack, "", "the Router stays silent; the Worker reports by itself");
 	// 0.2.193: the escape mechanism EXISTS now (takeForegroundEscape + handle
-	// wiring), so the ACK must carry the hint again — promising it was only
-	// dishonest while the wording predated the mechanism (review P1-1).
-	assert.match(ack, /前台执行/, "the ACK must advertise the now-real escape hatch");
-	assert.doesNotMatch(ack, /\/stop/, "/stop targets the chat session, not the work item — still must not be promised");
+	// No ACK at all now, so nothing to advertise: the escape hatch STILL WORKS
+	// (回复「前台执行」在 handle() 里独立判定)，用户不知道也不影响使用。
+	assert.doesNotMatch(ack, /\/stop|前台执行/, "no Router-side ACK: the Worker reports by itself");
 
 	const items = store.list();
 	assert.equal(items.length, 1, "exactly one work item must be created");
@@ -237,8 +236,9 @@ test(`dispatch WIRING: creates and fires with flag ${JSON.stringify(chatDispatch
 	assert.match(item.goal, /用户原始指令/, "the original wording must be preserved for the worker");
 	assert.deepEqual(fired.map((f) => f.id), [item.id], "the window must be fired immediately");
 	assert.equal(fired[0].ok, true, `real fireItem contract must accept it: ${JSON.stringify(fired)}`);
-	const shortId = item.id.slice(0, 8);
-	assert.ok(ack.includes(shortId), `the ACK must name the item (${shortId}) so the user can follow it: ${ack}`);
+	// No ACK to carry the id any more: the Worker's own progress/completion pushes
+	// identify the task, and the console task list shows it (user ruling 2026-11-06).
+	assert.equal(ack, "", "silent handoff");
 
 });
 }

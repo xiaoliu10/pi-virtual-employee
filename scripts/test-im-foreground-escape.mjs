@@ -128,8 +128,8 @@ async function dispatchAndEscape({ status = "queued", sender = "u1", extra = {} 
 
 test("escape converts a QUEUED chat-dispatched item: cancelled, original instruction re-runs inline", async () => {
 	const { ack, reply, item, store, sends, plans, fired } = await dispatchAndEscape();
-	assert.ok(ack, "dispatch must have ACKed");
-	assert.match(ack, /前台执行/, "the ACK must advertise the escape hatch");
+	assert.ok(ack !== undefined, "dispatch must have signalled the handoff (empty = silent)");
+	assert.equal(ack, "", "no Router-side ACK (user ruling 2026-11-06) — the Worker reports by itself");
 	assert.equal(store.get(item.id).status, "cancelled", "the item must be cancelled");
 	assert.equal(sends.length, 1, "exactly one inline turn");
 	assert.equal(sends[0], ORIGINAL, "the ORIGINAL instruction (from the goal) must re-run, not the phrase");
@@ -203,5 +203,5 @@ test("a sentence CONTAINING the words is ordinary text — it goes to the model,
 	// ("…再导出"), so the Router routes it to a Worker instead of executing it.
 	// The contract this test guards is "the escape hatch did not fire", which
 	// both paths satisfy — inline (old) or dispatched (new).
-	assert.ok(sends.length === 1 || /已转后台执行/.test(reply), "either inline or routed — never the hatch");
+	assert.ok(sends.length === 1 || reply === "", "either inline or routed (silent) — never the hatch");
 });
