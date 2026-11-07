@@ -79,6 +79,46 @@ test("linear lifecycle: spawn → running → done, result delivered to the SOUR
 	assert.match(h.store.get(w.id).conversation_id, /^worker:/);
 });
 
+test("CRASH RECOVERY: a worker left running by a dead process is flipped and reported", async () => {
+	// Field 2026-11-07 (the box): the app restarted at 22:12 (install) while a
+	// worker was in its final stage. The row stayed `running` forever — the
+	// group got a confident "报告已生成完毕" progress note and then NOTHING:
+	// no report, no error, and no way to know it had died. work_items already
+	// recovered (recoverWorking → waiting_human + pushed notice); worker_tasks
+	// had no recovery at all.
+	const { h, service } = harness();
+	// A worker started by a PREVIOUS process: started_at well before boot.
+	const past = Date.now() - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
+		VALUES ('wdead', '每日对账异常动态巡检（7天版·明细报告）继续', 'dt:group:g1', 'ma1', 'running', 'worker:wdead', ?, ?)`).run(past, past);
+
+	service.start();
+	await flush();
+
+	const row = h.store.get("wdead");
+	assert.equal(row.status, "error", "an orphaned worker must not stay running forever");
+	assert.match(row.error, /应用在执行中退出/, "the reason must say the process died, not blame the task");
+	assert.equal(row.finished_at != null, true, "it must look finished, not alive");
+
+	const notice = h.pushes.find((p) => p.cid === "dt:group:g1");
+	assert.ok(notice, "the source conversation MUST be told — silence was the original bug");
+	assert.match(notice.text, /任务执行被中断/);
+	assert.match(notice.text, /进度汇报|即将完成|报告已生成/, "it must warn that earlier progress notes were estimates, not results");
+	assert.match(notice.text, /重新执行/, "it must offer a way forward instead of leaving the user hanging");
+	assert.equal(h.sends.length, 0, "recovery must not silently re-run a dead worker");
+});
+
+test("CRASH RECOVERY: a worker started by THIS process is never treated as an orphan", async () => {
+	// The boot boundary must be real: a row started after boot is live work.
+	const { h } = harness();
+	const now = Date.now();
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
+		VALUES ('wlive', '活着的任务', 'dt:group:g1', 'ma1', 'running', 'worker:wlive', ?, ?)`).run(now, now + 1);
+	const victims = h.store.recoverOrphans(now, "x");
+	assert.equal(victims.length, 0, "a row started after boot is not an orphan");
+	assert.equal(h.store.get("wlive").status, "running", "live work must keep running");
+});
+
 test("STRUCTURAL SEPARATION: work-item markers in a worker reply are inert text", async () => {
 	const { h, service } = harness({
 		reply: () => ({ reply: "阶段完成。\n[[NEXT_CHECK]]: 2026-11-07 00:50 | 重查\n[[TASK_DONE]]" }),

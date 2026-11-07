@@ -91,6 +91,30 @@ export class WorkerTaskStore {
 		return r.changes ? this.get(row.id) : undefined;
 	}
 
+	/** Startup crash recovery (v0.2.206). `running` is an IN-MEMORY fact: the
+	 * process that owned the turn is gone, and nothing will ever call settle()
+	 * for that row. Field 2026-11-07 (the box): an install restarted the app at
+	 * 22:12 while a worker was in its final stage — the row stayed `running`
+	 * forever, so the user got progress notes claiming "报告已生成完毕" and
+	 * then silence: no final report, no error, no way to tell it had died.
+	 *
+	 * The work-item board already recovers (`recoverWorking` → waiting_human +
+	 * a pushed notice); worker_tasks had NOTHING. Flip orphans to `error` with
+	 * an honest reason so the row stops looking alive, and return them so the
+	 * service can tell the originating conversation.
+	 *
+	 * Bounded by `started_at`: a row started in THIS process cannot be an
+	 * orphan, so recovery only touches rows older than `bootAt`. */
+	recoverOrphans(bootAt: number, reason: string): WorkerTaskRow[] {
+		const rows = this.db.prepare(`SELECT * FROM worker_tasks WHERE status = 'running'
+			AND (started_at IS NULL OR started_at < ?)`).all(bootAt) as unknown as WorkerTaskRow[];
+		if (rows.length === 0) return [];
+		const stmt = this.db.prepare(`UPDATE worker_tasks SET status = 'error', error = ?, finished_at = ?
+			WHERE id = ? AND status = 'running'`);
+		for (const r of rows) stmt.run(reason, bootAt, r.id);
+		return rows.map((r) => this.get(r.id) ?? r);
+	}
+
 	listRecent(limit = 20): WorkerTaskRow[] {
 		return this.db.prepare("SELECT * FROM worker_tasks ORDER BY created_at DESC LIMIT ?").all(limit) as unknown as WorkerTaskRow[];
 	}

@@ -91,6 +91,12 @@ export class WorkerService<Session> {
 	start(intervalMs = 15_000): void {
 		if (this.running) return;
 		this.running = true;
+		// Orphan recovery MUST run before the first tick: `running` is an
+		// in-memory fact and the process that owned those rows is gone. Without
+		// this the row stays "running" forever and the source conversation never
+		// learns the worker died (field 2026-11-07: install restart mid-run, the
+		// group got progress notes then silence — no report, no error).
+		this.recoverOrphans();
 		const loop = () => {
 			if (!this.running) return;
 			try {
@@ -106,6 +112,26 @@ export class WorkerService<Session> {
 	stop(): void {
 		this.running = false;
 		if (this.wake) { this.clock.setTimeout(() => {}, 0); this.wake = undefined; }
+	}
+
+	/** Flip workers whose owning process died, and TELL the source
+	 * conversation. Silent recovery would repeat the original sin: the group
+	 * saw a confident "报告已生成完毕" progress note and then nothing at all.
+	 * Best-effort push — during early startup the IM adapter may not be up. */
+	private recoverOrphans(): void {
+		const bootAt = this.clock.now();
+		let orphans: WorkerTaskRow[];
+		try {
+			orphans = this.store.recoverOrphans(bootAt, "应用在执行中退出，该轮未完成");
+		} catch (err) {
+			this.opts.onError?.(err);
+			return;
+		}
+		for (const o of orphans) {
+			const title = o.instruction.slice(0, 60);
+			const text = `⚠️ **任务执行被中断：${title}**\n\n应用在执行中退出（升级或重启），这一轮没有跑完，也没有最终结果——如果你收到过「即将完成 / 报告已生成」之类的进度汇报，那是中断前的估计，不能当作结果。\n\n需要我重新执行吗？回复「重新执行」即可。`;
+			void Promise.resolve(this.opts.push(o.source_conversation, text)).catch(() => {});
+		}
 	}
 
 	/** Router's single entry point. Fire-and-forget: the Router never waits on
