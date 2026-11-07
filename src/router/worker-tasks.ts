@@ -7,7 +7,7 @@
  * cadence, no streaks, no resident. Scheduling code paths simply do not exist
  * here; that is the whole point of the split from work_items.
  */
-import type { DatabaseSync } from "node:sqlite";
+import type { DB } from "../db/sqlite.js";
 
 export type WorkerStatus = "queued" | "running" | "done" | "cancelled";
 
@@ -27,12 +27,12 @@ export interface WorkerTaskRow {
 }
 
 export class WorkerTaskStore {
-	private readonly db: DatabaseSync;
-	constructor(db: DatabaseSync) {
+	private readonly db: DB;
+	constructor(db: DB) {
 		this.db = db;
 	}
 
-	static migrate(db: DatabaseSync): void {
+	static migrate(db: DB): void {
 		db.exec(`CREATE TABLE IF NOT EXISTS worker_tasks (
 			id TEXT PRIMARY KEY,
 			instruction TEXT NOT NULL,
@@ -57,7 +57,7 @@ export class WorkerTaskStore {
 	}
 
 	get(id: string): WorkerTaskRow | undefined {
-		return this.db.prepare("SELECT * FROM worker_tasks WHERE id = ?").get(id) as WorkerTaskRow | undefined;
+		return this.db.prepare("SELECT * FROM worker_tasks WHERE id = ?").get(id) as unknown as WorkerTaskRow | undefined;
 	}
 
 	/** FIFO claim; atomic so two ticks cannot double-run one worker. */
@@ -84,7 +84,7 @@ export class WorkerTaskStore {
 	 * back into queued, and never a schedule. */
 	cancelForEscape(sourceConversation: string, senderId: string, note: string, now: number): WorkerTaskRow | undefined {
 		const row = this.db.prepare(`SELECT * FROM worker_tasks WHERE source_conversation = ? AND created_by = ?
-			AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1`).get(sourceConversation, senderId) as WorkerTaskRow | undefined;
+			AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1`).get(sourceConversation, senderId) as unknown as WorkerTaskRow | undefined;
 		if (!row) return undefined;
 		const r = this.db.prepare(`UPDATE worker_tasks SET status = 'cancelled', error = ?, finished_at = ?
 			WHERE id = ? AND status IN ('queued','running')`).run(note, now, row.id);
@@ -92,7 +92,7 @@ export class WorkerTaskStore {
 	}
 
 	listRecent(limit = 20): WorkerTaskRow[] {
-		return this.db.prepare("SELECT * FROM worker_tasks ORDER BY created_at DESC LIMIT ?").all(limit) as WorkerTaskRow[];
+		return this.db.prepare("SELECT * FROM worker_tasks ORDER BY created_at DESC LIMIT ?").all(limit) as unknown as WorkerTaskRow[];
 	}
 
 	/** The most recent worker of this conversation — Router uses it to route a
@@ -103,6 +103,6 @@ export class WorkerTaskStore {
 	 * tracks the DISPATCH round only; the durable session holds the dialogue. */
 	recentForConversation(sourceConversation: string): WorkerTaskRow | undefined {
 		return this.db.prepare("SELECT * FROM worker_tasks WHERE source_conversation = ? ORDER BY created_at DESC LIMIT 1")
-			.get(sourceConversation) as WorkerTaskRow | undefined;
+			.get(sourceConversation) as unknown as WorkerTaskRow | undefined;
 	}
 }

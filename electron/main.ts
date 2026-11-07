@@ -1480,7 +1480,10 @@ ${tailForProgress(decision.text)}`;
 			},
 		}),
 		push: (cid, text) => im.pushToConversation(cid, text),
-		abort: (session) => { try { session.abort({ preserveBackground: true }); } catch { /* abort is best-effort */ } },
+		// Agent.abort() takes no options (preserveBackground is engine.abortSession
+		// territory). A worker's background scripts belong to the turn being
+		// cancelled, so the plain abort is the correct semantics here.
+		abort: (session) => { try { session.abort(); } catch { /* abort is best-effort */ } },
 		progress: (task, session) => createProgressNotifier({
 			title: task.title,
 			target: task.target,
