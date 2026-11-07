@@ -4,6 +4,14 @@
 
 开源前的内部迭代细节不在此逐一罗列（完整历史见 git log）；以下从开源基线版本开始记录。
 
+## 0.2.204
+
+### English
+- **Worker turns are serialized per session**: a message typed while the worker is still running used to hit the kernel's mutual exclusion ("Agent is already processing…") and surface as 「⚠️ 执行未完成」. Follow-ups now queue behind the running turn on a per-session chain (shared with the dispatch turn) and are answered next — never rejected, never dropped, never reported as a failure.
+
+### 中文
+- **同一 worker 会话的轮次串行化**：worker 还在跑时用户追问，过去会撞上内核的并发互斥（「Agent is already processing…」）并显示「⚠️ 执行未完成」。现在追问排在当前轮之后的会话队列里（与派发轮共用同一条链），跑完即答——不拒绝、不丢失、不报失败。
+
 ## 0.2.203
 
 ### English
