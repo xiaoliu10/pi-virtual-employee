@@ -80,7 +80,11 @@ WorkService / work_items（自主任务体系，回归本名，不动）
 - [x] Router 接线：triage 任务型消息 → spawn（拆除建 work_items 路径）
 - [x] 追问路由：来源会话活跃 worker → 同会话新 turn
 - [x] 测试：线性终态 / 结果交付 / error 终态 / 追问续聊 / 标记免疫
-- [ ] 控制台「执行记录」展示（API 先行，UI 后续）
+- [x] 控制台任务列表**永不显示 worker 记录**（裁定 2026-11-07）：任务列表
+      数据源是 work_items（`tasks:workList`），worker_tasks 独立表 → 结构性
+      隔离，无需过滤代码。worker 的可见性 = 日志与 DB 查询（基础设施遥测），
+      不属于任务 UI；将来若有运维需要，做独立区块并明确标注「基础设施执行
+      记录」，与任务列表物理分开。
 
 ## 五、存量与过渡
 
