@@ -7,7 +7,7 @@
  * GUI-facing state (config, tasks, autostart) flows over IPC.
  */
 import os from "node:os";
-import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, screen, shell } from "electron";
 import { mkdir, readFile, writeFile, copyFile, readdir, rm } from "node:fs/promises";
 import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -160,11 +160,22 @@ let mainWindow: BrowserWindow | null = null;
 let onMainWindowClosed: () => void = () => {};
 
 function createWindow(): void {
+	// Clamp the window to the ACTUAL work area (field 2026-11-07, the box):
+	// 1024×768 display vs a 1360×860 default + 1060×680 minimum produced a
+	// window with no OS handle at all — process alive, renderer running, and
+	// nothing on screen for days. A window bigger than the screen must shrink
+	// (and the minimums must shrink with it), never open off-screen.
+	const work = screen.getPrimaryDisplay().workAreaSize;
+	const width = Math.min(1360, work.width);
+	const height = Math.min(860, work.height);
+	// Keep a comfortable floor, but never one the display cannot satisfy.
+	const minWidth = Math.min(1060, width);
+	const minHeight = Math.min(680, height);
 	mainWindow = new BrowserWindow({
-		width: 1360,
-		height: 860,
-		minWidth: 1060,
-		minHeight: 680,
+		width,
+		height,
+		minWidth,
+		minHeight,
 		titleBarStyle: "hiddenInset",
 		backgroundColor: "#ffffff",
 		// Window/taskbar icon in DEV (Linux/Win). Packaged apps take their
@@ -197,6 +208,32 @@ function createWindow(): void {
 	});
 
 	if (activeProfile !== "default") mainWindow.setTitle(`虚拟员工 — ${activeProfile}`);
+
+	// Belt and braces for constrained displays: a window that for any reason
+	// opened off-screen (multi-monitor removal, WM quirk, DPI change) must be
+	// pulled back into view instead of leaving a live process the user cannot
+	// reach. ready-to-show also guarantees the first paint happened.
+	mainWindow.once("ready-to-show", () => {
+		if (!mainWindow) return;
+		const bounds = mainWindow.getBounds();
+		const area = screen.getPrimaryDisplay().workArea;
+		const offScreen =
+			bounds.x + bounds.width < area.x + 40 ||
+			bounds.y + bounds.height < area.y + 40 ||
+			bounds.x > area.x + area.width - 40 ||
+			bounds.y > area.y + area.height - 40;
+		if (offScreen) {
+			console.warn(`[main] window off-screen (${JSON.stringify(bounds)} vs ${JSON.stringify(area)}) — re-centering`);
+			mainWindow.setBounds({
+				x: area.x + Math.max(0, Math.floor((area.width - Math.min(bounds.width, area.width)) / 2)),
+				y: area.y + Math.max(0, Math.floor((area.height - Math.min(bounds.height, area.height)) / 2)),
+				width: Math.min(bounds.width, area.width),
+				height: Math.min(bounds.height, area.height),
+			});
+		}
+		mainWindow.show();
+		mainWindow.focus();
+	});
 
 	mainWindow.on("closed", () => {
 		mainWindow = null;
