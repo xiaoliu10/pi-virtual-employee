@@ -4,6 +4,14 @@
 
 开源前的内部迭代细节不在此逐一罗列（完整历史见 git log）；以下从开源基线版本开始记录。
 
+## 0.2.201
+
+### English
+- **The 🤔 thinking reaction no longer flashes away on dispatched turns**: an empty reply (Router dispatched the message to a worker, silent by design) now parks the reaction on the message; it is recalled only when real output — worker progress or the result — actually lands on the conversation. Inline replies recall it as before.
+
+### 中文
+- **派发轮的 🤔 不再一闪而过**：空回复（消息已被 Router 派发给 worker，按设计静默）现在会把表情留在消息上，直到真实的输出——worker 的进度或结果——真正推送到该会话时才撤下。inline 回复照旧在回复落地时撤。
+
 ## 0.2.200
 
 ### English
