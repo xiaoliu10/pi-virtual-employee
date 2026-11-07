@@ -256,24 +256,30 @@ export class IMAdapterManager {
 			// same "absent = on" convention as taskPlanning.
 			const enabled = cfg.general.chatDispatch?.enabled !== false;
 			if (!enabled) return undefined;
+			const bridge = this.engine.workerBridge;
+			// Follow-up FIRST — before triage, not after (field 2026-11-07). A
+			// running worker on THIS conversation owns the dialogue: the worker
+			// asked "把验证码发给我", the user's reply is a bare code or a plain
+			// question that triage would route to the inline session — which has
+			// none of the worker's context ("你在等哪方面的短信?"). The user is
+			// talking to the thing they already dispatched; ONLY a conversation
+			// with no live worker goes through task triage.
+			if (bridge) {
+				const injected = await bridge.inject(msg.conversationId, msg.text, msg.actor?.senderId ?? "");
+				if (injected) {
+					console.log(`[im] dispatch triage: FOLLOW-UP → running worker conv=${msg.conversationId}`);
+					return "";
+				}
+			} else {
+				console.log("[im] dispatch triage: inline (worker infrastructure unavailable)");
+			}
 			const decision = triageMessage({ text: msg.text, plan, looksLikeTask: true }, true);
 			if (!decision.dispatch) {
 				console.log(`[im] dispatch triage: inline (${decision.reason}, steps=${decision.steps})`);
 				return undefined;
 			}
-			const bridge = this.engine.workerBridge;
 			if (!bridge) {
-				console.log("[im] dispatch triage: inline (worker infrastructure unavailable)");
 				return undefined;
-			}
-			// Follow-up first (conversation continuity, router-worker-v2 D-layer):
-			// a live worker on THIS conversation absorbs the message as a plain
-			// turn in its OWN durable session — the user is talking to the thing
-			// they already dispatched, not filing a new one.
-			const injected = await bridge.inject(msg.conversationId, msg.text, msg.actor?.senderId ?? "");
-			if (injected) {
-				console.log(`[im] dispatch triage: FOLLOW-UP → running worker conv=${msg.conversationId}`);
-				return "";
 			}
 			// New dispatch. NO admin gate: Worker is dialogue infrastructure —
 			// the engine-side RBAC on the send path already governs what the

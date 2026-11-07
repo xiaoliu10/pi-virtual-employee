@@ -101,6 +101,9 @@ export class WorkerTaskStore {
 	 * the context), so a follow-up is conversation CONTINUATION, not a state
 	 * transition. Follow-up turns are not recorded in this store — the store
 	 * tracks the DISPATCH round only; the durable session holds the dialogue. */
+	/** The conversation's most recent worker — follow-ups continue it (user
+	 * ruling 2026-11-07: a follow-up is CONVERSATION, not a state transition;
+	 * the session survives `done` precisely so the dialogue keeps its context). */
 	recentForConversation(sourceConversation: string): WorkerTaskRow | undefined {
 		return this.db.prepare("SELECT * FROM worker_tasks WHERE source_conversation = ? ORDER BY created_at DESC LIMIT 1")
 			.get(sourceConversation) as unknown as WorkerTaskRow | undefined;

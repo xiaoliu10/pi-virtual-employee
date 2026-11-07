@@ -152,6 +152,65 @@ function makeMemoryStore() {
 	};
 }
 
+test("follow-up FIRST: a bare question routes into the RUNNING worker, not the inline session (field 2026-11-07)", async () => {
+	const managerBundle = join(outDir, "mgr2.mjs");
+	await build({
+		stdin: {
+			contents: `
+				export { IMAdapterManager } from "./src/im/manager.ts";
+				export { WorkerTaskStore } from "./src/router/worker-tasks.ts";
+				export { WorkerService } from "./src/router/worker-service.ts";
+			`,
+			resolveDir: root, loader: "ts",
+		},
+		outfile: managerBundle, bundle: true, platform: "node", format: "esm",
+		packages: "external", logLevel: "silent",
+	});
+	const { IMAdapterManager, WorkerTaskStore, WorkerService } = await import(pathToFileURL(managerBundle).href + `?t=${Date.now()}`);
+	const db = new DatabaseSync(":memory:");
+	WorkerTaskStore.migrate(db);
+	const store = new WorkerTaskStore(db);
+	const sends = [];
+	const service = new WorkerService(store, {
+		open: async (cid) => ({ cid }),
+		send: async (_s, message) => { sends.push(message); return { reply: "收到验证码 123456，正在写入" }; },
+		push: async () => {},
+		clock: { now: () => Date.now(), setTimeout: () => {} },
+	});
+	const engine = {
+		workerBridge: {
+			spawn: (spec) => service.spawn(spec),
+			inject: (cid, message, senderId) => service.inject(cid, message, senderId),
+			cancelForEscape: (cid, senderId, note) => service.cancelForEscape(cid, senderId, note),
+		},
+	};
+	const config = {
+		all: () => ({
+			general: {},
+			security: { adminStaffIds: ["u1"], ownerStaffIds: [], people: [], defaultRole: "viewer" },
+			capabilities: {},
+		}),
+	};
+	const manager = Object.create(IMAdapterManager.prototype);
+	Object.defineProperties(manager, { engine: { value: engine }, config: { value: config } });
+
+	const ack1 = await manager.tryDispatchToWorker(
+		{ conversationId: "dt:g1", text: "跑一下平阳数币今日金额监控", actor: { senderId: "u1", channel: "dingtalk", chatType: "group" } },
+		undefined,
+	);
+	assert.equal(ack1, "");
+	service.start();
+	await new Promise((r) => setTimeout(r, 30));
+
+	const ack2 = await manager.tryDispatchToWorker(
+		{ conversationId: "dt:g1", text: "我没收到验证码，是不是没触发发送", actor: { senderId: "u1", channel: "dingtalk", chatType: "group" } },
+		undefined,
+	);
+	assert.equal(ack2, "", "the follow-up is absorbed by the worker; the Router stays silent");
+	assert.equal(sends.length, 2, "the question reached the worker session as a new turn");
+	assert.match(sends[1], /没触发发送/, "the user's actual wording arrives in the worker session");
+});
+
 for (const chatDispatch of [undefined, {}, { enabled: true }]) {
 test(`dispatch WIRING: spawns a worker with flag ${JSON.stringify(chatDispatch)}`, async () => {
 	const managerBundle = join(outDir, "mgr.mjs");
