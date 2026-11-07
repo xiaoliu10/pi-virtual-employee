@@ -354,3 +354,41 @@ test("window prefix: resident tasks forbid DONE and require NEXT_CHECK", () => {
 	assert.doesNotMatch(plain, /禁止输出/);
 	assert.match(plain, /目标全部完成/);
 });
+/**
+ * Work-item tests (autonomous work phase 2). Run with `node --test scripts/test-work.mjs`.
+ *
+ * Pinned properties: window-reply classification (markers lead a line, human
+ * wins, next_check parses the model's OWN cadence — the field explicitly
+ * rejected fixed high-frequency polling), the window prefix carrying
+ * conditions/progress/lessons (the "self-evolution memory"), and the store's
+ * staged-answer channel for waiting_human resumes.
+ */
+// User ruling 2026-11-06: the window prompt must NOT teach a chat-dispatched
+// one-shot the autonomous follow-up protocol — no 「观察点」cron planning, no
+// [[NEXT_CHECK]] protocol block, and the header must say 执行任务 not 自主任务.
+// (Field: 95b04015 — a chat task that planned observation points and pushed
+// with the autonomous 「下次跟进/跟进原因」 template.)
+test("one-shot window prefix drops the autonomous protocol and renames the identity", () => {
+	const base = {
+		title: "最近7天的对账结果统计", goal: "统计并推送报表", turn: 0,
+		budget: { maxTurns: 0, maxMinutes: 60 }, firstWindow: true,
+	};
+	const oneShot = buildWorkWindowPrefix({ ...base, oneShot: true });
+	assert.match(oneShot, /【执行任务】/);
+	assert.doesNotMatch(oneShot, /【自主任务】/);
+	assert.doesNotMatch(oneShot, /观察点/, "one-shot must not be taught cron-style observation planning");
+	// Prohibitive mentions are fine (「不要写 [[NEXT_CHECK]]」) — what must be
+	// absent is the PROTOCOL TEACHING: the follow-up-time format block and the
+	// segment-deferral instruction.
+	assert.ok(!oneShot.includes("最后一行单独写 [[NEXT_CHECK]]"), "no follow-up-time protocol block");
+	assert.ok(!oneShot.includes("写 [[NEXT_CHECK]] 顺延"), "no segment-deferral teaching");
+	assert.match(oneShot, /一次性执行任务/, "identity boundary must be explicit");
+
+	const resident = buildWorkWindowPrefix({ ...base, resident: true });
+	assert.match(resident, /【常驻巡检任务】/);
+
+	const autonomous = buildWorkWindowPrefix({ ...base });
+	assert.match(autonomous, /【自主任务】/, "mining/manual origins keep the autonomous identity");
+	assert.match(autonomous, /观察点/, "autonomous items keep the follow-up planning teaching");
+	assert.ok(autonomous.includes("[[NEXT_CHECK]]"));
+});

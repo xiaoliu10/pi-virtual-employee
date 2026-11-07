@@ -293,6 +293,11 @@ export interface WorkItemWindowContext {
 	lateByMs?: number;
 	/** 常驻巡检任务：无自然终点，DONE 被引擎拦截（field 2026-10-17）。 */
 	resident?: boolean;
+	/** 对话派发的一次性执行任务（user ruling 2026-11-06）：worker 任务与
+	 * 定时/自主任务是两类东西，不得自我排程——协议里不教 NEXT_CHECK，
+	 * 「跟进计划」降级为普通执行计划，身份从「自主任务」改为「执行任务」。
+	 * 引擎侧还有硬闸（WorkService 弃用此类 item 的 NEXT_CHECK 声明）。 */
+	oneShot?: boolean;
 	/** KB tool availability (engine definition gates). Protocol must never
 	 * reference unregistered tools; undefined = enabled (tests/legacy). */
 	kbSearchEnabled?: boolean;
@@ -308,6 +313,13 @@ export interface WorkItemWindowContext {
 // rhythm (field 2026-10-02: 自主任务的要素在于不定时，固定每天一次和定时任务没区别).
 const FIRST_WINDOW_PLAN =
 	"【首个窗口：先出跟进计划】给出简要计划再开始第一步：① 分几步完成目标；② 这件工作在一天里哪些时刻会有新信息可查（数据何时生成、批次何时跑完、何时出结果）——列出这些「观察点」及依据，并说明打算怎么覆盖它们（一天可以多次，例如 09:00 查昨日历史、12:30 查今日上午批次、15:00 查今日下午批次）；③ 有卡点的工作，计划里要写明「这类卡点先查知识库搜什么关键词；知识库没有再找谁问、问什么」（账号/登录/流程类卡点几乎都先在知识库；不确定解决时间就通过 [[NEED_HUMAN]] 问清再定跟进）。计划写完即开始第一步，无需等待确认。";
+/** 一次性执行任务的首窗计划（user ruling 2026-11-06）：这是 worker 任务，
+ * 不是巡检——不做「一天多观察点」的自主排程规划，做完即结束。 */
+const FIRST_WINDOW_ONESHOT_PLAN =
+	"【首个窗口：先出执行计划】给出简要计划再开始第一步：① 分几步完成目标，本窗口内一次性做完；② 有卡点的工作，计划里写明「这类卡点先查知识库搜什么关键词；知识库没有再找谁问、问什么」（账号/登录/流程类卡点几乎都先在知识库；不确定解决时间就通过 [[NEED_HUMAN]] 问清再干）。计划写完即开始第一步，无需等待确认。";
+/** 一次性任务的身份与边界（协议整段不教 NEXT_CHECK，见 protocol 组装）。 */
+const ONESHOT_IDENTITY =
+	"- 本任务是**一次性执行任务**（对话派发的 worker），不是自主/定时任务：目标完成后写 DONE 即结束，**没有「下次跟进」**。目标依赖未来才有的数据/条件（如当天对账数据未生成、批次未跑完）→ 把情况、建议的重查时间与原因写进**结果汇报**里，由用户决定是否建定时任务——不要写 [[NEXT_CHECK]]（引擎不会接受，写了也不会排程），也不要输出「下次跟进/跟进原因」这类自主任务格式。";
 
 /** System-side prefix for every window turn — goal, memory, budget, protocol. */
 export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
@@ -315,7 +327,7 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 	if (ctx.conditions?.trim()) memory.push(`【执行条件（务必遵守）】\n${ctx.conditions.trim()}`);
 	if (ctx.progress?.trim()) memory.push(`【此前进展】\n${ctx.progress.trim()}`);
 	if (ctx.lessons?.length) memory.push(`【踩坑记录（别再踩）】\n${ctx.lessons.map((l) => `- ${l}`).join("\n")}`);
-	if (ctx.firstWindow && ctx.turn === 0) memory.push(FIRST_WINDOW_PLAN);
+	if (ctx.firstWindow && ctx.turn === 0) memory.push(ctx.oneShot ? FIRST_WINDOW_ONESHOT_PLAN : FIRST_WINDOW_PLAN);
 	const head = ctx.turn === 0 ? "【工作窗口开始】" : `【工作窗口继续 · 本窗第 ${ctx.turn + 1} 轮】`;
 	const t = beijingNow(ctx.now ? new Date(ctx.now) : new Date());
 	const nowLine = `【当前时间】${t.date}（${t.weekdayName}）${t.time}，北京时间——「今天/昨天/本月」等时间口径一律以此为准，不要从历史消息里的旧日期推断今天。`;
@@ -350,20 +362,24 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 	// do not fit one window even at 90 minutes. The model must plan in segments
 	// and hand over cleanly when the budget runs low, rather than burning the
 	// whole window on the scan and pushing nothing.
-	const segmentRule = `- 长任务请自行分段推进：先把扫描跑完（结果写到文件，关键发现和进度用 manage_work 记下），再逐项处理，最后一次性给出结论。任一时点估计剩余时间装不下未完部分，就写 ${AUTONOMOUS_NEXT_CHECK_MARK} 顺延到下一窗口继续——不要自己把半成品结论发给群（引擎每轮会推送阶段进展，那是交接信息，不是结论）。「不要因假想轮数草草收尾」指的是别为想象中的轮数上限提前收工；时间真的不够且能干净交接时，就该按这里写 NEXT_CHECK 分段。`;
+	const segmentRule = ctx.oneShot
+		? `- 长任务请自行分段推进：先把扫描跑完（结果写到文件，关键发现和进度用 manage_work 记下），再逐项处理，最后一次性给出结论。时间预算装不下全部时，尽力推进到阶段完整点，把已完成的与未完成的部分如实写进结果汇报（引擎每轮会推送阶段进展，那是交接信息，不是结论）——本任务没有「下一窗口」，不要写半成品结论，也不要用 [[NEXT_CHECK]] 制造跟进。`
+		: `- 长任务请自行分段推进：先把扫描跑完（结果写到文件，关键发现和进度用 manage_work 记下），再逐项处理，最后一次性给出结论。任一时点估计剩余时间装不下未完部分，就写 ${AUTONOMOUS_NEXT_CHECK_MARK} 顺延到下一窗口继续——不要自己把半成品结论发给群（引擎每轮会推送阶段进展，那是交接信息，不是结论）。「不要因假想轮数草草收尾」指的是别为想象中的轮数上限提前收工；时间真的不够且能干净交接时，就该按这里写 NEXT_CHECK 分段。`;
 	const protocol = [
 		`窗口规则：`,
 		`- ${turnRule}，请优先推进关键路径，并把重要发现写入进展/踩坑。超时会自动顺延到下一窗口继续（连续 2 次仍完不成会暂停，请管理员调大本任务的 maxMinutes 或收窄范围/拆分任务）；执行出错或需要人协助会暂停等管理员明确恢复，不自动重试；写不出合法跟进时间时会按默认 1 小时顺延（连续 3 次除外）而不会暂停。`,
 		segmentRule,
-		`- 收尾顺序：先写完所有正文（进展、发现、汇报），最后一行才是结束标记（${AUTONOMOUS_DONE_MARK} / ${AUTONOMOUS_HUMAN_MARK} / ${AUTONOMOUS_NEXT_CHECK_MARK}）。标记行被输出截断等于没有收尾，窗口会空转到时间上限。`,
+		`- 收尾顺序：先写完所有正文（进展、发现、汇报），最后一行才是结束标记（${ctx.oneShot ? `${AUTONOMOUS_DONE_MARK} 或 ${AUTONOMOUS_HUMAN_MARK}` : `${AUTONOMOUS_DONE_MARK} / ${AUTONOMOUS_HUMAN_MARK} / ${AUTONOMOUS_NEXT_CHECK_MARK}`}）。标记行被输出截断等于没有收尾，窗口会空转到时间上限。`,
 		...(ctx.resident
 			? [`- 本任务是**常驻巡检**：没有「全部完成」的一天，禁止输出 ${AUTONOMOUS_DONE_MARK}（引擎不会接受——会被当作「本轮无异常」自动按节奏顺延并推送管理员）。本轮无异常/无事发生 → ${AUTONOMOUS_NEXT_CHECK_MARK} 按既定节奏顺延（连续正常可按你声明的策略降频）；只有管理员能 cancel 结束常驻任务。`]
 			: [`- 目标全部完成 → 最后一行单独写 ${AUTONOMOUS_DONE_MARK}，上方给出成果总结。`]),
 		needHumanBullet,
-		`- 本轮告一段落但目标未完成 → 最后一行单独写 ${AUTONOMOUS_NEXT_CHECK_MARK}: 下次跟进时间 | 原因。时间用以下三种写法之一：①「30分钟」「2小时」相对时间；②「2026-10-05 09:40」带年份的完整时间；③「9:40」「9点30」「明天 9:40」钟点。口语变体（「9点半」「上午9点」等）会尽量兼容，但解析不了会按默认 1 小时顺延（连续 3 次无法解析才会暂停；时间部分不能为空——先时间再「| 原因」；至少距现在 15 分钟；非法/过去/过近时间同样顺延不暂停）。下次时间完全由本次执行结果决定，不约定固定频率，一天可多次也可隔天：\n  · 有卡点（等第三方补数据、等对方处理、等资源）→ 不要盲目定时重试：如果不确定卡点何时解决，先写 ${AUTONOMOUS_HUMAN_MARK} 把问题抛出来问清楚（如「这个卡点大概什么时候能解决？」），按答复定下次时间；\n  · 时间常识：深夜/非工作时间对接方通常不会处理，把跟进推到对方可能处理的时间，不要空查；\n  · 按「观察点」安排：一天里哪些时刻会有新信息（数据生成、批次跑完、出结果）就在那些时刻查，一天可以多次（如 09:00 查昨日、12:30 查今日上午、15:00 查今日下午）；\n  · 发现异常可缩短间隔、提前再查；连续多轮全无异常且无新信息才拉长。时间必须写明依据，不要不加思考地默认「明天同一时间」。若写不出合法时间，系统会按默认 1 小时顺延并在推送里告知管理员，不会因格式问题暂停。`,
+		...(ctx.oneShot ? [] : [`- 本轮告一段落但目标未完成 → 最后一行单独写 ${AUTONOMOUS_NEXT_CHECK_MARK}: 下次跟进时间 | 原因。时间用以下三种写法之一：①「30分钟」「2小时」相对时间；②「2026-10-05 09:40」带年份的完整时间；③「9:40」「9点30」「明天 9:40」钟点。口语变体（「9点半」「上午9点」等）会尽量兼容，但解析不了会按默认 1 小时顺延（连续 3 次无法解析才会暂停；时间部分不能为空——先时间再「| 原因」；至少距现在 15 分钟；非法/过去/过近时间同样顺延不暂停）。下次时间完全由本次执行结果决定，不约定固定频率，一天可多次也可隔天：\n  · 有卡点（等第三方补数据、等对方处理、等资源）→ 不要盲目定时重试：如果不确定卡点何时解决，先写 ${AUTONOMOUS_HUMAN_MARK} 把问题抛出来问清楚（如「这个卡点大概什么时候能解决？」），按答复定下次时间；\n  · 时间常识：深夜/非工作时间对接方通常不会处理，把跟进推到对方可能处理的时间，不要空查；\n  · 按「观察点」安排：一天里哪些时刻会有新信息（数据生成、批次跑完、出结果）就在那些时刻查，一天可以多次（如 09:00 查昨日、12:30 查今日上午、15:00 查今日下午）；\n  · 发现异常可缩短间隔、提前再查；连续多轮全无异常且无新信息才拉长。时间必须写明依据，不要不加思考地默认「明天同一时间」。若写不出合法时间，系统会按默认 1 小时顺延并在推送里告知管理员，不会因格式问题暂停。`]),
+		...(ctx.oneShot ? [ONESHOT_IDENTITY] : []),
 		`- 工作过程中了解到执行条件（如「系统对账 08:00-09:30 自动跑，此时段勿手动对账」、依赖的单位/资源、账号权限边界）→ 立即用 manage_work 记录到条件里，后续窗口会带着这些条件工作。`,
 		lessonBullet,
 		unattendedBullet,
 	].join("\n");
-	return `${head}\n${nowLine}\n【自主任务】${ctx.title}\n【目标】${ctx.goal}\n${[...memory, protocol].join("\n\n")}\n${answerBlock}${lastCheck}${lateNote}${cadenceWarning}\n`;
+	const identity = ctx.oneShot ? "执行任务" : ctx.resident ? "常驻巡检任务" : "自主任务";
+	return `${head}\n${nowLine}\n【${identity}】${ctx.title}\n【目标】${ctx.goal}\n${[...memory, protocol].join("\n\n")}\n${answerBlock}${lastCheck}${lateNote}${cadenceWarning}\n`;
 }

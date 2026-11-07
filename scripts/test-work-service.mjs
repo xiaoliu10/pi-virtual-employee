@@ -1354,3 +1354,27 @@ test("postpone gate leaves a TIME-BUDGET deferral alone (legal continuation, not
 	assert.equal(row.status, "scheduled", "a time-budget deferral must keep its follow-up window");
 	assert.ok(!/循环空转/.test(row.question ?? ""), "and must not be described as a spin");
 });
+
+// User ruling 2026-11-06 (repeated): chat-dispatched WORKER items and
+// scheduled/autonomous items are different species. A worker's [[NEXT_CHECK]]
+// declaration must NOT program a follow-up — it degrades to done, the model's
+// suggestion stays in the pushed text, and nothing is scheduled. Field:
+// 95b04015 self-scheduled "2026-11-07 00:50" and its push wore the autonomous
+// template — reading as if a chat task had turned autonomous.
+test("chat-origin one-shot: [[NEXT_CHECK]] is suppressed, item settles done", async t => {
+	const h = fixture(t, { send: () => ({ reply: "已完成统计。11-06 数据未生成，建议 12:10 后重查。\n[[NEXT_CHECK]]: 2026-11-07 00:50 | 对账窗口后重查" }) });
+	const item = h.create("queued", { origin: "chat" });
+	h.service.start(); await flush();
+	const row = h.store.get(item.id);
+	assert.equal(row.status, "done", "chat one-shot must settle done, never scheduled");
+	assert.equal(row.next_check_at, null, "no follow-up may be programmed");
+	assert.match(h.pushes[h.pushes.length - 1].text, /12:10/, "the model's suggestion stays in the pushed text");
+});
+
+test("non-chat autonomous origin keeps the follow-up ability (unchanged)", async t => {
+	const h = fixture(t, { send: h => h.sends.length === 1 ? { reply: "阶段成果\n[[NEXT_CHECK]]: 30m | 等批次完成" } : { reply: "[[TASK_DONE]]" } });
+	const item = h.create("queued", { origin: "mining" });
+	h.service.start(); await flush();
+	assert.equal(h.store.get(item.id).status, "scheduled", "mining-origin follow-up still schedules");
+	assert.ok(h.clock.timers.size >= 1);
+});
