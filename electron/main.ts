@@ -171,6 +171,7 @@ function createWindow(): void {
 	// Keep a comfortable floor, but never one the display cannot satisfy.
 	const minWidth = Math.min(1060, width);
 	const minHeight = Math.min(680, height);
+	console.log(`[main] createWindow: display=${work.width}x${work.height} window=${width}x${height}`);
 	mainWindow = new BrowserWindow({
 		width,
 		height,
@@ -215,6 +216,7 @@ function createWindow(): void {
 	// reach. ready-to-show also guarantees the first paint happened.
 	mainWindow.once("ready-to-show", () => {
 		if (!mainWindow) return;
+		console.log("[main] ready-to-show fired");
 		const bounds = mainWindow.getBounds();
 		const area = screen.getPrimaryDisplay().workArea;
 		const offScreen =
