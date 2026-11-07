@@ -465,10 +465,6 @@ export class WorkService<Session extends WorkSession> {
 					title: fresh.title, goal: fresh.goal, conditions: fresh.conditions, progress: fresh.progress,
 					lessons: workLessons(fresh.lessons), turn, budget, answer: answer ?? undefined,
 					firstWindow, lateByMs, resident: active.prevResident === 1, kbSearchEnabled: kb.search, kbLearnEnabled: kb.learn,
-					// User ruling 2026-11-06: chat-dispatched one-shots are WORKER
-					// tasks — a different species from scheduled/autonomous items.
-					// The prompt must not teach them follow-up scheduling at all.
-					oneShot: fresh.origin === "chat" && active.prevResident !== 1,
 					lastCheck: active.dueAt ? { at: active.dueAt, reason: active.prevReason, streak: active.prevStreak ?? 0 } : undefined,
 					now: this.clock.now(),
 				});
@@ -603,20 +599,11 @@ export class WorkService<Session extends WorkSession> {
 					break;
 				}
 				if (decision.kind === "next_check") {
-					// User ruling 2026-11-06 (repeated): chat-dispatched WORKER items
-					// and scheduled/autonomous items are DIFFERENT species — a worker
-					// must never self-schedule. The model's declared follow-up (e.g.
-					// 「12:10 重查」) stays in the pushed text as a SUGGESTION; the
-					// engine does NOT program it. Want a follow-up? The admin creates
-					// a scheduled task (PR #165 already bars workers from doing that
-					// themselves; this closes the [[NEXT_CHECK]] back door — field:
-					// 95b04015 self-scheduled "2026-11-07 00:50" and the push wore the
-					// autonomous template, reading as the item had become autonomous).
-					if (fresh.origin === "chat" && active.prevResident !== 1) {
-						console.log(`[work] ${item.id.slice(0, 8)} next_check suppressed (chat-origin one-shot): 对话派发任务不得自我排程，按完成处理；跟进建议保留在推送文本中`);
-						outcome = "done";
-						break;
-					}
+					// (2026-11-07) chat-dispatched one-shots no longer exist: Router
+					// dispatches them to the Worker infrastructure (worker_tasks),
+					// never into work_items. Every row here IS an autonomous/task-
+					// system item, so a [[NEXT_CHECK]] declaration is legitimate by
+					// construction — the old suppression gate was transitional.
 					if (decision.nextCheckAt === undefined) {
 						// The model clearly WANTED a follow-up but the declared time was
 						// unparseable or unusable. Halting here killed the whole chain on a

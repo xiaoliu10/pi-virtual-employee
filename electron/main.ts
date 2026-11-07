@@ -19,6 +19,9 @@ import { setConfiguredReportHosts } from "../src/im/credential-egress.js";
 const RECOVERED_WORK_DELAY_MS = 60_000;
 import { formatRecoveredNote, planRecoveredDelivery, resolveTaskSourceTarget } from "../src/engine/durable/recovered-delivery.js";
 import { createWorkProgressNotifier, createRunProgressNotifier, resolveWorkProgressTarget } from "../src/scheduler/progress-wiring.js";
+import { createProgressNotifier } from "../src/scheduler/progress-notify.js";
+import { WorkerTaskStore } from "../src/router/worker-tasks.js";
+import { WorkerService } from "../src/router/worker-service.js";
 import { openDatabase, closeDatabase } from "../src/db/sqlite.js";
 import { ConfigStore, normalizeModelConfig, type ExternalProviderConfig, type Supplier } from "../src/db/config-store.js";
 import { HistoryStore } from "../src/db/history-store.js";
@@ -1457,6 +1460,43 @@ ${tailForProgress(decision.text)}`;
 	engine.workBridge = {
 		fireItem: fireWorkItem,
 		push: (cid, text) => im.pushToConversation(cid, text),
+	};
+
+	// Router/Worker INFRASTRUCTURE (user ruling 2026-11-07): the dispatch path
+	// for task-shaped chat messages. Shares only the durable-execution kernel
+	// primitives with the task system — its own table, its own linear
+	// lifecycle, its own session prefix. No work_items rows are created.
+	WorkerTaskStore.migrate(db);
+	const workerService = new WorkerService(new WorkerTaskStore(db), {
+		open: (cid) => {
+			history.ensureConversation(cid, "🛠 执行任务");
+			return engine.getOrCreateSession(cid);
+		},
+		send: (agent, message, senderId, sourceConversation) => engine.send(agent, message, {
+			actor: { senderId, channel: "scheduler", chatType: "single", memoryConversationId: sourceConversation },
+			onPersist: (cid) => {
+				const wc = mainWindow?.webContents;
+				if (wc && !wc.isDestroyed()) wc.send("im:activity", cid);
+			},
+		}),
+		push: (cid, text) => im.pushToConversation(cid, text),
+		abort: (session) => { try { session.abort({ preserveBackground: true }); } catch { /* abort is best-effort */ } },
+		progress: (task, session) => createProgressNotifier({
+			title: task.title,
+			target: task.target,
+			intervalMin: config.all().general.taskProgressMin,
+			summarize: () => engine.progressBriefDetailed(session, task.target),
+			push: async (cid, text) => { await im.pushToConversation(cid, text); },
+			isRunning: () => true,
+			log: (level, msg) => console.log(`[worker:progress] ${level} ${msg}`),
+		}),
+		maxConcurrent: 5,
+	});
+	workerService.start();
+	engine.workerBridge = {
+		spawn: (spec) => workerService.spawn(spec),
+		inject: (cid, message, senderId) => workerService.inject(cid, message, senderId),
+		cancelForEscape: (cid, senderId, note) => workerService.cancelForEscape(cid, senderId, note),
 	};
 	// Recovery + dispatch only after IM initialization and bridge installation.
 	workService.start();

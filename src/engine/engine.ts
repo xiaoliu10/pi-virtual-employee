@@ -558,6 +558,14 @@ export class EmployeeEngine implements EmployeeRuntime {
 	workItems?: WorkItemStore;
 	/** Main-process bridge for work items: fire a window now / push to a conversation. */
 	workBridge?: { fireItem: (id: string) => boolean; push: (conversationId: string, text: string) => Promise<{ ok: boolean; error?: string }> };
+	/** Router/Worker INFRASTRUCTURE bridge (user ruling 2026-11-07: Router/Worker
+	 * is foundational, NOT part of the task system). Injected by main.ts; the
+	 * IM manager's dispatch path uses it instead of creating work items. */
+	workerBridge?: {
+		spawn(spec: { instruction: string; sourceConversation: string; createdBy: string; maxMinutes?: number }): unknown;
+		inject(sourceConversation: string, message: string, senderId: string): Promise<boolean>;
+		cancelForEscape(sourceConversation: string, senderId: string, note: string): string | undefined;
+	};
 	/** Shared by automatic + manual mining; cursors live durably in HistoryStore. */
 	private miningInFlight = false;
 

@@ -31,6 +31,16 @@ export interface WorkerEngineDeps<Session> {
 	send(session: Session, message: string, senderId: string, sourceConversation: string): Promise<{ reply?: string; error?: string }>;
 	/** Deliver to the source conversation (idempotent upstream). */
 	push(conversationId: string, text: string): Promise<unknown> | unknown;
+	/** Cancel a live durable round (foreground-escape). Injected because the
+	 * abort surface lives on the session, which this service only holds. */
+	abort?(session: Session): void;
+	/** Long-task progress broadcaster (taskProgressMin cadence), same shape
+	 * WorkService injects. Optional — without it long workers run silent
+	 * until their result (the exact complaint that opened this file's field
+	 * history), so main.ts always wires it. */
+	progress?(task: { title: string; target: string; conversationId: string }, session: Session): {
+		start(): void; stop(): void; drain(timeoutMs?: number): Promise<void>;
+	};
 	maxConcurrent?: number;
 	clock?: { now(): number; setTimeout(fn: () => void, ms: number): unknown };
 	onError?(err: unknown): void;
@@ -51,6 +61,9 @@ export class WorkerService<Session> {
 	private running = false;
 	private wake?: unknown;
 	private readonly active = new Set<string>();
+	/** taskId → live durable session, so the foreground escape can abort the
+	 * round the way WorkService aborts a window. */
+	private readonly sessions = new Map<string, Session>();
 
 	constructor(store: WorkerTaskStore, opts: WorkerEngineDeps<Session>) {
 		this.store = store;
@@ -93,6 +106,23 @@ export class WorkerService<Session> {
 		return row;
 	}
 
+	/** 「前台执行」escape: cancel this conversation's QUEUED-or-RUNNING worker
+	 * (dispatcher only — same conversation AND same sender) and hand back the
+	 * original instruction for an inline re-run. A RUNNING round is aborted
+	 * first; a QUEUED one never starts. Returns undefined when nothing is
+	 * convertible (Router then re-runs the phrase inline as a plain message). */
+	cancelForEscape(sourceConversation: string, senderId: string, note: string): string | undefined {
+		const row = this.store.cancelForEscape(sourceConversation, senderId, note, this.clock.now());
+		if (!row) return undefined;
+		const session = row.status === "cancelled" ? this.sessions.get(row.id) : undefined;
+		if (session) {
+			try { this.opts.abort?.(session); } catch (err) { this.opts.onError?.(err); }
+			this.sessions.delete(row.id);
+		}
+		this.active.delete(row.id);
+		return row.instruction;
+	}
+
 	/** Route a follow-up message into the same durable session as this
 	 * conversation's most recent worker. Returns false when none exists
 	 * (Router then makes a NEW dispatch decision). A follow-up turn is
@@ -121,8 +151,20 @@ export class WorkerService<Session> {
 
 	private async execute(task: WorkerTaskRow): Promise<void> {
 		const session = await this.opts.open(task.conversation_id!);
-		await this.runTurn(task, session, task.instruction, task.created_by, { record: true });
-		this.active.delete(task.id);
+		this.sessions.set(task.id, session);
+		const notifier = this.opts.progress?.(
+			{ title: task.instruction.slice(0, 60), target: task.source_conversation, conversationId: task.conversation_id! },
+			session,
+		);
+		notifier?.start();
+		try {
+			await this.runTurn(task, session, task.instruction, task.created_by, { record: true });
+		} finally {
+			notifier?.stop();
+			await notifier?.drain(5_000).catch(() => {});
+			this.sessions.delete(task.id);
+			this.active.delete(task.id);
+		}
 	}
 
 	/** One durable round. `record` marks the DISPATCH round (the only one the

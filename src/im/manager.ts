@@ -222,29 +222,19 @@ export class IMAdapterManager {
 	 */
 	private takeForegroundEscape(msg: InboundMessage): { original: string; notice?: string } | undefined {
 		if (!isForegroundEscape(msg.text)) return undefined;
-		const store = this.engine.workItems;
-		if (!store) return { original: "", notice: "当前没有可切换的前台任务（工作列表不可用）。" };
-		const convertible = store.list()
-			.filter((r) => r.origin_conversation === msg.conversationId
-				// Structured origin first (2026-11-05): the note is a claim, not
-				// evidence — a row marked injected must not be escaped however its
-				// note reads. Legacy rows (no column) resolve through the same sniff
-				// this check used to do, so pre-migration items stay convertible.
-				&& resolveOrigin({ origin: (r.origin ?? null) as WorkOrigin | null, originNote: r.origin_note }) === "chat"
-				&& (r.created_by ?? null) === (msg.actor?.senderId ?? null)
-				&& (r.status === "queued" || r.status === "scheduled"))
-			.sort((a, b) => b.created_at - a.created_at)[0];
-		if (!convertible) {
-			return { original: "", notice: "没有可切换到前台的后台任务：只有仍排队或已计划下次跟进、且由你本人转派的任务可以切换；正在执行中的任务请先在控制台取消后再重新发送指令。" };
+		const bridge = this.engine.workerBridge;
+		if (!bridge) return { original: "", notice: "当前没有可切换的前台任务（执行通道不可用）。" };
+		// Worker-era escape: cancel THIS conversation's OWN queued-or-running
+		// worker (aborting a live durable round) and re-run its original
+		// instruction inline. Worker sessions hold no follow-up state, so there
+		// is no "scheduled next check" case to convert — cancelled is terminal.
+		const original = bridge.cancelForEscape(msg.conversationId, msg.actor?.senderId ?? "", "已由用户切换前台执行");
+		if (original === undefined) {
+			return { original: "", notice: "没有可切换到前台的后台任务：只有你本人派发、且仍在排队或执行中的任务可以切换。" };
 		}
-		const marker = "[用户原始指令]\n";
-		const idx = (convertible.goal ?? "").lastIndexOf(marker);
-		const original = idx >= 0 ? convertible.goal.slice(idx + marker.length).trim() : "";
-		store.cancel(convertible.id);
-		console.log(`[im] foreground escape: cancelled item=${convertible.id} conv=${msg.conversationId} by=${msg.actor?.senderId ?? "?"}`);
+		console.log(`[im] foreground escape: cancelled worker conv=${msg.conversationId} by=${msg.actor?.senderId ?? "?"}`);
 		return { original };
 	}
-
 	/**
 	 * Router → Worker dispatch (docs/design/router-worker.md P1).
 	 *
@@ -271,63 +261,37 @@ export class IMAdapterManager {
 				console.log(`[im] dispatch triage: inline (${decision.reason}, steps=${decision.steps})`);
 				return undefined;
 			}
-			const store = this.engine.workItems;
-			const bridge = this.engine.workBridge;
-			if (!store || !bridge) {
-				console.log("[im] dispatch triage: inline (work items unavailable)");
+			const bridge = this.engine.workerBridge;
+			if (!bridge) {
+				console.log("[im] dispatch triage: inline (worker infrastructure unavailable)");
 				return undefined;
 			}
-			// Work windows demand a declared-admin creator (WorkService.run gates
-			// on created_by; every other creation path goes through adminGate).
-			// Dispatching a non-admin would ACK and then immediately park as
-			// "管理员身份缺失" — dishonest twice over. Refuse with the real reason
-			// (review P1-2).
-			if (!isDeclaredAdmin(this.config, msg.actor?.senderId)) {
-				console.log(`[im] dispatch triage: inline (non-admin ${msg.actor?.senderId ?? "?"} cannot own a work item)`);
-				// MUST return undefined, not the notice: the caller treats a nonempty
-				// result as "dispatched" and returns before engine.send — the message
-				// would be acknowledged in text and then never executed (review P1-1,
-				// field 2026-11-04). The notice is a courtesy push; execution continues
-				// inline either way.
-				return undefined;
+			// Follow-up first (conversation continuity, router-worker-v2 D-layer):
+			// a live worker on THIS conversation absorbs the message as a plain
+			// turn in its OWN durable session — the user is talking to the thing
+			// they already dispatched, not filing a new one.
+			const injected = await bridge.inject(msg.conversationId, msg.text, msg.actor?.senderId ?? "");
+			if (injected) {
+				console.log(`[im] dispatch triage: FOLLOW-UP → running worker conv=${msg.conversationId}`);
+				return "";
 			}
-			const title = (msg.text.trim().split(/\r?\n/, 1)[0] ?? "").slice(0, 60) || "聊天转后台任务";
-			const item = store.create({
-				title,
-				// The plan IS the goal: the worker window reads it as the task spec,
-				// so what the user was promised is exactly what runs.
-				// Without a plan (deep-task path) the worker plans for itself from the
-				// raw instruction — better than serializing two jobs in one chat.
-				goal: plan ? `${plan}\n\n[用户原始指令]\n${msg.text}` : msg.text,
-				originConversation: msg.conversationId,
-				originNote: "从聊天转派（Router）",
-				// Structured provenance (2026-11-05): Router dispatch is the one origin
-				// that may auto-follow-up; the note alone is forgeable text.
-				origin: "chat",
-				// MUST be "queued": fireItem/listDue/claim only accept queued (or a
-				// due scheduled). "working" is a terminal orphan — the real
-				// WorkService probe returned false for it while the user already
-				// held the "已转后台" ACK, and after a restart recoverWorking()
-				// would file it as a FALSE crash-recovery notice (review P0-1).
-				status: "queued",
-				createdBy: msg.actor?.senderId ?? null,
-				createdChannel: msg.actor?.channel ?? null,
-				// A user's task jumps the queue: mined/scheduled items default to
-				// 100, so a due mining window cannot starve the promised "已转后台".
-				priority: 0,
+			// New dispatch. NO admin gate: Worker is dialogue infrastructure —
+			// the engine-side RBAC on the send path already governs what the
+			// actor may do, and a chat user saying "帮我查 X" has always been
+			// executable; Router-ising it only moves it off the foreground.
+			// The plan IS part of the instruction: what the user was promised is
+			// exactly what runs (plan-ahead product).
+			const instruction = plan ? `${plan}\n\n[用户原始指令]\n${msg.text}` : msg.text;
+			bridge.spawn({
+				instruction,
+				sourceConversation: msg.conversationId,
+				createdBy: msg.actor?.senderId ?? "",
+				maxMinutes: 30,
 			});
-			// Fire immediately so the work starts now rather than at the next tick.
-			const fired = bridge.fireItem(item.id);
-			console.log(`[im] dispatch triage: WORKER item=${item.id} steps=${decision.steps} fired=${fired} conv=${msg.conversationId}`);
-			// NO ACK (user ruling 2026-11-06): in a Router/Worker architecture the
-			// Worker owns all user-visible signalling — registration, progress and
-			// result all push back to this conversation on their own. A Router-side
-			// "已转后台执行" line is a redundant middle layer that only adds noise.
-			// The Router's job ends when the item is persisted and fired.
-			//
-			// The empty string is the "dispatched, say nothing" signal (see the
-			// caller): returning undefined would mean "run inline" and the task
-			// would execute twice.
+			console.log(`[im] dispatch triage: WORKER spawned steps=${decision.steps} conv=${msg.conversationId}`);
+			// NO ACK (user ruling 2026-11-06): the Worker owns all user-visible
+			// signalling — progress and result push back to this conversation on
+			// their own. The empty string is the "dispatched, say nothing" signal.
 			return "";
 		} catch (err) {
 			// Never let dispatch break the turn: fall back to inline execution.

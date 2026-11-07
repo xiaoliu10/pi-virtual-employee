@@ -9,7 +9,7 @@
  */
 import type { DatabaseSync } from "node:sqlite";
 
-export type WorkerStatus = "queued" | "running" | "done";
+export type WorkerStatus = "queued" | "running" | "done" | "cancelled";
 
 export interface WorkerTaskRow {
 	id: string;
@@ -69,12 +69,26 @@ export class WorkerTaskStore {
 		return r.changes ? this.get(row.id) : undefined;
 	}
 
-	/** The ONLY terminal transition: done. There is no scheduled/waiting state
-	 * to fall back into — a finished worker is finished forever. */
+	/** The ONLY terminal transition from running: done. There is no
+	 * scheduled/waiting state to fall back into — a finished worker is finished
+	 * forever. */
 	settle(id: string, result: { text?: string; error?: string }, now: number): WorkerTaskRow | undefined {
 		const r = this.db.prepare(`UPDATE worker_tasks SET status = 'done', result = ?, error = ?, finished_at = ?
 			WHERE id = ? AND status = 'running'`).run(result.text ?? null, result.error ?? null, now, id);
 		return r.changes ? this.get(id) : undefined;
+	}
+
+	/** 「前台执行」escape (router-worker D6): the DISPATCHER (same conversation,
+	 * same sender) may cancel a queued-or-running worker back into the
+	 * foreground. Cancelled is a legitimate linear terminal — never a loop
+	 * back into queued, and never a schedule. */
+	cancelForEscape(sourceConversation: string, senderId: string, note: string, now: number): WorkerTaskRow | undefined {
+		const row = this.db.prepare(`SELECT * FROM worker_tasks WHERE source_conversation = ? AND created_by = ?
+			AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1`).get(sourceConversation, senderId) as WorkerTaskRow | undefined;
+		if (!row) return undefined;
+		const r = this.db.prepare(`UPDATE worker_tasks SET status = 'cancelled', error = ?, finished_at = ?
+			WHERE id = ? AND status IN ('queued','running')`).run(note, now, row.id);
+		return r.changes ? this.get(row.id) : undefined;
 	}
 
 	listRecent(limit = 20): WorkerTaskRow[] {

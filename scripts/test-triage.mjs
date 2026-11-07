@@ -153,293 +153,67 @@ function makeMemoryStore() {
 }
 
 for (const chatDispatch of [undefined, {}, { enabled: true }]) {
-test(`dispatch WIRING: creates and fires with flag ${JSON.stringify(chatDispatch)}`, async () => {
+test(`dispatch WIRING: spawns a worker with flag ${JSON.stringify(chatDispatch)}`, async () => {
 	const managerBundle = join(outDir, "mgr.mjs");
 	await build({
 		stdin: {
 			contents: `
 				export { IMAdapterManager } from "./src/im/manager.ts";
-				export { WorkItemStore } from "./src/db/work-item-store.ts";
-				export { openDatabase } from "./src/db/sqlite.ts";
+				export { WorkerTaskStore } from "./src/router/worker-tasks.ts";
+				export { WorkerService } from "./src/router/worker-service.ts";
 			`,
 			resolveDir: root, loader: "ts",
 		},
 		outfile: managerBundle, bundle: true, platform: "node", format: "esm",
 		packages: "external", logLevel: "silent",
 	});
-	const { IMAdapterManager } = await import(pathToFileURL(managerBundle).href + `?t=${Date.now()}`);
-	// better-sqlite3 is built for Electron's ABI, so a plain-node test cannot open
-	// a real DB. This in-memory store implements the SAME contract the dispatch
-	// path uses (create/list + the row shape), which is what the assertions
-	// below actually verify.
-	const store = makeMemoryStore();
-
-	const fired = [];
-	// The manager only needs `engine.workItems` / `engine.workBridge` and the
-	// config for this path. The stub mimics the REAL contract (work-service.ts:141):
-	// only a queued row fires — an unconditional-true stub is exactly how the
-	// P0-1 false green survived review.
+	const { IMAdapterManager, WorkerTaskStore, WorkerService } = await import(pathToFileURL(managerBundle).href + `?t=${Date.now()}`);
+	const db = new DatabaseSync(":memory:");
+	WorkerTaskStore.migrate(db);
+	const store = new WorkerTaskStore(db);
+	const pushes = [];
+	const service = new WorkerService(store, {
+		open: async (cid) => ({ cid }),
+		send: async () => ({ reply: "完成" }),
+		push: async (cid, text) => { pushes.push({ cid, text }); },
+		clock: { now: () => Date.now(), setTimeout: () => {} },
+	});
 	const engine = {
-		workItems: store,
-		workBridge: {
-			fireItem: (id) => {
-				const row = store.get(id);
-				const ok = !!row && row.status === "queued";
-				fired.push({ id, ok, status: row?.status });
-				return ok;
-			},
-			push: async () => ({ ok: true }),
+		workerBridge: {
+			spawn: (spec) => service.spawn(spec),
+			inject: (cid, message, senderId) => service.inject(cid, message, senderId),
+			cancelForEscape: (cid, senderId, note) => service.cancelForEscape(cid, senderId, note),
 		},
 	};
 	const config = {
 		all: () => ({
 			general: { chatDispatch },
-			// Work windows demand a declared-admin creator (review P1-2) — the
-			// dispatching actor must be one, exactly like the admin-tool path.
 			security: { adminStaffIds: ["u1"], ownerStaffIds: [], people: [], defaultRole: "viewer" },
 			capabilities: {},
 		}),
 	};
 	const manager = Object.create(IMAdapterManager.prototype);
-	Object.defineProperties(manager, {
-		engine: { value: engine },
-		config: { value: config },
-	});
+	Object.defineProperties(manager, { engine: { value: engine }, config: { value: config } });
 
 	const ack = await manager.tryDispatchToWorker(
 		{ conversationId: "dt:single:abc", text: "登录 spay 抓取昨日账单，导出 Excel 发我", actor: { senderId: "u1", channel: "dingtalk", chatType: "single" } },
 		PLAN3,
 	);
 
-	// Architecture 2026-11-06: dispatch returns "" (handed off, stay SILENT) —
-	// only `undefined` means "run inline". The Worker owns user-visible signalling.
-	assert.equal(ack !== undefined, true, "a dispatch must signal the handoff (empty string = silent)");
-	// NO Router-side ACK (user ruling 2026-11-06): the Worker owns registration,
-	// progress and result pushes. A middle "已转后台执行" line is pure noise in a
-	// Router/Worker architecture, so dispatch returns the empty string.
+	// Router/Worker infrastructure (2026-11-07): dispatch spawns a WORKER —
+	// never a work item. Empty string = handed off, stay silent.
 	assert.equal(ack, "", "the Router stays silent; the Worker reports by itself");
-	// 0.2.193: the escape mechanism EXISTS now (takeForegroundEscape + handle
-	// No ACK at all now, so nothing to advertise: the escape hatch STILL WORKS
-	// (回复「前台执行」在 handle() 里独立判定)，用户不知道也不影响使用。
-	assert.doesNotMatch(ack, /\/stop|前台执行/, "no Router-side ACK: the Worker reports by itself");
-
-	const items = store.list();
-	assert.equal(items.length, 1, "exactly one work item must be created");
-	const item = items[0];
-	assert.equal(item.origin_conversation, "dt:single:abc", "results must be pushed back to the origin conversation");
-	assert.equal(item.created_by, "u1");
-	assert.equal(item.created_channel, "dingtalk");
-	// P0-1: fireItem/listDue/claim only accept "queued". Creating the item as
-	// "working" made it a permanent orphan while the user held the ACK.
-	assert.equal(item.status, "queued", `dispatch must create runnable items: ${item.status}`);
-	assert.match(item.goal, /登录 spay/, "the plan must become the worker's task spec");
-	assert.match(item.goal, /用户原始指令/, "the original wording must be preserved for the worker");
-	assert.deepEqual(fired.map((f) => f.id), [item.id], "the window must be fired immediately");
-	assert.equal(fired[0].ok, true, `real fireItem contract must accept it: ${JSON.stringify(fired)}`);
-	// No ACK to carry the id any more: the Worker's own progress/completion pushes
-	// identify the task, and the console task list shows it (user ruling 2026-11-06).
-	assert.equal(ack, "", "silent handoff");
-
+	const rows = store.listRecent(5);
+	assert.equal(rows.length, 1, "exactly one worker must be spawned");
+	const row = rows[0];
+	assert.equal(row.source_conversation, "dt:single:abc", "results must be pushed back to the origin conversation");
+	assert.equal(row.created_by, "u1");
+	assert.equal(row.status, "queued", "dispatch must create a queued worker");
+	assert.match(row.instruction, /登录 spay/, "the plan must become the worker's instruction");
+	assert.match(row.instruction, /用户原始指令/, "the original wording must be preserved");
+	// NO admin gate: Worker is dialogue infrastructure — RBAC governs the send
+	// path per actor, exactly like an inline turn (2026-11-07).
 });
+
 }
 
-test("dispatch WIRING: flag off → inline (no work item, old behaviour)", async () => {
-	const managerBundle = join(outDir, "mgr2.mjs");
-	await build({
-		stdin: {
-			contents: `
-				export { IMAdapterManager } from "./src/im/manager.ts";
-				export { WorkItemStore } from "./src/db/work-item-store.ts";
-				export { openDatabase } from "./src/db/sqlite.ts";
-			`,
-			resolveDir: root, loader: "ts",
-		},
-		outfile: managerBundle, bundle: true, platform: "node", format: "esm",
-		packages: "external", logLevel: "silent",
-	});
-	const { IMAdapterManager } = await import(pathToFileURL(managerBundle).href + `?t=${Date.now()}`);
-	const store = makeMemoryStore();
-	const fired = [];
-	const engine = {
-		workItems: store,
-		workBridge: {
-			fireItem: (id) => { const row = store.get(id); const ok = !!row && row.status === "queued"; fired.push({ id, ok }); return ok; },
-			push: async () => ({ ok: true }),
-		},
-	};
-	// Explicit opt-out must still bypass dispatch. The security block is present
-	// on purpose: WITHOUT it a run that reached isDeclaredAdmin() would throw on
-	// the missing adminStaffIds and the broad catch would return undefined — the
-	// test would pass even if the flag guard were deleted (review P2-1, mutation
-	// verified: removing `if (!enabled) return undefined` stayed green).
-	const config = {
-		all: () => ({
-			general: { chatDispatch: { enabled: false } },
-			security: { adminStaffIds: ["u1"], ownerStaffIds: [], people: [], defaultRole: "viewer" },
-			capabilities: {},
-		}),
-	};
-	const manager = Object.create(IMAdapterManager.prototype);
-	Object.defineProperties(manager, {
-		engine: { value: engine },
-		config: { value: config },
-	});
-	const ack = await manager.tryDispatchToWorker(
-		{ conversationId: "dt:single:abc", text: "登录 spay 抓取昨日账单，导出 Excel 发我", actor: { senderId: "u1", channel: "dingtalk", chatType: "single" } },
-		PLAN3,
-	);
-	assert.equal(ack, undefined, "with the flag explicitly false the caller must run inline");
-	assert.equal(store.list().length, 0, "no work item may exist");
-	assert.deepEqual(fired, []);
-});
-
-test("dispatch WIRING: a broken store falls back to INLINE, never a swallowed message", async () => {
-	const managerBundle = join(outDir, "mgr3.mjs");
-	await build({
-		stdin: { contents: `export { IMAdapterManager } from "./src/im/manager.ts";`, resolveDir: root, loader: "ts" },
-		outfile: managerBundle, bundle: true, platform: "node", format: "esm",
-		packages: "external", logLevel: "silent",
-	});
-	const { IMAdapterManager } = await import(pathToFileURL(managerBundle).href + `?t=${Date.now()}`);
-	const engine = {
-		workItems: { create: () => { throw new Error("db is gone"); } },
-		workBridge: { fireItem: () => true, push: async () => ({ ok: true }) },
-	};
-	let createAttempted = false;
-	engine.workItems.create = () => { createAttempted = true; throw new Error("db is gone"); };
-	const config = { all: () => ({ general: {}, security: { adminStaffIds: ["u"], people: [] }, capabilities: {} }) };
-	const manager = Object.create(IMAdapterManager.prototype);
-	Object.defineProperties(manager, { engine: { value: engine }, config: { value: config } });
-	const ack = await manager.tryDispatchToWorker(
-		{ conversationId: "c", text: "登录 spay 抓取账单导出", actor: { senderId: "u", channel: "dingtalk", chatType: "single" } },
-		PLAN3,
-	);
-	assert.equal(ack, undefined, "a throwing store must degrade to inline execution");
-	assert.equal(createAttempted, true, "must reach the failing store rather than fail at an earlier guard");
-});
-
-test("dispatch WIRING: no work-item subsystem → inline", async () => {
-	const managerBundle = join(outDir, "mgr4.mjs");
-	await build({
-		stdin: { contents: `export { IMAdapterManager } from "./src/im/manager.ts";`, resolveDir: root, loader: "ts" },
-		outfile: managerBundle, bundle: true, platform: "node", format: "esm",
-		packages: "external", logLevel: "silent",
-	});
-	const { IMAdapterManager } = await import(pathToFileURL(managerBundle).href + `?t=${Date.now()}`);
-	const manager = Object.create(IMAdapterManager.prototype);
-	Object.defineProperties(manager, {
-		engine: { value: {} },
-		config: { value: { all: () => ({ general: { chatDispatch: { enabled: true } }, capabilities: {} }) } },
-	});
-	const ack = await manager.tryDispatchToWorker({ conversationId: "c", text: "部署测试环境并执行完整回归测试", actor: undefined }, PLAN3);
-	assert.equal(ack, undefined);
-});
-
-test("dispatch WIRING: a NON-ADMIN keeps executing inline (never swallowed)", async () => {
-	// Review P1-1 (field 2026-11-04): the non-admin branch used to RETURN the
-	// courtesy warning. The caller treats any nonempty result as "dispatched"
-	// and returns before engine.send, so a viewer's task was acknowledged in
-	// text and then never executed. The branch must return undefined.
-	const managerBundle = join(outDir, "mgr5.mjs");
-	await build({
-		stdin: { contents: `export { IMAdapterManager } from "./src/im/manager.ts";`, resolveDir: root, loader: "ts" },
-		outfile: managerBundle, bundle: true, platform: "node", format: "esm",
-		packages: "external", logLevel: "silent",
-	});
-	const { IMAdapterManager } = await import(pathToFileURL(managerBundle).href + `?t=${Date.now()}`);
-	const store = makeMemoryStore();
-	const engine = {
-		workItems: store,
-		workBridge: { fireItem: () => true, push: async () => ({ ok: true }) },
-	};
-	const config = {
-		all: () => ({
-			general: {}, // absent → default ON, the path that exposes this to legacy installs
-			security: { adminStaffIds: ["admin1"], ownerStaffIds: [], people: [], defaultRole: "viewer" },
-			capabilities: {},
-		}),
-	};
-	const manager = Object.create(IMAdapterManager.prototype);
-	Object.defineProperties(manager, { engine: { value: engine }, config: { value: config } });
-	const ack = await manager.tryDispatchToWorker(
-		{ conversationId: "dt:single:abc", text: "登录 spay 系统抓取昨日账单，然后导出 Excel 发我", actor: { senderId: "viewer1", channel: "dingtalk", chatType: "single" } },
-		PLAN3,
-	);
-	assert.equal(ack, undefined, "a viewer must fall through to inline execution, not get an ACK");
-	assert.equal(store.list().length, 0, "and no work item may be created for them");
-});
-
-test("isForegroundEscape: exact phrase only — sentences containing the words must not hijack", () => {
-	for (const ok of ["前台执行", " 前台执行 ", "！前台执行。", "前台执行！", "。前台执行、"]) {
-		assert.equal(isForegroundEscape(ok), true, `must match: ${JSON.stringify(ok)}`);
-	}
-	for (const bad of ["", "前台执行一下", "请前台执行这个任务", "改为前台", "确认授权", "前台", "帮我前台执行一下再导出"]) {
-		assert.equal(isForegroundEscape(bad), false, `must NOT match: ${JSON.stringify(bad)}`);
-	}
-	assert.equal(FOREGROUND_ESCAPE_HINT.includes("前台执行"), true, "hint and matcher must agree on the phrase");
-});
-
-// field 2026-11-06 (Nova): SLS log query and a batch-deduction query ran ONE
-// AFTER ANOTHER in the same chat — 40+ minutes serialized. Root cause: dispatch
-// required a plan, and that day's plan side pass produced none, so triage never
-// even ran. Deep tasks must dispatch WITHOUT a plan.
-test("THE FIELD BUG: a deep task dispatches with NO plan (SLS log query)", () => {
-	const d = triageMessage({ text: "去sls 帮我查一下这比流水：0342026110600005180 的支付渠道下单日志", plan: undefined, looksLikeTask: true }, true);
-	assert.equal(d.dispatch, true, "naming SLS + 查一下 + 日志 is minutes of work — it must not serialize in the chat");
-	assert.equal(d.reason, "deep-task");
-});
-
-test("isDeepTask: external system + investigation verb, and nothing weaker", () => {
-	for (const yes of [
-		"去sls 帮我查一下这比流水",
-		"查一下支付渠道下单日志",
-		"排查一下接口报错",
-		"去堡垒机查一下昨天的操作",
-		"帮我查询数据库里这条记录",
-	]) assert.equal(isDeepTask(yes), true, `must be deep: ${yes}`);
-	for (const no of [
-		"你好",
-		"今天天气怎么样",
-		"部署测试环境并跑通",       // long-running verb, ordinary system → old path handles it
-		"帮我看下这个文件",         // no external system
-		"日志在哪",                 // external marker but no investigation verb
-	]) assert.equal(isDeepTask(no), false, `must NOT be deep: ${no}`);
-});
-
-test("a QUESTION about a deep system still stays inline (the trap this must not open)", () => {
-	for (const q of ["日志在哪？", "sls 查询失败了吗？", "查一下为什么报错？"]) {
-		const d = triageMessage({ text: q, plan: undefined, looksLikeTask: true }, true);
-		assert.equal(d.dispatch, false, `a question must stay inline: ${q}`);
-		// Reason may be "question" (deep-task branch) or "no-plan" (legacy branch);
-		// the contract asserted here is INLINE, never dispatched.
-	}
-});
-
-test("small talk never routes (the UX this architecture must protect)", () => {
-	for (const chat of ["你好", "在吗", "谢谢", "好的", "收到", "你是谁"]) {
-		const d = triageMessage({ text: chat, plan: undefined, looksLikeTask: true }, true);
-		assert.equal(d.dispatch, false, `chat must stay foreground: ${chat}`);
-		// reason may be "chat" or "question" — the contract is INLINE, never routed.
-	}
-});
-
-test("deep-task needs BOTH axes: investigation verb alone is not enough", () => {
-	// Dropping the external-system requirement would dispatch every casual
-	// 「查一下」 message to the background — the worst UX this module exists to
-	// prevent (design D1: 「你好」→「已转后台执行」).
-	for (const no of ["查一下", "帮我查一下这个", "查一下余额是多少", "查询一下今天的安排"]) {
-		assert.equal(isDeepTask(no), false, `verb without an external system must NOT be deep: ${no}`);
-	}
-	for (const yes of ["查一下 sls 日志", "查询数据库记录"]) {
-		assert.equal(isDeepTask(yes), true, `verb + system must be deep: ${yes}`);
-	}
-});
-
-test("small-talk gate is load-bearing: a ≤12-char non-question chat must not route", () => {
-	// These contain no task verb and no question marker, so ONLY isSmallTalk
-	// keeps them foreground. Without that gate they would be routed as "task".
-	for (const chat of ["好的，收到，谢谢啊", "嗯嗯，明白了，辛苦了"]) {
-		const d = triageMessage({ text: chat, plan: undefined, looksLikeTask: true }, true);
-		assert.equal(d.dispatch, false, `must stay foreground via the small-talk gate: ${chat}`);
-	}
-});
