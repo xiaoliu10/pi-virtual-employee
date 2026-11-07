@@ -68,6 +68,36 @@ test("chat cadence and task cadence are independent config keys", async () => {
 	db.close();
 });
 
+test("the scheduled-task heartbeat uses the TASK cadence, not the chat cadence", async () => {
+	// Field 2026-11-07 (the box): an autonomous/scheduled task reported every
+	// 10 minutes while taskProgressMin was 30 — the runner's in-turn heartbeat
+	// read longTaskProgressMin (the CHAT knob). The two mean different things:
+	//   longTaskProgressMin → an inline chat turn the user is watching
+	//   taskProgressMin     → a scheduled/autonomous window that runs on its own
+	// Wiring lives inline in main.ts's runner, so this pins the SOURCE: every
+	// progress-interval site in the scheduled-task runner must read taskProgressMin,
+	// and longTaskProgressMin may appear only in the IM manager (chat path).
+	const mainSrc = await readFile(join(root, "electron/main.ts"), "utf8");
+	const mgrSrc = await readFile(join(root, "src/im/manager.ts"), "utf8");
+
+	// The scheduled runner's heartbeat block, identified by its own log marker.
+	const heartbeatAt = mainSrc.indexOf("In-turn heartbeat while a turn is streaming");
+	assert.ok(heartbeatAt > 0, "the scheduled-task heartbeat block must exist");
+	const heartbeatBlock = mainSrc.slice(heartbeatAt, heartbeatAt + 2500);
+	assert.match(heartbeatBlock, /general\.taskProgressMin/, "scheduled heartbeat must read taskProgressMin");
+	assert.ok(
+		!/general\.longTaskProgressMin/.test(heartbeatBlock),
+		"scheduled heartbeat must NOT read longTaskProgressMin (chat cadence) — that is the 10-vs-30 confusion",
+	);
+
+	// The chat path keeps the chat knob (it is the only legitimate consumer).
+	assert.match(mgrSrc, /general\.longTaskProgressMin/, "the IM manager's chat heartbeat keeps longTaskProgressMin");
+
+	// No OTHER site in main.ts may use the chat knob for progress intervals.
+	const mainChatKnob = (mainSrc.match(/general\.longTaskProgressMin/g) ?? []).length;
+	assert.equal(mainChatKnob, 0, `main.ts must never read the chat cadence for task progress (found ${mainChatKnob})`);
+});
+
 test("a work window stops and drains its progress notifier before the completion push", async (t) => {
 	const db = await makeDb();
 	const store = new WorkItemStore(db);

@@ -754,8 +754,20 @@ async function main(): Promise<void> {
 			if (wc && !wc.isDestroyed()) wc.send("im:activity", cid);
 		};
 
-		// In-turn heartbeat (same shape as the IM manager's): every
-		// longTaskProgressMin while a turn is streaming, push a progress note.
+		// In-turn heartbeat while a turn is streaming — on the TASK cadence
+		// (taskProgressMin, default 30), NOT the chat cadence.
+		//
+		// Field 2026-11-07 (the box): a SCHEDULED/autonomous task reported every
+		// 10 minutes instead of 30. The two knobs mean different things and this
+		// call site had them crossed:
+		//   longTaskProgressMin — an INLINE chat turn (「@Nova 帮我查今天的交易额」)
+		//                         runs for minutes while the user watches, so
+		//                         notes are welcome (10).
+		//   taskProgressMin     — a scheduled/autonomous/work WINDOW runs for up
+		//                         to maxMinutes on its own; its final report is
+		//                         the deliverable and chat-frequency notes are
+		//                         noise (30). Same rule as the work windows and
+		//                         the worker bridge below.
 		//
 		// "Is a turn in flight?" must NOT come from agent.state.isStreaming: on the
 		// durable kernel (default since v0.2.167) engine.send returns through
@@ -763,7 +775,7 @@ async function main(): Promise<void> {
 		// never set — the whole heartbeat was dead and silent (subagent review
 		// P1-1, same root cause as v0.2.173's two call sites). durableRuntime.busy
 		// is the kernel-aware equivalent (engine.isIdle uses it the same way).
-		const progressMin = config.all().general.longTaskProgressMin;
+		const progressMin = config.all().general.taskProgressMin;
 		let progressInFlight = false;
 		const turnInFlight = (): boolean => engine.isConversationStreaming(chain.convId);
 		const heartbeat = progressMin > 0 && task.conversation_id
