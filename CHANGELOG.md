@@ -4,6 +4,14 @@
 
 开源前的内部迭代细节不在此逐一罗列（完整历史见 git log）；以下从开源基线版本开始记录。
 
+## 0.2.203
+
+### English
+- **Context management (context-management.md) implemented end to end**: durable rounds persist their memory anchors (memoryConversationId) on the execution record, so conversation-scoped memory survives tool calls — even after crash recovery; every IM turn now opens with a bounded context digest: who is in this conversation (recent speakers first, ≤10) and which tasks it recently ran (≤3, with worker IDs); finished workers land as searchable knowledge entries and a new worker_task_detail tool pulls the full record behind the prefix's worker:<id>. All injection paths pinned by mutation tests + budget assertions.
+
+### 中文
+- **上下文管理（context-management.md）全链路落地**：durable 轮把记忆锚点（memoryConversationId）持久化在执行记录上，工具调用期间——包括崩溃恢复后——会话级记忆不再丢失；每个 IM 轮次开头注入有界的上下文速览：本会话成员（最近发言优先，≤10）与最近执行的任务（≤3 条，带 worker 编号）；完成的任务落库为可检索知识条目，新增 worker_task_detail 工具按编号查完整记录。全部注入路径由变异测试 + 预算断言钉死。
+
 ## 0.2.202
 
 ### English
