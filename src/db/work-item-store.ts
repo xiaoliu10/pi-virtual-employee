@@ -162,6 +162,16 @@ export class WorkItemStore {
 		const row = this.db.prepare("SELECT MIN(next_check_at) AS at FROM work_items WHERE status = 'scheduled'").get() as { at: number | null };
 		return row.at ?? undefined;
 	}
+	/** TRUE if any row still owes its user a result (not done / cancelled).
+	 * Cheap probe for the UPDATE GATE: an unattended restart must wait for
+	 * tasks to finish, not merely for the model to look momentarily idle. */
+	hasOpen(): boolean {
+		const row = this.db.prepare(
+			`SELECT 1 AS x FROM work_items WHERE status NOT IN ('done','cancelled') LIMIT 1`,
+		).get() as { x: number } | undefined;
+		return !!row;
+	}
+
 	listByStatus(...statuses: WorkItemStatus[]): WorkItemRow[] {
 		if (!statuses.length) return [];
 		return this.db.prepare(`SELECT * FROM work_items WHERE status IN (${statuses.map(() => "?").join(",")}) ORDER BY updated_at DESC`).all(...statuses) as WorkItemRow[];

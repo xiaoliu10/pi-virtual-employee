@@ -2514,6 +2514,20 @@ ${tailForProgress(decision.text)}`;
 	};
 	syncReportHosts();
 
+	/** Any task still owing its user a result: queued/running workers or a
+	 * non-terminal work item. Used ONLY by the update gate — the watchdog and
+	 * other liveness checks keep asking the narrower "is the model busy now". */
+	const hasUnfinishedTasks = (): boolean => {
+		try {
+			if (workerTaskStoreHolder.store?.hasActive()) return true;
+			if (workItemStore?.hasOpen()) return true;
+		} catch (err) {
+			// A storage hiccup must not wedge updates forever.
+			console.warn("[updater] task-busy probe failed, treating as idle:", (err as Error).message);
+			return false;
+		}
+		return false;
+	};
 	setupUnattended({
 		enabled: () => updateMode() !== "off",
 		installBlocked: () => updateMode() === "download_only",
@@ -2527,7 +2541,17 @@ ${tailForProgress(decision.text)}`;
 				`🔔 新版本 v${version} 已下载完成。本机为「仅下载」更新模式，不会自动安装——请回复「确认更新到最新版」安装，或手动下载：${manualUrl}`,
 			).catch(() => {});
 		},
-		isIdle: () => engine.isIdle(),
+		// An unattended restart must wait for TASKS to finish, not merely for the
+		// model to look quiet. `engine.isIdle()` answers "is a turn in flight right
+		// now", which is TRUE between two submissions of the same worker and TRUE
+		// for a task that is queued but not yet started — exactly the gap where a
+		// restart killed a worker in its final stage on the box (2026-11-07: the
+		// group had been told 「报告已生成完毕，待读取并呈现」 and then got nothing).
+		//
+		// Field mistake worth remembering: that particular restart was a MANUAL
+		// silent install (`/S`), which this gate cannot stop. The gate protects
+		// the automatic path; the operator path still needs a human to wait.
+		isIdle: () => engine.isIdle() && !hasUnfinishedTasks(),
 		beginDrain: () => im.setDraining(true),
 		endDrain: () => im.setDraining(false),
 		prepareToInstall: async () => {

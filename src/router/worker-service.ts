@@ -113,30 +113,45 @@ export class WorkerService<Session> {
 		if (this.wake) { this.clock.setTimeout(() => {}, 0); this.wake = undefined; }
 	}
 
-	/** Reconcile workers whose owning process died. LOG ONLY — no push, no
-	 * re-dispatch, no re-queue.
+	/** Reconcile workers whose owning process died, and say so ONCE.
 	 *
-	 * User ruling 2026-11-07: 「崩溃恢复不见得是一件好事，要克制，如果一直不停
-	 * 的触发是有问题的，会造成死循环，模型后台空转」. A restart-triggered notice
-	 * invites a re-dispatch; if the box restarts again mid-run, notice →
-	 * re-dispatch → restart is a self-sustaining loop that burns model turns and
-	 * delivers nothing. The honest minimum is: the stale row stops claiming to
-	 * be running, and ops can see why in the log and in worker_task_detail.
+	 * User rulings, 2026-11-07 — both halves matter:
+	 *   (1) 「可以给一个提示 因为什么原因中断了 问用户是否原因重跑」: silence is not
+	 *     restraint. The group watched a progress note promise 「报告已生成完毕」
+	 *     and then nothing ever arrived; a person must be told the run was
+	 *     interrupted, why, and be offered the choice to re-run.
+	 *   (2) 「崩溃恢复不见得是一件好事，要克制，如果一直不停的触发是有问题的，
+	 *     会造成死循环，模型后台空转」: the notice must NOT start work by itself.
+	 *     It reports and asks; it never re-queues, never re-dispatches, never
+	 *     opens a session (zero model turns).
 	 *
-	 * The user still finds out through the paths that already exist and cost
-	 * nothing when idle: the task simply has no result, and asking about it
-	 * (worker_task_detail / 任务状态) reports the interruption reason. */
+	 * Both hold together because the notice is ONCE-PER-ROW: recoverOrphans only
+	 * returns rows it actually flipped (UPDATE gated on status='running'), so a
+	 * reboot loop cannot produce a notice loop — the second boot finds nothing to
+	 * flip and stays silent. A re-run happens only if a human asks for one. */
 	private recoverOrphans(): void {
 		const bootAt = this.clock.now();
 		let orphans: WorkerTaskRow[];
 		try {
-			orphans = this.store.recoverOrphans(bootAt, "应用在执行中退出，该轮未完成（如需继续请重新派发）");
+			orphans = this.store.recoverOrphans(bootAt, "应用在执行中退出，该轮未跑完（可回复「重新执行」重跑）");
 		} catch (err) {
 			this.opts.onError?.(err);
 			return;
 		}
 		for (const o of orphans) {
 			console.log(`[worker] orphan reconciled: ${o.id} (${o.source_conversation}) — ${o.instruction.slice(0, 60)}`);
+			const title = o.instruction.slice(0, 60).replace(/\s+/g, " ").trim();
+			const text = [
+				`⚠️ **任务被中断：${title}**`,
+				"",
+				"**原因**：应用在任务执行中退出了（升级 / 重启 / 崩溃），这一轮没有跑完，也没有最终结果。",
+				"",
+				"如果你之前收到过「即将完成 / 报告已生成」之类的进度汇报，那是中断前的估计——**不能当作结果**。",
+				"",
+				"回复「**重新执行**」我就重跑这一轮；不需要就忽略这条消息。",
+			].join("\n");
+			// Report + ask ONLY. Nothing is queued here: no re-dispatch, no session.
+			void Promise.resolve(this.opts.push(o.source_conversation, text)).catch(() => {});
 		}
 	}
 

@@ -122,6 +122,17 @@ export class WorkerTaskStore {
 		return flipped;
 	}
 
+	/** TRUE if a worker is queued or running — i.e. still owes a result.
+	 * The update gate uses this: `durableRuntime.busy` goes false BETWEEN two
+	 * submissions of the same worker, and a queued worker has never been busy,
+	 * so "idle" alone lets a restart land in the middle of a task. */
+	hasActive(): boolean {
+		const row = this.db.prepare(
+			`SELECT 1 AS x FROM worker_tasks WHERE status IN ('queued','running') LIMIT 1`,
+		).get() as { x: number } | undefined;
+		return !!row;
+	}
+
 	listRecent(limit = 20): WorkerTaskRow[] {
 		return this.db.prepare("SELECT * FROM worker_tasks ORDER BY created_at DESC LIMIT ?").all(limit) as unknown as WorkerTaskRow[];
 	}

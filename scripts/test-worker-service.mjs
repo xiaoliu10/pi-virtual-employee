@@ -79,16 +79,13 @@ test("linear lifecycle: spawn → running → done, result delivered to the SOUR
 	assert.match(h.store.get(w.id).conversation_id, /^worker:/);
 });
 
-test("STALE-ROW reconciliation corrects state but triggers NOTHING", async () => {
-	// Field 2026-11-07 (the box): the app restarted at 22:12 while a worker was
-	// in its final stage; the row stayed `running` forever and the group got a
-	// confident "报告已生成完毕" progress note then silence.
-	//
-	// User ruling the same day: 「崩溃恢复不见得是一件好事，要克制，如果一直不停
-	// 的触发是有问题的，会造成死循环，模型后台空转」. So the correction is
-	// INERT — the row stops claiming to be alive, and that is ALL. No push, no
-	// re-dispatch, no re-queue: a restart-triggered notice invites a
-	// re-dispatch, and a box that restarts again mid-run spins forever.
+test("INTERRUPTION notice: says WHY, asks whether to re-run, and starts nothing", async () => {
+	// User rulings, 2026-11-07 — both halves are load-bearing:
+	//  (1) 「可以给一个提示 因为什么原因中断了 问用户是否原因重跑」 — silence is not
+	//      restraint. The group watched a progress note promise 「报告已生成完毕」
+	//      and then nothing ever arrived.
+	//  (2) 「崩溃恢复不见得是一件好事，要克制，如果一直不停的触发是有问题的，会
+	//      造成死循环，模型后台空转」 — the notice must not start work by itself.
 	const { h, service } = harness();
 	const past = Date.now() - 60 * 60_000;
 	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
@@ -98,44 +95,69 @@ test("STALE-ROW reconciliation corrects state but triggers NOTHING", async () =>
 	await flush();
 
 	const row = h.store.get("wdead");
-	assert.equal(row.status, "error", "a stale row must not claim to be running");
+	assert.equal(row.status, "error", "a stale row must not claim to be running any more");
 	assert.match(row.error, /应用在执行中退出/, "the recorded reason must name the cause");
 	assert.equal(row.finished_at != null, true, "it must look finished, not alive");
 
-	// The克制 contract: nothing is set in motion.
-	assert.equal(h.pushes.length, 0, "recovery must NOT push — a notice invites a re-dispatch loop");
-	assert.equal(h.sends.length, 0, "recovery must NOT re-run the worker");
-	assert.equal(h.sessions.length, 0, "recovery must NOT even open a session (no model turn)");
+	const notices = h.pushes.filter((x) => x.cid === "dt:group:g1");
+	assert.equal(notices.length, 1, "exactly ONE notice per interrupted worker");
+	const text = notices[0].text;
+	assert.match(text, /任务被中断/, "it must name what happened");
+	assert.match(text, /原因/, "it must state a reason (the user asked 「为什么原因中断」)");
+	assert.match(text, /升级 \/ 重启 \/ 崩溃/, "the reason must be concrete, not vague");
+	assert.match(text, /不能当作结果/, "it must warn that earlier progress notes were estimates");
+	assert.match(text, /重新执行/, "it must offer the re-run choice");
+
+	// The restraint half: reporting is not doing.
+	assert.equal(h.sends.length, 0, "the notice must NOT re-run the worker by itself");
+	assert.equal(h.sessions.length, 0, "it must not even open a session (zero model turns)");
 	assert.equal(h.db.prepare("SELECT COUNT(*) c FROM worker_tasks WHERE status = 'queued'").get().c, 0,
-		"recovery must NOT re-queue");
+		"it must not re-queue");
 });
 
-test("STALE-ROW reconciliation is idempotent: a second boot is a no-op", async () => {
-	// Repeated restarts must not accumulate work: the UPDATE is gated on
-	// status = 'running', so once flipped the row can never be flipped again.
+test("INTERRUPTION notice is once-per-row: a reboot loop cannot produce a notice loop", async () => {
+	// This is what makes ruling (2) safe while still honouring ruling (1):
+	// recoverOrphans only returns rows it actually FLIPPED, and the UPDATE is
+	// gated on status='running', so the second boot finds nothing and stays
+	// silent. Five reboots must not mean five notices.
+	const { h, service } = harness();
+	const past = Date.now() - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
+		VALUES ('wdead', '巡检', 'dt:group:g1', 'ma1', 'running', 'worker:wdead', ?, ?)`).run(past, past);
+
+	service.start();          // boot 1 — flips + notifies
+	await flush();
+	service.stop();
+	service.start();          // boot 2 — must be a total no-op
+	await flush();
+	service.stop();
+	service.start();          // boot 3
+	await flush();
+
+	assert.equal(h.pushes.length, 1, "exactly one notice across three boots");
+	assert.equal(h.db.prepare("SELECT COUNT(*) c FROM worker_tasks WHERE status = 'error'").get().c, 1);
+});
+
+test("INTERRUPTION notice never rewrites an already-reconciled row", async () => {
+	// finished_at / error are the observable: a repeat flip would re-stamp them.
 	const { h } = harness();
 	const past = Date.now() - 60 * 60_000;
 	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
 		VALUES ('wdead', '巡检', 'dt:group:g1', 'ma1', 'running', 'worker:wdead', ?, ?)`).run(past, past);
 
-	const first = h.store.recoverOrphans(Date.now(), "x");
+	const first = h.store.recoverOrphans(Date.now(), "REASON-1");
 	assert.equal(first.length, 1, "the first boot flips the orphan");
-	// finished_at is the observable: a repeat flip would REWRITE it to the new
-	// boot time. Asserting only "returns nothing" would pass even if the second
-	// boot silently re-stamped the row, so read the column back.
 	const stamp = h.store.get("wdead").finished_at;
-	const err = h.store.get("wdead").error;
-	for (const later of [60_000, 120_000, 86_400_000, 7 * 86_400_000]) {
+	for (const later of [60_000, 86_400_000, 7 * 86_400_000]) {
 		const again = h.store.recoverOrphans(Date.now() + later, "REBOOT-" + later);
 		assert.equal(again.length, 0, `boot +${later}ms must be a no-op`);
 	}
 	const after = h.store.get("wdead");
-	assert.equal(after.finished_at, stamp, "a repeat boot must NOT re-stamp finished_at (that is a rewrite)");
-	assert.equal(after.error, err, "a repeat boot must NOT rewrite the recorded reason");
-	assert.equal(h.db.prepare("SELECT COUNT(*) c FROM worker_tasks").get().c, 1, "recovery never creates rows");
+	assert.equal(after.finished_at, stamp, "a repeat boot must NOT re-stamp finished_at");
+	assert.equal(after.error, "REASON-1", "a repeat boot must NOT rewrite the recorded reason");
 });
 
-test("STALE-ROW reconciliation leaves THIS process's live rows alone", async () => {
+test("reconciliation leaves THIS process's live rows alone", async () => {
 	const { h } = harness();
 	const now = Date.now();
 	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
@@ -143,6 +165,19 @@ test("STALE-ROW reconciliation leaves THIS process's live rows alone", async () 
 	const victims = h.store.recoverOrphans(now, "x");
 	assert.equal(victims.length, 0, "a row started after boot is live work");
 	assert.equal(h.store.get("wlive").status, "running", "live work must keep running");
+});
+
+test("hasActive() sees queued AND running workers (the update gate)", async () => {
+	// durableRuntime.busy goes false BETWEEN two submissions of the same worker,
+	// and a queued worker has never been busy — so "model idle" alone lets an
+	// unattended restart land in the middle of a task.
+	const { h, service } = harness();
+	assert.equal(h.store.hasActive(), false, "empty queue = nothing owed");
+	service.spawn({ instruction: "长任务", sourceConversation: "dt:group:g1", createdBy: "ma1" });
+	assert.equal(h.store.hasActive(), true, "a QUEUED worker already owes a result");
+	service.start();
+	await flush();
+	assert.equal(h.store.hasActive(), false, "settled = nothing owed");
 });
 
 test("STRUCTURAL SEPARATION: work-item markers in a worker reply are inert text", async () => {

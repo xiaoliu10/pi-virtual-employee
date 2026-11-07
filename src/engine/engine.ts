@@ -3588,6 +3588,32 @@ export class EmployeeEngine implements EmployeeRuntime {
 		return true;
 	}
 
+	/**
+	 * TRUE while an autonomous work item still owes its user a result
+	 * (non-terminal board rows). Used by the UPDATE GATE only.
+	 *
+	 * `isIdle` is a moment-in-time view of in-flight model work: between two
+	 * durable submissions of the same task it goes true, and a task that is
+	 * queued-but-not-yet-started has never been busy at all. An unattended
+	 * restart landing in that gap is exactly what killed a worker in its final
+	 * stage on the box (2026-11-07): the group had been told 「报告已生成完毕，
+	 * 待读取并呈现最终结果」 ten minutes earlier and then got nothing — no
+	 * report, no error, no notice.
+	 *
+	 * Kept OUT of isIdle(): the progress watchdog and every liveness check must
+	 * keep answering 「is the model busy right now」. Only the update gate needs
+	 * the stronger 「is the work done」 question.
+	 */
+	hasOpenWorkItems(): boolean {
+		if (!this.workItems) return false;
+		try {
+			return this.workItems.listByStatus("working", "waiting_human").length > 0;
+		} catch {
+			// A storage hiccup must not wedge updates forever: fail open.
+			return false;
+		}
+	}
+
 	/** Abort every in-flight agent turn — the install_now shutdown path (an
 	 * admin's explicit 立刻安装 outranks the tasks it interrupts). Returns how
 	 * many turns were aborted. */
