@@ -4,6 +4,18 @@
 
 开源前的内部迭代细节不在此逐一罗列（完整历史见 git log）；以下从开源基线版本开始记录。
 
+## 0.2.200
+
+### English
+- **Router/Worker is infrastructure again**: a dedicated `worker_tasks` linear state machine (queued → running → done | cancelled) replaces dispatch into `work_items`. A worker is one persistent durable conversation whose completion is a code event (the turn settling), not a parsed marker; `[[NEXT_CHECK]]` written there is inert text. Follow-ups continue the same session as conversation, not as state. The transitional oneShot prompt branches and the chat NEXT_CHECK gate are deleted.
+- **One browser per profile, many tab owners**: the box playwright shim v5.1 attaches to a live Chromium (own tab, own pages) or launches as host with `--remote-debugging-port=0`; two-strike stale-endpoint sweep. Real-Chromium e2e verified on the box. Immutable discipline: no profile clones, no `connect_over_cdp`, taskkill on a browser is an incident.
+- **Progress notes explain themselves**: timer install, first degraded push and every successful push are now logged (`progress pushed #N to <target>`); `taskProgressMin` vs `longTaskProgressMin` confusion documented.
+
+### 中文
+- **Router/Worker 回归基础设施**：新增独立 `worker_tasks` 线性状态机（queued → running → done | cancelled），派发不再写入 `work_items`。一个 worker 是一个持久 durable 会话，完成由代码事件（回合结算）判定而非解析标记；在其中写 `[[NEXT_CHECK]]` 只是惰性文本。追问是同一会话的对话延续，不是状态。过渡期的 oneShot prompt 分支与 chat NEXT_CHECK 闸门已删除。
+- **一个浏览器多标签页**：盒子 playwright shim v5.1 附着到存活的 Chromium（自己的标签页、自己的页），无端点则作为宿主启动并带 `--remote-debugging-port=0`；残留端点两击清扫。已在盒子做真 Chromium 端到端验证。不可变纪律：不克隆 profile、不自己 `connect_over_cdp`、对浏览器 taskkill 属于事故。
+- **进度汇报自证**：定时器安装、首次降级推送、每次成功推送都会留日志（`progress pushed #N to <target>`）；`taskProgressMin` 与 `longTaskProgressMin` 的语义区分已写清。
+
 ## v0.2.191 — Upgrade fix, dispatch on by default, concurrent workers
 
 ### English
