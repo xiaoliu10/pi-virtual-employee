@@ -4,6 +4,16 @@
 
 开源前的内部迭代细节不在此逐一罗列（完整历史见 git log）；以下从开源基线版本开始记录。
 
+## 0.2.205
+
+### English
+- **Windows on a small display finally shows its window**: a 1024×768 box ran three live processes — renderers, GPU, DingTalk connected — with no window handle at all, because the default 1360×860 window (and its 1060×680 minimum) did not fit the screen. The window now clamps to the real work area, and a `ready-to-show` guard re-centers and shows it if it ever lands off-screen.
+- **An owner is an owner inside a worker**: task-tool scoping used the worker's own transcript id and `verifiedIMActor()` rejects non-IM prefixes, so an owner asking「当前有哪些自主任务？」in a worker was silently downgraded to the single-conversation path and got「当前没有已登记的自主任务」. Worker rounds now resolve to their ORIGIN conversation, and the actor lookup falls back to the transcript id (where the engine stamps it).
+
+### 中文
+- **小屏 Windows 终于能看到窗口**：1024×768 的盒子上三个进程都在跑（渲染器、GPU、钉钉已连接），却完全没有窗口句柄——默认的 1360×860 窗口（以及 1060×680 的最小尺寸）比屏幕还大。现在窗口按真实工作区夹取，并加一道 `ready-to-show` 守卫：一旦落在屏幕外就重新居中并显示。
+- **worker 里的 owner 仍然是 owner**：任务工具的作用域用的是 worker 自己的转录 id，而 `verifiedIMActor()` 拒绝非 IM 前缀——于是 owner 在 worker 里问「当前有哪些自主任务？」被静默降级成只查本会话，回答「当前没有已登记的自主任务」。现在 worker 轮次解析回**来源会话**，身份查找也回退到转录 id（引擎实际存放它的地方）。
+
 ## 0.2.204
 
 ### English
