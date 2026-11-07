@@ -124,6 +124,46 @@ test("follow-up message continues the SAME session as CONVERSATION, state stays 
 	assert.ok(h.pushes.length >= 2, "the follow-up's reply is also delivered");
 });
 
+test("concurrent follow-ups on ONE worker session serialize instead of hitting the kernel's already-processing refusal", async () => {
+	// Field 2026-11-07 (box): the user typed while the worker was still running;
+	// pi-agent-core refuses a concurrent prompt ("Agent is already processing.
+	// Specify streamingBehavior…") and the user saw 执行未完成. A worker is
+	// DIALOGUE infrastructure — the second message must queue and answer NEXT.
+	let active = 0, maxActive = 0;
+	// Simulate the kernel's mutual exclusion: a non-serialized second prompt throws.
+	let sendCount = 0;
+	const serializedSend = async (session, message) => {
+		sendCount += 1;
+		active += 1;
+		maxActive = Math.max(maxActive, active);
+		try {
+			if (active > 1) throw new Error("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
+			await new Promise((r) => setTimeout(r, 20));
+			return { reply: "已处理：" + message };
+		} finally {
+			active -= 1;
+		}
+	};
+	const { h, service } = harness({ service: { send: serializedSend } });
+	const flushLong = async () => { for (let i = 0; i < 60; i++) await new Promise((r) => setTimeout(r, 5)); };
+
+	const w = service.spawn({ instruction: "第一件事", sourceConversation: "dt:serial", createdBy: "ma1" });
+	service.start();
+	await flush();
+	// three rapid follow-ups while the same session is in use
+	await Promise.all([
+		service.inject("dt:serial", "追问一", "ma1"),
+		service.inject("dt:serial", "追问二", "ma1"),
+		service.inject("dt:serial", "追问三", "ma1"),
+	]);
+	await flushLong();
+	assert.equal(maxActive, 1, "exactly one prompt may be in flight per session (serialized chain)");
+	const texts = h.pushes.map((p) => p.text).join("\n");
+	assert.ok(!texts.includes("already processing"), "no follow-up may surface the kernel's concurrency refusal");
+	assert.equal(sendCount, 4, "the dispatch turn + all three follow-ups ran");
+	assert.equal(h.store.get(w.id).status, "done", "follow-ups never move the linear state machine");
+});
+
 test("follow-up in a conversation with no worker returns false (Router decides anew)", async () => {
 	const { service } = harness();
 	assert.equal(await service.inject("dt:noworker", "你好", "ma1"), false);

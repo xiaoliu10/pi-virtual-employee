@@ -68,6 +68,18 @@ export class WorkerService<Session> {
 	/** taskId → live durable session, so the foreground escape can abort the
 	 * round the way WorkService aborts a window. */
 	private readonly sessions = new Map<string, Session>();
+	/**
+	 * sessionKey → tail of that session's turn chain.
+	 *
+	 * The kernel's Agent REFUSES a second prompt while one is in flight
+	 * ("Agent is already processing. Specify streamingBehavior…" — field
+	 * 2026-11-07 on the box, surfaced to the user as 执行未完成). Worker is
+	 * dialogue infrastructure: a follow-up typed while the worker is still
+	 * working must QUEUE behind the running turn and run after it settles —
+	 * not fail, not be dropped, and not be delivered as an error notice.
+	 * Keyed by conversation id (one chain per worker session).
+	 */
+	private readonly turnChains = new Map<string, Promise<void>>();
 
 	constructor(store: WorkerTaskStore, opts: WorkerEngineDeps<Session>) {
 		this.store = store;
@@ -137,8 +149,33 @@ export class WorkerService<Session> {
 		const recent = this.store.recentForConversation(sourceConversation);
 		if (!recent?.conversation_id) return false;
 		const session = await this.opts.open(recent.conversation_id);
-		void this.runTurn(recent, session, message, senderId, { record: false });
+		// Serialize on the session's turn chain: the kernel refuses concurrent
+		// prompts, and a user typing during a running turn expects their message
+		// to be ANSWERED NEXT, not rejected.
+		this.enqueueTurn(recent.conversation_id, () => this.runTurn(recent, session, message, senderId, { record: false }));
 		return true;
+	}
+
+	/** Append a turn to a session's serial chain. The chain never rejects: a
+	 * failing turn reports through runTurn's own error path, and a rejected
+	 * link would poison every later turn on that session. */
+	private enqueueTurn(sessionKey: string, run: () => Promise<void>): void {
+		const previous = this.turnChains.get(sessionKey) ?? Promise.resolve();
+		const next = previous.then(run, run).catch((err) => {
+			this.opts.onError?.(err);
+		});
+		this.turnChains.set(sessionKey, next);
+		// Drop the tail once it settles AND is still the tail, so a long-lived
+		// map cannot retain one entry per conversation forever.
+		void next.then(() => {
+			if (this.turnChains.get(sessionKey) === next) this.turnChains.delete(sessionKey);
+		});
+	}
+
+	/** True while this conversation still has queued/running turns (test seam +
+	 *  progress-pump sanity: a worker mid-chain is not idle). */
+	hasPendingTurns(sessionKey: string): boolean {
+		return this.turnChains.has(sessionKey);
 	}
 
 	private tick(): void {
@@ -162,7 +199,14 @@ export class WorkerService<Session> {
 		);
 		notifier?.start();
 		try {
-			await this.runTurn(task, session, task.instruction, task.created_by, { record: true });
+			// Enqueued like a follow-up: one serial chain per session, so the
+			// dispatch turn and any follow-ups never overlap on the Agent.
+			await new Promise<void>((resolve) => {
+				this.enqueueTurn(task.conversation_id!, async () => {
+					await this.runTurn(task, session, task.instruction, task.created_by, { record: true });
+					resolve();
+				});
+			});
 		} finally {
 			notifier?.stop();
 			await notifier?.drain(5_000).catch(() => {});
