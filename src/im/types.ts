@@ -161,6 +161,10 @@ export interface IMAdapter {
 	 * channel or the send fails, so callers can log and move on.
 	 */
 	push?(conversationId: string, text: string): Promise<{ ok: boolean; error?: string }>;
+	/** Recall a parked "thinking" reaction on this conversation (optional:
+	 * only channels that stamp reactions implement it). Called after a
+	 * successful outbound push - real output replaces the thinking marker. */
+	recallPendingReaction?(conversationId: string): void;
 	/**
 	 * Credential-egress audience for a conversation (who may see credential
 	 * text there). Optional — channels without the concept omit it and the

@@ -516,6 +516,9 @@ export class IMAdapterManager {
 			const pushed = await adapter.push(conversationId, piece);
 			if (!pushed.ok) return pushed;
 		}
+		// Real output just landed on this conversation: a 🤔 parked here by a
+		// dispatched turn (empty reply) has served its purpose — recall it.
+		this.adapterFor(conversationId)?.recallPendingReaction?.(conversationId);
 		return { ok: true };
 	}
 

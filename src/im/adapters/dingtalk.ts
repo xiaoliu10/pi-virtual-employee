@@ -442,12 +442,27 @@ export class DingtalkAdapter implements IMAdapter {
 						sendImage: (filePath) => this.sendImageFor(msg, filePath),
 					},
 				);
-				if (msg.sessionWebhook && reply) await this.deliverReply(reply, this.routeFromMsg(msg));
+				if (reply) {
+					if (msg.sessionWebhook) await this.deliverReply(reply, this.routeFromMsg(msg));
+					// A real reply landed on this message: the 🤔 has done its job.
+					this.pendingReactions.delete(conversationId);
+				} else if (target) {
+					// Empty reply = dispatched elsewhere (e.g. Router→Worker, which
+					// is silent by design). The turn is NOT over — keep the 🤔 on
+					// the message and let the progress/result push from the worker
+					// recall it when it finally lands on this conversation.
+					this.pendingReactions.set(conversationId, target);
+				}
 			} catch (err) {
 				console.error("[im:dingtalk] handle/reply failed", err);
 				void diag("dingtalk", `handle/reply failed: ${(err as Error).message}`, "warn");
 			} finally {
-				if (target) await this.emotionRecall(target).catch(() => {});
+				// Recall only when a reply was delivered in THIS handler (or the
+				// turn errored). A parked reaction survives; the next real push
+				// to the conversation clears it via recallPendingReaction().
+				if (target && !this.pendingReactions.has(conversationId)) {
+					await this.emotionRecall(target).catch(() => {});
+				}
 			}
 		});
 
@@ -1058,6 +1073,21 @@ export class DingtalkAdapter implements IMAdapter {
 	/** Stamp the "thinking" emoji reaction onto a message. */
 	private async emotionReply(target: EmotionTarget): Promise<void> {
 		await this.callEmotion("reply", target);
+	}
+
+	/** Parked 🤔 reactions: conversationId → the inbound message's emotion
+	 * target. Set when a turn ends without a reply (dispatched to a worker);
+	 * recalled by the next real outbound push to that conversation. */
+	private readonly pendingReactions = new Map<string, EmotionTarget>();
+
+	/** Recall the parked 🤔 for a conversation, if any. Called from the push
+	 * path (progress/result landing on the chat) — the moment the user sees
+	 * real output, the thinking marker has served its purpose. */
+	recallPendingReaction(conversationId: string): void {
+		const target = this.pendingReactions.get(conversationId);
+		if (!target) return;
+		this.pendingReactions.delete(conversationId);
+		void this.emotionRecall(target).catch(() => {});
 	}
 
 	/**
