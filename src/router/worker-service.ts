@@ -91,11 +91,10 @@ export class WorkerService<Session> {
 	start(intervalMs = 15_000): void {
 		if (this.running) return;
 		this.running = true;
-		// Orphan recovery MUST run before the first tick: `running` is an
-		// in-memory fact and the process that owned those rows is gone. Without
-		// this the row stays "running" forever and the source conversation never
-		// learns the worker died (field 2026-11-07: install restart mid-run, the
-		// group got progress notes then silence — no report, no error).
+		// Stale-row reconciliation before the first tick. `running` is an
+		// in-memory fact; the process that owned those rows is gone, so nothing
+		// will ever settle them and they would claim to be alive forever.
+		// Deliberately INERT (log only) — see recoverOrphans().
 		this.recoverOrphans();
 		const loop = () => {
 			if (!this.running) return;
@@ -114,23 +113,30 @@ export class WorkerService<Session> {
 		if (this.wake) { this.clock.setTimeout(() => {}, 0); this.wake = undefined; }
 	}
 
-	/** Flip workers whose owning process died, and TELL the source
-	 * conversation. Silent recovery would repeat the original sin: the group
-	 * saw a confident "报告已生成完毕" progress note and then nothing at all.
-	 * Best-effort push — during early startup the IM adapter may not be up. */
+	/** Reconcile workers whose owning process died. LOG ONLY — no push, no
+	 * re-dispatch, no re-queue.
+	 *
+	 * User ruling 2026-11-07: 「崩溃恢复不见得是一件好事，要克制，如果一直不停
+	 * 的触发是有问题的，会造成死循环，模型后台空转」. A restart-triggered notice
+	 * invites a re-dispatch; if the box restarts again mid-run, notice →
+	 * re-dispatch → restart is a self-sustaining loop that burns model turns and
+	 * delivers nothing. The honest minimum is: the stale row stops claiming to
+	 * be running, and ops can see why in the log and in worker_task_detail.
+	 *
+	 * The user still finds out through the paths that already exist and cost
+	 * nothing when idle: the task simply has no result, and asking about it
+	 * (worker_task_detail / 任务状态) reports the interruption reason. */
 	private recoverOrphans(): void {
 		const bootAt = this.clock.now();
 		let orphans: WorkerTaskRow[];
 		try {
-			orphans = this.store.recoverOrphans(bootAt, "应用在执行中退出，该轮未完成");
+			orphans = this.store.recoverOrphans(bootAt, "应用在执行中退出，该轮未完成（如需继续请重新派发）");
 		} catch (err) {
 			this.opts.onError?.(err);
 			return;
 		}
 		for (const o of orphans) {
-			const title = o.instruction.slice(0, 60);
-			const text = `⚠️ **任务执行被中断：${title}**\n\n应用在执行中退出（升级或重启），这一轮没有跑完，也没有最终结果——如果你收到过「即将完成 / 报告已生成」之类的进度汇报，那是中断前的估计，不能当作结果。\n\n需要我重新执行吗？回复「重新执行」即可。`;
-			void Promise.resolve(this.opts.push(o.source_conversation, text)).catch(() => {});
+			console.log(`[worker] orphan reconciled: ${o.id} (${o.source_conversation}) — ${o.instruction.slice(0, 60)}`);
 		}
 	}
 

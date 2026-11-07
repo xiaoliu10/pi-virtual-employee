@@ -91,28 +91,35 @@ export class WorkerTaskStore {
 		return r.changes ? this.get(row.id) : undefined;
 	}
 
-	/** Startup crash recovery (v0.2.206). `running` is an IN-MEMORY fact: the
-	 * process that owned the turn is gone, and nothing will ever call settle()
-	 * for that row. Field 2026-11-07 (the box): an install restarted the app at
-	 * 22:12 while a worker was in its final stage — the row stayed `running`
-	 * forever, so the user got progress notes claiming "报告已生成完毕" and
-	 * then silence: no final report, no error, no way to tell it had died.
+	/** Startup reconciliation (v0.2.206): a `running` row whose owning process
+	 * is GONE is a stale fact, not live work. Flip it to `error` so it stops
+	 * looking alive — NOTHING more.
 	 *
-	 * The work-item board already recovers (`recoverWorking` → waiting_human +
-	 * a pushed notice); worker_tasks had NOTHING. Flip orphans to `error` with
-	 * an honest reason so the row stops looking alive, and return them so the
-	 * service can tell the originating conversation.
+	 * Why this is deliberately inert (user ruling, 2026-11-07: 「崩溃恢复不见得
+	 * 是一件好事，要克制」): recovery that triggers ACTION is a loop generator.
+	 * If a restart mid-run causes a notice, and the notice causes a re-dispatch,
+	 * a box that restarts during the final stage of a long task spins forever —
+	 * each cycle burns a full model turn in the background and delivers nothing.
+	 * The store therefore only corrects state; it never re-queues, never
+	 * re-dispatches, and never spawns a follow-up.
 	 *
-	 * Bounded by `started_at`: a row started in THIS process cannot be an
-	 * orphan, so recovery only touches rows older than `bootAt`. */
+	 * Idempotent by construction: the UPDATE is gated on status = 'running', so
+	 * a second boot finds nothing and is a no-op. `started_at < bootAt` keeps
+	 * THIS process's live rows (and a concurrent profile sharing the DB) out of
+	 * scope — without it two instances would keep flipping each other and never
+	 * converge. */
 	recoverOrphans(bootAt: number, reason: string): WorkerTaskRow[] {
 		const rows = this.db.prepare(`SELECT * FROM worker_tasks WHERE status = 'running'
-			AND (started_at IS NULL OR started_at < ?)`).all(bootAt) as unknown as WorkerTaskRow[];
+			AND started_at IS NOT NULL AND started_at < ?`).all(bootAt) as unknown as WorkerTaskRow[];
 		if (rows.length === 0) return [];
 		const stmt = this.db.prepare(`UPDATE worker_tasks SET status = 'error', error = ?, finished_at = ?
 			WHERE id = ? AND status = 'running'`);
-		for (const r of rows) stmt.run(reason, bootAt, r.id);
-		return rows.map((r) => this.get(r.id) ?? r);
+		const flipped: WorkerTaskRow[] = [];
+		for (const r of rows) {
+			// changes === 0 means someone (another process) already handled it.
+			if (stmt.run(reason, bootAt, r.id).changes) flipped.push(this.get(r.id) ?? r);
+		}
+		return flipped;
 	}
 
 	listRecent(limit = 20): WorkerTaskRow[] {

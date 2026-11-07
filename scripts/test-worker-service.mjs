@@ -79,15 +79,17 @@ test("linear lifecycle: spawn → running → done, result delivered to the SOUR
 	assert.match(h.store.get(w.id).conversation_id, /^worker:/);
 });
 
-test("CRASH RECOVERY: a worker left running by a dead process is flipped and reported", async () => {
-	// Field 2026-11-07 (the box): the app restarted at 22:12 (install) while a
-	// worker was in its final stage. The row stayed `running` forever — the
-	// group got a confident "报告已生成完毕" progress note and then NOTHING:
-	// no report, no error, and no way to know it had died. work_items already
-	// recovered (recoverWorking → waiting_human + pushed notice); worker_tasks
-	// had no recovery at all.
+test("STALE-ROW reconciliation corrects state but triggers NOTHING", async () => {
+	// Field 2026-11-07 (the box): the app restarted at 22:12 while a worker was
+	// in its final stage; the row stayed `running` forever and the group got a
+	// confident "报告已生成完毕" progress note then silence.
+	//
+	// User ruling the same day: 「崩溃恢复不见得是一件好事，要克制，如果一直不停
+	// 的触发是有问题的，会造成死循环，模型后台空转」. So the correction is
+	// INERT — the row stops claiming to be alive, and that is ALL. No push, no
+	// re-dispatch, no re-queue: a restart-triggered notice invites a
+	// re-dispatch, and a box that restarts again mid-run spins forever.
 	const { h, service } = harness();
-	// A worker started by a PREVIOUS process: started_at well before boot.
 	const past = Date.now() - 60 * 60_000;
 	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
 		VALUES ('wdead', '每日对账异常动态巡检（7天版·明细报告）继续', 'dt:group:g1', 'ma1', 'running', 'worker:wdead', ?, ?)`).run(past, past);
@@ -96,26 +98,50 @@ test("CRASH RECOVERY: a worker left running by a dead process is flipped and rep
 	await flush();
 
 	const row = h.store.get("wdead");
-	assert.equal(row.status, "error", "an orphaned worker must not stay running forever");
-	assert.match(row.error, /应用在执行中退出/, "the reason must say the process died, not blame the task");
+	assert.equal(row.status, "error", "a stale row must not claim to be running");
+	assert.match(row.error, /应用在执行中退出/, "the recorded reason must name the cause");
 	assert.equal(row.finished_at != null, true, "it must look finished, not alive");
 
-	const notice = h.pushes.find((p) => p.cid === "dt:group:g1");
-	assert.ok(notice, "the source conversation MUST be told — silence was the original bug");
-	assert.match(notice.text, /任务执行被中断/);
-	assert.match(notice.text, /进度汇报|即将完成|报告已生成/, "it must warn that earlier progress notes were estimates, not results");
-	assert.match(notice.text, /重新执行/, "it must offer a way forward instead of leaving the user hanging");
-	assert.equal(h.sends.length, 0, "recovery must not silently re-run a dead worker");
+	// The克制 contract: nothing is set in motion.
+	assert.equal(h.pushes.length, 0, "recovery must NOT push — a notice invites a re-dispatch loop");
+	assert.equal(h.sends.length, 0, "recovery must NOT re-run the worker");
+	assert.equal(h.sessions.length, 0, "recovery must NOT even open a session (no model turn)");
+	assert.equal(h.db.prepare("SELECT COUNT(*) c FROM worker_tasks WHERE status = 'queued'").get().c, 0,
+		"recovery must NOT re-queue");
 });
 
-test("CRASH RECOVERY: a worker started by THIS process is never treated as an orphan", async () => {
-	// The boot boundary must be real: a row started after boot is live work.
+test("STALE-ROW reconciliation is idempotent: a second boot is a no-op", async () => {
+	// Repeated restarts must not accumulate work: the UPDATE is gated on
+	// status = 'running', so once flipped the row can never be flipped again.
+	const { h } = harness();
+	const past = Date.now() - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
+		VALUES ('wdead', '巡检', 'dt:group:g1', 'ma1', 'running', 'worker:wdead', ?, ?)`).run(past, past);
+
+	const first = h.store.recoverOrphans(Date.now(), "x");
+	assert.equal(first.length, 1, "the first boot flips the orphan");
+	// finished_at is the observable: a repeat flip would REWRITE it to the new
+	// boot time. Asserting only "returns nothing" would pass even if the second
+	// boot silently re-stamped the row, so read the column back.
+	const stamp = h.store.get("wdead").finished_at;
+	const err = h.store.get("wdead").error;
+	for (const later of [60_000, 120_000, 86_400_000, 7 * 86_400_000]) {
+		const again = h.store.recoverOrphans(Date.now() + later, "REBOOT-" + later);
+		assert.equal(again.length, 0, `boot +${later}ms must be a no-op`);
+	}
+	const after = h.store.get("wdead");
+	assert.equal(after.finished_at, stamp, "a repeat boot must NOT re-stamp finished_at (that is a rewrite)");
+	assert.equal(after.error, err, "a repeat boot must NOT rewrite the recorded reason");
+	assert.equal(h.db.prepare("SELECT COUNT(*) c FROM worker_tasks").get().c, 1, "recovery never creates rows");
+});
+
+test("STALE-ROW reconciliation leaves THIS process's live rows alone", async () => {
 	const { h } = harness();
 	const now = Date.now();
 	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
 		VALUES ('wlive', '活着的任务', 'dt:group:g1', 'ma1', 'running', 'worker:wlive', ?, ?)`).run(now, now + 1);
 	const victims = h.store.recoverOrphans(now, "x");
-	assert.equal(victims.length, 0, "a row started after boot is not an orphan");
+	assert.equal(victims.length, 0, "a row started after boot is live work");
 	assert.equal(h.store.get("wlive").status, "running", "live work must keep running");
 });
 
