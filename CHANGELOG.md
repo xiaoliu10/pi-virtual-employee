@@ -4,6 +4,14 @@
 
 开源前的内部迭代细节不在此逐一罗列（完整历史见 git log）；以下从开源基线版本开始记录。
 
+## 0.2.202
+
+### English
+- **Follow-up routing now happens BEFORE task triage**: a running worker on a conversation owns the dialogue — a bare reply (like an OTP code the worker asked for) is injected into the worker's session instead of falling to the context-less inline chat. Field 2026-11-07: the worker said "send me the code", the user's reply was triaged as a question, and the inline session answered "waiting for which SMS?" — three contexts, zero continuity.
+
+### 中文
+- **追问判定提前到任务 triage 之前**：会话上有运行中的 worker 时，对话归它——用户的裸回复（比如 worker 要的验证码）注入 worker 会话，不再落进没有上下文的 inline 聊天。现场 2026-11-07：worker 说「把验证码发给我」，用户回复被判为问句，inline 会话答「你在等哪方面的短信？」——三个上下文零连贯。
+
 ## 0.2.201
 
 ### English
