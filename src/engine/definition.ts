@@ -237,7 +237,17 @@ export function buildTools(input: ToolSetOptions): AgentTool<any>[] {
 	// scratch transcript id — so it is resolved ONCE here and the rest of this
 	// function keeps its single, unchanged meaning.
 	const options: ToolSetOptions = input.originConversationId
-		? { ...input, conversationId: input.originConversationId }
+		? {
+				...input,
+				conversationId: input.originConversationId,
+				// Actor lookup must fall back to the SCRATCH id: the engine stamps
+				// turnActor under the transcript the round runs on (worker:…), not
+				// under the origin chat. Without this, every admin check inside a
+				// worker would see "no verified actor" and silently downgrade an
+				// owner to a non-admin (field 2026-11-07).
+				resolveActor: (cid) =>
+					input.resolveActor(cid) ?? (cid === input.originConversationId ? input.resolveActor(input.conversationId) : undefined),
+			}
 		: input;
 	const tools: AgentTool<any>[] = [];
 	/**

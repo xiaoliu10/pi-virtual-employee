@@ -181,6 +181,51 @@ await build({
 const { buildTools, normalizeMcpServers } = await import(pathToFileURL(engineBundle).href + `?t=${Date.now()}`);
 
 /**
+ * Worker rounds run on a scratch transcript (`worker:<id>`) but every tool's
+ * conversation semantics — admin scope, audience, delivery — mean the ORIGIN
+ * chat. Field 2026-11-07 (box): an OWNER asked inside a worker「当前有哪些自主
+ * 任务？」and got「当前没有已登记的自主任务」, because (a) manage_work_items was
+ * scoped to the worker's own id and (b) verifiedIMActor rejects a non-IM prefix
+ * so the owner was silently downgraded. This pins the resolution, including the
+ * actor fallback to the scratch id (turnActor is stamped there, not on the origin).
+ */
+test("buildTools resolves a worker round to its ORIGIN conversation, actor lookup included", async () => {
+	// Field 2026-11-07 (box): an OWNER inside a worker asked「当前有哪些自主任务？」
+	// and got「当前没有已登记的自主任务」. Two independent breaks:
+	//   (a) manage_work_items scoped itself to the WORKER's transcript id;
+	//   (b) verifiedIMActor() rejects a non-IM prefix, so a `worker:…` id made
+	//       even an owner look unverified → non-admin (single-conversation) path.
+	// buildTools must therefore hand every tool the ORIGIN id AND an actor
+	// resolver that still finds the identity stamped on the scratch transcript.
+	const origin = "dt:group:origin";
+	const scratch = "worker:abc";
+	const calls = [];
+	const actor = { senderId: "manager5792", channel: "dingtalk", chatType: "group" };
+	const fakeConfig = { all: () => ({ security: { defaultRole: "viewer", adminStaffIds: [], ownerStaffIds: [] }, capabilities: { mcp: { enabled: false } }, kb: { enabled: false, learn: { enabled: false }, manage: { enabled: false }, research: { enabled: false } }, browser: { enabled: false }, computer: { enabled: false }, scheduler: { enabled: false }, documents: { enabled: false }, filesystem: { enabled: false }, reports: { enabled: false }, downloads: { enabled: false }, skills: { disabled: [] } }) };
+	const workItems = { list: () => [{ id: "3db7f642-x", title: "每日对账巡检", status: "waiting_human", origin_conversation: origin, updated_at: Date.now() }], get: () => undefined };
+	const tools = buildTools({
+		config: fakeConfig,
+		conversationId: scratch,
+		originConversationId: origin,
+		resolveActor: (cid) => { calls.push(cid); return cid === scratch ? actor : undefined; },
+		resolveMemoryContext: () => ({}),
+		work: { items: workItems, fireItem: () => true, mine: async () => ({ scanned: 0, proposals: [] }) },
+	});
+	const list = tools.find((t) => t.name === "manage_work_items");
+	assert.ok(list, "manage_work_items must be registered when work deps are present");
+
+	// The actor fallback: the tool asks for the ORIGIN id, the engine only has the
+	// scratch id stamped → without the fallback this returns undefined and an
+	// owner is downgraded to the single-conversation path.
+	calls.length = 0;
+	const result = await list.execute("c1", { action: "list" });
+	assert.ok(calls.includes(origin), `tools must resolve the actor under the ORIGIN id; saw ${JSON.stringify(calls)}`);
+	assert.ok(!result.details?.refused, "an origin-scoped IM conversation must not be refused as unverified");
+	// (b) verification: exactly one item exists, owned by the origin conversation.
+	assert.ok(String(result.content[0].text).includes("每日对账巡检"), `list must SEE the origin conversation's item: ${result.content[0].text}`);
+});
+
+/**
  * The regression this pins: moving MCP out of buildToolSetFor (needed so durable
  * can install it as its own hot-swappable extension) silently stripped MCP from
  * LEGACY sessions, which take their tools ONLY from that set.
