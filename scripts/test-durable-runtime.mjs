@@ -39,6 +39,32 @@ test('VE durable runtime executes a real adapted tool and projects one answer',a
  }finally{await runtime.close();db.close();}
 });
 
+test('memory anchors survive the durable identity round-trip (context-management P0-1)',async()=>{
+ // Field basis: a worker/scheduler round runs on a scratch conversation, but its
+ // memory scope must resolve to the ORIGINATING conversation. The anchor rides
+ // ctx.actor into the RouteDoc and comes back out of actorContext() for every
+ // tool call — including ones after a crash+recovery (persisted, not in-memory).
+ const db=new DatabaseSync(':memory:');
+ db.exec(`CREATE TABLE conversations (id TEXT PRIMARY KEY,title TEXT,created_at INTEGER,updated_at INTEGER,origin TEXT,model_supplier_id TEXT,model_model_id TEXT); CREATE TABLE messages (id TEXT PRIMARY KEY,conversation_id TEXT,role TEXT,content TEXT,created_at INTEGER);`);
+ const history=new HistoryStore(db);
+ const faux=fauxProvider();
+ const sessions=new Map();
+ const session=id=>{ if(!sessions.has(id)) sessions.set(id,new Agent({streamFn:faux.provider.streamSimple,sessionId:id,initialState:{model:faux.provider.getModels()[0],systemPrompt:'test'}})); return sessions.get(id); };
+ let toolActor;
+ const tools=()=>[{name:'peek_scope',label:'peek',description:'peek',parameters:Type.Object({}),execute:async()=>{return {content:[{type:'text',text:'ok'}]}; }}];
+ faux.setResponses([fauxAssistantMessage(fauxToolCall('peek_scope',{}),{stopReason:'toolUse'}),fauxAssistantMessage('done')]);
+ const runtime=await DurableRuntime.open({userDataDir:join(dir,'mem-anchor'),history,session,tools,
+  stream:(id,opts,messages)=>faux.provider.streamSimple(faux.provider.getModels()[0],{messages},opts),
+  withActor:async(id,ctx,text,run)=>{ toolActor=ctx.actor; return run(); },
+  onRecovered:async()=>{}});
+ try{
+  await runtime.send(session('sched:job-1'),'do the thing',{actor:{senderId:'person-a',channel:'scheduler',chatType:'single',memoryConversationId:'dt:group:abc123',memoryChannel:'dingtalk'}});
+  assert.ok(toolActor,'the durable tool ran inside withActor');
+  assert.equal(toolActor.memoryConversationId,'dt:group:abc123','conversation memory anchor must survive RouteDoc round-trip');
+  assert.equal(toolActor.memoryChannel,'dingtalk','memory channel must survive RouteDoc round-trip');
+ }finally{await runtime.close();db.close();}
+});
+
 test('failed startup scan closes its host before rejecting and never resumes work', async () => {
  const originalOpen = Harness.open;
  let closed = 0, resumed = 0;

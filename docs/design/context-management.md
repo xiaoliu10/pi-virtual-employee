@@ -66,12 +66,17 @@
 - worker/sched/work 的**结果落库时写一行检索友好的摘要**（标题=任务名，snippet=结论首行），使知识检索成为第二跳入口。
 - 工具返回体统一带 `related: [{id, kind, summary}]` 字段（先做 memory_search 与 task_detail 两个高频工具）。
 
-## 4. 实施顺序
+## 4. 实施顺序与状态
 
-1. **P0 修断链**：RouteDoc 携带 memoryConversationId（§2.1）+ 变异测试。不做这个，其他 Inline 都会被同一根因吃掉。
-2. **P0 凭据分离**（盒子）：对象图跨 profile 缺失无法用注入弥补。
-3. **P1 会话前缀扩展**：群活跃成员摘要 + 会话最近任务摘要（含预算与裁剪测试）。
-4. **P2 结果摘要落库 + 工具返回带 related**：补全 Chain of Recall 的第二跳。
-5. **P3 worker done 短窗续聊语义**（需产品裁定）。
+1. ~~**P0 修断链**：RouteDoc 携带 memoryConversationId~~ **✅ 已实施**（runtime.ts：RouteDoc 增加 memoryConversationId/memoryChannel 持久字段，executeTurn 写入、actorContext 恢复；变异测试钉住「durable 轮内 anchor 必须存活」，test-durable-runtime 12/12）。注：pi-session/legacy 路径本就不经过 RouteDoc（engine.send 直接带 actor），此修复只影响 durable 内核。
+2. **P0 凭据分离**（盒子）：对象图跨 profile 缺失无法用注入弥补。⏳ 待隧道恢复后执行（Orion 换钉钉应用凭据）。
+3. ~~**P1 会话前缀扩展**~~ **✅ 已实施**（engine.ts withConversationContext：群活跃成员摘要（≤10 人，最近发言优先）+ 会话最近任务摘要（≤3 条，instruction/result 摘要 + worker:<id>），预算 1200 字符超限截断；非 IM 会话不注入。test-context-prefix 4/4，变异红→绿验证。send() 挂载在 withTurnMemoryPrefix 外层）。
+4. ~~**P2 结果摘要落库 + 工具 related**~~ **✅ 已实施**（双件：① worker settle → onSettled 钩子 → main.ts 落库为普通知识条目（id=worker-<taskId> 幂等，非 memory-tagged——不挤占 turn 记忆索引，可被 search_knowledge_base 检索命中）；② 新工具 worker_task_detail(workerId) → 完整执行记录（telemetry 能力，operator floor）。related 判定：search_knowledge_base 已返回 id=<sourceId>、记忆条目经 turn 前缀全量可见——related 无增量，不写冗余代码。）
+5. ~~**P3 worker done 短窗续聊语义**~~ **✅ 已裁定并实施**（v0.2.202，f3c49fc：follow-up 检查前置到 triage 之前；done 后追问续进同一会话——用户裁定「追问是对话延续，非状态转换」，无短窗限制。变异测试 worker-service 抓回过一次错误改动的语义偏离。）
 
 每步的验收测试都遵循同一模式：变异验证（删掉注入代码测试必须红）+ 预算上限断言。
+
+## 5. 发版锚点
+
+- P0-1 + P1 + P2 + follow-up 前置：v0.2.203（含 v0.2.202 的 f3c49fc）
+- P0-2 凭据分离：盒子运维操作，随下次盒子维护窗口执行

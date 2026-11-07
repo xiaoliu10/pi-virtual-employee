@@ -20,6 +20,13 @@ interface RouteDoc {
 	chatType: string;
 	text: string;
 	projected: number;
+	/** Memory scope anchors (context-management.md §2 断链1). Unattended turns
+	 * (scheduler/work/worker channel) carry the ORIGINATING conversation here so
+	 * conversation-scoped memory stays reachable from inside the durable round.
+	 * Persisted on the RouteDoc because tools resolve identity AFTER restart via
+	 * actorContext() — an in-memory map would lose the anchor across recovery. */
+	memoryConversationId: string;
+	memoryChannel: string;
 }
 /** How long a recovered run may take to reach a terminal state before we report it as unfinished. */
 const RECOVERY_WAIT_MS = 10 * 60_000;
@@ -65,7 +72,7 @@ function withUsage(message: AssistantMessage): AssistantMessage {
 export const Route = defineDoc<RouteDoc>({
 	kind: "ve.execution", version: 1, scope: "conversation", history: "latest", fork: "initial",
 	checkpointWhen: () => false,
-	initial: () => ({ conversationId: "", requestId: "", staffId: "", verifiedRole: "", name: "", channel: "", chatType: "", text: "", projected: 0 }),
+	initial: () => ({ conversationId: "", requestId: "", staffId: "", verifiedRole: "", name: "", channel: "", chatType: "", text: "", projected: 0, memoryConversationId: "", memoryChannel: "" }),
 });
 interface RuntimeOptions {
 	userDataDir: string;
@@ -254,6 +261,11 @@ export class DurableRuntime {
 		return { ...this.liveContexts.get(cid), actor: route.staffId ? {
 			senderId: route.staffId, senderName: route.name, channel: route.channel,
 			chatType: route.chatType === "group" ? "group" : "single",
+			// Memory anchors ride the RouteDoc (persisted): a durable tool that
+			// resolves memory scope mid-round — possibly after a crash+recovery —
+			// must still see the ORIGINATING conversation, not the run's scratch id.
+			...(route.memoryConversationId ? { memoryConversationId: route.memoryConversationId } : {}),
+			...(route.memoryChannel ? { memoryChannel: route.memoryChannel } : {}),
 			...(verifiedRole ? { verifiedRole } : {}),
 		} : undefined };
 	}
@@ -376,7 +388,7 @@ export class DurableRuntime {
 		const id = agent.sessionId ?? "default";
 		const conv = await this.host.harness.createConversation({ ownership: { kind: "ownerless" }, agent: { model: { provider: "ve-runtime", modelId: "current" }, instructions: agent.state.systemPrompt }, init: async (tx, cid) => {
 			const route = await tx.doc(Route, cid);
-			Object.assign(route, { conversationId: id, requestId: `ve:${cid}`, staffId: ctx?.actor?.senderId ?? "", verifiedRole: ctx?.actor?.channel === "widget" ? ctx.actor.verifiedRole ?? "" : "", name: ctx?.actor?.senderName ?? "", channel: ctx?.actor?.channel ?? "", chatType: ctx?.actor?.chatType ?? "", text });
+			Object.assign(route, { conversationId: id, requestId: `ve:${cid}`, staffId: ctx?.actor?.senderId ?? "", verifiedRole: ctx?.actor?.channel === "widget" ? ctx.actor.verifiedRole ?? "" : "", name: ctx?.actor?.senderName ?? "", channel: ctx?.actor?.channel ?? "", chatType: ctx?.actor?.chatType ?? "", text, memoryConversationId: (ctx?.actor as { memoryConversationId?: string } | undefined)?.memoryConversationId ?? "", memoryChannel: (ctx?.actor as { memoryChannel?: string } | undefined)?.memoryChannel ?? "" });
 			// Import only on a NEW execution; resumed executions use their complete
 			// stored tool transcript and never rehydrate lossy UI messages.
 			for (const row of this.opts.history.listMessages(id)) {

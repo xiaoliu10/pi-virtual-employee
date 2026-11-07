@@ -34,6 +34,10 @@ export interface WorkerEngineDeps<Session> {
 	/** Cancel a live durable round (foreground-escape). Injected because the
 	 * abort surface lives on the session, which this service only holds. */
 	abort?(session: Session): void;
+	/** Result archival hook (context-management P2): called once per dispatched
+	 * turn with the final outcome, so main.ts can land a searchable record
+	 * (search_knowledge_base second hop). Errors here must never break delivery. */
+	onSettled?: (task: { id: string; instruction: string; sourceConversation: string; createdBy: string }, outcome: string) => void;
 	/** Long-task progress broadcaster (taskProgressMin cadence), same shape
 	 * WorkService injects. Optional — without it long workers run silent
 	 * until their result (the exact complaint that opened this file's field
@@ -192,7 +196,14 @@ export class WorkerService<Session> {
 	/** Source-conversation delivery; also the terminal transition for the
 	 * dispatch round (record=true). One push per turn. */
 	private async deliver(task: WorkerTaskRow, text: string, opts: { record: boolean }): Promise<void> {
-		if (opts.record) this.store.settle(task.id, text.startsWith("⚠️") ? { error: text } : { text }, this.clock.now());
+		if (opts.record) {
+			this.store.settle(task.id, text.startsWith("⚠️") ? { error: text } : { text }, this.clock.now());
+			try {
+				this.opts.onSettled?.({ id: task.id, instruction: task.instruction, sourceConversation: task.source_conversation, createdBy: task.created_by }, text);
+			} catch (err) {
+				this.opts.onError?.(err);
+			}
+		}
 		try {
 			await this.opts.push(task.source_conversation, text);
 		} catch (err) {

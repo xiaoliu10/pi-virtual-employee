@@ -539,7 +539,20 @@ async function main(): Promise<void> {
 		proposalsDir,
 		// run_script writes its parameter files here (script-params/<stem>/params.json).
 		userDataDir: userData,
-	}, { timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000, kernel });
+	}, {
+		timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000,
+		kernel,
+		// Context-management P1: the engine inlines recent worker task summaries
+		// into the conversation-context prefix. The store is created later (in
+		// the workerService block) — resolve through the holder lazily.
+		workerTaskSource: {
+			listRecentForConversation: (cid, limit) => workerTaskStoreHolder.store?.listRecentForConversation(cid, limit) ?? [],
+		},
+		// Context-management P2: the second hop behind the prefix's worker:<id>.
+		workerTaskDetail: (id) => workerTaskStoreHolder.store?.get(id),
+	});
+	/** Late-bound worker_tasks store (created with the workerService below). */
+	const workerTaskStoreHolder: { store?: WorkerTaskStore } = {};
 	// stdio MCP transports own child processes — disconnect them on quit
 	// (best-effort: will-quit cannot await, fire and forget).
 	// Electron's will-quit cannot await, and the process dies with the event loop:
@@ -1467,7 +1480,27 @@ ${tailForProgress(decision.text)}`;
 	// primitives with the task system — its own table, its own linear
 	// lifecycle, its own session prefix. No work_items rows are created.
 	WorkerTaskStore.migrate(db);
-	const workerService = new WorkerService(new WorkerTaskStore(db), {
+	const workerTaskStore = new WorkerTaskStore(db);
+	workerTaskStoreHolder.store = workerTaskStore;
+	const workerService = new WorkerService(workerTaskStore, {
+		// Context-management P2: land each finished worker as a searchable
+		// knowledge entry (manual source → search_knowledge_base hit), so a
+		// later "上次那个对账" resolves through retrieval, not guesswork. The
+		// entry is NOT memory-tagged — it must not crowd the turn memory index;
+		// the live summary lives in the conversation-context prefix instead.
+		onSettled: (task, outcome) => {
+			try {
+				const instruction = task.instruction.replace(/\s+/g, " ").slice(0, 60);
+				knowledge.upsertEntry({
+					id: `worker-${task.id}`,
+					title: `任务结果：${instruction}`,
+					tags: JSON.stringify(["worker", "任务结果", "执行记录"]),
+					content: `【对话任务执行记录】\n任务编号：worker:${task.id}\n来源会话：${task.sourceConversation}\n发起人：${task.createdBy}\n指令：${task.instruction}\n结果：${outcome}\n（详情可用 worker_task_detail 工具按编号查询）`,
+				});
+			} catch (err) {
+				console.warn("[worker] result archival failed (delivery unaffected):", err instanceof Error ? err.message : err);
+			}
+		},
 		open: (cid) => {
 			history.ensureConversation(cid, "🛠 执行任务");
 			return engine.getOrCreateSession(cid);

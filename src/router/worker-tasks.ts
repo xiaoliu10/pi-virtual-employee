@@ -104,6 +104,14 @@ export class WorkerTaskStore {
 	/** The conversation's most recent worker — follow-ups continue it (user
 	 * ruling 2026-11-07: a follow-up is CONVERSATION, not a state transition;
 	 * the session survives `done` precisely so the dialogue keeps its context). */
+	/** The conversation's recent tasks, newest first (context-management.md P1:
+	 * the Inline feed for "上次那个任务" style references). Bounded by the caller. */
+	listRecentForConversation(sourceConversation: string, limit: number): WorkerTaskRow[] {
+		return this.db.prepare(
+			"SELECT * FROM worker_tasks WHERE source_conversation = ? ORDER BY created_at DESC LIMIT ?",
+		).all(sourceConversation, limit) as unknown as WorkerTaskRow[];
+	}
+
 	recentForConversation(sourceConversation: string): WorkerTaskRow | undefined {
 		return this.db.prepare("SELECT * FROM worker_tasks WHERE source_conversation = ? ORDER BY created_at DESC LIMIT 1")
 			.get(sourceConversation) as unknown as WorkerTaskRow | undefined;

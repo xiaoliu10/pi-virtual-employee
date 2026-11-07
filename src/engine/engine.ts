@@ -268,6 +268,13 @@ export interface EngineOptions {
 	/** Credential store backing the Models registry. Default: FileCredentialStore
 	 * on the shared pi agent dir (auth.json). Injectable for tests. */
 	credentialStore?: CredentialStore;
+	/** Read side of worker_tasks for context injection (context-management P1):
+	 * recent tasks of THIS conversation, inlined as one-line summaries so "上次
+	 * 那个任务" resolves without a tool hop. Optional — tests omit it. */
+	workerTaskSource?: { listRecentForConversation(conversationId: string, limit: number): Array<{ id: string; instruction: string; status: string; result: string | null; error: string | null; created_at: number }>; };
+	/** worker_task_detail second hop (context-management P2): full record behind
+	 * the prefix's worker:<id>. Registered under the telemetry capability. */
+	workerTaskDetail?: (id: string) => { id: string; instruction: string; source_conversation: string; created_by: string; status: string; result: string | null; error: string | null; max_minutes: number; created_at: number; started_at: number | null; finished_at: number | null } | undefined;
 }
 
 /**
@@ -310,6 +317,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * work everywhere; injectable for tests. */
 	private readonly credentialStore: CredentialStore;
 	private readonly opts: { timeoutMs: number; streamFn?: StreamFn; retrySleepFn?: (ms: number) => Promise<void>; kernel: "legacy" | "pi-session" | "durable" };
+	/** worker_tasks read side for the conversation-context prefix (P1). */
+	private readonly workerTaskSource?: EngineOptions["workerTaskSource"];
+	/** worker_task_detail second hop (P2) handed to buildTools. */
+	private readonly workerTaskDetail?: EngineOptions["workerTaskDetail"];
 	private readonly skillLoader: SkillLoader;
 	/** Authoring surface for declarative skills (save_to_skill). */
 	private readonly skillWriter: SkillWriter;
@@ -368,6 +379,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 		options: EngineOptions = {},
 	) {
 		this.opts = { timeoutMs: options.timeoutMs ?? 0, streamFn: options.streamFn, retrySleepFn: options.retrySleepFn, kernel: options.kernel ?? "legacy" };
+		this.workerTaskSource = options.workerTaskSource;
+		this.workerTaskDetail = options.workerTaskDetail;
 		// Configured thresholds MUST reach the watchdog, otherwise every knob in
 		// Settings is dead code and the defaults silently win.
 		const pwCfg = this.config.all().general.progressWatchdog;
@@ -566,6 +579,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		inject(sourceConversation: string, message: string, senderId: string): Promise<boolean>;
 		cancelForEscape(sourceConversation: string, senderId: string, note: string): string | undefined;
 	};
+
 	/** Shared by automatic + manual mining; cursors live durably in HistoryStore. */
 	private miningInFlight = false;
 
@@ -1755,6 +1769,60 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * and correction are visible immediately. Returns the message unchanged
 	 * when there is no scoped memory.
 	 */
+	/** Inline budgets for the conversation-context prefix (context-management.md
+	 * P1 / Spill discipline). Members and recent tasks are SUMMARY lines with
+	 * IDs — never full histories; full text stays behind tool hops. */
+	private static readonly CONTEXT_MEMBER_LIMIT = 10;
+	private static readonly CONTEXT_TASK_LIMIT = 3;
+	private static readonly CONTEXT_PREFIX_BUDGET = 1200;
+
+	/** One-line context prefix: who is in this conversation + what tasks it
+	 * recently ran. This is the Chain-of-Recall first hop made Inline — the
+	 * user says "上次那个对账" and the model already holds `worker:<id>` to
+	 * pull the full record if needed, instead of asking "哪个对账？". */
+	private withConversationContext(conversationId: string, message: string): string {
+		// IM conversations only: console/sched sessions have no member roster,
+		// and injecting an empty block would be pure noise.
+		if (!/^(dt|feishu|wecom|echo):/.test(conversationId)) return message;
+		const blocks: string[] = [];
+		try {
+			// Active members, most recent speaker first (time locality). Name +
+			// id, one line — "目标按姓名解析" already works off this roster.
+			const members = (this.history.listMembers(conversationId) ?? [])
+				.filter((m) => m.name?.trim())
+				.slice(0, EmployeeEngine.CONTEXT_MEMBER_LIMIT);
+			if (members.length > 0) {
+				blocks.push(`【本会话成员（最近发言优先）】` + members.map((m) => `${m.name}(${m.staff_id})`).join("、"));
+			}
+			// Recent tasks of THIS conversation: instruction digest + result
+			// digest + id. The id is the second hop (task_detail-style tools can
+			// pull the full record when the summary is not enough).
+			const tasks = this.workerTaskSource?.listRecentForConversation(conversationId, EmployeeEngine.CONTEXT_TASK_LIMIT) ?? [];
+			const statusLabel: Record<string, string> = { queued: "排队中", running: "执行中", done: "已完成", cancelled: "已取消", failed: "失败" };
+			const lines = tasks.map((t) => {
+				const instruction = t.instruction.replace(/\s+/g, " ").slice(0, 40);
+				const outcome = (t.error || t.result || "").replace(/\s+/g, " ").slice(0, 60);
+				const when = new Date(t.created_at).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
+				return `- worker:${t.id}「${instruction}」${outcome ? `→ ${outcome}` : ""}（${statusLabel[t.status] ?? t.status}，${when}）`;
+			});
+			if (lines.length > 0) blocks.push(`【本会话最近任务】\n` + lines.join("\n"));
+		} catch (err) {
+			// Context injection is an enhancement: a failure must never poison
+			// the turn (same contract as withTurnMemoryPrefix).
+			console.warn("[engine] conversation context prefix failed — continuing without it:", err instanceof Error ? err.message : err);
+			return message;
+		}
+		if (blocks.length === 0) return message;
+		let prefix = blocks.join("\n") + "\n\n";
+		if (prefix.length > EmployeeEngine.CONTEXT_PREFIX_BUDGET) {
+			// Spill: over-budget prefix is truncated to the member line only —
+			// members are the higher-locality block for name resolution.
+			const first = blocks[0];
+			prefix = first.slice(0, EmployeeEngine.CONTEXT_PREFIX_BUDGET) + "\n\n";
+		}
+		return `【上下文速览（自动注入，可能过时；以对方当前消息为准）】\n${prefix}${message}`;
+	}
+
 	private withTurnMemoryPrefix(conversationId: string, ctx: { personOwner?: string; conversationOwner?: string }, message: string): string {
 		if (!ctx.personOwner && !ctx.conversationOwner) return message;
 		// Relevance-ranked against THIS message: only facts the turn can plausibly
@@ -2532,7 +2600,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		let degenerate = false;
 		let undeliveredSteer = false;
 		try {
-			const effectiveMessage = this.withTurnMemoryPrefix(conversationId, memoryCtx, message);
+			const effectiveMessage = this.withConversationContext(conversationId, this.withTurnMemoryPrefix(conversationId, memoryCtx, message));
 			const host = await this.ensureHost(agent, conversationId);
 			retries = await this.promptWithRetry(agent, host, conversationId, effectiveMessage, ctx?.images);
 		} catch (err) {
@@ -3492,6 +3560,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 					// Legacy/pi-session sessions take their tools ONLY from this set, so
 					// MCP must be included here for those kernels.
 					: { enabled: cfg.capabilities.mcp?.enabled ?? false, tools: this.mcpManager.tools() },
+					workerTaskDetail: this.workerTaskDetail,
 			work: this.workItems ? { items: this.workItems, fireItem: (id) => this.workBridge?.fireItem(id) ?? false, mine: (opts) => this.mineRecentWork({ ...opts, sinceTs: Date.now() - 24 * 60 * 60_000, sourceConversationId: inferConversationOrigin(conversationId) === "im" ? conversationId : undefined }) } : undefined });
 
 	}

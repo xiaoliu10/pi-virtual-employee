@@ -27,6 +27,7 @@ import type { InboundActor } from "../im/types.js";
 import { inferConversationOrigin } from "../db/history-store.js";
 import { buildSystemPrompt } from "./prompt.js";
 import { createKnowledgeTool } from "./tools/knowledge.js";
+import { createWorkerTaskDetailTool } from "./tools/worker-task.js";
 import { createSaveToKnowledgeTool, createRememberTool } from "./tools/save-knowledge.js";
 import { createManageKnowledgeTool } from "./tools/manage-knowledge.js";
 import { createSaveToSkillTool } from "./tools/save-skill.js";
@@ -94,6 +95,10 @@ export interface ToolSetOptions {
 	resolveActor: (conversationId: string) => (InboundActor & { text: string }) | undefined;
 	/** Resolve the live turn's verified person/conversation memory scope. */
 	resolveMemoryContext?: (conversationId: string) => { personOwner?: string; conversationOwner?: string };
+	/** worker_task_detail read side (context-management P2): the Chain-of-Recall
+	 * second hop behind the prefix's worker:<id> one-liners. Telemetry-flavored:
+	 * registered under the "telemetry" capability (operator floor). */
+	workerTaskDetail?: (id: string) => import("./tools/worker-task.js").WorkerTaskDetailRow | undefined;
 	/** Called after a skill is written/updated, so the engine can refresh its
 	 * skill cache and mark sessions stale without aborting the running turn. */
 	onSkillsChanged: () => Promise<void>;
@@ -256,6 +261,9 @@ export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
 	if (options.documentsEnabled)
 		tools.push(...guardAll("documents", createDocumentTools(options.documents, options.conversationId, options.resolveFileSender)));
 	if (options.filesystemEnabled) tools.push(...guardAll("filesystem", createFilesystemTools(options.filesystem)));
+	if (options.workerTaskDetail) {
+		tools.push(guarded("telemetry", createWorkerTaskDetailTool(options.workerTaskDetail)));
+	}
 	if (options.schedulerEnabled) {
 		const origin = inferConversationOrigin(options.conversationId);
 		tools.push(
