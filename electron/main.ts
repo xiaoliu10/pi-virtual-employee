@@ -550,6 +550,10 @@ async function main(): Promise<void> {
 		},
 		// Context-management P2: the second hop behind the prefix's worker:<id>.
 		workerTaskDetail: (id) => workerTaskStoreHolder.store?.get(id),
+		// Scratch sessions act for their origin chat (field 2026-11-07): inside a
+		// worker, `manage_work_items list` said「当前来源会话还没有自主任务」while
+		// the source chat owned one — tools resolved the worker's own id.
+		resolveOriginConversation: (cid) => workerTaskStoreHolder.store?.sourceForConversation(cid),
 	});
 	/** Late-bound worker_tasks store (created with the workerService below). */
 	const workerTaskStoreHolder: { store?: WorkerTaskStore } = {};

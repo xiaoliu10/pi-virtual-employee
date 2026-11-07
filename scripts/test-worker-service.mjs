@@ -169,6 +169,21 @@ test("follow-up in a conversation with no worker returns false (Router decides a
 	assert.equal(await service.inject("dt:noworker", "你好", "ma1"), false);
 });
 
+test("worker session resolves back to its SOURCE conversation for tool scoping", async () => {
+	// Field 2026-11-07 (box): inside a worker, `manage_work_items list` answered
+	// 「当前来源会话还没有自主任务」 while the source chat actually owned one —
+	// tools were scoped to the worker's own transcript id. The reverse lookup is
+	// what main.ts feeds resolveOriginConversation.
+	const { h, service } = harness();
+	const w = service.spawn({ instruction: "查自主任务", sourceConversation: "dt:group:origin", createdBy: "ma1" });
+	service.start();
+	await flush();
+	const convId = h.store.get(w.id).conversation_id;
+	assert.ok(convId, "the dispatch round recorded its durable conversation id");
+	assert.equal(h.store.sourceForConversation(convId), "dt:group:origin", "transcript id → origin chat");
+	assert.equal(h.store.sourceForConversation("dt:unknown"), undefined, "unknown ids resolve to nothing (inline fallback)");
+});
+
 test("claim is atomic: one dispatch runs exactly once", async () => {
 	const { h, service } = harness();
 	const w = service.spawn({ instruction: "x", sourceConversation: "dt:s3", createdBy: "ma1" });

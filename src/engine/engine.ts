@@ -268,6 +268,12 @@ export interface EngineOptions {
 	/** Credential store backing the Models registry. Default: FileCredentialStore
 	 * on the shared pi agent dir (auth.json). Injectable for tests. */
 	credentialStore?: CredentialStore;
+	/** Resolve the ORIGIN conversation a scratch session acts for. Worker and
+	 * scheduler rounds run on `worker:<id>` / `sched:*` transcripts but every
+	 * tool's conversation semantics (task scoping, delivery, audience) mean the
+	 * originating chat. Injected by main.ts from worker_tasks / scheduled_tasks;
+	 * absent (console/inline) = the session id itself. */
+	resolveOriginConversation?: (conversationId: string) => string | undefined;
 	/** Read side of worker_tasks for context injection (context-management P1):
 	 * recent tasks of THIS conversation, inlined as one-line summaries so "上次
 	 * 那个任务" resolves without a tool hop. Optional — tests omit it. */
@@ -319,6 +325,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 	private readonly opts: { timeoutMs: number; streamFn?: StreamFn; retrySleepFn?: (ms: number) => Promise<void>; kernel: "legacy" | "pi-session" | "durable" };
 	/** worker_tasks read side for the conversation-context prefix (P1). */
 	private readonly workerTaskSource?: EngineOptions["workerTaskSource"];
+	/** scratch session → originating IM conversation (see resolveOriginConversation). */
+	private readonly resolveOriginConversation?: EngineOptions["resolveOriginConversation"];
 	/** worker_task_detail second hop (P2) handed to buildTools. */
 	private readonly workerTaskDetail?: EngineOptions["workerTaskDetail"];
 	private readonly skillLoader: SkillLoader;
@@ -380,6 +388,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	) {
 		this.opts = { timeoutMs: options.timeoutMs ?? 0, streamFn: options.streamFn, retrySleepFn: options.retrySleepFn, kernel: options.kernel ?? "legacy" };
 		this.workerTaskSource = options.workerTaskSource;
+		this.resolveOriginConversation = options.resolveOriginConversation;
 		this.workerTaskDetail = options.workerTaskDetail;
 		// Configured thresholds MUST reach the watchdog, otherwise every knob in
 		// Settings is dead code and the defaults silently win.
@@ -3549,8 +3558,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 	buildToolSetFor(conversationId: string): AgentTool<any>[] {
 		const cfg = this.config.all();
+		// A worker/scheduler round acts for its origin chat: task scoping and
+		// delivery mean that chat, never the scratch id (field 2026-11-07).
+		const originConversationId = this.resolveOriginConversation?.(conversationId);
 
-		return buildTools({ kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), resolveMemoryContext: (cid) => this.turnMemoryContext.get(cid) ?? deriveMemoryContext(this.turnActor.get(cid), cid), onRoleRefusal: (cid, info) => this.noteAuthorizationNeeded(cid, info), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, userDataDir: this.paths.userDataDir, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules), mcp: this.opts.kernel === "durable"
+		return buildTools({ originConversationId, kbEnabled: cfg.kb.enabled, learnEnabled: cfg.kb.learn.enabled, manageEnabled: cfg.kb.manage.enabled, researchEnabled: cfg.kb.research.enabled, browserEnabled: cfg.browser.enabled, schedulerEnabled: cfg.scheduler.enabled, documentsEnabled: cfg.documents.enabled, filesystemEnabled: cfg.filesystem.enabled, reportsEnabled: cfg.reports.enabled, downloadsEnabled: cfg.downloads.enabled, knowledge: this.knowledge, browser: this.browser, computer: this.computer, scheduler: this.scheduler, documents: this.documents, filesystem: this.filesystem, reportService: this.reportService, downloadService: this.downloadService, skillWriter: this.skillWriter, userSkillsDir: this.paths.userSkillsDir, config: this.config, resolveActor: (cid) => this.turnActor.get(cid), resolveMemoryContext: (cid) => this.turnMemoryContext.get(cid) ?? deriveMemoryContext(this.turnActor.get(cid), cid), onRoleRefusal: (cid, info) => this.noteAuthorizationNeeded(cid, info), onSkillsChanged: () => this.markSkillsChanged(), onMemoryChanged: () => this.markMemoryChanged(), onConfigChanged: () => this.markConfigChanged(), listSkills: () => this.listSkills(), updates: this.updates, playwrightCliPath: this.playwrightCliPath, shellAuditLogPath: this.paths.shellAuditLogPath, userDataDir: this.paths.userDataDir, conversationId, isVisionModel: () => this.sessions.get(conversationId)?.state.model.input.includes("image") ?? false, resolveFileSender: (cid) => this.turnSendFile.get(cid), resolveImageSender: (cid) => this.turnSendImage.get(cid), screenshotDir: async () => { try { return await this.downloadService.dir(); } catch { return undefined; } }, listConversations: () => this.history.listConversations().map((c) => ({ id: c.id, title: c.title, origin: c.origin })), listMembers: (cid) => this.history.listMembers(cid).map((m) => ({ staffId: m.staff_id, name: m.name, lastSeenAt: m.last_seen_at, messageCount: m.message_count })), onToolEvent: (e) => this.recordToolTelemetry(conversationId, e), telemetry: this.telemetry, proposals: this.proposals, proposalsDir: this.paths.proposalsDir, promptLab: this.promptLab, runEvalTurn: async (input, rules) => this.runEvalTurn(`eval:${conversationId}`, rules, input), buildPromptWithRules: (rules) => this.buildPromptWithRules(conversationId, rules), mcp: this.opts.kernel === "durable"
 					// Under durable the MCP surface lives in its OWN registry
 					// extension (`ve-mcp`) so it can be replaced live — passing it here
 					// as well would register every MCP tool twice (the harness

@@ -101,6 +101,16 @@ export class WorkerTaskStore {
 	 * the context), so a follow-up is conversation CONTINUATION, not a state
 	 * transition. Follow-up turns are not recorded in this store — the store
 	 * tracks the DISPATCH round only; the durable session holds the dialogue. */
+	/** Reverse lookup: which SOURCE conversation does this transcript act for?
+	 * A worker session id (`worker:<taskId>` or the durable conversation id
+	 * stored on the row) resolves to the chat the user is actually talking in. */
+	sourceForConversation(conversationId: string): string | undefined {
+		const row = this.db.prepare(
+			"SELECT source_conversation FROM worker_tasks WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 1",
+		).get(conversationId) as unknown as { source_conversation: string } | undefined;
+		return row?.source_conversation;
+	}
+
 	/** The conversation's most recent worker — follow-ups continue it (user
 	 * ruling 2026-11-07: a follow-up is CONVERSATION, not a state transition;
 	 * the session survives `done` precisely so the dialogue keeps its context). */

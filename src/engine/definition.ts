@@ -109,6 +109,13 @@ export interface ToolSetOptions {
 	 * aborting the turn that performed it. */
 	onConfigChanged: () => void;
 	conversationId: string;
+	/** The conversation this turn logically BELONGS to when it differs from the
+	 * transcript's own id. A worker session (`worker:<id>`) acts on behalf of a
+	 * source chat: task scoping, origin filtering and delivery all mean the
+	 * SOURCE conversation, not the worker's scratch id. Absent = conversationId
+	 * (inline turns). Field 2026-11-07: inside a worker, manage_work_items list
+	 * answered「当前来源会话还没有自主任务」while the source chat owned one. */
+	originConversationId?: string;
 	/** Live vision-capability check for the session's current model (read at tool
 	 * execution time so mid-session model switches are honored). */
 	isVisionModel: () => boolean;
@@ -224,7 +231,14 @@ export function guardTool(capability: string, tool: AgentTool<any>, options: Too
 	};
 }
 
-export function buildTools(options: ToolSetOptions): AgentTool<any>[] {
+export function buildTools(input: ToolSetOptions): AgentTool<any>[] {
+	// EVERY tool below treats `conversationId` as "the conversation this turn is
+	// about". For a worker/scheduler round that is the ORIGIN chat, not the
+	// scratch transcript id — so it is resolved ONCE here and the rest of this
+	// function keeps its single, unchanged meaning.
+	const options: ToolSetOptions = input.originConversationId
+		? { ...input, conversationId: input.originConversationId }
+		: input;
 	const tools: AgentTool<any>[] = [];
 	/**
 	 * Capability guard (RBAC): wraps a tool's execute with a server-side
