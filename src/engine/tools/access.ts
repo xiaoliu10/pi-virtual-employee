@@ -81,8 +81,11 @@ function wouldKeepAnAdmin(
 	newRole: Role | undefined,
 ): boolean {
 	const people = simulated.filter((p) => p.staffId !== target);
-	if (newRole === "admin") people.push({ staffId: target, role: "admin" });
-	if (people.some((p) => p.role === "admin")) return true;
+	if (newRole === "admin" || newRole === "owner") people.push({ staffId: target, role: newRole });
+	// owner is an admin superset (ROLE_RANK): a deployment whose only remaining
+	// principal is its owner is still managed. Counting role === "admin" alone
+	// refuses a legitimate demotion with 「否则将没有任何人能管理系统」.
+	if (people.some((p) => p.role === "admin" || p.role === "owner")) return true;
 	return sec.adminStaffIds.some((id) => id !== target);
 }
 

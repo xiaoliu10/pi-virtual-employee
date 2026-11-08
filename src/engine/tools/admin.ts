@@ -239,7 +239,11 @@ export function createManageAdminTool(deps: AdminToolDeps): AgentTool {
 				if (!isSingle) return refuse("管理员名单只能在 IM 单聊中查看。");
 				// Admins come from two places: the legacy whitelist plus role-assigned
 				// admins in security.people — report both so the list is complete.
-				const roleAdmins = (deps.config.all().security.people ?? []).filter((p) => p.role === "admin").map((p) => p.staffId);
+				// owner counts as an admin (strict superset, ROLE_RANK): listing only
+				// role === "admin" hides a deployment's owner from its own admin list.
+				const roleAdmins = (deps.config.all().security.people ?? [])
+					.filter((p) => p.role === "admin" || p.role === "owner")
+					.map((p) => p.staffId);
 				const all = [...new Set([...adminIds, ...roleAdmins])];
 				if (all.length === 0) {
 					return {
@@ -307,7 +311,11 @@ export function createManageAdminTool(deps: AdminToolDeps): AgentTool {
 			if (current.length <= 1) {
 				// Removing the last whitelist entry is only safe when another admin
 				// still exists via a role assignment in security.people.
-				const roleAdmins = (deps.config.all().security.people ?? []).filter((p) => p.role === "admin" && p.staffId !== target);
+				// "Last admin" must count owners too — otherwise removing the last
+				// whitelisted admin looks safe while the only remaining principal is
+				// an owner, and the guard fires on an already-managed deployment.
+				const roleAdmins = (deps.config.all().security.people ?? [])
+					.filter((p) => (p.role === "admin" || p.role === "owner") && p.staffId !== target);
 				if (roleAdmins.length === 0) {
 					return refuse("不能移除最后一位管理员（否则将没有任何人能通过对话管理系统）。如需更换，请先添加新的管理员，或用 manage_access 指派另一位 admin 角色。");
 				}

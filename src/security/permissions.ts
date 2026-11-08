@@ -193,13 +193,25 @@ export function isOwner(config: ConfigStore, senderId: string | undefined | null
 }
 
 /**
- * True when the deployment has at least one admin configured. False = UNCLAIMED,
- * where the first explicit confirmer in a 1:1 chat becomes the first admin.
+ * True when the deployment has at least one admin-or-owner configured. False =
+ * UNCLAIMED, where the first explicit confirmer in a 1:1 chat becomes the first
+ * admin.
+ *
+ * `owner` counts (field 2026-11-08). This is the UNCLAIMED probe every admin
+ * gate consults BEFORE it looks at the caller's own role, so omitting owner here
+ * refuses the deployment's owner with 「管理员尚未设置」 on a deployment that is
+ * plainly claimed — the exact inversion of the superset contract in
+ * ROLE_RANK above. A deployment whose only configured principal is its owner is
+ * claimed, and that owner must be able to run manage_settings.
  */
 export function hasAnyAdmin(config: ConfigStore): boolean {
 	const sec = config.all().security;
 	if (sec.adminStaffIds.length > 0) return true;
-	return (sec.people ?? []).some((p) => asRole(p.role) === "admin");
+	if (Array.isArray(sec.ownerStaffIds) && sec.ownerStaffIds.length > 0) return true;
+	return (sec.people ?? []).some((p) => {
+		const role = asRole(p.role);
+		return role === "admin" || role === "owner";
+	});
 }
 
 /** Capability keys a conversation floor may set (validation set for the config tool). */
