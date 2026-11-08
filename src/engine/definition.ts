@@ -245,8 +245,31 @@ export function buildTools(input: ToolSetOptions): AgentTool<any>[] {
 				// under the origin chat. Without this, every admin check inside a
 				// worker would see "no verified actor" and silently downgrade an
 				// owner to a non-admin (field 2026-11-07).
-				resolveActor: (cid) =>
-					input.resolveActor(cid) ?? (cid === input.originConversationId ? input.resolveActor(input.conversationId) : undefined),
+				// The fallback must return an actor that AGREES with the rewritten
+				// conversationId, or every IM-shaped check downstream (verifiedIMActor
+				// wants chatType single|group + a matching dt: prefix) fails on a
+				// mismatch that does not exist: conversationId is the ORIGIN chat
+				// (dt:group:…), while the only live turn actor is stamped on the
+				// worker transcript (worker:…), so its chatType is the worker's.
+				//
+				// Field 2026-11-07: an OWNER asked inside a worker to change their own
+				// task's prompt and was told 「只能到任务来源的群聊里操作」 — the owner
+				// exemption in work.ts never got a chance to run because the actor
+				// never verified. Reported as 「我是最高权限，我应该可以修改任何配置和
+				// 任务」. Identity (senderId) is what authorization needs; the channel
+				// labels describe the chat we are ACTING FOR, so they come from the
+				// origin chat.
+				resolveActor: (cid) => {
+					const direct = input.resolveActor(cid);
+					if (direct) return direct;
+					if (cid !== input.originConversationId) return undefined;
+					const scratch = input.resolveActor(input.conversationId);
+					if (!scratch) return undefined;
+					const origin = input.originConversationId;
+					const channel = origin.startsWith("dt:") ? "dingtalk" : scratch.channel;
+					const chatType = origin.startsWith("dt:group:") ? "group" : origin.startsWith("dt:") ? "single" : scratch.chatType;
+					return { ...scratch, channel, chatType, conversationId: origin };
+				},
 			}
 		: input;
 	const tools: AgentTool<any>[] = [];
