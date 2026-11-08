@@ -4,6 +4,14 @@
 
 开源前的内部迭代细节不在此逐一罗列（完整历史见 git log）；以下从开源基线版本开始记录。
 
+## 0.2.207
+
+### English
+- **「重新执行」now actually re-runs, deterministically**: the interrupt notice promised「回复『重新执行』我就重跑这一轮」— but when the user replied exactly that, the model asked「请告诉我要重新执行的具体任务是什么？」. Three defects stacked: the worker session's transcript is in-memory only (30 minutes of work history died with the restart), the notice never landed in the group's history (pushes are transport-only), and no code recognized the word. Now `inject()` intercepts the exact reply before routing: it finds the interrupted row in `worker_tasks` (where the original instruction survives verbatim) and spawns a NEW worker with the same instruction/source/creator/budget — zero dependence on any session history, zero model turns wasted asking "what should I re-run?". Conversational deliveries (the notice, the confirmation, the final result) now also land in the conversation's history, so the model reading the chat sees the full thread.
+
+### 中文
+- **「重新执行」现在真的会重跑，而且是确定性的**：中断通知承诺「回复『重新执行』我就重跑这一轮」——用户照做了，模型却回「请告诉我要重新执行的具体任务是什么？」。三层缺陷叠加：worker 会话的 transcript 是纯内存（30 分钟工作历史随重启消失）、通知从未落入群聊历史（推送只是传输层）、没有任何代码认识「重新执行」这个词。现在 `inject()` 在路由之前拦截这个精确回复：直接在 `worker_tasks` 表里找到被中断的行（原始指令原文就在那里），用它同样的指令/来源/创建人/预算 spawn 全新 worker——完全不依赖任何会话历史，不浪费一个模型回合去问「要重跑什么」。对话性投递（中断通知、重跑确认、最终结果）现在也会落入会话历史，群里模型能看到完整脉络。
+
 ## 0.2.206
 
 ### English
