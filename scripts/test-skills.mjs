@@ -332,3 +332,19 @@ test("disabling pi-auto-research removes BOTH its body and the preamble research
 		"disabling the skill must also drop the preamble research hint (review M2)");
 	assert.ok(without.includes("pi-knowledge-base"), "other skills still load");
 });
+
+test("a matching skill must be EXECUTED, not answered with a capability disclaimer", async () => {
+	// Field 2026-11-08 (Nova, 「查一下这笔流水的支付渠道下单日志」): the exact skill
+	// for that task was inlined right there, and the model replied 「我运行在一个
+	// 临时的本地会话环境中，没有连接到你公司的支付系统…请把日志贴给我」 without ever
+	// running it. Skills are inlined in full precisely so the model CAN run them —
+	// the preamble must forbid declaring inability before trying.
+	const loader = new SkillLoader(join(root, "resources", "skills"), join(dataDir, "unused-user"));
+	const { skills } = await loader.list();
+	const block = formatInlineSkills(skills);
+	assert.match(block, /匹配到技能就必须按它去做/, "the preamble must demand execution");
+	assert.match(block, /严禁在未执行技能前就回答/, "and forbid the pre-execution disclaimer");
+	// The ban must live in the PREAMBLE (always present), not inside one skill body.
+	const firstSkill = block.indexOf("<skill name=");
+	assert.ok(block.indexOf("匹配到技能就必须按它去做") < firstSkill, "preamble comes before any skill body");
+});

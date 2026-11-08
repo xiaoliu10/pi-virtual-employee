@@ -53,6 +53,12 @@ const INTEGRITY_MARKERS = [
 // One semantic marker per discipline line (review P3): a dropped line must
 // fail these assertions, so every one of the six lines is individually pinned.
 const DISCIPLINE_MARKERS = [
+	// Field 2026-11-08 (Nova): a matching skill sat unused while the model answered
+	// "我无法查询…我运行在临时的本地会话环境中". Declaring yourself unable without
+	// trying an available path is fabricating a refusal — it must stay in the
+	// immutable discipline block.
+	"不许未尝试就声明做不到",
+	"能力自述必须基于本轮真实失败",
 	"## 执行与验收纪律（内置，勿删）",
 	"结论必须有本轮工具证据支撑",
 	"原因尚未确认",
