@@ -30,7 +30,7 @@ await build({
 		contents: `
 			export { EmployeeEngine, TRANSIENT_RETRIES, LENGTH_EMPTY_GIVE_UP, transientRetryBackoffMs, isDegenerateReplyText } from "./src/engine/engine.ts";
 			export { estimateTokensSafe } from "./src/engine/context.ts";
-			export { ConfigStore } from "./src/db/config-store.ts";
+			export { ConfigStore, DEFAULTS } from "./src/db/config-store.ts";
 			export { HistoryStore } from "./src/db/history-store.ts";
 			export { FileCredentialStore } from "./src/engine/credential-store.ts";
 			export { agents } from "@earendil-works/pi-agent-core";
@@ -154,7 +154,7 @@ await build({
 		},
 	],
 });
-const { EmployeeEngine, TRANSIENT_RETRIES, LENGTH_EMPTY_GIVE_UP, transientRetryBackoffMs, isDegenerateReplyText, estimateTokensSafe, ConfigStore, HistoryStore, FileCredentialStore } = await import(pathToFileURL(bundle).href);
+const { EmployeeEngine, TRANSIENT_RETRIES, LENGTH_EMPTY_GIVE_UP, transientRetryBackoffMs, isDegenerateReplyText, estimateTokensSafe, ConfigStore, HistoryStore, FileCredentialStore, DEFAULTS } = await import(pathToFileURL(bundle).href);
 
 /** Real engine + injected retry-sleep capturing the backoff schedule. */
 function makeEngine(t, { streamFn, retrySleepFn } = {}) {
@@ -684,7 +684,11 @@ test("undelivered steer warning survives a tool-cap final-summary overwrite", as
 		result = await sendPromise;
 	}
 	assert.equal(runs, 2, "the real tool-cap hook forces a final summary");
-	assert.match(result.reply, /^已保存结果，剩余任务未完成/);
+	// The cap reply now LEADS with the cause notice (field 2026-11-08: a bare
+	// summary left the user with no idea why the run stopped) — the invariant is
+	// containment: the summary AND the steer warning both survive.
+	assert.match(result.reply, /已保存结果，剩余任务未完成/);
+	assert.match(result.reply, /工具调用已达上限（1 步）/, "the cause notice must be present");
 	assert.doesNotMatch(result.reply, /正在处理工具步骤/, "summary replaces the initial narration");
 	assert.match(result.reply, /有中途指令尚未送达模型/);
 	assert.equal(result.deterministic, false, "the summary remains a model outcome");
@@ -851,4 +855,50 @@ test("cumulative budget accumulates per tool step and resets with each user turn
 	assert.equal(map.size, 0, "the counter must be cleared when the user turn ends (otherwise the next turn aborts instantly)");
 	await engine.send(agent, "second turn");
 	assert.equal(map.size, 0, "and again on the second message");
+});
+
+test("maxToolSteps=0 never trips the cap on a normal single-turn run", async (t) => {
+	// The 0=unlimited branch (`if (max <= 0) return`) lives in the pi-session
+	// loop's finishTurn hook; with the shipped default (0), no run may end with
+	// a cap-stop notice — the ops task that typed a 19-digit id key-by-key died
+	// on the old 20-step cap (field 2026-11-08).
+	let runs = 0;
+	const { engine, config } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		return {
+			async *[Symbol.asyncIterator]() {},
+			result: async () => ({ role: "assistant", content: [{ type: "text", text: `step answer ${runs}` }], stopReason: "stop" }),
+		};
+	} });
+	supplierConfig(config);
+	config.update({ general: { maxToolSteps: 0 } });
+	const agent = engine.getOrCreateSession("conv-cap-unlimited");
+	const result = await engine.send(agent, "do a task");
+	assert.doesNotMatch(result.reply, /工具调用已达上限/, "unlimited steps must not produce a cap notice");
+	assert.match(result.reply, /step answer/, "the normal reply path is untouched");
+});
+
+test("the shipped default is unlimited (maxToolSteps=0)", () => {
+	assert.equal(DEFAULTS.general.maxToolSteps, 0, "defaults must not carry the old 99/20 caps");
+});
+
+test("a tool-cap stop explains WHY and how to continue (formatCapHitReply)", async (t) => {
+	// Field 2026-11-08: the old `capSummary || notice` short-circuit dropped the
+	// cause whenever a summary existed — the user got a bare task summary with
+	// no idea the run was stopped or that 「继续」 resumes it.
+	let runs = 0;
+	const { engine, config } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		return {
+			async *[Symbol.asyncIterator]() {},
+			result: async () => ({ role: "assistant", content: [{ type: "text", text: `working ${runs}` }], stopReason: "stop" }),
+			toolResults: [{ role: "toolResult", content: [{ type: "text", text: `r${runs}` }] }],
+		};
+	} });
+	supplierConfig(config);
+	config.update({ general: { maxToolSteps: 1 } });
+	const agent = engine.getOrCreateSession("conv-cap-explain");
+	const result = await engine.send(agent, "do a long task");
+	assert.match(result.reply, /本轮工具调用已达上限（1 步）/, "the cause must be present");
+	assert.match(result.reply, /回复「继续」/, "and the resume hint");
 });

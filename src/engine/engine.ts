@@ -57,6 +57,22 @@ export function isEngineAbortText(cause: string): boolean {
 export function engineAbortFailureText(): string {
 	return "⚠️ 这次执行被系统中止了。常见原因：① 长时间无进展，被看门狗主动停止；② 发送了停止指令；③ 应用重启或更新。已完成的部分已保留，可以回复「继续」从当前进度接着做。";
 }
+
+/** The reply for a turn cut short by the tool-step cap (field 2026-11-08).
+ * The old code was `capSummary || notice` — a generated summary SHORT-CIRCUITED
+ * the explanation, so the user got a bare task summary with no idea the run had
+ * been stopped or how to continue. Cause + next step always come first. */
+export function formatCapHitReply(max: number, capSummary: string | null | undefined): string {
+	const summary = capSummary?.trim();
+	if (!summary) {
+		return `⚠️ 本轮已达到工具调用上限（${max} 步），系统已停止继续调用工具。当前任务可能尚未完成，请提高上限后重试，或把任务拆成更小的步骤。`;
+	}
+	const notice =
+		`⚠️ 本轮工具调用已达上限（${max} 步），任务尚未完成——不是做不了，是本轮步数用完了。\n\n` +
+		"接下来：回复「继续」即可从当前进度接着做；这类需要大量逐步操作的任务，可在设置里调高 maxToolSteps。\n\n" +
+		"以下是本轮已完成的进展：";
+	return `${notice}\n\n${summary}`;
+}
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { Api, AuthInteraction, AuthPrompt, AuthEvent, CredentialStore, ImageContent, Model, MutableModels, TextContent, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { ConfigStore, Supplier } from "../db/config-store.js";
@@ -2757,9 +2773,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 					"以下是本轮已完成的进展：";
 				reply = capSummary?.trim() ? `${notice}\n\n${capSummary}` : notice;
 			} else {
-				reply =
-					capSummary ||
-					`⚠️ 本轮已达到工具调用上限（${max} 步），系统已停止继续调用工具。当前任务可能尚未完成，请提高上限后重试，或把任务拆成更小的步骤。`;
+				reply = formatCapHitReply(max, capSummary);
 			}
 		}
 
