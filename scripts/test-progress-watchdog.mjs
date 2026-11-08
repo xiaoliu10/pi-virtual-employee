@@ -86,6 +86,45 @@ test("100 distinct calls never escalate (the core constraint)", () => {
 	assert.equal(wd.level("c1"), 0);
 });
 
+test("OBSERVATION: repeated identical browser_screenshot is a legal wait, not a loop", () => {
+	// Field 2026-11-08 (the box): a worker drove a browser through a bastion login
+	// and polled browser_screenshot while the page loaded. Three byte-identical
+	// frames tripped identicalWarnAfter (3) and the watchdog soft-stopped a
+	// HEALTHY turn — the user saw 「执行未完成：This operation was aborted」 while
+	// idleMs=13, llmInFlight=0, 最近活动 0s (the task was visibly working).
+	const { wd } = makeWatchdog();
+	const fp = "same-frame";
+	// THREE identical shots — the exact count that killed the real turn.
+	for (let i = 1; i <= 3; i++) {
+		assert.notEqual(wd.touch("c1", fp, { toolName: "browser_screenshot" }), "identical-loop",
+			`shot #${i} must NOT be judged a loop`);
+	}
+	// Past the observation allowance it IS a dead loop: an observer that never
+	// sees anything new must still be stopped.
+	let hit = null;
+	for (let i = 4; i <= 12 && !hit; i++) {
+		const v = wd.touch("c1", fp, { toolName: "browser_screenshot" });
+		if (v === "identical-loop") hit = i;
+	}
+	assert.ok(hit, "an observer that never sees new content must eventually be stopped");
+	assert.ok(hit > 3, `the allowance must be larger than identicalWarnAfter, stopped at #${hit}`);
+});
+
+test("OBSERVATION does not exempt mutation tools (a hot write loop still halts)", () => {
+	const { wd } = makeWatchdog();
+	const fp = "same-write";
+	const seen = [];
+	for (let i = 1; i <= 4; i++) seen.push(wd.touch("c1", fp, { toolName: "browser_type" }));
+	assert.ok(seen.includes("identical-loop"), "a repeated identical MUTATION is a loop and must halt");
+});
+
+test("OBSERVATION resets the moment something new appears", () => {
+	const { wd } = makeWatchdog();
+	for (let i = 0; i < 5; i++) wd.touch("c1", "frame-A", { toolName: "browser_screenshot" });
+	const v = wd.touch("c1", "frame-B", { toolName: "browser_screenshot" });
+	assert.equal(v, "progress", "a CHANGED screen is new work — the allowance must not pin the turn");
+});
+
 test("same fingerprint repeats: idle inside the window, nudge at it, soft-stop at the second", () => {
 	const { wd, now } = makeWatchdog();
 	wd.touch("c1", "fp");

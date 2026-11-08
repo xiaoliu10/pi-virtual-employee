@@ -314,9 +314,14 @@ export function createManageAdminTool(deps: AdminToolDeps): AgentTool {
 				// "Last admin" must count owners too — otherwise removing the last
 				// whitelisted admin looks safe while the only remaining principal is
 				// an owner, and the guard fires on an already-managed deployment.
-				const roleAdmins = (deps.config.all().security.people ?? [])
+				const sec = deps.config.all().security;
+				const roleAdmins = (sec.people ?? [])
 					.filter((p) => (p.role === "admin" || p.role === "owner") && p.staffId !== target);
-				if (roleAdmins.length === 0) {
+				// The whitelists carry the rank too, and hasAnyAdmin counts them —
+				// so this guard must also accept an ownerStaffIds grant outside the
+				// people[] list (the mirror of access.ts's wouldKeepAnAdmin).
+				const otherOwner = (sec.ownerStaffIds ?? []).some((id) => id !== target);
+				if (roleAdmins.length === 0 && !otherOwner) {
 					return refuse("不能移除最后一位管理员（否则将没有任何人能通过对话管理系统）。如需更换，请先添加新的管理员，或用 manage_access 指派另一位 admin 角色。");
 				}
 			}

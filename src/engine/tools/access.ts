@@ -75,7 +75,7 @@ function capabilityLegend(): string {
  * (where the next person to say 「确认」 in a 1:1 chat would become admin).
  */
 function wouldKeepAnAdmin(
-	sec: { adminStaffIds: string[]; people?: { staffId: string; role: string }[] },
+	sec: { adminStaffIds: string[]; ownerStaffIds?: string[]; people?: { staffId: string; role: string }[] },
 	simulated: { staffId: string; role: string }[],
 	target: string,
 	newRole: Role | undefined,
@@ -86,6 +86,20 @@ function wouldKeepAnAdmin(
 	// principal is its owner is still managed. Counting role === "admin" alone
 	// refuses a legitimate demotion with 「否则将没有任何人能管理系统」.
 	if (people.some((p) => p.role === "admin" || p.role === "owner")) return true;
+	// The whitelists are the OTHER way to carry the rank, and hasAnyAdmin counts
+	// them — so this guard must too, or a deployment managed purely through
+	// ownerStaffIds/adminStaffIds loses the ability to demote anyone.
+	//
+	// resolveRole's precedence is people[] > ownerStaffIds > adminStaffIds: the
+	// people[] entry this demotion WRITES for `target` shadows any whitelist
+	// grant the target holds. So the target must be EXCLUDED from the whitelist
+	// checks below — otherwise demoting the only owner looks safe ("still an
+	// owner via ownerStaffIds") while resolveRole now returns viewer, leaving
+	// the deployment CLAIMED (hasAnyAdmin still counts the list) with NO
+	// effective administrator — recoverable only through the desktop UI.
+	// (The exclusion is the load-bearing line: whitelist.some(id => id !==
+	// target).)
+	if ((sec.ownerStaffIds ?? []).some((id) => id !== target)) return true;
 	return sec.adminStaffIds.some((id) => id !== target);
 }
 

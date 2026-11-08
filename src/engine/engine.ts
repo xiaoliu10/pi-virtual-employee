@@ -2761,7 +2761,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string },
 	): void {
 		this.touchActivity(conversationId); // tool start/end — life, even without telemetry
-		if (event.fingerprint) this.noteToolProgress(conversationId, event.fingerprint);
+		if (event.fingerprint) this.noteToolProgress(conversationId, event.fingerprint, event.name);
 		if (!this.telemetry) return;
 		try {
 			this.turnToolCalls.set(conversationId, (this.turnToolCalls.get(conversationId) ?? 0) + 1);
@@ -2781,7 +2781,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * the level to zero inside the watchdog, so a task that started moving
 	 * again is never touched.
 	 */
-	private noteToolProgress(conversationId: string, fingerprint: string): void {
+	private noteToolProgress(conversationId: string, fingerprint: string, toolName?: string): void {
 		// Defensive: a watchdog failure must never break the tool call it merely
 		// observes. `general` is optional in some host configs, so the whole
 		// evaluation is wrapped rather than relying on optional chaining alone.
@@ -2799,7 +2799,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// "manage_process poll -> 仍在运行" fingerprint a LEGAL wait. Feed the
 			// watchdog that fact so it defers instead of aborting the turn.
 			const hasRunningBackground = this.inventoryBackgroundProcesses(conversationId).length > 0;
-			verdict = this.progress.touch(conversationId, fingerprint, { hasRunningBackground });
+			verdict = this.progress.touch(conversationId, fingerprint, { hasRunningBackground, toolName });
 		} catch {
 			return; // observing must never become a failure mode
 		}

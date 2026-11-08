@@ -54,9 +54,28 @@ export interface ProgressWatchdogOptions {
 	identicalWarnAfter: number;
 	/** Nth identical fingerprint in a row that aborts the turn outright. */
 	identicalHaltAfter: number;
-	/** Longest multi-call cycle period detected (A,B,A,B = 2). Consecutive
+	/** Longest multi-call cycle detected (A,B,A,B = 2). Consecutive
 	 * streaks cannot see these: every alternation resets the counter. */
 	maxCyclePeriod: number;
+	/** Tools whose repeated identical result is a LEGAL observation, not a loop.
+	 *
+	 * Field 2026-11-08 (the box): a worker drove a browser through a bastion login
+	 * and polled `browser_screenshot` three times while the page loaded. The three
+	 * frames were byte-identical (still spinning), so `identicalCount` hit
+	 * `identicalWarnAfter` and the watchdog soft-stopped a HEALTHY turn — the user
+	 * saw 「执行未完成：This operation was aborted」 on a task that was making
+	 * progress (llmInFlight=0, 最近活动 0s at the moment of the stop).
+	 *
+	 * Watching the same screen twice is how automation waits for a page to settle;
+	 * it is not spinning. These tools therefore get a SEPARATE, larger threshold
+	 * (`observationRepeatAfter`): repeated identical frames are tolerated far
+	 * longer, but never forever — an agent that keeps screenshotting without ever
+	 * changing anything is still a dead loop and must be stopped. */
+	observationTools: readonly string[];
+	/** Identical consecutive repeats allowed for an `observationTools` call before
+	 * it is judged a loop. Larger than `identicalWarnAfter` because looking at an
+	 * unchanged screen is legal; finite so a truly stuck observer is still caught. */
+	observationRepeatAfter: number;
 	/** Injectable clock for tests. */
 	now?: () => number;
 }
@@ -70,6 +89,23 @@ export const PROGRESS_WATCHDOG_DEFAULTS: ProgressWatchdogOptions = {
 	identicalWarnAfter: 3,
 	identicalHaltAfter: 5,
 	maxCyclePeriod: 4,
+	// Observation surfaces: an unchanged screen is a legal wait, not a loop.
+	// 8 repeats ~= several minutes of polling at typical cadence, after which a
+	// truly stuck observer is still stopped (the halt threshold scales with it).
+	observationTools: [
+		"browser_screenshot",
+		"browser_read",
+		"browser_evaluate",
+		"view_image",
+		"read_file",
+		"list_directory",
+		"list_downloads",
+		"list_documents",
+		"manage_process",
+		"check_my_access",
+		"get_current_time",
+	],
+	observationRepeatAfter: 8,
 };
 
 export type ProgressTouch =
@@ -176,11 +212,22 @@ export class ProgressWatchdog {
 		this.now = options.now ?? Date.now;
 	}
 
+	/** True for tools whose repeated identical result means "nothing changed yet"
+	 * rather than "the agent is stuck". Configured, never inferred from a name
+	 * pattern — a regex over tool names would silently exempt a future tool. */
+	private isObservationTool(name: string): boolean {
+		return this.options.observationTools.includes(name);
+	}
+
 	/**
 	 * Record one tool call outcome. Returns what the engine should do about it.
 	 * `idle` = a repeat, but the window has not run out yet — do nothing.
 	 */
-	touch(conversationId: string, fingerprint: string, opts?: { hasRunningBackground?: boolean }): ProgressTouch {
+	touch(
+		conversationId: string,
+		fingerprint: string,
+		opts?: { hasRunningBackground?: boolean; toolName?: string },
+	): ProgressTouch {
 		const now = this.now();
 		let state = this.states.get(conversationId);
 		if (!state) {
@@ -210,8 +257,16 @@ export class ProgressWatchdog {
 		const legalWait = opts?.hasRunningBackground === true;
 		const fastLoop = now - state.lastProgressAt < this.options.stallWindowMs / 2;
 		if (!legalWait && fastLoop) {
-			// Consecutive identical: the trivial hot loop.
-			if (state.identicalCount >= this.options.identicalWarnAfter) return "identical-loop";
+			// Consecutive identical: the trivial hot loop — EXCEPT for observation
+			// tools, where an unchanged result is the expected answer while a page
+			// or process settles (field 2026-11-08: three identical
+			// browser_screenshot calls during a bastion login soft-stopped a
+			// healthy turn). The allowance is FINITE: past `observationRepeatAfter`
+			// an observer that never sees anything new is a dead loop too.
+			const observationLimit = opts?.toolName && this.isObservationTool(opts.toolName)
+				? this.options.observationRepeatAfter
+				: this.options.identicalWarnAfter;
+			if (state.identicalCount >= observationLimit) return "identical-loop";
 			// Repeating multi-call cycle (A,B,A,B): each alternation resets the
 			// streak above, so the history walk is the only thing that sees it.
 			if (this.detectCycle(state.history)) return "cycle-loop";
