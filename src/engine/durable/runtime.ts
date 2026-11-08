@@ -83,6 +83,11 @@ interface RuntimeOptions {
 	 *  Optional: a caller with no MCP support (tests, standalone hosts) omits it and
 	 *  the durable host simply carries an empty `ve-mcp` extension. */
 	mcpTools?(id: string): AgentTool<any>[];
+	/** Turn-input composer (review 1796f433 #1): durable turns otherwise submit
+	 * the RAW text, bypassing the task brief / memory prefix the legacy path
+	 * applies — prefixes are prompt-only and must never reach history. Optional
+	 * so tests and standalone hosts keep working without it. */
+	turnInput?(id: string, text: string, ctx?: { actor?: unknown }): string;
 	stream(id: string, options: SimpleStreamOptions, messages: Message[]): ReturnType<StreamFn>;
 	withActor<T>(id: string, ctx: SendCtx, text: string, run: () => Promise<T>): Promise<T>;
 	onRecovered(id: string, result: SendResult, occurrenceId: string): Promise<void>;
@@ -425,7 +430,8 @@ export class DurableRuntime {
 			this.opts.history.ensureConversation(id, text.slice(0, 40));
 			this.opts.history.appendMessage(id, "user", text);
 			ctx?.onPersist?.(id);
-			const content = ctx?.images?.length ? [{ type: "text" as const, text }, ...ctx.images.map((image) => ({ type: "image" as const, ...image }))] : text;
+			const effectiveText = this.opts.turnInput ? this.opts.turnInput(id, text, ctx?.actor ? { actor: ctx.actor } : undefined) : text;
+			const content = ctx?.images?.length ? [{ type: "text" as const, text: effectiveText }, ...ctx.images.map((image) => ({ type: "image" as const, ...image }))] : effectiveText;
 			const submission = await conv.submit({ type: "input", content, requestId: `ve:${conv.id}` }, context);
 			const outcome = await submission.wait(context);
 			const result = await this.result(conv, outcome.status === "done" ? outcome.answer : undefined);

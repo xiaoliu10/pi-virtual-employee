@@ -827,6 +827,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			userDataDir, history: this.history,
 			session: (id) => this.getOrCreateSession(id),
 			tools: (id) => this.buildToolSetFor(id),
+			turnInput: (id, text, ctx) => this.buildTurnInputFor(id, text, ctx as { actor?: import("../im/types.js").InboundActor } | undefined),
 			mcpTools: (id) => this.mcpToolsFor(id),
 			stream: (id, options, messages) => {
 				const { supplier, modelId } = this.resolveForConversation(id);
@@ -1898,6 +1899,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 	private static readonly CONTEXT_MEMBER_LIMIT = 10;
 	private static readonly CONTEXT_TASK_LIMIT = 3;
 	private static readonly CONTEXT_PREFIX_BUDGET = 1200;
+	/** worker_tasks 的真实状态词汇表——中断写的是 error 不是 failed（review
+	 * e6c6fd82.../1796f433 #2：词汇不匹配时裸英文 error 直接漏进中文简报）。 */
+	private static readonly TASK_STATUS_LABEL: Record<string, string> = {
+		queued: "排队中", running: "执行中", done: "已完成", cancelled: "已取消", error: "失败",
+	};
 
 	/** One-line context prefix: who is in this conversation + what tasks it
 	 * recently ran. This is the Chain-of-Recall first hop made Inline — the
@@ -1927,12 +1933,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// digest + id. The id is the second hop (task_detail-style tools can
 			// pull the full record when the summary is not enough).
 			const tasks = this.workerTaskSource?.listRecentForConversation(conversationId, EmployeeEngine.CONTEXT_TASK_LIMIT) ?? [];
-			const statusLabel: Record<string, string> = { queued: "排队中", running: "执行中", done: "已完成", cancelled: "已取消", failed: "失败" };
 			const lines = tasks.map((t) => {
 				const instruction = t.instruction.replace(/\s+/g, " ").slice(0, 40);
 				const outcome = (t.error || t.result || "").replace(/\s+/g, " ").slice(0, 60);
 				const when = new Date(t.created_at).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
-				return `- worker:${t.id}「${instruction}」${outcome ? `→ ${outcome}` : ""}（${statusLabel[t.status] ?? t.status}，${when}）`;
+				return `- worker:${t.id}「${instruction}」${outcome ? `→ ${outcome}` : ""}（${EmployeeEngine.TASK_STATUS_LABEL[t.status] ?? t.status}，${when}）`;
 			});
 			if (lines.length > 0) blocks.push(`【本会话最近任务】\n` + lines.join("\n"));
 		} catch (err) {
@@ -1953,6 +1958,19 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	/**
+	 * The composed turn input (task brief + memory prefix) — the SAME
+	 * composition the legacy/pi-session path applies inline. Durable turns call
+	 * this from the runtime boundary (review 1796f433 #1: the brief was
+	 * legacy-only while durable is the DEFAULT kernel, so the fix never ran on
+	 * a default deployment). The raw text keeps reaching appendMessage —
+	 * prefixes are prompt-only and never persisted.
+	 */
+	buildTurnInputFor(conversationId: string, text: string, ctx?: { actor?: import("../im/types.js").InboundActor }): string {
+		const memoryCtx = deriveMemoryContext(ctx?.actor, conversationId);
+		return this.withConversationContext(conversationId, this.withTurnMemoryPrefix(conversationId, memoryCtx, text));
+	}
+
+	/**
 	 * Worker-session task brief: what THIS worker is for, what ELSE the source
 	 * conversation has, and an explicit boundary rule. The field failure was a
 	 * worker answering a question about a DIFFERENT task with its own task's
@@ -1962,26 +1980,33 @@ export class EmployeeEngine implements EmployeeRuntime {
 	private withWorkerTaskBrief(conversationId: string, message: string): string {
 		const blocks: string[] = [];
 		try {
-			const statusLabel: Record<string, string> = { queued: "排队中", running: "执行中", done: "已完成", cancelled: "已取消", failed: "失败" };
 			const own = this.workerTaskDetail?.(conversationId.slice("worker:".length));
 			if (own) {
-				blocks.push(`【你手上的任务】${conversationId}「${own.instruction.replace(/\s+/g, " ").slice(0, 50)}」（${statusLabel[own.status] ?? own.status}）`);
+				blocks.push(`【你手上的任务】${conversationId}「${own.instruction.replace(/\s+/g, " ").slice(0, 50)}」（${EmployeeEngine.TASK_STATUS_LABEL[own.status] ?? own.status}）`);
 				// The SOURCE conversation's other tasks: what the user might be
 				// referring to when they say 「那…呢」 without naming the task.
-				const others = (this.workerTaskSource?.listRecentForConversation(own.source_conversation, 5) ?? [])
-					.filter((t) => t.id !== own.id);
+				// Fetch limit+1 then filter: the own task is usually the newest
+				// row and would eat one of the slots otherwise (review #6).
+				const others = (this.workerTaskSource?.listRecentForConversation(own.source_conversation, 6) ?? [])
+					.filter((t) => t.id !== own.id)
+					.slice(0, 5);
+				let boundary =
+					"【边界】用户这条消息如果问的不是你手上的任务：如实说明你只负责「你手上的任务」";
 				if (others.length > 0) {
 					const lines = others.map((t) => {
 						const instruction = t.instruction.replace(/\s+/g, " ").slice(0, 40);
 						const outcome = (t.error || t.result || "").replace(/\s+/g, " ").slice(0, 60);
-						return `- worker:${t.id}「${instruction}」${outcome ? `→ ${outcome}` : ""}（${statusLabel[t.status] ?? t.status}）`;
+						return `- worker:${t.id}「${instruction}」${outcome ? `→ ${outcome}` : ""}（${EmployeeEngine.TASK_STATUS_LABEL[t.status] ?? t.status}）`;
 					});
 					blocks.push(`【同一来源会话的其他任务（不是你负责的）】\n` + lines.join("\n"));
+					boundary += "，把上面其他任务的状态转述给用户参考";
+				} else {
+					// Review #5: with no others listed, pointing at 「上面其他任务」
+					// invites hedging or invention — say plainly there are none.
+					boundary += "。本会话没有查到其他任务，不要编造其他任务的进展";
 				}
-				blocks.push(
-					"【边界】用户这条消息如果问的不是你手上的任务：如实说明你只负责「你手上的任务」，把上面其他任务的状态转述给用户参考；" +
-						"绝不把自己任务的产物当作其他任务的结果回复，也不要编造其他任务的进展。",
-				);
+				boundary += "；绝不把自己任务的产物当作其他任务的结果回复。";
+				blocks.push(boundary);
 			}
 		} catch (err) {
 			// Same contract as withConversationContext: an enhancement must never
@@ -1992,8 +2017,16 @@ export class EmployeeEngine implements EmployeeRuntime {
 		if (blocks.length === 0) return message;
 		let prefix = blocks.join("\n") + "\n\n";
 		if (prefix.length > EmployeeEngine.CONTEXT_PREFIX_BUDGET) {
-			const first = blocks[0];
-			prefix = first.slice(0, EmployeeEngine.CONTEXT_PREFIX_BUDGET) + "\n\n";
+			// Review #4: over budget, keep the OWN-TASK line and the BOUNDARY rule
+			// (the payload of this fix) and drop the others block first — the
+			// boundary is the part that prevents the field failure.
+			const keep = [blocks[0], blocks[blocks.length - 1]].filter((b) => b.includes("【边界】") ? b : b !== blocks[blocks.length - 1] || blocks.length === 1);
+			const kept = blocks.length > 1 ? [blocks[0], blocks[blocks.length - 1]] : [blocks[0]];
+			prefix = kept.join("\n") + "\n\n";
+			if (prefix.length > EmployeeEngine.CONTEXT_PREFIX_BUDGET) {
+				prefix = kept[kept.length - 1].slice(0, EmployeeEngine.CONTEXT_PREFIX_BUDGET) + "\n\n";
+			}
+			void keep;
 		}
 		return `【上下文速览（自动注入，可能过时；以对方当前消息为准）】\n${prefix}${message}`;
 	}
