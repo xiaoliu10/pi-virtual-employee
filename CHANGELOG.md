@@ -4,6 +4,22 @@
 
 开源前的内部迭代细节不在此逐一罗列（完整历史见 git log）；以下从开源基线版本开始记录。
 
+## 0.2.206
+
+### English
+- **The progress watchdog no longer kills healthy browser waits**: a worker driving a bastion login polled `browser_screenshot` three times while the page loaded; the three identical frames tripped the identical-loop counter and the watchdog soft-stopped a HEALTHY turn — the user saw「⚠️ 执行未完成：This operation was aborted」while the log at that very moment read `最近活动 0s` (the task was visibly working). Observation tools (screenshot/read/evaluate/process polling/file listing) now get a separate, larger threshold — still finite, so a truly stuck observer is still stopped.
+- **Scheduled/autonomous tasks report on the TASK cadence**: the scheduled-task runner's heartbeat read `longTaskProgressMin` (the chat knob, 10 min) instead of `taskProgressMin` (the task knob, 30), so a long-running task chatted every 10 minutes. The settings catalog text that said the chat knob covers「定时任务执行期」— the source of the confusion — is fixed too.
+- **Owner authority is now global**: `hasAnyAdmin()` — the UNCLAIMED probe every admin gate consults before checking the caller — did not count owners, so a deployment whose only configured principal was its owner refused that owner with「管理员尚未设置」. Also fixed: the admin list, the last-admin guard, and role demotion now all count `ownerStaffIds`, and the demotion guard excludes the target from whitelist checks because a `people[]` entry SHADOWS a whitelist grant (otherwise demoting the only owner yields a claimed-but-unmanaged deployment). Owner can now manage config, scripts, knowledge and memory from a 1:1 chat, per the design contract that owner is a strict superset of admin.
+- **An interrupted worker says so, once**: a worker left `running` by a dead process used to stay that way forever (progress notes promising「报告已生成完毕」followed by silence). Startup reconciliation flips stale rows to `error` with an honest notice — reason, warning that earlier progress notes were estimates, and a re-run offer. The notice is once-per-row (a reboot loop cannot produce a notice loop) and starts NOTHING: no re-dispatch, no re-queue, zero model turns.
+- **Unattended updates wait for tasks to finish**: the update gate now requires「no task still owes a result」(queued/running workers, non-terminal work items), not merely a momentarily idle model — `isIdle` goes true BETWEEN two durable submissions of the same worker, which is exactly where a restart used to land.
+
+### 中文
+- **进度看门狗不再误杀正常的浏览器等待**：worker 过堡垒机登录时页面加载中连拍了三次 `browser_screenshot`，三次相同帧触发了 identical-loop 计数，看门狗把一个完全健康的回合 soft-stop 了——用户看到「⚠️ 执行未完成：This operation was aborted」，而停止瞬间的日志写着「最近活动 0s」（任务正在干活）。观察型工具（截图/读页/evaluate/进程轮询/文件列表）现在有独立且更大的阈值——仍然有限，真卡死的观察者照样会被停。
+- **定时/自主任务按任务节奏汇报**：定时任务执行器的心跳读的是 `longTaskProgressMin`（聊天节奏，10 分钟）而不是 `taskProgressMin`（任务节奏，30 分钟），长任务每 10 分钟就推一次进度。设置目录里那句「聊天参数覆盖定时任务执行期」的误导文案（混淆的源头）也一并修正。
+- **owner 权限真正全局化**：`hasAnyAdmin()`——所有 admin 门槛在检查调用者之前先查的「部署是否已认领」探针——不认 owner，导致只配了 owner 的部署把自己的 owner 拒之门外（「管理员尚未设置」）。同时修复：管理员列表、最后管理员守卫、角色降级守卫都补上 `ownerStaffIds`；降级守卫把 target 从 whitelist 检查中剔除——因为 `people[]` 条目会**遮蔽** whitelist 授权（否则把唯一 owner 降级会得到「已认领但无人管理」的部署）。现在 owner 可以在单聊里管理配置、脚本、知识和记忆，与「owner 是 admin 严格超集」的设计契约一致。
+- **被中断的 worker 会说一声，且只说一次**：进程死掉后遗留的 `running` worker 曾经永远悬着（进度汇报说「报告已生成完毕」然后石沉大海）。启动对账把陈旧行翻成 `error` 并推送诚实通知——说明原因、警告之前的进度只是估计、并给出重跑选项。通知每行只发一次（重启循环不会造成通知循环），且**不启动任何东西**：不重派、不重排队、零模型回合。
+- **无人值守更新等任务收尾**：更新门现在要求「没有任务还欠着一个结果」（排队/运行中的 worker、非终态工作项），而不是模型恰好空闲——`isIdle` 在同一个 worker 的两次 durable 提交之间会短暂为 true，那正是重启曾经落进去的位置。
+
 ## 0.2.205
 
 ### English
