@@ -31,6 +31,16 @@ export interface WorkerEngineDeps<Session> {
 	send(session: Session, message: string, senderId: string, sourceConversation: string): Promise<{ reply?: string; error?: string }>;
 	/** Deliver to the source conversation (idempotent upstream). */
 	push(conversationId: string, text: string): Promise<unknown> | unknown;
+	/** Land a CONVERSATIONAL delivery into the source conversation's history
+	 * (the interrupt notice, the re-run confirmation, the final result).
+	 * Pushes are transport-only — a group's model reading its transcript never
+	 * sees them — so anything that INVITES A REPLY must also land in history,
+	 * or the reply arrives into a conversation that has no idea what it answers
+	 * (field 2026-11-08: the notice promised 「回复重新执行我就重跑」, the user
+	 * replied, and the group model asked 「请告诉我要重新执行的具体任务」 — it
+	 * had never seen the notice). Progress heartbeats are NOT conversational
+	 * and must not land here. */
+	recordDelivery?: (conversationId: string, text: string) => void;
 	/** Cancel a live durable round (foreground-escape). Injected because the
 	 * abort surface lives on the session, which this service only holds. */
 	abort?(session: Session): void;
@@ -151,6 +161,10 @@ export class WorkerService<Session> {
 				"回复「**重新执行**」我就重跑这一轮；不需要就忽略这条消息。",
 			].join("\n");
 			// Report + ask ONLY. Nothing is queued here: no re-dispatch, no session.
+			// The notice INVITES a reply, so it must land in the conversation's
+			// history too (recordDelivery) — a push alone is invisible to the
+			// model that will read the reply (field 2026-11-08).
+			this.opts.recordDelivery?.(o.source_conversation, text);
 			void Promise.resolve(this.opts.push(o.source_conversation, text)).catch(() => {});
 		}
 	}
@@ -193,6 +207,28 @@ export class WorkerService<Session> {
 	 * durable session holds the dialogue, and the reply is delivered to the
 	 * source conversation like any other turn's result. */
 	async inject(sourceConversation: string, message: string, senderId: string): Promise<boolean> {
+		// Deterministic re-run (field 2026-11-08): the interrupt notice ends with
+		// 「回复『重新执行』我就重跑这一轮」. Honor that promise HERE — as code,
+		// not as model behavior — because the worker session the notice refers to
+		// has NO usable history: pi-session keeps the transcript in memory
+		// (SessionManager.inMemory), so after the restart that killed the run the
+		// session is EMPTY. Routing「重新执行」into it produces exactly what the
+		// user saw: 「请告诉我要重新执行的具体任务是什么？」. Everything the re-run
+		// needs survives in worker_tasks: the original instruction, verbatim.
+		const retryMatch = /^\s*(重新执行|重跑)\s*$/.test(message);
+		if (retryMatch) {
+			const retry = this.retryInterrupted(sourceConversation);
+			if (retry) {
+				const cid = retry.conversation_id ?? `worker:${retry.id}`;
+				const note = `✅ 已重新派发：${retry.instruction.replace(/\s+/g, " ").slice(0, 60)}。新一轮任务编号 ${cid}，完成后结果照常推回本会话。`;
+				this.opts.recordDelivery?.(sourceConversation, note);
+				void Promise.resolve(this.opts.push(sourceConversation, note)).catch(() => {});
+				return true;
+			}
+			// No interrupted worker to re-run: fall through to the ordinary
+			// follow-up path — the message may still be a valid continuation of
+			// some other worker.
+		}
 		const recent = this.store.recentForConversation(sourceConversation);
 		if (!recent?.conversation_id) return false;
 		const session = await this.opts.open(recent.conversation_id);
@@ -217,6 +253,28 @@ export class WorkerService<Session> {
 		void next.then(() => {
 			if (this.turnChains.get(sessionKey) === next) this.turnChains.delete(sessionKey);
 		});
+	}
+
+	/** Respawn the newest INTERRUPTED worker of this conversation as a NEW task
+	 * (same instruction, same source, same creator, same budget). Returns the
+	 * fresh queued row, or null when there is nothing interrupted to re-run.
+	 *
+	 * This is a NEW spawn, not a resurrection: the dead run's in-memory session
+	 * is gone (pi-session in-memory transcript), and there is nothing to resume
+	 * INTO — what survives (the instruction, in worker_tasks) is exactly what a
+	 * fresh run consumes. Identity stays with the ORIGINAL creator so the
+	 * re-run's authority matches the run that was interrupted. */
+	private retryInterrupted(sourceConversation: string): WorkerTaskRow | null {
+		const dead = this.store.latestInterruptedFor(sourceConversation);
+		if (!dead) return null;
+		const row = this.spawn({
+			instruction: dead.instruction,
+			sourceConversation: dead.source_conversation,
+			createdBy: dead.created_by,
+			maxMinutes: dead.max_minutes ?? undefined,
+		});
+		console.log(`[worker] re-run: ${dead.id} (interrupted) → new ${row.id} via 「重新执行」`);
+		return row;
 	}
 
 	/** True while this conversation still has queued/running turns (test seam +
@@ -296,6 +354,10 @@ export class WorkerService<Session> {
 			}
 		}
 		try {
+			// The final result is conversational (the user will reply to it in
+			// the source chat) — same rule as the interrupt notice and the
+			// re-run confirmation.
+			this.opts.recordDelivery?.(task.source_conversation, text);
 			await this.opts.push(task.source_conversation, text);
 		} catch (err) {
 			this.opts.onError?.(err);

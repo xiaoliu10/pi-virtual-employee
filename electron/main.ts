@@ -1568,6 +1568,16 @@ ${tailForProgress(decision.text)}`;
 			},
 		}),
 		push: (cid, text) => im.pushToConversation(cid, text),
+		// Conversational deliveries land in the source conversation's history:
+		// pushes are transport-only, and a model reading the transcript never
+		// sees them. Without this the interrupt notice and the re-run
+		// confirmation are invisible to the very reply they invite (field
+		// 2026-11-08: 「重新执行」 arrived into a group chat whose history had
+		// neither the notice nor the original instruction).
+		recordDelivery: (cid, text) => {
+			history.ensureConversation(cid, null);
+			history.appendMessage(cid, "assistant", text);
+		},
 		// Agent.abort() takes no options (preserveBackground is engine.abortSession
 		// territory). A worker's background scripts belong to the turn being
 		// cancelled, so the plain abort is the correct semantics here.

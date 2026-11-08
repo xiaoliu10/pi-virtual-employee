@@ -44,7 +44,7 @@ function harness(overrides = {}) {
 	const store = new WorkerTaskStore(db);
 	const h = {
 		db, store,
-		sessions: [], sends: [], pushes: [], errors: [],
+		sessions: [], sends: [], pushes: [], errors: [], recorded: [],
 		open: async (cid) => { h.sessions.push(cid); return { cid }; },
 		send: async (session, message) => {
 			h.sends.push({ session, message });
@@ -54,6 +54,7 @@ function harness(overrides = {}) {
 	};
 	const service = new WorkerService(store, {
 		open: h.open, send: h.send, push: h.push,
+		recordDelivery: (cid, text) => { h.recorded.push({ cid, text }); },
 		maxConcurrent: 3, clock: { now: () => Date.now(), setTimeout: (fn) => { h.wake = fn; return fn; } },
 		onError: (e) => h.errors.push(e),
 		...overrides.service,
@@ -62,6 +63,92 @@ function harness(overrides = {}) {
 }
 
 const flush = async () => { for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r)); };
+
+test("「重新执行」respawns the interrupted worker deterministically (no context needed)", async () => {
+	// Field 2026-11-08: the interrupt notice promised 「回复『重新执行』我就重跑
+	// 这一轮」. The user replied exactly that in the group — and the model asked
+	// 「请告诉我要重新执行的具体任务是什么？」. Three defects stacked: the worker
+	// session's transcript is in-memory (gone with the restart), the notice never
+	// landed in the group's history, and nothing anywhere recognized「重新执行」.
+	//
+	// The fix is DETERMINISTIC: the re-run is spawned from worker_tasks itself
+	// (the original instruction survives there), before the message can reach
+	// the empty session.
+	const { h, service } = harness();
+	const past = Date.now() - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, error, max_minutes, conversation_id, created_at, started_at)
+		VALUES ('wdead', '每日对账异常动态巡检与群内汇报（7天版·明细报告）继续', 'dt:group:g1', 'ma1', 'error', '应用在执行中退出，该轮未跑完（可回复「重新执行」重跑）', 30, 'worker:wdead', ?, ?)`).run(past, past);
+
+	const injected = await service.inject("dt:group:g1", "重新执行", "ma1");
+	assert.equal(injected, true, "「重新执行」 must be claimed");
+
+	// A NEW worker row with the SAME instruction — that is the whole point:
+	// the instruction survives in worker_tasks when nothing else does.
+	const rows = h.db.prepare("SELECT * FROM worker_tasks ORDER BY created_at").all();
+	assert.equal(rows.length, 2, "exactly one new spawn");
+	const [, fresh] = rows;
+	assert.equal(fresh.status, "queued");
+	assert.equal(fresh.instruction, "每日对账异常动态巡检与群内汇报（7天版·明细报告）继续");
+	assert.equal(fresh.source_conversation, "dt:group:g1");
+	assert.equal(fresh.created_by, "ma1", "identity stays with the ORIGINAL creator");
+	assert.equal(fresh.max_minutes, 30);
+	assert.notEqual(fresh.id, "wdead", "a NEW row, not a resurrection of the dead one");
+
+	// A confirmation lands in the conversation, and in HISTORY (recordDelivery):
+	// the next model reading this chat must see that the re-run was issued.
+	const confirm = h.pushes.find((p) => /已重新派发/.test(p.text));
+	assert.ok(confirm, "a confirmation must be pushed");
+	assert.ok(h.recorded.some((r) => r.cid === "dt:group:g1" && /已重新派发/.test(r.text)),
+		"the confirmation must land in history too (recordDelivery)");
+
+	// The empty dead session must NOT receive the message (that is what produced
+	// 「请告诉我要重新执行的具体任务」): no open/send on the old session.
+	assert.equal(h.sends.length, 0, "no model turn on the dead session");
+});
+
+test("「重新执行」 with NO interrupted worker falls through to the ordinary follow-up", async () => {
+	const { h, service } = harness();
+	const past = Date.now() - 60 * 60_000;
+	// A DONE worker exists — follow-up on it is conversation (settled semantics).
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wdone', '统计任务', 'dt:group:g1', 'ma1', 'done', '完成', 'worker:wdone', ?, ?, ?)`).run(past, past, past);
+	const injected = await service.inject("dt:group:g1", "重新执行", "ma1");
+	assert.equal(injected, true, "still routed as follow-up");
+	assert.equal(h.db.prepare("SELECT COUNT(*) c FROM worker_tasks").get().c, 1, "no new spawn");
+	assert.equal(h.sends.length, 1, "the message reached the settled session as conversation");
+	const already = h.pushes.filter((p) => /已重新派发/.test(p.text));
+	assert.equal(already.length, 0, "no misleading confirmation");
+});
+
+test("a non-retry message never triggers the respawn (exact-match guard)", async () => {
+	const { h, service } = harness();
+	const past = Date.now() - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, error, conversation_id, created_at, started_at)
+		VALUES ('wdead', '巡检', 'dt:group:g1', 'ma1', 'error', '应用在执行中退出，该轮未跑完', 'worker:wdead', ?, ?)`).run(past, past);
+	// 「不要重新执行」 is a DIFFERENT sentence — exact-match keeps it out.
+	const injected = await service.inject("dt:group:g1", "不要重新执行", "ma1");
+	assert.equal(injected, true, "still a follow-up on the dead session's conversation");
+	assert.equal(h.db.prepare("SELECT COUNT(*) c FROM worker_tasks").get().c, 1, "no spawn from a non-exact match");
+});
+
+test("the interrupt notice lands in history (recordDelivery), not just the transport", async () => {
+	const { h, service } = harness();
+	const past = Date.now() - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
+		VALUES ('wdead', '巡检', 'dt:group:g1', 'ma1', 'running', 'worker:wdead', ?, ?)`).run(past, past);
+	service.start();
+	await flush();
+	const rec = h.recorded.find((r) => r.cid === "dt:group:g1" && /任务被中断/.test(r.text));
+	assert.ok(rec, "the interrupt notice must be recorded into the conversation history");
+});
+
+test("the final result also lands in history (the group can see what was delivered)", async () => {
+	const { h, service } = harness();
+	service.spawn({ instruction: "统计", sourceConversation: "dt:group:g1", createdBy: "ma1" });
+	service.start(); await flush();
+	const rec = h.recorded.find((r) => r.cid === "dt:group:g1" && /37 笔/.test(r.text));
+	assert.ok(rec, "the result must be recorded into the conversation history");
+});
 
 test("linear lifecycle: spawn → running → done, result delivered to the SOURCE conversation", async () => {
 	const { h, service } = harness();

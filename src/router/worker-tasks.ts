@@ -168,4 +168,17 @@ export class WorkerTaskStore {
 		return this.db.prepare("SELECT * FROM worker_tasks WHERE source_conversation = ? ORDER BY created_at DESC LIMIT 1")
 			.get(sourceConversation) as unknown as WorkerTaskRow | undefined;
 	}
+
+	/** The newest worker of this conversation that startup reconciliation marked
+	 * INTERRUPTED (the marker string recoverOrphans writes). This — not a fuzzy
+	 * status guess — is what the deterministic re-run path keys on: the notice
+	 * promised 「回复重新执行我就重跑这一轮」, so「重新执行」must find the row it
+	 * was talking about WITHOUT any session history (the transcript is gone —
+	 * pi-session keeps it in memory only). The instruction that produced the
+	 * original run is right here in the row; no context needed. */
+	latestInterruptedFor(sourceConversation: string): WorkerTaskRow | undefined {
+		return this.db.prepare(`SELECT * FROM worker_tasks WHERE source_conversation = ?
+			AND status = 'error' AND error LIKE '%应用在执行中退出%'
+			ORDER BY created_at DESC LIMIT 1`).get(sourceConversation) as unknown as WorkerTaskRow | undefined;
+	}
 }
