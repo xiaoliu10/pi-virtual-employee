@@ -48,6 +48,13 @@ export interface WorkerEngineDeps<Session> {
 	 * turn with the final outcome, so main.ts can land a searchable record
 	 * (search_knowledge_base second hop). Errors here must never break delivery. */
 	onSettled?: (task: { id: string; instruction: string; sourceConversation: string; createdBy: string }, outcome: string) => void;
+	/** Full task context for a re-run (field 2026-11-08): the interrupted row's
+	 * instruction is often just a title + 「继续」 — the substance lives in the
+	 * matching work item (goal/conditions/progress). Without this the respawned
+	 * worker starts from two bare user lines and re-explores from zero (the
+	 * original run burned half an hour getting there). Looked up at retry time,
+	 * NOT at boot, so it sees the current state. */
+	taskContext?: (sourceConversation: string, instruction: string) => string | null;
 	/** Long-task progress broadcaster (taskProgressMin cadence), same shape
 	 * WorkService injects. Optional — without it long workers run silent
 	 * until their result (the exact complaint that opened this file's field
@@ -267,13 +274,20 @@ export class WorkerService<Session> {
 	private retryInterrupted(sourceConversation: string): WorkerTaskRow | null {
 		const dead = this.store.latestInterruptedFor(sourceConversation);
 		if (!dead) return null;
+		// The instruction alone is often a bare「…继续」— the substance (goal,
+		// conditions, progress) lives in the matching work item. Attach it so the
+		// fresh worker starts with what the dead run had spent half an hour
+		// accumulating. Failure to find context is fine: the worker can still
+		// explore, exactly like the original run did.
+		const context = this.opts.taskContext?.(sourceConversation, dead.instruction) ?? null;
+		const instruction = context ? `${dead.instruction}\n\n${context}` : dead.instruction;
 		const row = this.spawn({
-			instruction: dead.instruction,
+			instruction,
 			sourceConversation: dead.source_conversation,
 			createdBy: dead.created_by,
 			maxMinutes: dead.max_minutes ?? undefined,
 		});
-		console.log(`[worker] re-run: ${dead.id} (interrupted) → new ${row.id} via 「重新执行」`);
+		console.log(`[worker] re-run: ${dead.id} (interrupted) → new ${row.id} via 「重新执行」${context ? " (with task context)" : ""}`);
 		return row;
 	}
 

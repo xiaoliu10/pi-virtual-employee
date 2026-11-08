@@ -1592,6 +1592,36 @@ ${tailForProgress(decision.text)}`;
 			log: (level, msg) => console.log(`[worker:progress] ${level} ${msg}`),
 		}),
 		maxConcurrent: 5,
+		// Re-run context (field 2026-11-08): a respawned worker's instruction is
+		// often a bare title + 「继续」. Find the matching work item — prefer a
+		// title substring match, fall back to the newest non-terminal item of the
+		// same source conversation — and hand the fresh worker its goal,
+		// conditions and progress verbatim. The original run had accumulated that
+		// context over half an hour; the re-run should not start from zero.
+		taskContext: (sourceConversation, instruction) => {
+			try {
+				const store = workItemStore;
+				if (!store) return null;
+				const probe = instruction.replace(/继续$/, "").trim().slice(0, 40);
+				const all = store.list();
+				const byTitle = all.find((it) => !["done", "cancelled"].includes(it.status) && it.title.includes(probe) && probe.length >= 6);
+				const bySource = all
+					.filter((it) => it.origin_conversation === sourceConversation && !["done", "cancelled"].includes(it.status))
+					.sort((a, b) => b.updated_at - a.updated_at)[0];
+				const item = byTitle ?? bySource;
+				if (!item) return null;
+				const parts = [
+					`【任务目标（来自自主任务 ${item.id.slice(0, 8)}，重跑请接着做）】`,
+					item.goal,
+					item.conditions ? `\n【执行条件】\n${item.conditions}` : "",
+					item.progress ? `\n【中断前的进展（供参考，请核实后继续）】\n${item.progress}` : "",
+				].filter(Boolean);
+				return parts.join("\n");
+			} catch (err) {
+				console.warn("[worker] task context lookup failed (retry continues without it):", err instanceof Error ? err.message : err);
+				return null;
+			}
+		},
 	});
 	workerService.start();
 	engine.workerBridge = {

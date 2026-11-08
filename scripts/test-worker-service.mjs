@@ -106,6 +106,38 @@ test("「重新执行」respawns the interrupted worker deterministically (no co
 	assert.equal(h.sends.length, 0, "no model turn on the dead session");
 });
 
+test("re-run enriches the instruction with the matching task context", async () => {
+	// The interrupted row's instruction is often a bare title + 「继续」 — the
+	// substance (goal/conditions/progress) lives in the matching work item.
+	// Without enrichment the fresh worker starts from two bare user lines and
+	// re-explores from zero (the original run burned half an hour accumulating).
+	const { h, service } = harness({
+		service: {
+			taskContext: (sourceConversation, instruction) =>
+				`【任务目标（来自自主任务 3db7f642，重跑请接着做）】\n每日巡检 spay 最近 7 天全部商户的日终对账异常\n【中断前的进展（供参考，请核实后继续）】\n已扫 7 天，异常 59`,
+		},
+	});
+	const past = Date.now() - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, error, conversation_id, created_at, started_at)
+		VALUES ('wdead', '每日对账异常动态巡检与群内汇报（7天版·明细报告）继续', 'dt:group:g1', 'ma1', 'error', '应用在执行中退出，该轮未跑完', 'worker:wdead', ?, ?)`).run(past, past);
+
+	await service.inject("dt:group:g1", "重新执行", "ma1");
+	const fresh = h.db.prepare("SELECT * FROM worker_tasks WHERE id != 'wdead'").get();
+	assert.match(fresh.instruction, /每日对账异常动态巡检与群内汇报（7天版·明细报告）继续/, "original instruction kept");
+	assert.match(fresh.instruction, /【任务目标/, "goal attached");
+	assert.match(fresh.instruction, /中断前的进展/, "progress attached");
+});
+
+test("re-run without available context keeps the bare instruction (lookup failure is fine)", async () => {
+	const { h, service } = harness({ service: { taskContext: () => null } });
+	const past = Date.now() - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, error, conversation_id, created_at, started_at)
+		VALUES ('wdead', '巡检 继续', 'dt:group:g1', 'ma1', 'error', '应用在执行中退出', 'worker:wdead', ?, ?)`).run(past, past);
+	await service.inject("dt:group:g1", "重新执行", "ma1");
+	const fresh = h.db.prepare("SELECT * FROM worker_tasks WHERE id != 'wdead'").get();
+	assert.equal(fresh.instruction, "巡检 继续", "no context → instruction unchanged, the worker can still explore");
+});
+
 test("「重新执行」 with NO interrupted worker falls through to the ordinary follow-up", async () => {
 	const { h, service } = harness();
 	const past = Date.now() - 60 * 60_000;
