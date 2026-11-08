@@ -28,7 +28,7 @@ export interface WorkerEngineDeps<Session> {
 	open(conversationId: string): Promise<Session> | Session;
 	/** One durable round: returns when the turn settles. reply = the final
 	 * assistant text (code-extracted result — no marker parsing anywhere). */
-	send(session: Session, message: string, senderId: string, sourceConversation: string): Promise<{ reply?: string; error?: string }>;
+	send(session: Session, message: string, senderId: string, sourceConversation: string): Promise<{ reply?: string; error?: string; deterministic?: boolean }>;
 	/** Deliver to the source conversation (idempotent upstream). */
 	push(conversationId: string, text: string): Promise<unknown> | unknown;
 	/** Cancel a live durable round (foreground-escape). Injected because the
@@ -338,8 +338,24 @@ export class WorkerService<Session> {
 		try {
 			const r = await this.opts.send(session, message, senderId, task.source_conversation);
 			const text = (r.reply ?? "").trim();
-			if (r.error || !text) {
-				await this.deliver(task, `⚠️ 执行未完成：${r.error ?? "模型无返回"}`, opts);
+			if (!text && r.error) {
+				// Only fall back to the raw error when there is NO reply: send()
+				// already turns known failures (abort, overflow, login) into a
+				// Chinese explanation with next steps — dropping it for
+				// 「执行未完成：This operation was aborted」 was the field bug.
+				await this.deliver(task, `⚠️ 执行未完成：${r.error}`, opts);
+				return;
+			}
+			if (!text) {
+				await this.deliver(task, "⚠️ 执行未完成：模型无返回", opts);
+				return;
+			}
+			// Review e6c6fd82 #1: a NON-deterministic reply WITH an error means
+			// the model answered something but the run still recorded a failure
+			// (e.g. a mid-run tool channel died) — appending keeps the failure
+			// signal; replacing (or dropping) it hides that the task is unfinished.
+			if (r.error && !r.deterministic) {
+				await this.deliver(task, `${text}\n\n⚠️ 执行未完成：${r.error}`, opts);
 				return;
 			}
 			// The reply is pushed VERBATIM. Work-item markers in it are inert —

@@ -22,6 +22,41 @@ import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, gener
 import { formatPlanForTurn, formatPlanMessage, looksLikeTask, parsePlan, PLAN_PROMPT_HEADER, shouldPushPlanToChat } from "./task-planner.js";
 import { createModels, normalizeContext, ModelsError } from "@earendil-works/pi-ai";
 import { SIDE_PASS_DEFAULT_LEVEL, applyThinkingDeclaration } from "../shared/thinking.js";
+
+/** Human words for why THIS engine stopped a turn (field 2026-11-08: the
+ * watchdog abort surfaced as the SDK's bare English "This operation was
+ * aborted" — the model-facing language rule cannot fix deterministic strings,
+ * so the strings themselves must be Chinese). Unknown kinds return undefined
+ * and the raw error passes through. */
+export function describeAbortReason(reason: string): string | undefined {
+	switch (reason) {
+		case "runaway":
+		case "watchdog":
+			return "系统看门狗判定本回合已卡住（同一步骤反复执行或长时间无进展），已主动停止这一轮；已完成的部分不会丢失。";
+		case "user":
+			return "已按停止指令中断这一轮。";
+		case "restart":
+			return "应用重启中断了这一轮。";
+		case "install_now":
+			return "安装更新中断了这一轮。";
+		default:
+			return undefined;
+	}
+}
+
+/** Narrow SDK-abort signature (review e6c6fd82 #3): a bare /abort/i match also
+ * hits relay texts like "request aborted by upstream" — a transient flake, not
+ * a watchdog stop — so the class test anchors on the exact SDK wording or the
+ * error's own name. */
+export function isEngineAbortText(cause: string): boolean {
+	return /this operation was aborted/i.test(cause) || /aborterror/i.test(cause);
+}
+
+/** The user-facing explanation for an engine-initiated abort (extracted so the
+ * exact pushed string has a direct test — review e6c6fd82 #2). */
+export function engineAbortFailureText(): string {
+	return "⚠️ 这次执行被系统中止了。常见原因：① 长时间无进展，被看门狗主动停止；② 发送了停止指令；③ 应用重启或更新。已完成的部分已保留，可以回复「继续」从当前进度接着做。";
+}
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { Api, AuthInteraction, AuthPrompt, AuthEvent, CredentialStore, ImageContent, Model, MutableModels, TextContent, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { ConfigStore, Supplier } from "../db/config-store.js";
@@ -2795,6 +2830,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 			console.warn("[engine] compaction failed:", err);
 		}
 
+		// The abort marker is consumed by telemetry below — read it FIRST so the
+		// reason can ride the returned error in Chinese (field 2026-11-08: the
+		// user got 「执行未完成：This operation was aborted」 because the watchdog's
+		// knowledge of WHY it stopped never reached the delivered text).
+		const abortReason = this.turnAborts.get(conversationId);
 		this.recordTurnTelemetry({
 			conversationId,
 			turnId,
@@ -2815,7 +2855,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// retries; the reply is the canned apology). Chain runners use it to PAUSE
 		// and wait for an admin instead of burning budget on turns that will fail
 		// the same way (field 2026-10-05).
-		return { reply, error: hardError ?? (errorMessage ? loginGuidanceOf(errorMessage) ?? errorMessage : undefined), deterministic };
+		let outError = hardError ?? (errorMessage ? loginGuidanceOf(errorMessage) ?? errorMessage : undefined);
+		if (abortReason) {
+			// A turn WE aborted carries an honest Chinese reason; the SDK's bare
+			// "This operation was aborted" tells the user nothing. The English
+			// text stays in parentheses for greppability against main.log.
+			// Review e6c6fd82 #4: a retry-backoff abort exits promptWithRetry
+			// CLEANLY (no throw → no error) — without this fill the turn would
+			// end as silence-as-success with no explanation at all.
+			const described = describeAbortReason(abortReason);
+			if (described) outError = outError ? `${described}（系统错误：${outError}）` : described;
+		}
+		return { reply, error: outError, deterministic };
 	}
 
 	/** One tool call, linked to the turn that made it. Never throws. */
@@ -3064,11 +3115,22 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 	/** Deterministic reply of last resort — always non-empty, in Chinese. */
 	private deterministicFailure(cause?: string): string {
+		// Overflow FIRST (review e6c6fd82 #3): its message can contain "abort",
+		// and it is the strictly more specific diagnosis.
 		if (cause && isContextOverflowError(cause)) {
 			return (
 				"⚠️ 这次没能完成：本会话累计的内容超出了模型能一次处理的长度上限（已尝试自动压缩与裁剪仍未通过）。\n\n" +
 				"建议：① 用 /new 开一个新会话再发这个任务（最快）；② 把任务拆成更小的步骤；③ 让我少读一点（例如只读需要的字段/时间段，而不是整页或整表）。"
 			);
+		}
+		// Watchdog/user/restart aborts arrive as the SDK's bare English "This
+		// operation was aborted" — translate the CLASS via the narrow signature,
+		// and point at the resume path (field 2026-11-08: the English text leaked
+		// straight into the pushed reply despite the Chinese-only rule;
+		// deterministic strings are not governed by the model, so they must be
+		// written Chinese here).
+		if (cause && isEngineAbortText(cause)) {
+			return engineAbortFailureText();
 		}
 		if (cause) {
 			return `⚠️ 抱歉，这次没能完成你的请求：${cause}。\n\n我已经尽力尝试，但没有成功。可以稍后重试，或把任务拆成更小的步骤再发给我。`;
