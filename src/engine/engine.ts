@@ -1991,7 +1991,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 					.filter((t) => t.id !== own.id)
 					.slice(0, 5);
 				let boundary =
-					"【边界】用户这条消息如果问的不是你手上的任务：如实说明你只负责「你手上的任务」";
+					"【边界】两种情况分别处理：\n" +
+					"① 用户在**询问某个任务的结果或状态**（「查到没有」「结果呢」这类）：问的是你手上的任务就如实回答";
 				if (others.length > 0) {
 					const lines = others.map((t) => {
 						const instruction = t.instruction.replace(/\s+/g, " ").slice(0, 40);
@@ -2005,7 +2006,16 @@ export class EmployeeEngine implements EmployeeRuntime {
 					// invites hedging or invention — say plainly there are none.
 					boundary += "。本会话没有查到其他任务，不要编造其他任务的进展";
 				}
-				boundary += "；绝不把自己任务的产物当作其他任务的结果回复。";
+				boundary += "；绝不把自己任务的产物当作其他任务的结果回复。\n" +
+					// Field 2026-11-08 23:44 (the FIRST boundary wording backfired):
+					// the model read 「你只负责 X」 as a CAPABILITY limit and refused a
+					// brand-new lookup with 「我这边只负责…没有…能力或权限」 — while the
+					// exact skill for it sat in its prompt. Follow-up continuation is a
+					// DESIGN contract (done → user keeps talking → worker executes);
+					// the boundary separates QUESTIONS about tasks from NEW WORK, it
+					// must never gate the latter.
+					"② 用户提出**新的请求或继续指令**（给了新的单号、要查新的东西、纠正做法、继续执行）：这是发给你的正常工作——" +
+					"按可用技能和工具照常执行，不要因为「超出初始任务描述」而拒绝，也不要说「我只负责某个任务」。你的会话就是承接这些请求的地方。";
 				blocks.push(boundary);
 			}
 		} catch (err) {
@@ -2020,13 +2030,16 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// Review #4: over budget, keep the OWN-TASK line and the BOUNDARY rule
 			// (the payload of this fix) and drop the others block first — the
 			// boundary is the part that prevents the field failure.
-			const keep = [blocks[0], blocks[blocks.length - 1]].filter((b) => b.includes("【边界】") ? b : b !== blocks[blocks.length - 1] || blocks.length === 1);
-			const kept = blocks.length > 1 ? [blocks[0], blocks[blocks.length - 1]] : [blocks[0]];
+			let kept = blocks.length > 1 ? [blocks[0], blocks[blocks.length - 1]] : [blocks[0]];
+			if (kept.join("\n").length > EmployeeEngine.CONTEXT_PREFIX_BUDGET) {
+				// Even the pair overflows: the boundary block is the whole point —
+				// keep it intact rather than hard-cutting the rule mid-sentence.
+				kept = [blocks[blocks.length - 1]];
+			}
 			prefix = kept.join("\n") + "\n\n";
 			if (prefix.length > EmployeeEngine.CONTEXT_PREFIX_BUDGET) {
-				prefix = kept[kept.length - 1].slice(0, EmployeeEngine.CONTEXT_PREFIX_BUDGET) + "\n\n";
+				prefix = kept[0].slice(0, EmployeeEngine.CONTEXT_PREFIX_BUDGET) + "\n\n";
 			}
-			void keep;
 		}
 		return `【上下文速览（自动注入，可能过时；以对方当前消息为准）】\n${prefix}${message}`;
 	}

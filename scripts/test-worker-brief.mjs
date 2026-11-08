@@ -77,6 +77,9 @@ test("happy path: own task + other tasks + boundary, own id excluded, message ri
 	assert.match(out, /【同一来源会话的其他任务（不是你负责的）】/, "others header");
 	assert.match(out, /worker:taskB「查询支付渠道下单日志」→ spay 登录态失效/, "other task + outcome, newline collapsed");
 	assert.match(out, /【边界】/, "boundary rule present");
+	assert.match(out, /两种情况分别处理/, "questions vs new-work are separated (field 2026-11-08 23:44)");
+	assert.match(out, /② 用户提出\*\*新的请求或继续指令\*\*/, "new-work must be EXECUTED, not disclaimed");
+	assert.match(out, /不要因为「超出初始任务描述」而拒绝/, "the refusal pretext is explicitly banned");
 	const othersSection = out.slice(out.indexOf("【同一来源会话的其他任务"), out.indexOf("【边界】"));
 	assert.ok(!othersSection.includes("worker:taskC"), "own id excluded from others list");
 	assert.ok(out.trimEnd().endsWith(MSG), "user message rides last");
@@ -138,14 +141,14 @@ test("budget spill keeps the OWN-TASK line AND the boundary rule (review #4)", (
 	// the budget to force the path and pin its semantics: the boundary rule is the
 	// payload of this fix, so the spill must drop the OTHERS block, never it.
 	const origBudget = EmployeeEngine.CONTEXT_PREFIX_BUDGET;
-	EmployeeEngine.CONTEXT_PREFIX_BUDGET = 200;
+	EmployeeEngine.CONTEXT_PREFIX_BUDGET = 600;
 	try {
 		const out = engine.withWorkerTaskBrief("worker:taskC", MSG);
 		const prefix = out.slice(0, out.length - MSG.length);
 		assert.match(prefix, /【你手上的任务】/, "own task survives the spill");
 		assert.match(prefix, /【边界】/, "the boundary rule MUST survive the spill");
 		assert.doesNotMatch(prefix, /【同一来源会话的其他任务/, "others block is the spill victim");
-		assert.ok(prefix.length <= 220, `the truncated prefix respects the budget (got ${prefix.length})`);
+		assert.ok(prefix.length <= 620, `the truncated prefix respects the budget (got ${prefix.length})`);
 	} finally {
 		EmployeeEngine.CONTEXT_PREFIX_BUDGET = origBudget;
 	}

@@ -914,4 +914,5 @@ test("worker sessions get a task-boundary brief (field 2026-11-08: cross-task an
 	assert.match(src, /【你手上的任务】/, "the brief names the worker's own task");
 	assert.match(src, /【同一来源会话的其他任务/, "and lists the source conversation's other tasks");
 	assert.match(src, /绝不把自己任务的产物当作其他任务的结果回复/, "with an explicit boundary rule");
+	assert.match(src, /② 用户提出\*\*新的请求或继续指令\*\*/, "new work must still be executed — the boundary never gates follow-up work");
 });
