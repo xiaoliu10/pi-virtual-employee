@@ -181,6 +181,22 @@ export class HistoryStore {
 			.all(conversationId) as MessageRow[];
 	}
 
+	/** Bounded tail read for reports (session_detail / widget session query):
+	 * newest N rows, returned oldest→newest. Never loads the full history. */
+	listMessagesTail(conversationId: string, limit: number): MessageRow[] {
+		const rows = this.db
+			.prepare("SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at DESC, id DESC LIMIT ?")
+			.all(conversationId, Math.max(1, limit)) as MessageRow[];
+		return rows.reverse();
+	}
+
+	/** Message count for a conversation (header totals without loading rows). */
+	countMessages(conversationId: string): number {
+		return (this.db
+			.prepare("SELECT COUNT(*) AS c FROM messages WHERE conversation_id = ?")
+			.get(conversationId) as { c: number }).c;
+	}
+
 	/** Recent tail for explicit lookbacks; automatic mining uses durable pages below. */
 	listMessagesSince(conversationId: string, sinceTs: number, limit = 40): MessageRow[] {
 		return this.db

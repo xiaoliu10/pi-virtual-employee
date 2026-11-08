@@ -78,6 +78,7 @@ async function start(overrides = {}) {
 		port: 0,
 		log: () => {},
 		tickets,
+		sessionQuery: overrides.sessionQuery,
 	});
 	after(() => {
 		// undici's keep-alive socket would make close() wait forever.
@@ -272,4 +273,42 @@ test("chat bursts are rate limited per token+client", async (t) => {
 		last = await post("/api/widget/chat", { message: `m${i}` }, { ...bearer(TOKEN), "X-VE-Ticket": tkBurst, origin: ORIGIN });
 	}
 	assert.equal(last.status, 429, "the 31st chat inside one minute is refused");
+});
+
+test("GET /api/session/<id>: operator-secret tier, malformed ids never kill the server", async (t) => {
+	const queries = [];
+	const { base, get } = await start({
+		sessionQuery: (sessionId, limit) => {
+			queries.push({ sessionId, limit });
+			return sessionId === "dt:group:g1"
+				? { matched: true, text: "## 会话 dt:group:g1\n历史消息共 57 条" }
+				: { matched: false, text: "没有找到" };
+		},
+	});
+	// No secret → 403 even with a valid bearer: the access token alone must
+	// never become an all-conversation read oracle (review 2026-11-08).
+	const noSecret = await get("/api/session/dt:group:g1", bearer(TOKEN));
+	assert.equal(noSecret.status, 403, "bearer alone is refused");
+	// Wrong secret → 403.
+	const badSecret = await get("/api/session/dt:group:g1", { ...bearer(TOKEN), "X-VE-Secret": "nope" });
+	assert.equal(badSecret.status, 403);
+	// Valid secret + token → 200 with the report; limit clamped to [1,30].
+	const ok = await get("/api/session/dt%3Agroup%3Ag1?limit=999", { ...bearer(TOKEN), "X-VE-Secret": "test-secret" });
+	assert.equal(ok.status, 200);
+	const body = await ok.json();
+	assert.match(body.report, /57 条/);
+	// Malformed percent-escape → 400, and the server SURVIVES (the listener is
+	// async: an uncaught URIError here would take down the whole Electron main).
+	const malformed = await get("/api/session/%E0%A4%A", { ...bearer(TOKEN), "X-VE-Secret": "test-secret" });
+	assert.equal(malformed.status, 400, "bad escape is a 400, not a crash");
+	// Empty id → 400 ("" would silently match nothing yet report matched).
+	const empty = await get("/api/session/%20%20", { ...bearer(TOKEN), "X-VE-Secret": "test-secret" });
+	assert.equal(empty.status, 400);
+	// Unknown id → 404 (after the double gate).
+	const miss = await get("/api/session/nope", { ...bearer(TOKEN), "X-VE-Secret": "test-secret" });
+	assert.equal(miss.status, 404);
+	// The server is still alive after all of the above.
+	const still = await get("/api/session/dt%3Agroup%3Ag1", { ...bearer(TOKEN), "X-VE-Secret": "test-secret" });
+	assert.equal(still.status, 200);
+	assert.deepEqual(queries.map((q) => q.limit), [30, 10, 10], "limit clamped, empty id never reaches the store");
 });

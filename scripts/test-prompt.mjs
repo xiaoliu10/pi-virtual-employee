@@ -75,6 +75,16 @@ const DISCIPLINE_MARKERS = [
 
 ];
 
+test("the conversation id rides the system prompt as 「本会话标识」", () => {
+	const withId = buildSystemPrompt({ ...BASE, conversationId: "dt:group:x" });
+	assert.match(withId, /本会话标识/);
+	assert.match(withId, /`dt:group:x`/);
+	const noId = buildSystemPrompt({ ...BASE });
+	assert.doesNotMatch(noId, /本会话标识/, "no id → no section");
+	assert.doesNotMatch(noId, /worker_task_detail|session_detail/, "the section never names tools that may be absent");
+});
+
+
 test("execution-discipline rules are present in a default prompt", () => {
 	const prompt = buildSystemPrompt({ ...BASE, ...ALL_ON });
 	for (const marker of DISCIPLINE_MARKERS) {

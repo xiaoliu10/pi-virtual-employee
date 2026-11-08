@@ -247,7 +247,10 @@ test("the engine's buildToolSetFor routes MCP by kernel", async () => {
 	// Read the routing expression out of the source: a plain-string check would
 	// pass on a broken implementation, so assert the actual conditional shape.
 	const src = readFileSync(join(root, "src/engine/engine.ts"), "utf8");
-	const region = src.slice(src.indexOf("buildToolSetFor(conversationId"), src.indexOf("isIdle()"));
+	// Anchor on the DEFINITION signature, not the first call site: engine.ts has
+	// callers (and isIdle references) long before the definition, and an
+	// indexOf-based first-hit slice silently drifts as the file grows.
+	const region = src.slice(src.indexOf("buildToolSetFor(conversationId: string)"), src.indexOf("isIdle()", src.indexOf("buildToolSetFor(conversationId: string)")));
 	const stripped = region.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 	assert.match(stripped, /mcp:\s*this\.opts\.kernel === "durable"/, "MCP inclusion must branch on the kernel");
 	// The legacy branch must pass the real manager tools, not an empty list.

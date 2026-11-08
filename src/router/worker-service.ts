@@ -31,16 +31,6 @@ export interface WorkerEngineDeps<Session> {
 	send(session: Session, message: string, senderId: string, sourceConversation: string): Promise<{ reply?: string; error?: string }>;
 	/** Deliver to the source conversation (idempotent upstream). */
 	push(conversationId: string, text: string): Promise<unknown> | unknown;
-	/** Land a CONVERSATIONAL delivery into the source conversation's history
-	 * (the interrupt notice, the re-run confirmation, the final result).
-	 * Pushes are transport-only — a group's model reading its transcript never
-	 * sees them — so anything that INVITES A REPLY must also land in history,
-	 * or the reply arrives into a conversation that has no idea what it answers
-	 * (field 2026-11-08: the notice promised 「回复重新执行我就重跑」, the user
-	 * replied, and the group model asked 「请告诉我要重新执行的具体任务」 — it
-	 * had never seen the notice). Progress heartbeats are NOT conversational
-	 * and must not land here. */
-	recordDelivery?: (conversationId: string, text: string) => void;
 	/** Cancel a live durable round (foreground-escape). Injected because the
 	 * abort surface lives on the session, which this service only holds. */
 	abort?(session: Session): void;
@@ -168,10 +158,13 @@ export class WorkerService<Session> {
 				"回复「**重新执行**」我就重跑这一轮；不需要就忽略这条消息。",
 			].join("\n");
 			// Report + ask ONLY. Nothing is queued here: no re-dispatch, no session.
-			// The notice INVITES a reply, so it must land in the conversation's
-			// history too (recordDelivery) — a push alone is invisible to the
-			// model that will read the reply (field 2026-11-08).
-			this.opts.recordDelivery?.(o.source_conversation, text);
+			// Deliberately NOT written into the source conversation's history
+			// (0.2.207's recordDelivery did that): a worker's follow-up replies
+			// never come from the source conversation's session, so those copies
+			// land as user-less assistant fragments and POISON the source
+			// history's rehydration. The reply the notice invites (「重新执行」)
+			// is handled deterministically in inject(), which reads worker_tasks
+			// — it never needed the model to see the notice.
 			void Promise.resolve(this.opts.push(o.source_conversation, text)).catch(() => {});
 		}
 	}
@@ -228,8 +221,12 @@ export class WorkerService<Session> {
 			if (retry) {
 				const cid = retry.conversation_id ?? `worker:${retry.id}`;
 				const note = `✅ 已重新派发：${retry.instruction.replace(/\s+/g, " ").slice(0, 60)}。新一轮任务编号 ${cid}，完成后结果照常推回本会话。`;
-				this.opts.recordDelivery?.(sourceConversation, note);
-				void Promise.resolve(this.opts.push(sourceConversation, note)).catch(() => {});
+				// The spawn is already real — a failed confirmation must be
+				// OBSERVABLE (push-only means no history anchor left): surface it
+				// through onError instead of swallowing it.
+				void Promise.resolve(this.opts.push(sourceConversation, note)).catch((err) => {
+					this.opts.onError?.(err instanceof Error ? err : new Error(String(err)));
+				});
 				return true;
 			}
 			// No interrupted worker to re-run: fall through to the ordinary
@@ -368,10 +365,6 @@ export class WorkerService<Session> {
 			}
 		}
 		try {
-			// The final result is conversational (the user will reply to it in
-			// the source chat) — same rule as the interrupt notice and the
-			// re-run confirmation.
-			this.opts.recordDelivery?.(task.source_conversation, text);
 			await this.opts.push(task.source_conversation, text);
 		} catch (err) {
 			this.opts.onError?.(err);

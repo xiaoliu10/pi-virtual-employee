@@ -571,7 +571,10 @@ async function main(): Promise<void> {
 	}
 
 	const reportService = new ReportService(new ArtifactStore(db), config);
-	const engine = new EmployeeEngine(config, history, knowledge, browser, scheduler, documents, filesystem, reportService, downloadService, {
+	// Explicit annotation: options callbacks below reference `engine` (lazy —
+	// arrow bodies run post-construction), and without the annotation TS infers
+	// a self-referential any.
+	const engine: EmployeeEngine = new EmployeeEngine(config, history, knowledge, browser, scheduler, documents, filesystem, reportService, downloadService, {
 		builtinSkillsDir,
 		userSkillsDir,
 		shellAuditLogPath: path.join(userData, "logs", "shell-audit.log"),
@@ -1450,6 +1453,11 @@ ${tailForProgress(decision.text)}`;
 			// retries forward on EADDRINUSE, and only the port that actually bound is
 			// persisted — business systems embed a literal URL, so it must be stable.
 			const started = await startWidgetServer({
+				// Remote session lookup (field 2026-11-08): the same report the
+				// in-chat session_detail tool renders, over HTTP — so an operator
+				// on the desktop can point a browser/curl at the box and see what
+				// a conversation was actually doing. Bearer-auth at the endpoint.
+				sessionQuery: (sessionId, limit) => engine.sessionDetailReport(sessionId, limit),
 				portBase: w.port >= WIDGET_PORT_BASE ? w.port : WIDGET_PORT_BASE,
 				portAttempts: WIDGET_PORT_ATTEMPTS,
 				config: () => {
@@ -1568,16 +1576,6 @@ ${tailForProgress(decision.text)}`;
 			},
 		}),
 		push: (cid, text) => im.pushToConversation(cid, text),
-		// Conversational deliveries land in the source conversation's history:
-		// pushes are transport-only, and a model reading the transcript never
-		// sees them. Without this the interrupt notice and the re-run
-		// confirmation are invisible to the very reply they invite (field
-		// 2026-11-08: 「重新执行」 arrived into a group chat whose history had
-		// neither the notice nor the original instruction).
-		recordDelivery: (cid, text) => {
-			history.ensureConversation(cid, null);
-			history.appendMessage(cid, "assistant", text);
-		},
 		// Agent.abort() takes no options (preserveBackground is engine.abortSession
 		// territory). A worker's background scripts belong to the turn being
 		// cancelled, so the plain abort is the correct semantics here.

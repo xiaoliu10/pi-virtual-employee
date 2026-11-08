@@ -44,7 +44,7 @@ function harness(overrides = {}) {
 	const store = new WorkerTaskStore(db);
 	const h = {
 		db, store,
-		sessions: [], sends: [], pushes: [], errors: [], recorded: [],
+		sessions: [], sends: [], pushes: [], errors: [],
 		open: async (cid) => { h.sessions.push(cid); return { cid }; },
 		send: async (session, message) => {
 			h.sends.push({ session, message });
@@ -54,7 +54,6 @@ function harness(overrides = {}) {
 	};
 	const service = new WorkerService(store, {
 		open: h.open, send: h.send, push: h.push,
-		recordDelivery: (cid, text) => { h.recorded.push({ cid, text }); },
 		maxConcurrent: 3, clock: { now: () => Date.now(), setTimeout: (fn) => { h.wake = fn; return fn; } },
 		onError: (e) => h.errors.push(e),
 		...overrides.service,
@@ -94,12 +93,13 @@ test("「重新执行」respawns the interrupted worker deterministically (no co
 	assert.equal(fresh.max_minutes, 30);
 	assert.notEqual(fresh.id, "wdead", "a NEW row, not a resurrection of the dead one");
 
-	// A confirmation lands in the conversation, and in HISTORY (recordDelivery):
-	// the next model reading this chat must see that the re-run was issued.
+	// The confirmation goes out as a push ONLY — it must NOT be written into
+	// the source conversation's history (0.2.207's recordDelivery did that, and
+	// every worker reply copied there landed as a user-less assistant fragment
+	// that poisoned the chat's rehydrated context). The「重新执行」reply is
+	// claimed deterministically in inject() — it never needed history.
 	const confirm = h.pushes.find((p) => /已重新派发/.test(p.text));
 	assert.ok(confirm, "a confirmation must be pushed");
-	assert.ok(h.recorded.some((r) => r.cid === "dt:group:g1" && /已重新派发/.test(r.text)),
-		"the confirmation must land in history too (recordDelivery)");
 
 	// The empty dead session must NOT receive the message (that is what produced
 	// 「请告诉我要重新执行的具体任务」): no open/send on the old session.
@@ -163,23 +163,28 @@ test("a non-retry message never triggers the respawn (exact-match guard)", async
 	assert.equal(h.db.prepare("SELECT COUNT(*) c FROM worker_tasks").get().c, 1, "no spawn from a non-exact match");
 });
 
-test("the interrupt notice lands in history (recordDelivery), not just the transport", async () => {
+test("the interrupt notice is a PUSH only — never a history write", async () => {
+	// Field regression 2026-11-08 (0.2.207 recordDelivery): worker replies copied
+	// into the source conversation's history arrived WITHOUT their user turns
+	// (those live in the worker session), so the chat's rehydrated context became
+	// a pile of orphan assistant fragments. History writes for worker deliveries
+	// are banned; the invited reply (「重新执行」) is claimed in inject().
 	const { h, service } = harness();
 	const past = Date.now() - 60 * 60_000;
 	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
 		VALUES ('wdead', '巡检', 'dt:group:g1', 'ma1', 'running', 'worker:wdead', ?, ?)`).run(past, past);
 	service.start();
 	await flush();
-	const rec = h.recorded.find((r) => r.cid === "dt:group:g1" && /任务被中断/.test(r.text));
-	assert.ok(rec, "the interrupt notice must be recorded into the conversation history");
+	const notice = h.pushes.find((p) => /任务被中断/.test(p.text));
+	assert.ok(notice, "the interrupt notice must be pushed to the source conversation");
 });
 
-test("the final result also lands in history (the group can see what was delivered)", async () => {
+test("the final result is a PUSH only — never a history write", async () => {
 	const { h, service } = harness();
 	service.spawn({ instruction: "统计", sourceConversation: "dt:group:g1", createdBy: "ma1" });
 	service.start(); await flush();
-	const rec = h.recorded.find((r) => r.cid === "dt:group:g1" && /37 笔/.test(r.text));
-	assert.ok(rec, "the result must be recorded into the conversation history");
+	const pushed = h.pushes.find((p) => /37 笔/.test(p.text));
+	assert.ok(pushed, "the result must be pushed to the source conversation");
 });
 
 test("linear lifecycle: spawn → running → done, result delivered to the SOURCE conversation", async () => {

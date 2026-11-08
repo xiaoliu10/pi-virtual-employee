@@ -73,6 +73,11 @@ export interface WidgetDeps {
 	 * (e.g. ["127.0.0.1"] behind a local nginx). Empty = never trust the header.
 	 */
 	trustedProxies?: string[];
+	/** Session query (field 2026-11-08): GET /api/session/<id> lets an operator
+	 * — desktop, browser, curl — look a conversation UP remotely and see what the
+	 * VE worker was actually doing. Absent = endpoint returns 501 (feature off).
+	 * The response is identical to the in-chat session_detail tool. */
+	sessionQuery?: (sessionId: string, limit: number) => { text: string; matched: boolean };
 }
 
 /** Strip the IPv4-mapped IPv6 prefix so "::ffff:10.0.0.1" and "10.0.0.1" compare equal. */
@@ -286,6 +291,47 @@ export async function startWidgetServer(deps: WidgetDeps): Promise<{ port: numbe
 		const clientKey = `${presented.slice(0, 8)}:${req.socket.remoteAddress ?? "?"}`;
 		if (req.method === "POST" && url === "/api/widget/chat" && rateLimited(clientKey)) {
 			return sendJson(res, 429, { error: "请求过于频繁，请稍后再试" }, cfg.allowedOrigins.length ? origin : "*");
+		}
+
+		// GET /api/session/<id>?limit=N — operator session lookup. Remote
+		// debugging path: desktop → windows box → "what was the worker actually
+		// doing?" without SSH or the console UI.
+		// Auth is DOUBLE-tier by design (field: the access token is embedded in
+		// every browser page and must never become an all-conversation read
+		// oracle): the Bearer token proves it's the app's own surface, and the
+		// operator secret — the same x-ve-secret that mints tickets — proves the
+		// caller is an operator. Cross-conversation reads are also rate-limited
+		// and logged: enumeration is an ops capability, not a free oracle.
+		if (req.method === "GET" && url.startsWith("/api/session/")) {
+			// Bearer already verified by the outer gate above (tokenMatches, constant-time).
+			if (!cfg.secret || !secretMatches(SECRET_HEADER.exec(req.headers["x-ve-secret"] as string ?? "")?.[1] ?? "", cfg.secret)) {
+				log(`[widget] /api/session rejected: missing operator secret from ${clientAddress(req, deps.trustedProxies ?? [])}`);
+				return sendJson(res, 403, { error: "会话查询需要操作员密钥（x-ve-secret）" }, origin);
+			}
+			if (!deps.sessionQuery) {
+				return sendJson(res, 501, { error: "session query not enabled" }, origin);
+			}
+			let sessionId = "";
+			try {
+				sessionId = decodeURIComponent(url.slice("/api/session/".length));
+			} catch {
+				return sendJson(res, 400, { error: "malformed session id" }, origin); // #1: bad %escape must not kill the server
+			}
+			sessionId = sessionId.trim();
+			if (!sessionId) {
+				return sendJson(res, 400, { error: "missing session id" }, origin); // #6: '' would match nothing yet report matched
+			}
+			if (rateLimited(`session:${clientKey}`)) {
+				return sendJson(res, 429, { error: "请求过于频繁，请稍后再试" }, origin); // #7: no unlimited enumeration
+			}
+			const q = new URLSearchParams((req.url ?? "").split("?")[1] ?? "");
+			const limit = Math.max(1, Math.min(30, Math.floor(Number(q.get("limit")) || 10)));
+			const result = deps.sessionQuery(sessionId, limit);
+			log(`[widget] session query ${result.matched ? "ok" : "miss"}: ${sessionId.slice(0, 24)} by ${clientAddress(req, deps.trustedProxies ?? [])}`);
+			if (!result.matched) {
+				return sendJson(res, 404, { error: "session not found", sessionId }, origin);
+			}
+			return sendJson(res, 200, { sessionId, report: result.text }, origin);
 		}
 
 		if (req.method === "GET" && url === "/api/widget/config") {

@@ -28,6 +28,7 @@ import { inferConversationOrigin } from "../db/history-store.js";
 import { buildSystemPrompt } from "./prompt.js";
 import { createKnowledgeTool } from "./tools/knowledge.js";
 import { createWorkerTaskDetailTool } from "./tools/worker-task.js";
+import { createSessionDetailTool } from "./tools/session-detail.js";
 import { createSaveToKnowledgeTool, createRememberTool } from "./tools/save-knowledge.js";
 import { createManageKnowledgeTool } from "./tools/manage-knowledge.js";
 import { createSaveToSkillTool } from "./tools/save-skill.js";
@@ -99,6 +100,10 @@ export interface ToolSetOptions {
 	 * second hop behind the prefix's worker:<id> one-liners. Telemetry-flavored:
 	 * registered under the "telemetry" capability (operator floor). */
 	workerTaskDetail?: (id: string) => import("./tools/worker-task.js").WorkerTaskDetailRow | undefined;
+	/** session_detail (field 2026-11-08): look a conversation UP by id — recent
+	 * messages, its worker tasks, its work items. The query side of session
+	 * visibility (the model's own id rides the system prompt). Telemetry. */
+	sessionDetail?: import("./tools/session-detail.js").SessionDetailDeps;
 	/** Called after a skill is written/updated, so the engine can refresh its
 	 * skill cache and mark sessions stale without aborting the running turn. */
 	onSkillsChanged: () => Promise<void>;
@@ -310,6 +315,9 @@ export function buildTools(input: ToolSetOptions): AgentTool<any>[] {
 	if (options.filesystemEnabled) tools.push(...guardAll("filesystem", createFilesystemTools(options.filesystem)));
 	if (options.workerTaskDetail) {
 		tools.push(guarded("telemetry", createWorkerTaskDetailTool(options.workerTaskDetail)));
+	}
+	if (options.sessionDetail) {
+		tools.push(guarded("telemetry", createSessionDetailTool(options.sessionDetail)));
 	}
 	if (options.schedulerEnabled) {
 		const origin = inferConversationOrigin(options.conversationId);

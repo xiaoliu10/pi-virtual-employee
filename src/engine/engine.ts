@@ -49,12 +49,13 @@ import type { DownloadService } from "../downloads/download-service.js";
 import { buildSystemPrompt, buildTools, guardTool, withTelemetry } from "./definition.js";
 import type { UpdateOperations } from "./tools/update.js";
 import { hasActiveShellCommands } from "./tools/shell.js";
-import {effectiveAuthorizationRole, ROLE_RANK, checkPermission, isLocalConversation, resolveRole} from "../security/permissions.js";
+import {effectiveAuthorizationRole, ROLE_RANK, checkPermission, isDeclaredAdmin, isLocalConversation, resolveRole} from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
 import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
 import { ProgressWatchdog } from "./progress-watchdog.js";
 import { createMcpManager, type McpManager } from "./tools/mcp.js";
+import { renderSessionDetail } from "./tools/session-detail.js";
 import { normalizeMcpServers } from "../shared/mcp.js";
 import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, recentAssistantVisibleTexts, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, substantialAnchorOf, SUMMARIZER_RETRY, taskAnchorOf, truncateToFit, usableContextWindow, turnMemoryPrefix } from "./context.js";
 import { extractProgressFromTexts, formatDeterministicBrief, standardizeProgressReport } from "./progress.js";
@@ -329,6 +330,68 @@ export class EmployeeEngine implements EmployeeRuntime {
 	private readonly resolveOriginConversation?: EngineOptions["resolveOriginConversation"];
 	/** worker_task_detail second hop (P2) handed to buildTools. */
 	private readonly workerTaskDetail?: EngineOptions["workerTaskDetail"];
+
+	/** HTTP-side session query (widget GET /api/session/<id>): the SAME report
+	 * the in-chat session_detail tool renders (deps assembled live, field
+	 * 2026-11-08), so desktop/operator debugging sees exactly what the model
+	 * would answer. */
+	sessionDetailReport(sessionId: string, limit = 10): { text: string; matched: boolean } {
+		const deps = this.sessionDetailDeps();
+		if (!deps) return { text: "session query unavailable (no history store)", matched: false };
+		return renderSessionDetail(deps, sessionId, Math.max(1, Math.min(30, limit)));
+	}
+
+	private sessionDetailDeps(conversationId = ""): import("./tools/session-detail.js").SessionDetailDeps {
+		// this.history is a constructor-required dep (never undefined in prod);
+		// the guard is for host stubs.
+		return {
+			conversationId,
+			resolveActor: (cid) => this.turnActor.get(cid) as { senderId?: string } | undefined,
+			isAdmin: (senderId) => isDeclaredAdmin(this.config, senderId),
+			listMessages: (cid, limit = 10) => {
+				// Tail-read ONLY: a full conversation load per query would drag
+				// entire histories into memory for a 10-line report.
+				const rows = this.history.listMessagesTail
+					? this.history.listMessagesTail(cid, limit)
+					: this.history.listMessages(cid).slice(-limit);
+				return rows.map((m) => ({ role: m.role, content: m.content, created_at: m.created_at }));
+			},
+			countMessages: (cid) => this.history.countMessages(cid),
+			// "Workers RELATED to this conversation": querying a worker: id returns
+			// THAT task itself (its record is what an operator debugging the dead
+			// run needs); any other id returns the tasks it dispatched.
+			listWorkers: (cid, limit) => {
+				if (cid.startsWith("worker:")) {
+					const t = this.workerTaskDetail?.(cid.slice("worker:".length));
+					return t ? [{ id: t.id, instruction: t.instruction, status: t.status, source_conversation: t.source_conversation, created_at: t.created_at }] : [];
+				}
+				return (this.workerTaskSource?.listRecentForConversation(cid, limit) ?? []).map((t) => ({
+					id: t.id, instruction: t.instruction, status: t.status, source_conversation: cid, created_at: t.created_at,
+				}));
+			},
+			// Work items hang off the SOURCE conversation: querying a worker: id
+			// resolves its origin first, so the operator sees the autonomous task
+			// this worker was continuing (the goal/conditions lives there).
+			workItemsOf: (cid) => {
+				const origin = cid.startsWith("worker:")
+					? (this.workerTaskDetail?.(cid.slice("worker:".length))?.source_conversation ?? cid)
+					: cid;
+				return (this.workItems?.list() ?? [])
+					.filter((it) => it.origin_conversation === origin)
+					.map((it) => ({ id: it.id, title: it.title, status: it.status }));
+			},
+			isStreaming: (cid) => {
+				// A restart leaves worker rows stuck in queued/running (the crash
+				// the operator is debugging) while the in-memory maps are empty —
+				// a persisted non-terminal worker row counts as busy, not 空闲.
+				if (cid.startsWith("worker:")) {
+					const st = this.workerTaskDetail?.(cid.slice("worker:".length))?.status;
+					if (st === "queued" || st === "running") return true;
+				}
+				return !this.isIdle() && (this.durableRuntime?.isBusyConversation(cid) === true || this.sessions.get(cid)?.state.isStreaming === true);
+			},
+		};
+	}
 	private readonly skillLoader: SkillLoader;
 	/** Authoring surface for declarative skills (save_to_skill). */
 	private readonly skillWriter: SkillWriter;
@@ -2918,6 +2981,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		return {
 			name: cfg.identity.name,
 			appVersion: this.updates?.getStatus().currentVersion,
+			conversationId,
 			role: cfg.identity.role,
 			duty: cfg.identity.duty,
 			serviceHours: cfg.identity.serviceHours,
@@ -3573,6 +3637,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 					// MCP must be included here for those kernels.
 					: { enabled: cfg.capabilities.mcp?.enabled ?? false, tools: this.mcpManager.tools() },
 					workerTaskDetail: this.workerTaskDetail,
+					sessionDetail: this.sessionDetailDeps(conversationId),
 			work: this.workItems ? { items: this.workItems, fireItem: (id) => this.workBridge?.fireItem(id) ?? false, mine: (opts) => this.mineRecentWork({ ...opts, sinceTs: Date.now() - 24 * 60 * 60_000, sourceConversationId: inferConversationOrigin(conversationId) === "im" ? conversationId : undefined }) } : undefined });
 
 	}
