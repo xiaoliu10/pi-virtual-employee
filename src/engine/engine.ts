@@ -1904,6 +1904,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * user says "上次那个对账" and the model already holds `worker:<id>` to
 	 * pull the full record if needed, instead of asking "哪个对账？". */
 	private withConversationContext(conversationId: string, message: string): string {
+		// Worker sessions get a DIFFERENT brief (field 2026-11-08: a follow-up
+		// injected into the reconciliation worker answered 「那日志到底查到没有」
+		// with the reconciliation report — the worker saw no task list, could not
+		// tell the user's question apart from its own task, and passed its own
+		// product off as the answer). IM sessions get members + recent tasks.
+		if (conversationId.startsWith("worker:")) return this.withWorkerTaskBrief(conversationId, message);
 		// IM conversations only: console/sched sessions have no member roster,
 		// and injecting an empty block would be pure noise.
 		if (!/^(dt|feishu|wecom|echo):/.test(conversationId)) return message;
@@ -1940,6 +1946,52 @@ export class EmployeeEngine implements EmployeeRuntime {
 		if (prefix.length > EmployeeEngine.CONTEXT_PREFIX_BUDGET) {
 			// Spill: over-budget prefix is truncated to the member line only —
 			// members are the higher-locality block for name resolution.
+			const first = blocks[0];
+			prefix = first.slice(0, EmployeeEngine.CONTEXT_PREFIX_BUDGET) + "\n\n";
+		}
+		return `【上下文速览（自动注入，可能过时；以对方当前消息为准）】\n${prefix}${message}`;
+	}
+
+	/**
+	 * Worker-session task brief: what THIS worker is for, what ELSE the source
+	 * conversation has, and an explicit boundary rule. The field failure was a
+	 * worker answering a question about a DIFFERENT task with its own task's
+	 * product — the brief exists so the model can tell the two apart and be
+	 * honest about the boundary. Prefix-only (never persisted).
+	 */
+	private withWorkerTaskBrief(conversationId: string, message: string): string {
+		const blocks: string[] = [];
+		try {
+			const statusLabel: Record<string, string> = { queued: "排队中", running: "执行中", done: "已完成", cancelled: "已取消", failed: "失败" };
+			const own = this.workerTaskDetail?.(conversationId.slice("worker:".length));
+			if (own) {
+				blocks.push(`【你手上的任务】${conversationId}「${own.instruction.replace(/\s+/g, " ").slice(0, 50)}」（${statusLabel[own.status] ?? own.status}）`);
+				// The SOURCE conversation's other tasks: what the user might be
+				// referring to when they say 「那…呢」 without naming the task.
+				const others = (this.workerTaskSource?.listRecentForConversation(own.source_conversation, 5) ?? [])
+					.filter((t) => t.id !== own.id);
+				if (others.length > 0) {
+					const lines = others.map((t) => {
+						const instruction = t.instruction.replace(/\s+/g, " ").slice(0, 40);
+						const outcome = (t.error || t.result || "").replace(/\s+/g, " ").slice(0, 60);
+						return `- worker:${t.id}「${instruction}」${outcome ? `→ ${outcome}` : ""}（${statusLabel[t.status] ?? t.status}）`;
+					});
+					blocks.push(`【同一来源会话的其他任务（不是你负责的）】\n` + lines.join("\n"));
+				}
+				blocks.push(
+					"【边界】用户这条消息如果问的不是你手上的任务：如实说明你只负责「你手上的任务」，把上面其他任务的状态转述给用户参考；" +
+						"绝不把自己任务的产物当作其他任务的结果回复，也不要编造其他任务的进展。",
+				);
+			}
+		} catch (err) {
+			// Same contract as withConversationContext: an enhancement must never
+			// poison the turn.
+			console.warn("[engine] worker task brief failed — continuing without it:", err instanceof Error ? err.message : err);
+			return message;
+		}
+		if (blocks.length === 0) return message;
+		let prefix = blocks.join("\n") + "\n\n";
+		if (prefix.length > EmployeeEngine.CONTEXT_PREFIX_BUDGET) {
 			const first = blocks[0];
 			prefix = first.slice(0, EmployeeEngine.CONTEXT_PREFIX_BUDGET) + "\n\n";
 		}
