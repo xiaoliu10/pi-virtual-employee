@@ -902,3 +902,16 @@ test("a tool-cap stop explains WHY and how to continue (formatCapHitReply)", asy
 	assert.match(result.reply, /本轮工具调用已达上限（1 步）/, "the cause must be present");
 	assert.match(result.reply, /回复「继续」/, "and the resume hint");
 });
+
+test("worker sessions get a task-boundary brief (field 2026-11-08: cross-task answer mixup)", async () => {
+	// The reconciliation worker answered 「那日志到底查到没有」 with the
+	// reconciliation report: withConversationContext SKIPPED worker: ids, so the
+	// worker saw no task list and could not tell the user's question apart from
+	// its own task. The brief must exist, be routed, and carry the boundary rule.
+	const { readFileSync } = await import("node:fs");
+	const src = readFileSync(join(root, "src/engine/engine.ts"), "utf8");
+	assert.match(src, /if \(conversationId\.startsWith\("worker:"\)\) return this\.withWorkerTaskBrief/, "worker: ids must route to the task brief");
+	assert.match(src, /【你手上的任务】/, "the brief names the worker's own task");
+	assert.match(src, /【同一来源会话的其他任务/, "and lists the source conversation's other tasks");
+	assert.match(src, /绝不把自己任务的产物当作其他任务的结果回复/, "with an explicit boundary rule");
+});
