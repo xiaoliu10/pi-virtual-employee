@@ -20,6 +20,7 @@
  * structurally separate.
  */
 import { WorkerTaskStore, type WorkerTaskRow } from "./worker-tasks.js";
+import { looksLikeTask } from "../engine/task-planner.js";
 
 /** Injected durable-execution primitives (same shape WorkService uses — the
  * shared KERNEL below both infrastructures; nothing task-flavored crosses). */
@@ -235,6 +236,19 @@ export class WorkerService<Session> {
 		}
 		const recent = this.store.recentForConversation(sourceConversation);
 		if (!recent?.conversation_id) return false;
+		// ONLY a LIVE worker owns the dialogue unconditionally (field 2026-11-07:
+		// the worker asked 「把验证码发给我」, the user's reply must reach IT).
+		// A FINISHED worker (done/error/cancelled) is history: a NEW task request
+		// (triage-fires) must fall through to spawn/inline — routing it into the
+		// finished worker's session made the boundary brief turn it away entirely
+		// (field 2026-11-08 23:44: 「我这边只负责平阳数币监控…没有…能力或权限」 for a
+		// fresh serial-number lookup). Conversational follow-ups (「结果呢」「继续」 —
+		// not task-shaped) still continue here: the done-worker continuation
+		// contract stays intact.
+		const LIVE_STATUSES = new Set(["queued", "running"]);
+		if (!LIVE_STATUSES.has(recent.status) && looksLikeTask(message)) {
+			return false;
+		}
 		const session = await this.opts.open(recent.conversation_id);
 		// Serialize on the session's turn chain: the kernel refuses concurrent
 		// prompts, and a user typing during a running turn expects their message

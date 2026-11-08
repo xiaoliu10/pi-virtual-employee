@@ -464,3 +464,29 @@ test("an error with NO reply still falls back to 执行未完成", async () => {
 	service.start(); await flush();
 	assert.match(h.pushes[0]?.text ?? "", /执行未完成：something broke/);
 });
+
+test("a FINISHED worker no longer swallows a NEW task request — triage decides (field 23:44)", async () => {
+	// Field 2026-11-08 23:44: a fresh serial-number lookup was injected into the
+	// finished 「平阳数币监控」 worker, whose boundary brief turned it away with
+	// 「我这边只负责…没有…能力或权限」. The gate: done/error workers keep the
+	// CONTINUATION contract (non-task follow-ups still inject) but a task-shaped
+	// NEW request falls through to triage (spawn/inline decides).
+	const { h, service } = harness();
+	const past = Date.now() - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
+		VALUES ('wdone', '平阳数币今日交易金额监控', 'dt:group:g1', 'ma1', 'done', 'worker:wdone', ?, ?)`).run(past, past);
+	const taskMsg = "0002026110800003400。帮我查一下这笔流水的支付渠道下单日志，先查 spay 再查 sls，然后汇总异常";
+	assert.equal(await service.inject("dt:group:g1", taskMsg, "ma1"), false, "task-shaped request into a done worker → falls through");
+	// Conversational follow-up on the SAME finished worker still injects (contract).
+	assert.equal(await service.inject("dt:group:g1", "结果呢", "ma1"), true, "non-task follow-up keeps the continuation contract");
+	assert.equal(await service.inject("dt:group:g1", "继续", "ma1"), true, "「继续」 still continues");
+});
+
+test("a LIVE worker still owns the dialogue unconditionally", async () => {
+	const { h, service } = harness();
+	const now = Date.now();
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
+		VALUES ('wlive', '长任务执行中', 'dt:group:g1', 'ma1', 'running', 'worker:wlive', ?, ?)`).run(now, now);
+	const taskMsg = "0002026110800003400。帮我查一下这笔流水的支付渠道下单日志，先查 spay 再查 sls，然后汇总异常";
+	assert.equal(await service.inject("dt:group:g1", taskMsg, "ma1"), true, "even task-shaped text reaches a running worker (verification codes etc.)");
+});
