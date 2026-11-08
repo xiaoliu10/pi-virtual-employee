@@ -419,3 +419,48 @@ test("claim is atomic: one dispatch runs exactly once", async () => {
 	assert.equal(h.sends.length, 1);
 	assert.equal(h.store.get(w.id).status, "done");
 });
+
+test("a DETERMINISTIC Chinese failure reply is delivered VERBATIM (field 2026-11-08)", async () => {
+	// Field: send() returned { reply: 中文兜底(含原因和续跑指引), error: 英文原文,
+	// deterministic: true } and runTurn pushed 「⚠️ 执行未完成：This operation was
+	// aborted」 — DISCARDING the Chinese explanation because `r.error || !text`
+	// treated any error as more urgent than the reply. The deterministic reply IS
+	// the finished failure message; appending the raw error after it would be
+	// noise on noise.
+	const { h, service } = harness({ reply: (h) => ({
+		reply: "⚠️ 这次执行被系统中止了。常见原因：① 长时间无进展…可以回复「继续」接着做。",
+		error: "This operation was aborted",
+		deterministic: true,
+	}) });
+	service.spawn({ instruction: "统计", sourceConversation: "dt:group:g1", createdBy: "ma1" });
+	service.start(); await flush();
+	const pushed = h.pushes.map((p) => p.text).join("\n");
+	assert.match(pushed, /这次执行被系统中止了/, "the Chinese reply must be delivered");
+	assert.doesNotMatch(pushed, /执行未完成：/, "no appended failure line — the reply already IS the failure report");
+	assert.doesNotMatch(pushed, /This operation was aborted/, "no English leaks to the user at all");
+});
+
+test("a NON-deterministic reply with an error keeps the failure signal (appended)", async () => {
+	// Review e6c6fd82 #1: { reply: 模型正常回答, error: "…", deterministic: false }
+	// means the model answered something but the run still recorded a failure.
+	// Replacing (or dropping) the error hides that the task is unfinished — the
+	// failure line must be APPENDED after the reply, not swallow it.
+	const { h, service } = harness({ reply: (h) => ({
+		reply: "已完成第一步的核对，明细如下：…",
+		error: "tool channel died mid-run",
+		deterministic: false,
+	}) });
+	service.spawn({ instruction: "统计", sourceConversation: "dt:group:g1", createdBy: "ma1" });
+	service.start(); await flush();
+	const pushed = h.pushes[0]?.text ?? "";
+	assert.match(pushed, /已完成第一步的核对/, "the model's partial answer is delivered");
+	assert.match(pushed, /⚠️ 执行未完成：tool channel died mid-run/, "the failure signal is appended");
+	assert.ok(pushed.indexOf("已完成第一步") < pushed.indexOf("执行未完成"), "answer first, failure after");
+});
+
+test("an error with NO reply still falls back to 执行未完成", async () => {
+	const { h, service } = harness({ reply: (h) => ({ reply: "", error: "something broke" }) });
+	service.spawn({ instruction: "统计", sourceConversation: "dt:group:g1", createdBy: "ma1" });
+	service.start(); await flush();
+	assert.match(h.pushes[0]?.text ?? "", /执行未完成：something broke/);
+});
