@@ -1,10 +1,11 @@
 /** Durable execution owned by VE; UI history is a projection of the transcript. */
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createModels, createProvider, createAssistantMessageEventStream, type Model, type Api, type Message, type AssistantMessage, type SimpleStreamOptions } from "@earendil-works/pi-ai";
-import { defineDoc, ProviderDoc, type Conversation, type ConversationId, type Cursor, type ToolRegistration } from "@earendil-works/pi-durable";
+import { defineDoc, ProviderDoc, type Conversation, type ConversationId, type Cursor, type EntryRecord, type ToolRegistration } from "@earendil-works/pi-durable";
 import type { Agent, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
 import type { SendCtx, SendResult, TurnProcessEvent } from "../engine.js";
 import type { HistoryStore } from "../../db/history-store.js";
+import { looksLikeImperative, looksLikeTask, NARRATION_GUARD_NOTICE } from "../task-planner.js";
 import { openDurableHost, type DurableHost } from "./harness-host.js";
 import { toDurableTool } from "./ve-tools.js";
 
@@ -49,6 +50,16 @@ const ZERO_USAGE = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalToke
 /** A run that DID finish but produced no text at all (see result()). */
 const EMPTY_ANSWER_REPLY = "本次执行已结束，但模型没有返回任何内容（网关可能中断了响应）。请重新描述你的需求，我会再执行一次。";
 /**
+ * Narration-guard continuation (field 2026-11-09). A bare `continue` submission
+ * cannot force a new round here: pi-durable's generation only answers a context
+ * ending in a user/toolResult message — after a completed assistant answer it
+ * settles `nothing_to_answer` WITHOUT a request (measured on the real Harness).
+ * So the guard submits ONE new input carrying this system nudge — the same
+ * injected-user-message mechanism the settle gate's verify/repair rounds use.
+ * Strictly once: the requestId is spent a single time, never rotated or retried.
+ */
+const NARRATION_GUARD_NUDGE = "上一次响应只有过程叙述，没有调用任何工具执行任务。请立即实际执行任务（调用工具），完成后给出结果；不要再只描述打算做什么。";
+/**
  * Replies THIS runtime synthesizes when a run produced no answer. They are
  * delivery-time notices, not employee speech — and every one of them that gets
  * persisted into the conversation history teaches the model to imitate it:
@@ -57,13 +68,13 @@ const EMPTY_ANSWER_REPLY = "本次执行已结束，但模型没有返回任何�
  * (stop=stop, 12 tokens) — the model copied its own transcript. So the durable
  * import drops them instead of replaying them into the transcript.
  */
-const SYNTHETIC_FALLBACK_REPLIES = ["执行已暂停，请检查恢复状态。", EMPTY_ANSWER_REPLY];
+const SYNTHETIC_FALLBACK_REPLIES = ["执行已暂停，请检查恢复状态。", EMPTY_ANSWER_REPLY, NARRATION_GUARD_NOTICE];
 function isSyntheticFallbackReply(text: string): boolean {
 	const normalized = (text ?? "").replace(/\s+/g, "").trim();
 	// Match on the DISTINCTIVE FRAGMENTS, not the whole sentence: the notice text
 	// is free to be reworded (it already was once), and a rewritten notice must not
 	// silently stop being recognized.
-	return /执行已暂停|模型没有返回任何内容|请检查恢复状态/.test(normalized);
+	return /执行已暂停|模型没有返回任何内容|请检查恢复状态|已尝试继续执行但模型没有实际动作/.test(normalized);
 }
 function withUsage(message: AssistantMessage): AssistantMessage {
 	return message.usage ? message : { ...message, usage: { ...ZERO_USAGE } };
@@ -109,6 +120,9 @@ export class DurableRuntime {
 	private readonly tails = new Map<string, Promise<unknown>>();
 	private readonly tasks = new Set<Promise<unknown>>();
 	private closing = false;
+	/** Conversations aborted since their last send() — the narration guard checks
+	 * this before submitting its one nudge (review 94189d6f P3). */
+	private readonly turnAbortIds = new Set<string>();
 	private constructor(private readonly opts: RuntimeOptions) {}
 
 	static async open(opts: RuntimeOptions): Promise<DurableRuntime> {
@@ -350,6 +364,7 @@ export class DurableRuntime {
 		}
 	}
 	abort(id: string): boolean {
+		this.turnAbortIds.add(id); // the narration guard must not nudge an aborted turn
 		const set = this.active.get(id);
 		// background:true is THE fix (field 2026-11-06, the box): autonomous /
 		// work-window runs hang off BACKGROUND nodes, and pi-durable's walkDown
@@ -367,6 +382,7 @@ export class DurableRuntime {
 	async send(agent: Agent, text: string, ctx?: SendCtx): Promise<SendResult> {
 		if (this.closing) throw new Error("Durable runtime is closing");
 		const id = agent.sessionId ?? "default";
+		this.turnAbortIds.delete(id); // a NEW turn clears the previous turn's abort
 		// Keep current callbacks scoped to the submission and serialize same-chat
 		// admission; other chats continue independently.
 		const previous = this.tails.get(id) ?? Promise.resolve();
@@ -434,7 +450,39 @@ export class DurableRuntime {
 			const content = ctx?.images?.length ? [{ type: "text" as const, text: effectiveText }, ...ctx.images.map((image) => ({ type: "image" as const, ...image }))] : effectiveText;
 			const submission = await conv.submit({ type: "input", content, requestId: `ve:${conv.id}` }, context);
 			const outcome = await submission.wait(context);
-			const result = await this.result(conv, outcome.status === "done" ? outcome.answer : undefined);
+			let result = await this.result(conv, outcome.status === "done" ? outcome.answer : undefined);
+			// NARRATION GUARD (field 2026-11-09): a task-shaped turn that made ZERO
+			// tool calls must not settle for process narration (「我来尝试登录…先检查
+			// 工具」 then silence — nothing dispatched, nothing executed; the user ruled
+			// such replies unwanted). Force ONE continue and deliver the new answer;
+			// if the continuation still takes no action, deliver it WITH the honest
+			// notice. Exactly once — never a loop (flood-loop lesson). Failure notices
+			// (result.error) are already honest outcomes and are left alone.
+			// Review 94189d6f P3: an aborted turn must not get the nudge — /stop or
+			// a watchdog soft-stop landed mid-turn means the user cancelled it; one
+			// extra billed LLM call is exactly the wasted spend the guard avoids.
+			const abortedMidTurn = this.turnAbortIds.has(id);
+			if (!result.error && !abortedMidTurn && (looksLikeTask(text) || looksLikeImperative(text)) && !(await this.hadToolAction(conv))) {
+				console.warn(`[durable] narration guard: zero-tool task turn → forced continue via input (conv=${id})`);
+				const priorEntries = await this.entryIdSnapshot(conv);
+				try {
+					// ONE nudge input, one requestId, no retry: a bare continue would
+					// settle nothing_to_answer (assistant-tailed context), and a second
+					// attempt would be the flood loop this guard must never become.
+					const continued = await conv.submit({ type: "input", content: NARRATION_GUARD_NUDGE, requestId: `ve:${conv.id}:narration-guard` }, context);
+					const continuedOutcome = await continued.wait(context);
+					result = await this.result(conv, continuedOutcome.status === "done" ? continuedOutcome.answer : undefined);
+				} catch (err) {
+					// Fail-open: a broken continuation must not swallow the turn. The
+					// notice below still tells the user no real action happened.
+					console.warn("[durable] narration guard continue failed:", err instanceof Error ? err.message : err);
+				}
+				// Only the CONTINUATION's entries count: the first round's (lack of)
+				// evidence must not leak into the second judgment.
+				if (!result.error && !(await this.hadToolAction(conv, priorEntries))) {
+					result = { ...result, reply: `${result.reply}\n\n${NARRATION_GUARD_NOTICE}` };
+				}
+			}
 			await this.project(conv, result);
 			ctx?.onPersist?.(id);
 			return result;
@@ -444,6 +492,43 @@ export class DurableRuntime {
 			this.untrack(conv, id);
 		}
 	}
+	/**
+	 * Snapshot of every entry id currently committed in this turn's conversation.
+	 * The narration guard uses it to scope the post-continue tool-evidence check
+	 * to entries the continuation appended (entries are append-only per turn).
+	 */
+	private async entryIdSnapshot(conv: Conversation): Promise<Set<EntryRecord["id"]>> {
+		const ids = new Set<EntryRecord["id"]>();
+		let cursor: Cursor | undefined;
+		do {
+			const page = await conv.entries({ order: "ascending" }, 100, cursor, context);
+			for (const entry of page.items) ids.add(entry.id);
+			cursor = page.next;
+		} while (cursor);
+		return ids;
+	}
+
+	/**
+	 * Did the run commit a real tool action? Evidence is a tool-result entry or
+	 * an assistant entry carrying toolCall parts (a call whose result entry was
+	 * orphaned still counts as an attempt). Imported UI history (ve.history) is
+	 * text context, never this run's work. `exclude` skips a prior snapshot so
+	 * the continuation is judged on its own entries only.
+	 */
+	private async hadToolAction(conv: Conversation, exclude?: ReadonlySet<EntryRecord["id"]>): Promise<boolean> {
+		let cursor: Cursor | undefined;
+		do {
+			const page = await conv.entries({ order: "ascending" }, 100, cursor, context);
+			for (const entry of page.items) {
+				if (exclude?.has(entry.id) || entry.kind === "ve.history") continue;
+				if (entry.kind === "pi.tool-result") return true;
+				if ((entry.model ?? []).some((m) => m.role === "assistant" && m.content.some((part) => part.type === "toolCall"))) return true;
+			}
+			cursor = page.next;
+		} while (cursor);
+		return false;
+	}
+
 	/**
 	 * Read a finished run's answer. A submission that reaches `done` can still
 	 * carry an EMPTY assistant content: the groq/qwen gateway occasionally closes a

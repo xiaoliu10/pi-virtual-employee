@@ -123,6 +123,44 @@ test("hasLongRunningVerb recognises the action vocabulary", () => {
 	assert.equal(hasLongRunningVerb("现在几点"), false);
 });
 
+// ── field 2026-11-09: 「继续 登录生产后台管理」 died as foreground narration ──
+// 登录 was a task verb (task-planner looksLikeTask) but missing from the
+// long-running vocabulary. The added verbs are all multi-character forms (the
+// 盯/爬 lesson) and must not weaken the question / short-chat exemptions.
+
+test("hasLongRunningVerb recognises the login/verification vocabulary (field 2026-11-09)", () => {
+	for (const t of ["登录生产后台", "登陆系统", "检查当前环境", "验证登录状态", "打开管理端", "访问控制台", "上传附件", "同步数据", "重启服务"]) {
+		assert.equal(hasLongRunningVerb(t), true, `should look long-running: ${t}`);
+	}
+});
+
+test("login-shaped task messages route with a ≥2-step plan (field dispatch case)", () => {
+	// The exact field message, task-shaped with the side pass's plan.
+	const d = triageMessage({ text: "继续 登录生产后台管理", plan: PLAN3, looksLikeTask: true }, true);
+	assert.equal(d.dispatch, true, "the field message must route, not stay foreground");
+	for (const text of ["登录 spay 后台，然后检查环境并验证登录状态", "重启网关服务，再检查健康状态"]) {
+		const decision = triageMessage({ text, plan: PLAN3, looksLikeTask: true }, true);
+		assert.equal(decision.dispatch, true, `must route: ${text}`);
+	}
+});
+
+test("the new verbs never override the question / short-utterance exemptions", () => {
+	// Question shapes carrying a new verb stay inline.
+	for (const text of ["登录入口在哪", "重启了吗", "验证是什么意思", "怎么上传？"]) {
+		const d = triageMessage({ text, plan: PLAN3, looksLikeTask: true }, true);
+		assert.equal(d.dispatch, false, `question must stay inline: ${text}`);
+		assert.equal(d.reason, "question");
+	}
+	// isQuestion's short exemption keys off TASK_VERB_HINT, not this verb list:
+	// a bare new verb + 一下 with no hint stays chat, exactly as before.
+	for (const text of ["验证一下", "同步一下", "打开一下"]) {
+		assert.equal(isQuestion(text), true, `short utterance stays chat: ${text}`);
+		const d = triageMessage({ text, plan: PLAN3, looksLikeTask: true }, true);
+		assert.equal(d.dispatch, false);
+		assert.equal(d.reason, "question");
+	}
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // WIRING: the triage deciding "dispatch" is worth nothing unless a work item is
 // actually created, fired, and the ACK returned instead of running inline.
@@ -276,3 +314,21 @@ test(`dispatch WIRING: spawns a worker with flag ${JSON.stringify(chatDispatch)}
 
 }
 
+
+// NOTE (review 94189d6f P1 resolution): the production call site (manager.ts)
+// passes looksLikeTask:true for the planless dispatch path BY DESIGN (7457cdd
+// "Router 只路由"): the not-task gate is intentionally bypassed and
+// isQuestion/isSmallTalk are the real gatekeepers. Passing the real detector
+// there REGRESSES dispatch for genuine task messages lacking multi-step
+// evidence (verified: 「跑一下平阳数币今日金额监控」 stops routing). So these tests
+// pin the field message through the shape checks, as production does.
+test("the field message routes via the shape checks (production passes looksLikeTask:true)", () => {
+	const d = triageMessage({ text: "继续 登录生产后台管理", plan: undefined, looksLikeTask: true }, true);
+	assert.equal(d.dispatch, true, "「继续 登录生产后台管理」 is not a question (TASK_VERB_HINT carve-out) and not smalltalk → routed to a Worker");
+});
+
+test("a question-shaped short message with a task verb stays foreground (isQuestion)", () => {
+	const d = triageMessage({ text: "登录密码是什么", plan: undefined, looksLikeTask: true }, true);
+	assert.equal(d.dispatch, false, "Q&A must not be dispatched just because it carries a task verb");
+	assert.equal(d.reason, "question");
+});

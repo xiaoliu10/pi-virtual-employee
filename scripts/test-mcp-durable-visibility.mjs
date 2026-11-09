@@ -378,10 +378,11 @@ test("P1: mcpToolsFor actually APPLIES the guard (not just guardTool in isolatio
 	engine.turnActor = new Map([["dt:group:x", { senderId: "u1", senderName: "someone" }]]);
 	engine.noteAuthorizationNeeded = () => {};
 	// The telemetry wrapper (added after the RBAC guard) touches these maps via
-	// recordToolTelemetry → touchActivity. This test builds the engine with
-	// Object.create, so constructor-initialised maps do not exist.
+	// recordToolTelemetry → touchActivity / turn-tool counting. This test builds
+	// the engine with Object.create, so constructor-initialised maps do not exist.
 	engine.turnActivity = new Map();
 	engine.turnActivityLog = new Map();
+	engine.turnToolCalls = new Map();
 	engine.mcpManager = { tools: () => [{
 		name: "mcp__etc__query", label: "q", description: "q",
 		parameters: { type: "object", properties: {} },

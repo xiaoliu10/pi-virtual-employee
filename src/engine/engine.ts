@@ -19,7 +19,7 @@ import { sidePassMaxTokens } from "./side-pass-budget.js";
 import { runningBackgroundProcesses, stopBackgroundProcesses } from "./tools/shell.js";
 import type { Skill } from "./skills/types.js";
 import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "./pi-compaction.js";
-import { formatPlanForTurn, formatPlanMessage, looksLikeTask, parsePlan, PLAN_PROMPT_HEADER, shouldPushPlanToChat } from "./task-planner.js";
+import { formatPlanForTurn, formatPlanMessage, looksLikeImperative, looksLikeTask, NARRATION_GUARD_NOTICE, parsePlan, PLAN_PROMPT_HEADER, shouldPushPlanToChat } from "./task-planner.js";
 import { createModels, normalizeContext, ModelsError } from "@earendil-works/pi-ai";
 import { SIDE_PASS_DEFAULT_LEVEL, applyThinkingDeclaration } from "../shared/thinking.js";
 
@@ -471,6 +471,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** Original requester text per in-flight turn — the payload a pending admin
 	 * authorization replays. Set in send(), cleared in its finally. */
 	private readonly turnUserMessage = new Map<string, string>();
+	/** Narration-guard snapshots (review 94189d6f P3): turn-scoped context
+	 * captured at turn start, re-registered for the guard's continuation, and
+	 * dropped with it. Never consulted outside the guard. */
+	private readonly turnActorsSaved = new Map<string, (InboundActor & { text: string }) | undefined>();
+	private readonly turnMemorySaved = new Map<string, { personOwner?: string; conversationOwner?: string } | undefined>();
+	private readonly turnSendFileSaved = new Map<string, FileSender | undefined>();
+	private readonly turnSendImageSaved = new Map<string, ImageSender | undefined>();
 	/** One-shot admin delegation: pending 「确认授权」 requests per conversation. */
 	private readonly authorizations = new AuthorizationStore();
 	/** Last observed sign of life per conversation's current turn (LLM stream
@@ -2765,11 +2772,18 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// closure passed into buildTools.
 		if (ctx?.sendFile) this.turnSendFile.set(conversationId, ctx.sendFile);
 		if (ctx?.sendImage) this.turnSendImage.set(conversationId, ctx.sendImage);
-		if (ctx?.actor) this.turnActor.set(conversationId, { ...ctx.actor, text: message });
 		// A turn that arrives WITHOUT verified sender metadata must never inherit
 		// the previous sender's identity (roles are per-person, and one group
 		// conversation serves many senders).
+		if (ctx?.actor) this.turnActor.set(conversationId, { ...ctx.actor, text: message });
 		else if (!isLocalConversation(conversationId)) this.turnActor.delete(conversationId);
+		// Review 94189d6f P3: snapshot the turn-scoped context the narration
+		// guard's continuation will need — the turn's finally deletes these maps
+		// BEFORE the guard runs, and a continuation without them degrades to
+		// viewer RBAC with no authorization/memory/file channels.
+		this.turnActorsSaved.set(conversationId, ctx?.actor ? { ...ctx.actor, text: message } : undefined);
+		this.turnSendFileSaved.set(conversationId, ctx?.sendFile);
+		this.turnSendImageSaved.set(conversationId, ctx?.sendImage);
 		// The requester's original text, for the admin one-shot authorization
 		// flow: a role-refusal registers it as the pending request to replay.
 		// Cleared in the finally like the other per-turn state.
@@ -2781,6 +2795,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// knowledge-search filter.
 		const memoryCtx = deriveMemoryContext(ctx?.actor, conversationId);
 		this.turnMemoryContext.set(conversationId, memoryCtx);
+		this.turnMemorySaved.set(conversationId, { ...memoryCtx });
 		// First sign of life for the stall watchdog — every event below refreshes it.
 		this.touchActivity(conversationId);
 
@@ -2820,9 +2835,14 @@ export class EmployeeEngine implements EmployeeRuntime {
 		let deterministic = false;
 		let degenerate = false;
 		let undeliveredSteer = false;
+		// Hoisted for the narration guard below: its continuation re-drives the
+		// same effective input through the same host when the SDK refuses to
+		// continue from a completed assistant tail.
+		let host: SessionHost | undefined;
+		let effectiveMessage = message;
 		try {
-			const effectiveMessage = this.withConversationContext(conversationId, this.withTurnMemoryPrefix(conversationId, memoryCtx, message));
-			const host = await this.ensureHost(agent, conversationId);
+			effectiveMessage = this.withConversationContext(conversationId, this.withTurnMemoryPrefix(conversationId, memoryCtx, message));
+			host = await this.ensureHost(agent, conversationId);
 			retries = await this.promptWithRetry(agent, host, conversationId, effectiveMessage, ctx?.images);
 		} catch (err) {
 			// Login-shaped failures get actionable Chinese guidance (review H4) at
@@ -2917,6 +2937,80 @@ export class EmployeeEngine implements EmployeeRuntime {
 			}
 		}
 
+		// NARRATION GUARD (field 2026-11-09): a task-shaped turn that made ZERO tool
+		// calls must not settle for process narration (「我来尝试登录…先检查工具」 then
+		// silence — nothing executed; the user ruled such replies unwanted). Force
+		// ONE continuation and re-read the reply; if the model still takes no
+		// action, deliver WITH the honest notice. Exactly once — never a loop
+		// (flood-loop lesson). Turns that already failed honestly (deterministic),
+		// were cap/budget-paused, errored, or deliberately stopped stay untouched;
+		// ephemeral side passes (eval/learn) are not user turns at all.
+		if (!ctx?.ephemeral && !hardError && !deterministic && !capHit && !contextBudgetHit
+			&& !this.turnAborts.has(conversationId)
+			&& (looksLikeTask(message) || looksLikeImperative(message)) && (this.turnToolCalls.get(conversationId) ?? 0) === 0) {
+			console.warn(`[engine] narration guard: task turn for ${conversationId} ended with zero tool calls — continuing once`);
+			// Review 94189d6f P3: the continuation runs AFTER the turn's finally
+			// deleted the turn-scoped context (actor/memory/sendFile) — without
+			// re-registration the continuation loses RBAC identity (viewer),
+			// authorization pending state, and memory scoping. Re-populate the
+			// snapshots captured before the cleanup; cleared again in the guard's
+			// own finally.
+			const savedActor = this.turnActorsSaved.get(conversationId);
+			const savedMemory = this.turnMemorySaved.get(conversationId);
+			const savedSendFile = this.turnSendFileSaved.get(conversationId);
+			const savedSendImage = this.turnSendImageSaved.get(conversationId);
+			if (savedActor) this.turnActor.set(conversationId, savedActor);
+			if (savedMemory) this.turnMemoryContext.set(conversationId, savedMemory);
+			if (savedSendFile) this.turnSendFile.set(conversationId, savedSendFile);
+			if (savedSendImage) this.turnSendImage.set(conversationId, savedSendImage);
+			let continuedReply = "";
+			const guardUnsubscribe = agent.subscribe((event: AgentEvent) => {
+				if (event.type === "message_end" && (event.message as { role?: string }).role === "assistant") {
+					continuedReply = extractText(event.message);
+				}
+			});
+			try {
+				this.stripDanglingAssistant(agent);
+				try {
+					await this.safeContinue(agent);
+				} catch (err) {
+					const text = err instanceof Error ? err.message : String(err);
+					if (!text.startsWith("Cannot continue")) throw err;
+					// A completed narration tail is not a resumable anchor (the SDK
+					// refuses assistant-role continuation) — replay the instruction,
+					// the same fallback promptWithRetry uses.
+					const visionImages: ImageContent[] | undefined =
+						ctx?.images?.length && agent.state.model.input.includes("image")
+							? ctx.images.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }))
+							: undefined;
+					await this.driveTurn(host, agent, effectiveMessage, visionImages);
+				}
+			} catch (err) {
+				// Fail-open: a broken continuation must not swallow the turn. The
+				// notice below still tells the user no real action happened.
+				console.warn("[engine] narration guard continuation failed:", err instanceof Error ? err.message : err);
+			} finally {
+				guardUnsubscribe();
+				// The continuation's stream touches re-populated turnActivity after
+				// the turn's cleanup above; drop it again so an idle process keeps
+				// accumulating no per-conversation state. The re-populated turn
+				// context maps go with it — no state survives the guard.
+				this.turnActivity.delete(conversationId);
+				this.turnActor.delete(conversationId);
+				this.turnMemoryContext.delete(conversationId);
+				this.turnSendFile.delete(conversationId);
+				this.turnSendImage.delete(conversationId);
+				this.turnActorsSaved.delete(conversationId);
+				this.turnMemorySaved.delete(conversationId);
+				this.turnSendFileSaved.delete(conversationId);
+				this.turnSendImageSaved.delete(conversationId);
+			}
+			if (continuedReply.trim()) reply = continuedReply;
+			if ((this.turnToolCalls.get(conversationId) ?? 0) === 0) {
+				reply = `${reply}\n\n${NARRATION_GUARD_NOTICE}`;
+			}
+		}
+
 		// Add delivery status only after choosing the outcome: it must neither
 		// mask an empty reply's failure nor be overwritten by a final summary.
 		if (undeliveredSteer) {
@@ -2988,9 +3082,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 	): void {
 		this.touchActivity(conversationId); // tool start/end — life, even without telemetry
 		if (event.fingerprint) this.noteToolProgress(conversationId, event.fingerprint, event.name);
+		// The turn's tool count is turn bookkeeping (the narration guard reads it
+		// to prove zero action), not telemetry — count even without a store.
+		this.turnToolCalls.set(conversationId, (this.turnToolCalls.get(conversationId) ?? 0) + 1);
 		if (!this.telemetry) return;
 		try {
-			this.turnToolCalls.set(conversationId, (this.turnToolCalls.get(conversationId) ?? 0) + 1);
 			this.telemetry.recordTool({ ...event, conversationId, turnId: this.turnIds.get(conversationId) });
 		} catch (err) {
 			console.warn("[engine] telemetry tool write failed:", err instanceof Error ? err.message : err);

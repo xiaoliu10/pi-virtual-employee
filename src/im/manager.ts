@@ -273,6 +273,14 @@ export class IMAdapterManager {
 			} else {
 				console.log("[im] dispatch triage: inline (worker infrastructure unavailable)");
 			}
+			// ARCHITECTURE (7457cdd, "Router 只路由不执行"): the planless dispatch path
+			// deliberately passes looksLikeTask:true — the not-task gate is bypassed and
+			// isQuestion/isSmallTalk are the real gatekeepers. Verified 2026-11-09:
+			// passing the real detector here REGRESSES dispatch for genuine task-shaped
+			// messages that lack multi-step evidence (「跑一下平阳数币今日金额监控」
+			// → looksLikeTask=false → no longer routed). Over-dispatch is the accepted
+			// failure mode (TASK_VERB_HINT comment); a false negative executes in the
+			// Router, which is the architecture violation.
 			const decision = triageMessage({ text: msg.text, plan, looksLikeTask: true }, true);
 			if (!decision.dispatch) {
 				console.log(`[im] dispatch triage: inline (${decision.reason}, steps=${decision.steps})`);
