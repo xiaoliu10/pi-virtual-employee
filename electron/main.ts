@@ -1050,6 +1050,9 @@ ${tailForProgress(decision.text)}`;
 	 */
 	const workService = new WorkService({
 		store: workItemStore,
+		// 恢复简报 read side (P1, design §9): the interrupted task's recent tool
+		// digests ride the first window's prefix after recoverWorking().
+		ledger: contextStore,
 		// Watchdog soft-stop sliding-window counter — drives the postpone gate
 		// (a watchdog-killed window must not re-arm the next one by itself).
 		runawayCount: (id) => engine.runawayCount(id),

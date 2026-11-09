@@ -15,6 +15,7 @@ import { allowsSelfScheduling, originLabel, resolveOrigin, type WorkOrigin } fro
  * so two windows can never start the same row even if listDue() races.
  */
 import type { WorkItemRow, WorkItemStore } from "../db/work-item-store.js";
+import type { TurnRecord } from "../context/records.js";
 import { buildWorkWindowPrefix, DEFAULT_NEXT_CHECK_MS, DEFAULT_WINDOW_BUDGET, nextRoutineStreak, parseWindowReply, REMIND_DEFAULT_MS, REMIND_MAX_MS, REMIND_MIN_MS } from "./work.js";
 import { hasMiningSecrets } from "./mining.js";
 
@@ -40,8 +41,6 @@ interface ActiveWindow<Session> {
 	prevKicked?: number;
 	/** 常驻巡检标记（pre-claim snapshot）：DONE 被拦截为按节奏顺延。 */
 	prevResident?: number;
-	/** Consecutive auto-deferred wall-clock timeouts entering this window. */
-	prevTimeouts?: number;
 	/** 上次自声明节奏（pre-claim snapshot）：DONE 拦截的顺延时长依据。 */
 	prevCadenceMs?: number | null;
 	session?: Session;
@@ -49,7 +48,7 @@ interface ActiveWindow<Session> {
 	deadline?: ReturnType<typeof setTimeout>;
 	settled: Promise<void>;
 }
-type Store = Pick<WorkItemStore, "get" | "listDue" | "listByStatus" | "nextWakeAt" | "claim" | "recoverWorking" | "subscribe" | "setStatus" | "setField" | "clearAnswer" | "setFixedStreak" | "setFallbackStreak" | "setTimeoutStreak" | "markReminded" | "setCadence">;
+type Store = Pick<WorkItemStore, "get" | "listDue" | "listByStatus" | "nextWakeAt" | "claim" | "recoverWorking" | "subscribe" | "setStatus" | "setField" | "clearAnswer" | "setFixedStreak" | "setFallbackStreak" | "markReminded" | "setCadence">;
 interface Clock {
 	now(): number;
 	setTimeout(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
@@ -67,6 +66,10 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	/** Live KB tool availability, forwarded to the window protocol so it never
 	 * references unregistered tools (save_to_knowledge needs learn enabled). */
 	kbFeatures?(): { search: boolean; learn: boolean };
+	/** CCL ledger read side (P1 恢复简报, design §9): the interrupted task's
+	 * recent tool digests ride the first window's prefix after recoverWorking().
+	 * Absent (unit tests) → no brief block, prefix behavior unchanged. */
+	ledger?: { listTurns(conversationId: string): TurnRecord[] };
 	learn?(item: WorkItemRow, result: string): void | Promise<void>;
 	/** Kill background processes this item's window left running, called when the
 	 * item reaches DONE (field 2026-11-06: a finished task's driver script kept
@@ -122,19 +125,44 @@ export function buildWorkLearning(item: WorkItemRow, result: string): { title: s
 
 /** stopReason used when the wall-clock cap fires (kept as a constant so the
  * defer branches can recognise it — the deadline callback and the loop check
- * must agree on the exact string). */
-const TIMEOUT_STOP_REASON = "工作窗口时间上限已到，已自动顺延；请核查已发生的操作。";
-/** How far a timed-out window defers itself (user ruling 2026-10-23): short
- * enough that a multi-window task keeps moving, long enough that the next
- * window starts after the current turn's teardown finishes. */
-const TIMEOUT_DEFER_MS = 5 * 60_000;
-/** Consecutive wall-clock timeouts before the chain stops auto-deferring and
- * asks for the admin (user ruling 2026-10-23): an auto-defer that never
- * terminates is a silent busy-loop — the model never finishes, the window
- * keeps timing out, and nobody is told. Two deferrals mean the task genuinely
- * does not fit the budget; a human must resize it (raise max_minutes) or
- * split it. */
-const MAX_CONSECUTIVE_TIMEOUTS = 2;
+ * must agree on the exact string). The cap is now a STOP for the admin, not a
+ * self-deferred continuation (design §8.2 删自动顺延复活 — the flood-loop of
+ * 2026-11-06 was exactly an abort-revival layer stacking on another). */
+const TIMEOUT_STOP_REASON = "工作窗口时间上限已到，已暂停；请核查已发生的操作。";
+/** The honest pause a wall-clock cap produces: error/waiting_human only
+ * re-enter through a user message or explicit instruction; the model can still
+ * hand over cleanly BEFORE the cap with a self-declared [[NEXT_CHECK]]. The
+ * copy names the per-item knob the admin actually has. Exported for tests. */
+export function timeoutPauseQuestion(maxMinutes: number): string {
+	return `已因时间上限（${maxMinutes} 分钟）暂停：请先核查已发生的操作（文件、浏览器、远端会话），再明确恢复；如任务确需更长窗口，用 update 调大本任务的 maxMinutes（如 180），或收窄范围/拆成多个任务。`;
+}
+
+/** Max tool digests the recovery brief inlines (design §9: the brief is the
+ * interrupted progress, read by the admin AND the next model window). */
+export const RECOVERY_BRIEF_MAX_DIGESTS = 8;
+/** The one-line guard every brief carries. */
+export const RECOVERY_BRIEF_GUARD = "以下为中断前进度，先核对现场（文件、浏览器、远端会话）再重复任何外部动作。";
+
+/**
+ * 【恢复简报】 block from a work:<id> partition: the most recent tool digests
+ * (max {@link RECOVERY_BRIEF_MAX_DIGESTS}) plus the verify-before-repeat guard.
+ * An empty ledger (old items without TurnRecords) → undefined → the window
+ * prefix stays byte-identical to before. Each line is bounded: engine-collected
+ * digests are already bounded, but hand-written rows must not blow the prefix up.
+ * Exported for tests — the brief content is the recovery contract.
+ */
+export function buildRecoveryBrief(records: TurnRecord[], max = RECOVERY_BRIEF_MAX_DIGESTS): string | undefined {
+	const digests = records.filter((r) => r.kind === "tool-digest" && r.toolDigest).slice(-max);
+	if (digests.length === 0) return undefined;
+	const lines = digests.map((r) => {
+		const d = r.toolDigest!;
+		const cost = typeof d.durationMs === "number" ? `（${d.durationMs}ms）` : "";
+		const line = `${d.name}${cost} 参数:${d.argsBrief || "（无）"} → 结果:${d.resultBrief || "（无记录）"}`;
+		return line.length > 160 ? `${line.slice(0, 160)}…` : line;
+	});
+	return `【恢复简报】${RECOVERY_BRIEF_GUARD}\n${lines.map((l) => `- ${l}`).join("\n")}`;
+}
+
 /** Default concurrent work windows per profile (user ruling 2026-11-04). */
 const DEFAULT_MAX_CONCURRENT = 5;
 
@@ -143,6 +171,12 @@ export class WorkService<Session extends WorkSession> {
 	private recovered = false;
 	private unsubscribe?: () => void;
 	private wakeTimer?: ReturnType<typeof setTimeout>;
+	/** Items recoverWorking() flipped at THIS start(): their first window's
+	 * prefix carries the 【恢复简报】 block (design §9). Consumed on the first
+	 * window of each item — later windows are ordinary continuations. In-memory
+	 * by design: the durable facts (status flip, notice push) are already
+	 * persisted; only the FIRST-window brief is a process-lifetime concern. */
+	private readonly recoveredItems = new Set<string>();
 	/** Running windows, keyed by work-item id. Bounded by maxConcurrent. */
 	private readonly active = new Set<ActiveWindow<Session>>();
 	private readonly maxConcurrent: number;
@@ -175,6 +209,7 @@ export class WorkService<Session extends WorkSession> {
 			// honest notice per affected item. Best-effort: during early startup
 			// the IM adapter may not be up yet, so failures are swallowed.
 			const victims = this.opts.store.recoverWorking();
+			for (const v of victims) this.recoveredItems.add(v.id);
 			for (const v of victims) {
 				if (!v.origin_conversation) continue;
 				const text = `⚠️ **任务被中断：${v.title}**\n\n应用在执行中退出，本轮进度已保留，任务处于「需要人工」状态。请核查已发生的操作后，回复明确指示以恢复（或直接取消）。`;
@@ -359,7 +394,6 @@ export class WorkService<Session extends WorkSession> {
 					prevFallback: row.fallback_streak ?? 0,
 					prevKicked: row.kicked_off ?? 0,
 					prevResident: row.resident ?? 0,
-					prevTimeouts: row.timeout_streak ?? 0,
 					prevCadenceMs: row.cadence_ms ?? null,
 				};
 				this.active.add(active);
@@ -385,15 +419,6 @@ export class WorkService<Session extends WorkSession> {
 		let nextStreak = 0;
 		let emptyReplies = 0;
 		let stallRetriedThisTurn = false;
-		// True only when THIS window settled via the timeout auto-defer (which
-		// persists an incremented streak). Every other close — done, a model-declared
-		// NEXT_CHECK, a human handover, a circuit-break pause, an error — is a normal
-		// close: "连续 N 次超时" counts consecutive timeouts, so a window that ended
-		// any other way must give the next hard timeout a fresh count (e.g. scan
-		// window hard-times out → defer → the follow-up window hands over via a
-		// normal NEXT_CHECK; a stale streak would falsely trip the breaker on the
-		// next single timeout).
-		let timeoutDeferred = false;
 		// Declared OUTSIDE the try so the catch/finally paths read the same cap.
 		let budget = this.budget;
 		let outcome: "done" | "waiting_human" | "scheduled" = "waiting_human";
@@ -401,45 +426,37 @@ export class WorkService<Session extends WorkSession> {
 			if (!this.running) return;
 			item = store.claim(active.id, this.clock.now());
 			if (!item) return;
+			// RECOVERY BRIEF (P1, design §9): this item was flipped out of "working"
+			// by recoverWorking() at THIS boot — its window (all turns of it) carries
+			// the ledger's recent tool digests + the verify-before-repeat guard. An
+			// empty ledger (old items) → undefined → prefix behavior unchanged.
+			const recovering = this.recoveredItems.delete(active.id);
+			const recoveryBrief = recovering && this.opts.ledger ? buildRecoveryBrief(this.opts.ledger.listTurns(convId)) : undefined;
 			const initialProgress = item.progress;
 			const startedAt = this.clock.now();
 			// Per-item cap wins over the service default (admin "调大 maxMinutes" — the
-			// circuit-breaker message promises this knob, so it must exist; subagent
-			// review P1 2026-10-23). Read ONCE at window start: a change mid-window
-			// lands on the next window, never retargeting a cap already running.
+			// timeout pause names this knob, so it must exist; subagent review P1
+			// 2026-10-23). Read ONCE at window start: a change mid-window lands on the
+			// next window, never retargeting a cap already running.
 			if (item.max_minutes && item.max_minutes > 0) budget = { ...this.budget, maxMinutes: item.max_minutes };
-			// Window budget exhausted -> this SAME item continues next window: keep its
-				// background work running so the next window can harvest it.
+			// Window budget exhausted -> the deadline aborts the turn and the window
+			// STOPS for the admin (see TIMEOUT_STOP_REASON); its background work is
+			// preserved so the admin can inspect what it produced.
 				active.deadline = this.clock.setTimeout(() => this.abortActive(active, TIMEOUT_STOP_REASON, true), budget.maxMinutes * 60_000);
 			for (let turn = 0; budget.maxTurns <= 0 || turn < budget.maxTurns; turn++) {
 				// Fresh notebook and live identity on EVERY turn (including turn zero).
 				const fresh = store.get(item.id);
 				if (!fresh || fresh.status !== "working") return;
 				if (active.stopReason || !this.running || this.clock.now() - startedAt >= budget.maxMinutes * 60_000) {
-					// Wall-clock cap reached. User ruling 2026-10-23: this used to pause
-					// for explicit admin recovery, so a window that ran out mid-scan
-					// pushed NOTHING and the admin had to babysit every window. The
-					// window now defers itself (scheduled + a short NEXT_CHECK) and the
-					// push tells the admin what state it handed over — the chain resumes
-					// on its own. Only a genuine error / admin pause / cancel keeps the
-					// waiting_human path.
+					// Wall-clock cap reached: STOP for the admin (design §8.2 删自动顺延
+					// 复活 — the flood-loop of 2026-11-06 was exactly an abort-revival
+					// layer stacking on another recovery layer). Only a user message or
+					// explicit instruction re-enters; a window that sees the cap coming
+					// can still hand over cleanly via a self-declared [[NEXT_CHECK]].
 					const timedOut = active.stopReason === TIMEOUT_STOP_REASON
 						|| (!active.stopReason && this.clock.now() - startedAt >= budget.maxMinutes * 60_000);
 					if (timedOut) {
-						const streak = (active.prevTimeouts ?? 0) + 1;
-						if (streak >= MAX_CONSECUTIVE_TIMEOUTS) {
-							// The budget does not fit this task. Stop looping and let
-							// the admin resize (raise max_minutes) or split it.
-							question = `已连续 ${streak} 次因时间上限（${budget.maxMinutes} 分钟）自动顺延仍未完成——这件工作装不进当前窗口预算。请用 update 调大 maxMinutes（如 180），或收窄本轮范围/拆成多个任务，然后明确恢复。`;
-							break;
-						}
-						store.setTimeoutStreak(item.id, streak);
-						timeoutDeferred = true;
-						outcome = "scheduled";
-						nextCheckAt = this.clock.now() + TIMEOUT_DEFER_MS;
-						nextReason = "窗口时间上限已到，未完成部分自动顺延（下一窗口从已保存进度继续）";
-						nextStreak = active.prevStreak ?? 0;
-						question = "";
+						question = timeoutPauseQuestion(budget.maxMinutes);
 						break;
 					}
 					question = active.stopReason ?? (budget.maxTurns > 0 ? "工作窗口预算已用尽，请管理员明确恢复。" : "工作窗口时间上限已到，请管理员明确恢复。");
@@ -466,6 +483,7 @@ export class WorkService<Session extends WorkSession> {
 					lessons: workLessons(fresh.lessons), turn, budget, answer: answer ?? undefined,
 					firstWindow, lateByMs, resident: active.prevResident === 1, kbSearchEnabled: kb.search, kbLearnEnabled: kb.learn,
 					lastCheck: active.dueAt ? { at: active.dueAt, reason: active.prevReason, streak: active.prevStreak ?? 0 } : undefined,
+					recoveryBrief,
 					now: this.clock.now(),
 				});
 				// Engine no-reply signals (result.error, or deterministic with a canned
@@ -535,24 +553,11 @@ export class WorkService<Session extends WorkSession> {
 				// below and let the source conversation see why work stopped.
 				if (!current || current.status === "cancelled") return;
 				if (current.status !== "working") { outcome = "waiting_human"; break; }
-				// A wall-clock timeout is an auto-defer, not a stop-for-admin: it
-				// must not fall through to the waiting_human phrasing here (user
-				// ruling 2026-10-23 — this branch used to swallow the timeout and
-				// pause the chain even though the deadline callback had already
-				// marked the run as deferring).
+				// The deadline fired mid-turn (abort landed after the send settled):
+				// the wall-clock cap is the honest budget stop — same question as the
+				// loop-head branch, no auto-defer revival (design §8.2).
 				if (active.stopReason === TIMEOUT_STOP_REASON) {
-					const streak = (active.prevTimeouts ?? 0) + 1;
-					if (streak >= MAX_CONSECUTIVE_TIMEOUTS) {
-						question = `已连续 ${streak} 次因时间上限（${budget.maxMinutes} 分钟）自动顺延仍未完成——这件工作装不进当前窗口预算。请用 update 调大 maxMinutes（如 180），或收窄本轮范围/拆成多个任务，然后明确恢复。`;
-						break;
-					}
-					store.setTimeoutStreak(item.id, streak);
-					timeoutDeferred = true;
-					outcome = "scheduled";
-					nextCheckAt = this.clock.now() + TIMEOUT_DEFER_MS;
-					nextReason = "窗口时间上限已到，未完成部分自动顺延（下一窗口从已保存进度继续）";
-					nextStreak = active.prevStreak ?? 0;
-					question = "";
+					question = timeoutPauseQuestion(budget.maxMinutes);
 					break;
 				}
 				if (active.stopReason || !this.running) { question = active.stopReason ?? "应用停止执行，请管理员明确恢复。"; break; }
@@ -645,23 +650,12 @@ export class WorkService<Session extends WorkSession> {
 			// Respect explicitly written progress; narration is only a fallback.
 			if (fresh?.status === "working" && fresh.progress === initialProgress && lastText.trim()) store.setField(item.id, "progress", lastText.trim().slice(-1200));
 		} catch (err) {
-			// A window that ran out of wall clock mid-turn surfaces here as an
-			// abort — that is the auto-defer case, not a failure: hand the work over
-			// instead of pausing for the admin (user ruling 2026-10-23).
+			// A window that ran out of wall clock mid-send surfaces here as an abort
+			// — the same budget stop as the loop-head branch, NOT an execution error
+			// (the deadline already said what happened; no onError noise).
 			if (active.stopReason === TIMEOUT_STOP_REASON) {
-				const streak = (active.prevTimeouts ?? 0) + 1;
-				if (streak >= MAX_CONSECUTIVE_TIMEOUTS) {
-					outcome = "waiting_human";
-					question = `已连续 ${streak} 次因时间上限（${budget.maxMinutes} 分钟）自动顺延仍未完成——这件工作装不进当前窗口预算。请用 update 调大 maxMinutes（如 180），或收窄本轮范围/拆成多个任务，然后明确恢复。`;
-				} else {
-					store.setTimeoutStreak(item?.id ?? "", streak);
-					timeoutDeferred = true;
-					outcome = "scheduled";
-					nextCheckAt = this.clock.now() + TIMEOUT_DEFER_MS;
-					nextReason = "窗口时间上限已到，未完成部分自动顺延（下一窗口从已保存进度继续）";
-					nextStreak = active.prevStreak ?? 0;
-					question = "";
-				}
+				outcome = "waiting_human";
+				question = timeoutPauseQuestion(budget.maxMinutes);
 			} else {
 				outcome = "waiting_human";
 				// Do not push raw exception strings (may include credentials/URLs).
@@ -694,11 +688,7 @@ export class WorkService<Session extends WorkSession> {
 				// admin (waiting_human, honest copy). Second kill inside the sliding
 				// window (admin resumed and it looped again): say so and recommend
 				// cancelling or splitting instead of resuming again.
-				// `!timeoutDeferred`: a window that hit its TIME BUDGET is a legal
-				// continuation (work.ts teaches "scan, write results, continue next
-				// window"), not a spin. It must survive the gate even if this item was
-				// caught by one transient loop earlier in the sliding window.
-				if (outcome === "scheduled" && !timeoutDeferred) {
+				if (outcome === "scheduled") {
 					// KEY ALIGNMENT: the engine counts watchdog soft-stops under the
 					// session id it saw the tools through — `work:<itemId>` for a window
 					// (WorkService.open uses that id, engine's send keys on
@@ -735,10 +725,6 @@ export class WorkService<Session extends WorkSession> {
 				}
 				store.setStatus(item.id, outcome, outcome === "waiting_human" ? question || active.stopReason || "请管理员明确恢复。" : null, nextCheckAt ?? null, nextReason);
 				if (outcome === "scheduled") store.setFixedStreak(item.id, nextStreak);
-				// A non-timeout close resets the consecutive-timeout meter: the breaker
-				// counts CONSECUTIVE hard timeouts, and a normal close (or the breaker
-				// pausing for the admin) starts a fresh count for the next window.
-				if (!timeoutDeferred && (active.prevTimeouts ?? 0) > 0) store.setTimeoutStreak(item.id, 0);
 			}
 			// A window that closed WITHOUT the gate demoting it clears the soft-stop
 			// history: the counter answers "is this window still spinning?", so a

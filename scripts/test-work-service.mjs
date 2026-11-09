@@ -10,8 +10,8 @@ import { buildSync } from "esbuild";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const tmp = await mkdtemp(join(root, "node_modules/.work-service-test-"));
 after(() => rm(tmp, { recursive: true, force: true }));
-buildSync({ stdin: { contents: 'export * from "./src/scheduler/work-service.ts"; export * from "./src/db/work-item-store.ts";', resolveDir: root, loader: "ts" }, outfile: join(tmp, "service.mjs"), bundle: true, platform: "node", format: "esm", packages: "external" });
-const { WorkService, WorkItemStore, buildWorkLearning, pushHeaderLabel } = await import(pathToFileURL(join(tmp, "service.mjs")));
+buildSync({ stdin: { contents: 'export * from "./src/scheduler/work-service.ts"; export * from "./src/db/work-item-store.ts"; export { ContextStore } from "./src/context/store.ts";', resolveDir: root, loader: "ts" }, outfile: join(tmp, "service.mjs"), bundle: true, platform: "node", format: "esm", packages: "external" });
+const { WorkService, WorkItemStore, buildWorkLearning, pushHeaderLabel, buildRecoveryBrief, timeoutPauseQuestion, ContextStore } = await import(pathToFileURL(join(tmp, "service.mjs")));
 const schema = (await readFile(join(root, "src/db/sqlite.ts"), "utf8")).match(/CREATE TABLE IF NOT EXISTS work_items \([\s\S]*?\);/)[0];
 const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(r => setImmediate(r)); };
 function deferred() { let resolve, reject; const promise = new Promise((r, j) => { resolve = r; reject = j; }); return { promise, resolve, reject }; }
@@ -39,9 +39,12 @@ function SENTINEL_DEADLINE(h) {
 function fixture(t, overrides = {}) {
 	const db = new DatabaseSync(":memory:"); db.exec(schema);
 	if (!db.prepare("PRAGMA table_info(work_items)").all().some(c => c.name === "answer")) db.exec("ALTER TABLE work_items ADD COLUMN answer TEXT");
-	const h = { db, store: new WorkItemStore({ prepare: sql => db.prepare(sql) }), clock: new Clock(), sends: [], pushes: [], learned: [], released: [], errors: [], aborted: [], abortOpts: [], reclaimed: [], gates: [], admin: true };
+	// Real CCL ledger on the SAME db (P1 恢复简报): the service reads the
+	// interrupted item's tool digests from here via opts.ledger.
+	const ledger = new ContextStore(db);
+	const h = { db, store: new WorkItemStore({ prepare: sql => db.prepare(sql) }), ledger, clock: new Clock(), sends: [], pushes: [], learned: [], released: [], errors: [], aborted: [], abortOpts: [], reclaimed: [], gates: [], admin: true };
 	h.service = new WorkService({
-		store: h.store, clock: h.clock, budget: { maxTurns: 3, maxMinutes: 30 },
+		store: h.store, clock: h.clock, budget: { maxTurns: 3, maxMinutes: 30 }, ledger,
 		isAdmin: id => h.admin && id === "admin",
 		open: (item, cid) => ({ id: item.id, cid, abort: (opts) => { h.aborted.push(item.id); h.abortOpts.push({ id: item.id, opts }); } }),
 		send: async (session, message, actor) => { h.sends.push({ session, message, actor }); return overrides.send ? overrides.send(h, session, message) : { reply: "成果\n[[TASK_DONE]]" }; },
@@ -310,12 +313,15 @@ test("deadline actually aborts a hung send, never races it with a new send", asy
 	assert.deepEqual(h.aborted, [first.id], "the hung send was aborted at the deadline");
 	assert.equal(h.sends.length, 1, "no new send was raced in");
 	gate.resolve({ reply: "[[TASK_DONE]]" }); await flush();
-	// User ruling 2026-10-23: a timed-out window defers itself instead of
-	// pausing for the admin — the chain resumes on its own timer. The deferred
-	// time comes from the FAKE clock (advanced past the deadline above).
+	// Design §8.2 删自动顺延复活 (flood-loop 2026-11-06 root-cause semantics): a
+	// wall-clock timeout is a budget stop for the admin — the deferred window the
+	// old ruling armed IS the auto-revival that got deleted. The FAKE clock
+	// advanced past the deadline above; nothing may self-schedule a continuation.
 	const firstRow = h.store.get(first.id);
-	assert.equal(firstRow.status, "scheduled", "the timeout defers, does not pause");
-	assert.match(h.store.get(first.id).next_check_reason ?? "", /时间上限已到.*自动顺延/);
+	assert.equal(firstRow.status, "waiting_human", "the timeout stops for the admin, no self-defer");
+	assert.match(firstRow.question ?? "", /时间上限（30 分钟）暂停/);
+	assert.match(firstRow.question ?? "", /调大 maxMinutes|拆成多个任务/, "the pause names the knobs that exist");
+	assert.equal(firstRow.next_check_at, null, "no continuation window is armed");
 	assert.equal(h.store.get(first.id).answer, "已审批，请核查", "aborted send is not a successful delivery");
 	assert.equal(h.store.get(second.id).status, "done");
 	assert.equal(h.sends.length, 2);
@@ -879,54 +885,52 @@ test("explicit maxTurns 0 also means unlimited (0 is a ruling, not a falsy bug)"
 	assert.equal(h.store.get(h.store.list()[0].id).status, "done");
 });
 
-test("the wall-clock cap now DEFERS the window instead of pausing for the admin", async t => {
-	// User ruling 2026-10-23: the spay 7-day patrol needs 25-30 min of pure
-	// scanning plus per-row re-reconciles; the old behaviour (pause and wait for
-	// explicit admin recovery) wasted whole windows and pushed nothing. Each
-	// send advances the FAKE clock so the loop's time check trips without
+test("the wall-clock cap now STOPS the window for the admin (no auto-defer revival)", async t => {
+	// Design §8.2 / §5.2 (flood-loop 2026-11-06 root-cause semantics) DELETES the
+	// 2026-10-23 self-defer: the window reaching its wall clock is a budget stop.
+	// Each send advances the FAKE clock so the loop's time check trips without
 	// spinning in microtasks.
 	const h = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } }, send: h2 => { h2.clock.time += 6 * 60_000; return { reply: "持续推进，尚未完成" }; } });
 	const item = h.create();
 	h.service.start(); await flush();
 	assert.ok(h.sends.length >= 5, "several turns ran inside the window");
 	const row = h.store.get(item.id);
-	assert.equal(row.status, "scheduled", "the time cap defers the window — no admin babysitting");
-	assert.match(row.next_check_reason ?? "", /时间上限已到.*自动顺延/, "the defer must say why");
-	// The fixture runs on a FAKE clock: compare against it, never Date.now().
-	assert.equal(row.next_check_at, h.clock.time + 5 * 60_000, "a next check is scheduled 5 minutes out");
-	assert.equal(row.question, null, "no waiting_human question is left behind");
-	// The DEADLINE timer is cleared on exit; what remains (≤1) is the
-	// waiting_human REMINDER timer — a pause must never go silent (field
-	// 2026-10-04), so its timer surviving the window is correct behavior.
+	assert.equal(row.status, "waiting_human", "the time cap stops for the admin");
+	assert.match(row.question ?? "", /时间上限（30 分钟）暂停/);
+	assert.match(row.question ?? "", /maxMinutes/, "the pause names the resize knob");
+	// No revival: advancing the clock must NOT start another window.
+	const sendsBefore = h.sends.length;
+	await h.clock.advance(6 * 60_000); await flush();
+	assert.equal(h.sends.length, sendsBefore, "no new send after the budget stop — revival needs a user message");
+	// The fixture runs on a FAKE clock; only the reminder timer may remain.
 	assert.ok(h.clock.timers.size <= 1, "the window deadline was cleared; at most the reminder timer remains");
 });
 
-test("two consecutive hard timeouts circuit-break to waiting_human with a resize/split ask", async t => {
-	// The breaker exists because "defer forever" is silent busywork: a task that
-	// cannot fit the budget twice in a row needs the admin to resize or split it.
-	// Each send advances the FAKE clock so the cap trips without spinning.
+test("the FIRST hard timeout already pauses with the resize/split ask (no defer streak, no revival)", async t => {
+	// Design §8.2: the timeout auto-defer (and its consecutive-timeout breaker)
+	// is deleted — a task that cannot fit the budget stops at the FIRST cap
+	// instead of burning a +5min revival window nobody asked for.
 	const h = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } }, send: h2 => { h2.clock.time += 6 * 60_000; return { reply: "持续推进，尚未完成" }; } });
 	const item = h.create();
 	h.service.start(); await flush();
-	let row = h.store.get(item.id);
-	assert.equal(row.status, "scheduled", "window 1 defers (streak 1)");
-	assert.equal(row.timeout_streak, 1);
-	await h.clock.advance(5 * 60_000 + 1); // ride the defer into window 2
-	await flush();
-	row = h.store.get(item.id);
-	assert.equal(row.status, "waiting_human", "2 consecutive hard timeouts must not defer forever");
-	assert.match(row.question ?? "", /调大 maxMinutes/, "the pause names the per-item knob that actually exists");
+	const row = h.store.get(item.id);
+	assert.equal(row.status, "waiting_human", "the first cap stop lands in waiting_human");
+	assert.equal(row.timeout_streak, 0, "the defer meter is retired — nothing writes it");
+	assert.equal(row.next_check_at, null, "no +5min revival window");
+	assert.match(row.question ?? "", /调大本任务的 maxMinutes/, "the pause names the per-item knob that actually exists");
 	assert.match(row.question ?? "", /拆成多个任务/, "…or narrow/split the work");
-	// The breaker pause itself starts a fresh count: after the admin resizes and
-	// resumes, ONE new timeout defers again instead of instantly re-breaking.
-	assert.equal(row.timeout_streak, 0, "the breaker pause resets the meter for the resumed chain");
+	// error/waiting_human only re-enter through a user message or explicit
+	// instruction: riding the clock forward must not resurrect the chain.
+	const before = h.sends.length;
+	await h.clock.advance(2 * 3_600_000); await flush();
+	assert.equal(h.sends.length, before, "no auto-resume after the budget stop");
 });
 
-test("a normal close clears the consecutive-timeout meter (stale streak must not false-trip)", async t => {
-	// Scan window hard-times out (streak 1) → the follow-up window hands over
-	// via a normal NEXT_CHECK / DONE. The meter counts CONSECUTIVE timeouts, so
-	// the normal close must reset it — otherwise the next single timeout would
-	// falsely read as "2 in a row" and pause the chain.
+test("a stale timeout_streak in the row is inert: model-declared closes are unaffected (the defer meter is retired)", async t => {
+	// The consecutive-timeout breaker is gone with the auto-defer (design §8.2),
+	// so windows no longer maintain timeout_streak. A stale value left by an old
+	// binary must be inert — a normal model-declared close still works, and the
+	// service does not touch the column either way.
 	const nextCheck = fixture(t, {
 		options: { budget: { maxTurns: 0, maxMinutes: 30 } },
 		send: () => ({ reply: "扫描完成，已落盘；处理阶段下次继续\n[[NEXT_CHECK]]: 2 小时后" }),
@@ -935,8 +939,8 @@ test("a normal close clears the consecutive-timeout meter (stale streak must not
 	nextCheck.db.prepare("UPDATE work_items SET timeout_streak = 1 WHERE id = ?").run(n.id);
 	nextCheck.service.start(); await flush();
 	let row = nextCheck.store.get(n.id);
-	assert.equal(row.status, "scheduled", "the model-declared NEXT_CHECK closed the window normally");
-	assert.equal(row.timeout_streak, 0, "a NEXT_CHECK close resets the timeout meter");
+	assert.equal(row.status, "scheduled", "the model-declared NEXT_CHECK closes the window normally");
+	assert.equal(row.timeout_streak, 1, "the retired meter is neither read nor written");
 
 	const done = fixture(t, { options: { budget: { maxTurns: 0, maxMinutes: 30 } } }); // default send → DONE
 	const d = done.create();
@@ -944,23 +948,20 @@ test("a normal close clears the consecutive-timeout meter (stale streak must not
 	done.service.start(); await flush();
 	row = done.store.get(d.id);
 	assert.equal(row.status, "done");
-	assert.equal(row.timeout_streak, 0, "a DONE close resets the timeout meter too");
+	assert.equal(row.timeout_streak, 1, "still inert on a DONE close");
 });
 
-test("the CATCH timeout exit defers too (production's most common path)", async t => {
+test("the CATCH timeout exit also stops for the admin (production's most common path)", async t => {
 	// Deadline fires while send is in flight → the real engine aborts and returns
-	// { error } → WorkService throws → the catch block. This was the ONLY untested
-	// of the three timeout exits (subagent review P2-2), yet it is the one real
-	// windows hit. The send trips the clock past the cap AND errors exactly once.
+	// { error } → WorkService throws → the catch block. The send trips the clock
+	// past the cap AND throws exactly once, reproducing the real ordering.
 	const h = fixture(t, {
 		options: { budget: { maxTurns: 0, maxMinutes: 30 } },
 		send: h2 => {
 			if (h2.sends.length === 1) {
-				// Reproduce the REAL ordering: the deadline timer fires first (it is what
-				// sets active.stopReason), and only then the in-flight send fails. That
-				// pairing is what routes the throw to the timeout branch of the catch.
-				// THROW, not { error }: an error-result enters the silent-retry chain
-				// (60s backoff on the fake clock, which never advances here).
+				// The deadline timer fires first (it sets active.stopReason), and only
+				// then the in-flight send fails — THROW, not { error }: an error-result
+				// enters the silent-retry chain (60s backoff on the fake clock).
 				const deadline = SENTINEL_DEADLINE(h2);
 				h2.clock.time = deadline;
 				for (const [id, timer] of [...h2.clock.timers]) {
@@ -974,10 +975,10 @@ test("the CATCH timeout exit defers too (production's most common path)", async 
 	const item = h.create();
 	h.service.start(); await flush();
 	const row = h.store.get(item.id);
-	assert.equal(row.status, "scheduled", "a caught timeout must defer, not pause");
-	assert.match(row.next_check_reason ?? "", /自动顺延/);
-	assert.equal(row.timeout_streak, 1);
-	assert.deepEqual(h.errors, [], "an auto-deferred timeout is not an execution error");
+	assert.equal(row.status, "waiting_human", "a caught timeout must stop for the admin, not defer");
+	assert.match(row.question ?? "", /时间上限（30 分钟）暂停/);
+	assert.equal(row.next_check_at, null, "no revival window");
+	assert.deepEqual(h.errors, [], "a budget stop is not an execution error — no onError noise");
 });
 
 test("a per-item maxMinutes overrides the service default for THAT window", async t => {
@@ -992,8 +993,8 @@ test("a per-item maxMinutes overrides the service default for THAT window", asyn
 	h.service.start(); await flush();
 	assert.ok(h.sends.length >= 2, `must survive past the 30-minute service default (sends=${h.sends.length})`);
 	const row = h.store.get(item.id);
-	assert.equal(row.status, "scheduled", "it still eventually defers — but at 90 minutes, not 30");
-	assert.match(row.next_check_reason ?? "", /自动顺延/);
+	assert.equal(row.status, "waiting_human", "it still eventually stops — but at 90 minutes, not 30");
+	assert.match(row.question ?? "", /时间上限（90 分钟）暂停/, "the pause names the cap that ACTUALLY tripped");
 });
 
 test("unlimited turns: a cancel and a need-human pause still win immediately", async t => {
@@ -1307,6 +1308,76 @@ test("recoverWorking pushes an interrupted notice to each origin conversation", 
 	assert.match(notices[0].text, /需要人工|核查/, "the notice must tell the admin what to do");
 });
 
+// ── 恢复简报（P1, design §9）：recoverWorking 翻出的任务，首个窗口 prefix 带
+// 账本工具摘要 + 「先核对现场」护栏；空账本（旧任务）不加块，行为与现状一致。──
+
+test("recovery brief content: recent tool digests (max 8, bounded lines) + the verify-first guard", () => {
+	const rec = (seq, name, args, result, durationMs) => ({
+		conversationId: "work:x", seq, kind: "tool-digest", text: "", ts: 1000 + seq,
+		toolDigest: { name, argsBrief: args, resultBrief: result, durationMs },
+	});
+	// 10 digests → only the LAST 8 ride the brief (zero-padded names so the
+	// substring probes can't collide: "step_1" vs "step_10").
+	const rows = [];
+	for (let i = 1; i <= 10; i++) rows.push(rec(i, `step_${String(i).padStart(2, "0")}`, `q=${i}`, `结果${i}`, i * 10));
+	const brief = buildRecoveryBrief(rows);
+	assert.ok(brief, "a ledger with digests yields a brief");
+	assert.ok(brief.startsWith("【恢复简报】"));
+	assert.ok(brief.includes("以下为中断前进度，先核对现场"), "the guard line is the brief's opening");
+	assert.ok(!brief.includes("step_01") && !brief.includes("step_02"), "oldest digests beyond the cap are dropped");
+	for (let i = 3; i <= 10; i++) assert.ok(brief.includes(`step_${String(i).padStart(2, "0")}`), `digest ${i} rides the brief`);
+	assert.ok(brief.includes("step_10（100ms）"), "cost rides the line");
+	// Empty ledger (old items without TurnRecords) → NO block at all.
+	assert.equal(buildRecoveryBrief([]), undefined);
+	assert.equal(buildRecoveryBrief([{ conversationId: "work:x", seq: 1, kind: "request", text: "只有请求行", ts: 1 }]), undefined, "a ledger without tool digests yields no brief");
+	// Hand-written rows cannot blow the prefix up: each line is bounded.
+	const long = rec(1, "explode", "长".repeat(400), "长".repeat(400), 5);
+	assert.ok(buildRecoveryBrief([long]).length < 500, "individual lines are clipped");
+	assert.equal(timeoutPauseQuestion(90), "已因时间上限（90 分钟）暂停：请先核查已发生的操作（文件、浏览器、远端会话），再明确恢复；如任务确需更长窗口，用 update 调大本任务的 maxMinutes（如 180），或收窄范围/拆成多个任务。");
+});
+
+test("the first window after recoverWorking carries 【恢复简报】 in its prefix; a fresh task does not", async (t) => {
+	const h = fixture(t, { send: h2 => h2.sends.length <= 2 ? gate.promise : { reply: "[[TASK_DONE]]" } });
+	const gate = h.gate();
+	// An item left "working" by a crash, whose ledger holds tool digests.
+	const recovered = h.store.create({ title: "中断的对账", goal: "完成对账", status: "working", createdBy: "admin", originConversation: "dt:source" });
+	h.ledger.appendNext(`work:${recovered.id}`, { conversationId: `work:${recovered.id}`, kind: "request", text: "完成对账", ts: 1 });
+	h.ledger.appendNext(`work:${recovered.id}`, { conversationId: `work:${recovered.id}`, kind: "tool-digest", text: "", ts: 2, toolDigest: { name: "search_knowledge_base", argsBrief: "q=对账入口", resultBrief: "找到登录指引", durationMs: 120 } });
+	// A second, also-recovered item with an EMPTY ledger (old task, no TurnRecords).
+	const oldTask = h.store.create({ title: "旧任务", goal: "旧目标", status: "working", createdBy: "admin", originConversation: "dt:source" });
+	await h.service.start();
+	await flush();
+	assert.equal(h.store.get(recovered.id).status, "waiting_human", "recovery flipped both");
+	assert.equal(h.store.get(oldTask.id).status, "waiting_human");
+	// Explicit resume re-enters both; the RECOVERED one gets the brief.
+	h.store.resume(recovered.id, "继续对账"); await flush();
+	await flush();
+	assert.ok(h.sends.some(s2 => s2.message.includes("【恢复简报】")), "the recovered window's prefix carries the brief");
+	assert.ok(h.sends.some(s2 => /search_knowledge_base（120ms） 参数:q=对账入口 → 结果:找到登录指引/.test(s2.message)), "the digest line is inline (with its cost)");
+	assert.ok(h.sends.some(s2 => s2.message.includes("先核对现场")), "the verify-first guard rides along");
+	h.store.resume(oldTask.id, "继续旧任务"); await flush(); await flush();
+	const oldSends = h.sends.filter(s2 => s2.message.includes("旧目标"));
+	assert.ok(oldSends.length >= 1, "the old task's window ran");
+	assert.ok(oldSends.every(s2 => !s2.message.includes("【恢复简报】")), "empty ledger → NO brief block (behavior identical to before)");
+	await h.service.stop();
+	for (const g of h.gates) g.resolve({ reply: "[[TASK_DONE]]" });
+	await h.service.whenIdle();
+});
+
+test("the brief rides EVERY turn of the recovered window, but not a later window", async (t) => {
+	const h = fixture(t, { send: h2 => h2.sends.length === 1 ? { reply: "进展\n[[NEED_HUMAN]]: 需要审批号" } : h2.sends.length === 2 ? { reply: "继续推进中" } : { reply: "[[TASK_DONE]]" } });
+	const item = h.store.create({ title: "中断的巡检", goal: "巡检", status: "working", createdBy: "admin", originConversation: "dt:source" });
+	h.ledger.appendNext(`work:${item.id}`, { conversationId: `work:${item.id}`, kind: "tool-digest", text: "", ts: 2, toolDigest: { name: "browser.open", argsBrief: "url=…", resultBrief: "登录页已打开", durationMs: 800 } });
+	await h.service.start(); await flush();
+	h.store.resume(item.id, "管理员答复"); await flush(); await flush();
+	assert.equal(h.sends.length, 1, "the recovered window's turn 1 ran");
+	assert.ok(h.sends[0].message.includes("【恢复简报】"), "turn 1 carries the brief");
+	// NEED_HUMAN paused the window; a resume starts a NEW window — no brief there.
+	h.store.resume(item.id, "审批号 1234"); await flush(); await flush();
+	assert.ok(h.sends.length >= 3, "the continuation window ran to DONE");
+	assert.ok(!h.sends[1].message.includes("【恢复简报】"), "a later window is an ordinary continuation");
+});
+
 test("a window that closes normally CLEARS the soft-stop history", async (t) => {
 	// The counter answers "is this window still spinning?", a CONSECUTIVE-run
 	// question. If a healthy close left it standing, one transient loop would
@@ -1331,10 +1402,10 @@ test("a gate-demoted window KEEPS the history (so the second strike escalates)",
 	assert.deepEqual(h.runawayCleared, [], "the demotion must not erase the evidence it acted on");
 });
 
-test("postpone gate leaves a TIME-BUDGET deferral alone (legal continuation, not a spin)", async (t) => {
-	// A window that ran out of wall clock is taught to write progress and continue
-	// on the NEXT_CHECK — the canonical long-task shape. It must not be demoted
-	// just because one transient loop was caught earlier in the sliding window.
+test("a time-budget stop lands in waiting_human even with the runaway counter set (the gate has no timeout exception any more)", async (t) => {
+	// With the auto-defer deleted (design §8.2) there IS no "time-budget
+	// deferral" for the postpone gate to spare: the wall-clock cap is a budget
+	// stop, and the gate only ever demotes model-declared `scheduled` outcomes.
 	// Same shape as the proven deadline test: EXPLICIT 30-minute budget, a gate
 	// blocks the first send so the window is in flight when the deadline fires.
 	// (A never-resolving send promise wedges whenIdle() forever — that hung the
@@ -1351,6 +1422,7 @@ test("postpone gate leaves a TIME-BUDGET deferral alone (legal continuation, not
 	gate.resolve({ reply: "已保存进度" });
 	await h.service.whenIdle();
 	const row = h.store.get(item.id);
-	assert.equal(row.status, "scheduled", "a time-budget deferral must keep its follow-up window");
+	assert.equal(row.status, "waiting_human", "the budget stop pauses for the admin");
+	assert.match(row.question ?? "", /时间上限（30 分钟）暂停/, "it is the budget stop, not the spin copy");
 	assert.ok(!/循环空转/.test(row.question ?? ""), "and must not be described as a spin");
 });
