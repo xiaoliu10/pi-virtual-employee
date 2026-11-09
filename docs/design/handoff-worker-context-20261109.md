@@ -1,8 +1,8 @@
 # worker 上下文管理失效（2026-11-09 现场，交接文档）
 
-> 状态：**根因已定位到日志层，代码级根因未确认，未修复**。
-> 交接原因：盒子 SSH（UU 隧道 127.0.0.1:12223）不稳定，无法持续取证。
-> 优先级建议：**P0**——所有长会话 worker 会周期性彻底废掉（任何消息进 400）。
+> 状态：**根因已代码级实锤（同日第二轮排查），未修复**。
+> 优先级建议：**P0**——所有长会话 worker 会周期性彻底废掉（任何消息进 400）；
+> 所有会话跨重建即失忆（40 行以外的历史无任何摘要兜底）。
 
 ---
 
@@ -61,35 +61,54 @@
 
 ---
 
-## 三、根因假设（较大把握，**未代码级验证**）
+## 三、根因（代码级实锤，2026-11-09 第二轮排查）
 
-**嫌疑：压缩写错了 transcript（内核分裂）。**
+三层机制叠加，每层都有代码位置：
 
-背景事实（已在本仓库验证过）：
+### A. durable worker 的压缩从未到达模型（投影/事实源分裂）
 
-- 盒子 `engineKernel = durable`（`electron/main.ts:542` 默认），pi-session 为底层
-- worker 会话刻意用 `SessionManager.inMemory()`（`src/engine/session-host.ts`），
-  messages 表是唯一事实源，重建时 `rehydrateMessages(history.listMessages)` 灌回
-- `compactWithLife` / `maybeCompact`（`src/engine/pi-compaction.ts` +
-  `src/engine/engine.ts`）压缩的是 **VE 持有的 `agent.messages`**
+- `maybeCompact`（`src/engine/context.ts:831`）只改**内存投影**
+  `agent.state.messages = [system, summary, recent...]`
+- durable worker 的实际请求从 **durable transcript** 构建：worker 会话创建时
+  把 DB messages 表**无界全量** import 进 durable transcript
+  （`src/engine/durable/runtime.ts:372` 起：`history.listMessages(id)` 是
+  `ORDER BY created_at ASC` 无 LIMIT，逐行 `tx.appendEntry`）
+- 于是 compact「成功」日志照打、请求照样全量 → 400 → in-turn recovery
+  再 compact（再改投影）→ 请求还是全量 → 循环
+- 日志完全吻合：`377 turns` 六次不变（每次都从全量 DB 重建投影再裁）、
+  `209k→298k` 单调递增（每轮 +12k 新内容入库）、litellm 连续 400
 
-假设链条：durable/pi-session 内核下，实际发给模型的 prompt 可能来自
-`AgentSession` 自己的 transcript（或 harness 的 `conv.submit` 上下文），
-而 compact 只改了 `agent.messages`——**两条 transcript 不同步**，于是：
+### B. 压缩摘要不落库：任何重建 = 彻底失忆
 
-- 日志打印「377 turns」（读的是没被改的那条，或压缩根本没落到实际使用的对象）
-- 每次 compact 只是往其中一条追加 summary → token 只增不减
-- 实际请求越压越大，最终 400
+- summary 只存在于内存投影；DB `messages` 表没有任何 compaction 记录
+  （`src/db/history-store.ts` grep compaction 为空）
+- 会话重建（skills/memory/config 任何 revision bump、重启、空闲清理）→
+  `getOrCreateSession`（`engine.ts:1304`）→ `rehydrateMessages(listMessages())`
+  只取 **tail 40 行**（`context.ts:32` `REHYDRATE_MAX_MESSAGES = 40`）、turn-aligned
+- 40 行以外的一切——**包括压缩摘要本身**——永久消失，没有任何摘要兜底。
+  这是「上下文一直在丢」的直接来源：worker 长任务中途任何一次重建，
+  早期任务上下文全没了
 
-**验证切入点（按顺序）**：
+### C. A 与 B 互相放大
 
-1. `src/engine/pi-compaction.ts` 的 `maybeCompact` / `compactTurns`：
-   确认它改的是哪个对象的 messages，以及 compact 后谁读这个对象
-2. `src/engine/durable/runtime.ts` 的 `executeTurn` / `conv.submit`：
-   确认 prompt 真正取自哪里（harness 的 generation 上下文 vs agent.state.messages）
-3. `src/engine/durable/harness-host.ts`：harness 侧是否持有独立 transcript
-4. 加一条**不变量日志**：compact 后立刻打印「实际将发送的 token 估算」——
-   与「压缩前」对比；如果没下降，就是本 bug，且以后能第一时间发现
+A 让长任务 worker 在「忘事（刚被裁）」与「400（全量灌回）」之间震荡；
+B 保证每次重建后即使想恢复也没有摘要可用——压缩的成果既到不了模型，
+也活不过重建。legacy 主会话同样有 B（同一条 rehydrate 路径），只是主会话
+消息少、很少触发 compact，暴露得晚。
+
+### 修复方向（两件事缺一不可）
+
+1. **压缩落库**：compact 成功后把 summary 写入 messages 表（特殊 role），
+   被裁行标记 archived（软删）；`rehydrateMessages` 改为「从最新 summary 行起
+   + tail 40」——重建不再失忆，历史表不再无限膨胀
+2. **durable import 尊重压缩视图**：durable transcript 构建从最后一个 summary
+   行起灌（或 harness 侧加 keepRecentTokens 窗口）——压缩真正作用到请求
+
+### 验证锚点（修复后必须过）
+
+- 不变量断言：compact 后「下一次真实请求的 token 估算」必须小于压缩前；
+  否则 console.warn 且放弃继续压缩（不再进入 6 连败循环）
+- 重启前 worker 投影行数 vs 重启后 rehydrate 行数：摘要必须保留
 
 ---
 
