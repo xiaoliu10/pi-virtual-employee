@@ -157,7 +157,10 @@ export function buildRecoveryBrief(records: TurnRecord[], max = RECOVERY_BRIEF_M
 	const lines = digests.map((r) => {
 		const d = r.toolDigest!;
 		const cost = typeof d.durationMs === "number" ? `（${d.durationMs}ms）` : "";
-		const line = `${d.name}${cost} 参数:${d.argsBrief || "（无）"} → 结果:${d.resultBrief || "（无记录）"}`;
+		// Review 9b41e5ba P3-4: hand-written rows may carry newlines that would
+		// inject forged prefix sections (【目标】…) — collapse to one line BEFORE
+		// the length cap so the guard survives future writers / DB edits.
+		const line = `${d.name}${cost} 参数:${(d.argsBrief || "（无）").replace(/\s+/g, " ")} → 结果:${(d.resultBrief || "（无记录）").replace(/\s+/g, " ")}`;
 		return line.length > 160 ? `${line.slice(0, 160)}…` : line;
 	});
 	return `【恢复简报】${RECOVERY_BRIEF_GUARD}\n${lines.map((l) => `- ${l}`).join("\n")}`;

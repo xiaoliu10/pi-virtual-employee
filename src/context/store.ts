@@ -96,6 +96,36 @@ export class ContextStore {
 	 * engine's turn commits (request / reply / tool digests); {@link appendTurn}
 	 * remains for explicit-position writes (compaction write-back, tests).
 	 */
+	/** Review 9b41e5ba P3-2: one turn = request + digests + reply in ONE
+	 * transaction (commitWorkTurn must never leave a half turn behind). Same
+	 * atomic INSERT…SELECT seq allocation per row — inside the transaction each
+	 * statement sees the previous row, so MAX(seq)+1 allocates consecutively. */
+	appendNextMany(conversationId: string, records: Array<Omit<TurnRecord, "seq">>): void {
+		if (records.length === 0) return;
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			const insert = this.db.prepare(
+				"INSERT INTO context_entries (conversation_id, seq, kind, text, tool_digest_json, refs_json, created_at) " +
+					"SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ? FROM context_entries WHERE conversation_id = ?",
+			);
+			for (const record of records) {
+				insert.run(
+					conversationId,
+					record.kind,
+					record.text,
+					record.toolDigest ? JSON.stringify(record.toolDigest) : null,
+					record.refs ? JSON.stringify(record.refs) : null,
+					record.ts,
+					conversationId,
+				);
+			}
+			this.db.exec("COMMIT");
+		} catch (err) {
+			this.db.exec("ROLLBACK");
+			throw err;
+		}
+	}
+
 	appendNext(conversationId: string, record: Omit<TurnRecord, "seq">): TurnRecord {
 		const result = this.db
 			.prepare(
@@ -145,8 +175,15 @@ export class ContextStore {
 				"INSERT INTO context_entries (conversation_id, seq, kind, text, tool_digest_json, refs_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
 			);
 			for (const record of insertRecords) {
+				// Review 9b41e5ba P3-3: the partition is the caller's argument — a
+				// record carrying a different conversationId must never cross-write
+				// into another partition (contract-level defense; compactIfNeeded
+				// preserves identity today, but the store must not trust that).
+				if (record.conversationId !== conversationId) {
+					throw new Error(`replaceHead: record conversationId ${record.conversationId} does not match partition ${conversationId}`);
+				}
 				insert.run(
-					record.conversationId,
+					conversationId,
 					record.seq,
 					record.kind,
 					record.text,

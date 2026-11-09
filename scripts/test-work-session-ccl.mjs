@@ -256,6 +256,48 @@ test("withTelemetry: briefs are bounded, secrets masked, errors carried on the f
 	assert.ok(fail.argsBrief.includes("q"));
 });
 
+test("review 9b41e5ba P2-1/P2-2: value-shape secrets are masked in args, results AND error briefs", async () => {
+	const events = [];
+	const tool = {
+		name: "probe",
+		async execute() {
+			return { content: [{ type: "text", text: "ok body Authorization: Bearer sk-live-abcdef123456; url https://x.invalid/?token=tok123&x=1" }] };
+		},
+	};
+	const wrapped = withTelemetry(tool, (e) => events.push(e));
+	// args: Bearer / key=value / PEM block / bare key names — all masked
+	await wrapped.execute("t1", { body: "Authorization: Bearer sk-live-abcdef123456", pem: "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----", privateKey: "-----BEGIN RSA PRIVATE KEY-----\nBBBB\n-----END RSA PRIVATE KEY-----", access_key: "AKIA123", session: "sess-999" }, undefined, undefined);
+	const a = events[0].argsBrief;
+	for (const leaked of ["sk-live", "AKIA123", "sess-999", "BEGIN OPENSSH", "BEGIN RSA", "AAAA", "BBBB"]) {
+		assert.ok(!a.includes(leaked), `args must not leak ${leaked}: got ${a}`);
+	}
+	assert.ok(a.includes("Bearer ***") || a.includes("***"), "Bearer form masked with key preserved");
+	// result text: value shapes masked on the RESULT side too
+	const r = events[0].resultBrief;
+	assert.ok(!r.includes("sk-live-abcdef123456") && !r.includes("tok123"), "result brief must mask value shapes");
+	assert.ok(r.includes("Bearer ***") && r.includes("token ***"), "result keeps the masked key names");
+	// error text masked on the failure event
+	const boom = withTelemetry({ name: "fetch", async execute() { throw new Error("GET https://api.invalid/v1?token=topsecret failed"); } }, (e2) => events.push(e2));
+	await assert.rejects(() => boom.execute("t2", {}, undefined, undefined));
+	const fail = events[1];
+	assert.ok(!fail.resultBrief.includes("topsecret"), "error brief must mask URL tokens");
+});
+
+test("review 9b41e5ba P3-1: noBriefs skips collection; brief collection failure never flips the call", async () => {
+	const events = [];
+	const big = { blob: "x".repeat(200000) };
+	const gated = withTelemetry({ name: "big", async execute(p) { return { content: [{ type: "text", text: JSON.stringify(p) }] }; } }, (e) => events.push(e), { noBriefs: true });
+	await gated.execute("t1", big, undefined, undefined);
+	assert.equal(events[0].argsBrief, undefined, "noBriefs skips args collection");
+	assert.equal(events[0].resultBrief, undefined, "noBriefs skips result collection");
+	// briefToolResult throwing must not flip the successful call into a failure
+	const broken = withTelemetry({ name: "weird", async execute() { return { get content() { throw new Error("envelope"); } }; } }, (e) => events.push(e));
+	const r = await broken.execute("t2", {}, undefined, undefined);
+	assert.ok(r && typeof r === "object", "the successful call result is untouched");
+	assert.equal(events[1].ok, true, "a brief bug must not flip ok");
+	assert.match(events[1].resultBrief, /结果摘要采集失败/);
+});
+
 // ── the full turn path through the real engine ───────────────────────────────
 
 const WORK_PREFIX = "【工作窗口开始】\n【自主任务】月末对账\n【目标】完成月末核对\n\n窗口规则：略。\n\n请按目标与执行条件推进工作。";

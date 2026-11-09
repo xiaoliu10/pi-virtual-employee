@@ -576,17 +576,26 @@ export function stubDuplicateResult<T>(
 	}
 }
 
+export interface TelemetryOptions {
+	/** Skip digest brief collection entirely (deep-copy + stringify of the
+	 * whole params/result) — briefs are only consumed by work+contextStore
+	 * sessions; other conversations pay the cost for nothing (review P3-1). */
+	noBriefs?: boolean;
+}
+
 export function withTelemetry(
 	tool: AgentTool<any>,
 	onEvent: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string; argsBrief?: string; resultBrief?: string }) => void,
+	options?: TelemetryOptions,
 ): AgentTool<any> {
+	const collectBriefs = !options?.noBriefs;
 	return {
 		...tool,
 		async execute(toolCallId, params, signal, onUpdate) {
 			const started = Date.now();
 			// WorkSession digest briefs: collected ONCE here (bounded + masked below)
 			// and carried on both the success and the failure event.
-			const argsBrief = briefToolArgs(params);
+			const argsBrief = collectBriefs ? briefToolArgs(params) : undefined;
 			try {
 				const result = await tool.execute(toolCallId, params, signal, onUpdate);
 				const details = (result as { details?: { refused?: boolean; capability?: string } } | undefined)?.details;
@@ -595,7 +604,7 @@ export function withTelemetry(
 				// tool + normalized params + result digest. Computed here — the
 				// OUTERMOST wrapper — so both kernels and every capability feed it.
 				const fingerprint = computeToolFingerprint(tool.name, params, result);
-				onEvent({ name: tool.name, durationMs: Date.now() - started, ok: !refused, refused, refusedCapability: details?.capability, fingerprint, argsBrief, resultBrief: briefToolResult(result) });
+				onEvent({ name: tool.name, durationMs: Date.now() - started, ok: !refused, refused, refusedCapability: details?.capability, fingerprint, argsBrief, resultBrief: collectBriefs ? briefToolResultSafe(result) : undefined });
 				// Duplicate-result stub (Hermes tool_guardrails, ported 2026-11-06):
 				// a polling loop that reads the SAME unchanged payload every round
 				// otherwise pushes the whole thing into the context each time. From
@@ -611,7 +620,7 @@ export function withTelemetry(
 					ok: false,
 					error,
 					argsBrief,
-					resultBrief: briefText(error),
+					resultBrief: collectBriefs ? briefText(maskResultText(error)) : undefined,
 					// A throwing tool still carries a fingerprint: the same tool with
 					// the same params throwing the same error every round IS a loop.
 					fingerprint: computeToolFingerprint(tool.name, params, error),
@@ -633,11 +642,25 @@ const DIGEST_BRIEF_MAX_CHARS = 240;
 /** Leaf values under these keys never enter the (permanent, replayed) ledger:
  * tool args can carry credentials, and truncation alone would still leak the
  * secret itself when it sits inside the first 240 chars. */
-const DIGEST_SECRET_KEY_RE = /pass|pwd|secret|token|api_?key|authorization|cookie|credential|otp|验证码|密码|密钥/i;
+const DIGEST_SECRET_KEY_RE = /pass|pwd|secret|token|api_?key|authorization|cookie|credential|otp|验证码|密码|密钥|private[_-]?key|access[_-]?key|session|(^|[^a-z])key($|[^a-z])/i;
+
+/** VALUE shapes (review 9b41e5ba P2-1): secrets also arrive as free text —
+ * "Authorization: Bearer …" bodies, URL query tokens, PEM blocks — where no
+ * key name ever identifies them. Mask the value forms wherever they appear.
+ * PEM blocks are dropped whole (no useful prefix); key=value / Bearer forms
+ * keep their key so the digest still says WHAT was masked. */
+const DIGEST_PEM_BLOCK_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g;
+const DIGEST_SECRET_VALUE_RE = /(api[_-]?key|access[_-]?key|token|password|passwd|pwd|secret|session[_-]?id|credential|[Bb]earer)[=:：]?\s*\S+/g;
 
 function briefText(raw: string): string {
 	const text = raw.replace(/\s+/g, " ").trim();
 	return text.length > DIGEST_BRIEF_MAX_CHARS ? `${text.slice(0, DIGEST_BRIEF_MAX_CHARS)}…（截断）` : text;
+}
+
+function maskValueShapes(text: string): string {
+	return text
+		.replace(DIGEST_PEM_BLOCK_RE, "***")
+		.replace(DIGEST_SECRET_VALUE_RE, "$1 ***");
 }
 
 function maskSecrets(value: unknown, key = ""): unknown {
@@ -647,8 +670,10 @@ function maskSecrets(value: unknown, key = ""): unknown {
 		for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = maskSecrets(v, k);
 		return out;
 	}
-	if (typeof value === "string" && key && DIGEST_SECRET_KEY_RE.test(key)) return "***";
-	return value;
+	if (typeof value !== "string") return value;
+	if (key && DIGEST_SECRET_KEY_RE.test(key)) return "***";
+	// Free-text values still carry Bearer headers / URL tokens / PEM blocks.
+	return maskValueShapes(value);
 }
 
 function briefToolArgs(params: unknown): string {
@@ -660,9 +685,26 @@ function briefToolArgs(params: unknown): string {
 	}
 }
 
+/** Tool results and error messages reach the SAME permanent ledger as args —
+ * review 9b41e5ba P2-2: the masking contract is empty unless it covers them.
+ * Key masking is moot here (plain text, no keys) but value shapes are not. */
+function maskResultText(text: string): string {
+	return maskValueShapes(text);
+}
+
 /** Tool results are `{ content: [{ type: "text", text }] }` envelopes; flatten
  * the text blocks. Non-text blocks (images, …) degrade to a marker — the digest
- * stays honest about what the tool produced without inlining it. */
+ * stays honest about what the tool produced without inlining it. Never throws:
+ * a brief-collection bug must not flip a successful call into a failure. */
+function briefToolResultSafe(result: unknown): string {
+	try {
+		return briefToolResult(result);
+	} catch (err) {
+		console.warn("[engine] briefToolResult failed:", err instanceof Error ? err.message : err);
+		return "（结果摘要采集失败）";
+	}
+}
+
 function briefToolResult(result: unknown): string {
 	const blocks = (result as { content?: Array<{ type?: string; text?: string }> } | undefined)?.content;
 	if (!Array.isArray(blocks)) return "（无文本结果）";
@@ -674,5 +716,5 @@ function briefToolResult(result: unknown): string {
 	}
 	const text = texts.join("\n");
 	if (!text.trim()) return nonText > 0 ? `（无文本结果，含 ${nonText} 个非文本块）` : "（无文本结果）";
-	return briefText(text);
+	return briefText(maskResultText(text));
 }

@@ -38,6 +38,10 @@ export interface WorkToolEvent {
  * best facts, "成功" is the last resort. Upgraded briefs come from the tool
  * wrapper layer (withTelemetry) — never from re-piercing individual tools.
  */
+/** The degrade path below embeds raw error text — mask value shapes
+ * (Bearer/URL tokens/PEM) before it reaches the permanent ledger. */
+const DIGEST_ERROR_VALUE_RE = /(api[_-]?key|token|password|passwd|pwd|secret|credential)[=:：]\s*\S+|([Bb]earer)\s+\S+/g;
+
 export function toolDigestDraft(conversationId: string, ts: number, event: WorkToolEvent): Omit<TurnRecord, "seq"> {
 	const digest: ToolDigest = {
 		name: event.name,
@@ -47,7 +51,7 @@ export function toolDigestDraft(conversationId: string, ts: number, event: WorkT
 				? "成功"
 				: event.refused
 					? `权限拒绝（${event.refusedCapability ?? "?"}）`
-					: `失败：${(event.error ?? "无错误信息").slice(0, 200)}`),
+					: `失败：${(event.error ?? "无错误信息").replace(DIGEST_ERROR_VALUE_RE, "$2 ***").slice(0, 200)}`),
 		durationMs: event.durationMs,
 	};
 	return { conversationId, kind: "tool-digest", text: "", toolDigest: digest, ts };

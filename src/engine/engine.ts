@@ -1594,16 +1594,26 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * Never throws: the ledger serves the NEXT window, and a write failure must
 	 * not turn an already-delivered reply into an error.
 	 */
-	private async commitWorkTurn(conversationId: string, message: string, reply: string, agent: Agent): Promise<void> {
+	private async commitWorkTurn(conversationId: string, message: string, reply: string, agent: Agent, deterministic: boolean): Promise<void> {
 		const store = this.opts.contextStore;
 		if (!store) return;
 		const digests = this.workToolDigests.get(conversationId) ?? [];
 		this.workToolDigests.delete(conversationId);
 		try {
+			// Review 9b41e5ba P3-2: request/digests/reply is ONE turn — write it in
+			// ONE transaction so a mid-turn failure cannot leave a half turn (a
+			// request without its reply) replaying into every later window.
 			const ts = Date.now();
-			store.appendNext(conversationId, { conversationId, kind: "request", text: workRequestText(message), ts });
-			for (const digest of digests) store.appendNext(conversationId, digest);
-			if (reply.trim()) store.appendNext(conversationId, { conversationId, kind: "reply", text: reply, ts });
+			const records: Array<Omit<TurnRecord, "seq">> = [
+				{ conversationId, kind: "request", text: workRequestText(message), ts },
+				...digests,
+			];
+			// A deterministic failure template ("模型服务中断…") is not the task's
+			// outcome — in the ledger it degrades to a delivery notice so later
+			// windows never replay the boilerplate as the reply.
+			if (reply.trim() && !deterministic) records.push({ conversationId, kind: "reply", text: reply, ts });
+			else if (deterministic) records.push({ conversationId, kind: "delivery", text: "（本轮因模型服务中断未产出结果，任务未完成）", ts });
+			store.appendNextMany(conversationId, records);
 		} catch (err) {
 			console.warn("[engine] work ledger commit failed:", err instanceof Error ? err.message : err);
 			return;
@@ -3164,7 +3174,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// digests + reply), then let the ledger compact itself. Best-effort — the
 		// ledger is the NEXT window's context, never this reply's delivery path.
 		if (isWork && !ctx?.ephemeral) {
-			await this.commitWorkTurn(conversationId, message, reply, agent);
+			await this.commitWorkTurn(conversationId, message, reply, agent, deterministic);
 		}
 
 		// Context management: summarize old turns once the transcript approaches
@@ -4055,7 +4065,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// both the progress watchdog and tool-event telemetry (independent
 			// review: a durable MCP call fired recordToolTelemetry ZERO times).
 			const guarded = guardTool("mcp", tool, guardOptions);
-			return withTelemetry(guarded, (e) => this.recordToolTelemetry(conversationId, e));
+			// Review 9b41e5ba P3-1: brief collection deep-copies and stringifies the
+			// whole params/result — only work+contextStore sessions ever consume the
+			// briefs, so other conversations pass undefined and skip that cost.
+			const wantBriefs = isWorkConversation(conversationId) && Boolean(this.opts.contextStore);
+			return withTelemetry(guarded, (e) => this.recordToolTelemetry(conversationId, e), wantBriefs ? undefined : { noBriefs: true });
 		});
 	}
 

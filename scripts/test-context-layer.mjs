@@ -574,3 +574,45 @@ test("review P3-2: listTurns with a NaN limit does not throw and reads the parti
 	const rows = s.listTurns("c1", { limit: NaN });
 	assert.equal(rows.length, 1, "non-finite limit is treated as unlimited");
 });
+
+
+// ── review 9b41e5ba fixes ────────────────────────────────────────────────────
+
+test("review P3-3: replaceHead refuses records that cross partitions", () => {
+	const ctx = store();
+	ctx.appendNext("p1", { conversationId: "p1", kind: "request", text: "a", ts: 1 });
+	assert.throws(
+		() => ctx.replaceHead("p1", [], [{ conversationId: "p2", seq: 9, kind: "system", text: "evil", ts: 2 }]),
+		/match partition/,
+		"a record carrying a foreign conversationId must never land in p1",
+	);
+	assert.equal(ctx.listTurns("p2").length, 0, "p2 untouched");
+	assert.equal(ctx.listTurns("p1").length, 1, "p1 intact");
+});
+
+test("review P3-2: appendNextMany commits ALL rows or NONE (mid-batch failure rolls back)", () => {
+	const ctx = store();
+	ctx.appendNext("p1", { conversationId: "p1", kind: "request", text: "old", ts: 1 });
+	// one row with a poisoned toolDigest (unserializable via getter) → JSON.stringify throws mid-batch
+	const poisoned = { conversationId: "p1", kind: "tool-digest", text: "", ts: 2, toolDigest: { name: "t", argsBrief: "", resultBrief: "", durationMs: 1, get poison() { throw new Error("nope"); } } };
+	assert.throws(
+		() => ctx.appendNextMany("p1", [
+			{ conversationId: "p1", kind: "request", text: "new", ts: 3 },
+			poisoned,
+			{ conversationId: "p1", kind: "reply", text: "r", ts: 4 },
+		]),
+		/nope/,
+	);
+	const rows = ctx.listTurns("p1");
+	assert.deepEqual(rows.map((r) => r.kind), ["request"], "only the pre-batch row survives — the batch is atomic");
+});
+
+test("review P3-2: appendNextMany allocates consecutive seqs inside the transaction", () => {
+	const ctx = store();
+	ctx.appendNextMany("p1", [
+		{ conversationId: "p1", kind: "request", text: "q", ts: 1 },
+		{ conversationId: "p1", kind: "tool-digest", text: "", ts: 2, toolDigest: { name: "t", argsBrief: "", resultBrief: "成功", durationMs: 5 } },
+		{ conversationId: "p1", kind: "reply", text: "r", ts: 3 },
+	]);
+	assert.deepEqual(ctx.listTurns("p1").map((r) => r.seq), [1, 2, 3], "MAX(seq)+1 inside the tx sees the previous row");
+});
