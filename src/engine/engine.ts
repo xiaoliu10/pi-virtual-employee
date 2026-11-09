@@ -114,6 +114,7 @@ import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL
 import { buildBundle, recordsToMessages, type ContextBundle } from "../context/bundle.js";
 import { compactIfNeeded, type CompactOutcome as LedgerCompact } from "../context/compact.js";
 import type { ContextStore } from "../context/store.js";
+import type { TurnRecord } from "../context/records.js";
 import { isWorkConversation, replaceHeadDiff, toolDigestDraft, workLedgerBudgetTokens, workRequestText } from "./work-ledger.js";
 import { extractProgressFromTexts, formatDeterministicBrief, standardizeProgressReport } from "./progress.js";
 import { fetchModelInfo, resolveEffectiveLimits, type RemoteModelInfo } from "./model-info.js";
