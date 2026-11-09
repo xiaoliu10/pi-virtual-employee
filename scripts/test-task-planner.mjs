@@ -118,6 +118,28 @@ test("the chat message leads with the goal in one 📋 line", () => {
 	assert.ok(!msg.includes("按此执行"), "no machine boilerplate in chat");
 });
 
+test("an uncertain estimate stays invisible: no ⏱ line, no plan push (user ruling 2026-11-10)", () => {
+	const plan = m.parsePlan("耗时：不确定\n目标：登录后台核对配置\n流程：登录 → 核对\n1. 登录\n2. 核对");
+	assert.equal(plan.estimatedMinutes, 0, "「不确定」 parses to unknown (0), never a fabricated number");
+	const msg = m.formatPlanMessage(plan);
+	assert.ok(!msg.includes("⏱"), "no estimate line is shown when the model is not sure");
+	assert.ok(!msg.includes("不确定"), "the raw word does not leak into the chat card either");
+	assert.ok(msg.includes("登录后台核对配置"), "goal and flow still render");
+	assert.equal(m.shouldPushPlanToChat(plan), false, "an unknown duration never proves 'long' — no push");
+});
+
+test("the prompt header demands rigor: a number only with a reliable basis, machine time only", () => {
+	// User ruling 2026-11-10: 如果不确定就不要写，要严谨。The field card
+	// 「⏱ 预计约 30 分钟」 for a 2-minute login task was an uncalibrated guess
+	// that also tripped the ≥30min push gate — noise and misinformation from
+	// the same root.
+	assert.match(m.PLAN_PROMPT_HEADER, /可靠依据/, "a number requires a reliable basis");
+	assert.match(m.PLAN_PROMPT_HEADER, /不确定/, "the honest escape is mandated");
+	assert.match(m.PLAN_PROMPT_HEADER, /严禁编造/, "fabricating a number is forbidden");
+	assert.match(m.PLAN_PROMPT_HEADER, /机器执行时间/, "machine time only");
+	assert.match(m.PLAN_PROMPT_HEADER, /不计入/, "human-wait time is excluded");
+});
+
 test("the prompt header asks for the outline AND the hidden steps", () => {
 	// The side pass must now yield 耗时 + 目标 + 流程 (the chat outline) plus the
 	// numbered steps (the turn context) in one call.
@@ -157,6 +179,11 @@ test("duration parsing handles the shapes a model actually writes", () => {
 	assert.equal(parseDurationMinutes("半小时"), 30);
 	assert.equal(parseDurationMinutes("2 天"), 2880);
 	assert.equal(parseDurationMinutes("大约 3 小时"), 180);
+	// User ruling 2026-11-10: "如果不确定就不要写 要严谨" — the model writes
+	// 「不确定」 when it has no reliable basis; that must parse to 0 (unknown),
+	// never to a fabricated number.
+	assert.equal(parseDurationMinutes("不确定"), 0);
+	assert.equal(parseDurationMinutes("不确定（需要等验证码）"), 0);
 	// Unknown / empty must be 0 — callers treat 0 as "not proven long".
 	for (const t of ["", "不确定", "一会儿", undefined]) assert.equal(parseDurationMinutes(t), 0, `should be 0: ${t}`);
 });
