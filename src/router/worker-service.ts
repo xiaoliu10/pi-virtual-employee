@@ -22,6 +22,7 @@
 import { WorkerTaskStore, type WorkerTaskRow } from "./worker-tasks.js";
 import { looksLikeTask } from "../engine/task-planner.js";
 import { isBareContextToken } from "../im/triage.js";
+import { SYNTHETIC_FALLBACK_FRAGMENTS_RE } from "../db/history-store.js";
 
 /** Injected durable-execution primitives (same shape WorkService uses — the
  * shared KERNEL below both infrastructures; nothing task-flavored crosses). */
@@ -47,6 +48,21 @@ export interface WorkerEngineDeps<Session> {
 	 * original run burned half an hour getting there). Looked up at retry time,
 	 * NOT at boot, so it sees the current state. */
 	taskContext?: (sourceConversation: string, instruction: string) => string | null;
+	/** Source-conversation context for a NEWLY dispatched worker (user ruling
+	 * 2026-11-10): 「worker 还是需要对话记录的，不然一直丢上下文体验非常差」. A
+	 * worker born with only its instruction cannot resolve a reference like
+	 * 「875055」 that the triggering chat established turns earlier — it guesses
+	 * and asks the user what the conversation already answered (field
+	 * 2026-11-10). The Router hands it a bounded excerpt of the source
+	 * conversation instead.
+	 *
+	 * Partition law (soft isolation, user ruling 2026-11-10): the excerpt comes
+	 * from the SAME conversation only — never cross-chat. A group worker gets
+	 * that group's stream, which every member can already see; a single-chat
+	 * worker gets that user's stream. Nothing wider is ever assembled.
+	 * Looked up at EXECUTE time (not spawn) so a queued worker sees the chat as
+	 * it is when the work actually starts. */
+	sourceContext?: (sourceConversation: string) => string | null;
 	/** Long-task progress broadcaster (taskProgressMin cadence), same shape
 	 * WorkService injects. Optional — without it long workers run silent
 	 * until their result (the exact complaint that opened this file's field
@@ -57,6 +73,73 @@ export interface WorkerEngineDeps<Session> {
 	maxConcurrent?: number;
 	clock?: { now(): number; setTimeout(fn: () => void, ms: number): unknown };
 	onError?(err: unknown): void;
+}
+
+/** Bounds for the source-context excerpt. Sized against a 200k window: 24
+ * messages ≈ the last few exchanges, 10k chars ≈ ~5k CJK tokens — enough to
+ * resolve references without crowding the worker's own working set. */
+export const SOURCE_CONTEXT_MAX_MESSAGES = 24;
+export const SOURCE_CONTEXT_MAX_CHARS = 10_000;
+export const SOURCE_CONTEXT_MAX_PER_MESSAGE = 500;
+
+/** Render one message's content as plain text (defensive: history rows can
+ * carry structured/array content from older projections). */
+function flattenMessageContent(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (content == null) return "";
+	if (Array.isArray(content)) {
+		return content
+			.map((part) => {
+				if (typeof part === "string") return part;
+				if (part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string") {
+					return (part as { text: string }).text;
+				}
+				try { return JSON.stringify(part); } catch { return ""; }
+			})
+			.join("\n");
+	}
+	if (typeof content === "object" && typeof (content as { text?: unknown }).text === "string") {
+		return (content as { text: string }).text;
+	}
+	try { return JSON.stringify(content); } catch { return ""; }
+}
+
+/**
+ * Build the 【来源会话近期上下文】 block handed to a freshly dispatched worker.
+ *
+ * Tail-aligned: the most recent exchanges matter for resolving references, so
+ * rows are collected from the END backwards and the result is rendered in
+ * chronological order. Synthetic delivery-time fallback notices are filtered
+ * out (they are not employee speech — feeding them back teaches the model to
+ * imitate 「执行已暂停，请检查恢复状态。」). Returns null when nothing usable
+ * remains, so the caller can skip the block entirely (byte-identical prompt).
+ */
+export function buildSourceContextExcerpt(rows: Array<{ role: string; content: unknown }>): string | null {
+	if (!rows || rows.length === 0) return null;
+	const picked: string[] = [];
+	let used = 0;
+	let omitted = 0;
+	for (let i = rows.length - 1; i >= 0; i--) {
+		const row = rows[i];
+		const raw = flattenMessageContent(row?.content).trim();
+		if (!raw) continue;
+		if (SYNTHETIC_FALLBACK_FRAGMENTS_RE.test(raw.replace(/\s+/g, ""))) continue;
+		const label = row.role === "assistant" ? "助手:" : row.role === "user" ? "用户:" : `${row.role}:`;
+		const text = raw.length > SOURCE_CONTEXT_MAX_PER_MESSAGE
+			? `${raw.slice(0, SOURCE_CONTEXT_MAX_PER_MESSAGE)}…`
+			: raw;
+		const line = `${label} ${text}`;
+		if (picked.length >= SOURCE_CONTEXT_MAX_MESSAGES || used + line.length > SOURCE_CONTEXT_MAX_CHARS) {
+			omitted = i + 1;
+			break;
+		}
+		picked.unshift(line);
+		used += line.length + 1;
+	}
+	if (picked.length === 0) return null;
+	const head = ["【来源会话近期上下文（用于理解指令中的指代，不要单独复述）】"];
+	if (omitted > 0) head.push("（更早的消息已省略）");
+	return [...head, ...picked].join("\n");
 }
 
 export interface WorkerSpec {
@@ -349,7 +432,13 @@ export class WorkerService<Session> {
 			// dispatch turn and any follow-ups never overlap on the Agent.
 			await new Promise<void>((resolve) => {
 				this.enqueueTurn(task.conversation_id!, async () => {
-					await this.runTurn(task, session, task.instruction, task.created_by, { record: true });
+					// User ruling 2026-11-10: the dispatch turn carries a bounded
+					// excerpt of the source conversation READ the block is prepended
+					// so the instruction (the actual task) stays most recent. A null
+					// excerpt leaves the message byte-identical to before.
+					const context = this.opts.sourceContext?.(task.source_conversation) ?? null;
+					const firstMessage = context ? `${context}\n\n【任务指令】\n${task.instruction}` : task.instruction;
+					await this.runTurn(task, session, firstMessage, task.created_by, { record: true });
 					resolve();
 				});
 			});

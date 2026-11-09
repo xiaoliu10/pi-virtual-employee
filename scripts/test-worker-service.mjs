@@ -26,7 +26,7 @@ process.on("exit", () => { try { rmSync(dir, { recursive: true, force: true }); 
 
 await build({
 	stdin: {
-		contents: `export { WorkerTaskStore } from "./src/router/worker-tasks.ts";\nexport { WorkerService } from "./src/router/worker-service.ts";`,
+		contents: `export { WorkerTaskStore } from "./src/router/worker-tasks.ts";\nexport { WorkerService, buildSourceContextExcerpt, SOURCE_CONTEXT_MAX_MESSAGES, SOURCE_CONTEXT_MAX_CHARS, SOURCE_CONTEXT_MAX_PER_MESSAGE } from "./src/router/worker-service.ts";`,
 		resolveDir: root,
 		loader: "ts",
 	},
@@ -36,7 +36,8 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { WorkerTaskStore, WorkerService } = await import(pathToFileURL(join(dir, "ws.mjs")).href);
+const { WorkerTaskStore, WorkerService, buildSourceContextExcerpt, SOURCE_CONTEXT_MAX_MESSAGES, SOURCE_CONTEXT_MAX_CHARS, SOURCE_CONTEXT_MAX_PER_MESSAGE } =
+	await import(pathToFileURL(join(dir, "ws.mjs")).href);
 
 function harness(overrides = {}) {
 	const db = new DatabaseSync(":memory:");
@@ -514,6 +515,91 @@ test("a CANCELLED worker gets the same bare-token guard (review P3-4)", async ()
 		VALUES ('wcan', '发送短信后锁住页面，登录成功才能关', 'dt:single:m3', 'u1', 'cancelled', 'worker:wcan', ?, ?)`).run(past, past);
 	assert.equal(await service.inject("dt:single:m3", "ORDER-2026-11-10-0001", "u1"), false, "cancelled worker must not swallow a bare order id");
 	assert.equal(await service.inject("dt:single:m3", "结果呢", "u1"), true, "continuation still reaches the cancelled worker");
+});
+
+// ─── 2026-11-10: a dispatched worker carries the source conversation ────────
+// User ruling: 「worker 还是需要对话记录的，不然一直丢上下文体验非常差」. Field: a
+// worker spawned from a single chat was born with the instruction alone, so it
+// could not resolve 「875055」 — the answer was three turns up in the very chat
+// that spawned it.
+
+test("buildSourceContextExcerpt renders a tail-aligned block with role labels", () => {
+	const rows = [
+		{ role: "user", content: "我的编号 875055 是单号" },
+		{ role: "assistant", content: "明白，875055 是单号。" },
+		{ role: "user", content: "查一下它的支付渠道" },
+	];
+	const block = buildSourceContextExcerpt(rows);
+	assert.ok(block.includes("【来源会话近期上下文"), "block header present");
+	assert.ok(block.includes("用户: 我的编号 875055 是单号"), "user line labelled");
+	assert.ok(block.includes("助手: 明白，875055 是单号。"), "assistant line labelled");
+	// Chronological order restored after the backwards walk.
+	assert.ok(block.indexOf("我的编号") < block.indexOf("查一下它的支付渠道"), "chronological order");
+	assert.ok(!block.includes("更早的消息已省略"), "no omission marker when everything fits");
+});
+
+test("buildSourceContextExcerpt filters synthetic delivery notices and empty rows", () => {
+	const rows = [
+		{ role: "user", content: "帮我查流水" },
+		{ role: "assistant", content: "执行已暂停，请检查恢复状态。" },
+		{ role: "assistant", content: "   " },
+		{ role: "assistant", content: null },
+	];
+	const block = buildSourceContextExcerpt(rows);
+	assert.ok(block.includes("帮我查流水"));
+	assert.ok(!block.includes("执行已暂停"), "synthetic notice never fed back to a worker");
+	assert.ok(!block.includes("助手: \n"), "empty rows skipped");
+	assert.equal(buildSourceContextExcerpt([]), null, "nothing usable → null");
+	assert.equal(buildSourceContextExcerpt([{ role: "assistant", content: "执行已暂停，请检查恢复状态。" }]), null, "only notices → null");
+});
+
+test("buildSourceContextExcerpt enforces the per-message and total caps", () => {
+	const long = "字".repeat(SOURCE_CONTEXT_MAX_PER_MESSAGE + 200);
+	const one = buildSourceContextExcerpt([{ role: "user", content: long }]);
+	assert.ok(one.includes("…"), "per-message truncation marker");
+	assert.ok(one.length <= SOURCE_CONTEXT_MAX_PER_MESSAGE + 80, "per-message cap applied");
+
+	const many = Array.from({ length: SOURCE_CONTEXT_MAX_MESSAGES + 6 }, (_, i) => ({ role: "user", content: `第${i}条` }));
+	const block = buildSourceContextExcerpt(many);
+	assert.ok(block.includes("（更早的消息已省略）"), "omission marker when the window overflows");
+	assert.ok(block.includes(`第${SOURCE_CONTEXT_MAX_MESSAGES + 5}条`), "newest row always kept");
+	assert.ok(!block.includes("第0条"), "oldest rows dropped first");
+	assert.ok(block.length <= SOURCE_CONTEXT_MAX_CHARS + 200, "total cap honoured");
+});
+
+test("buildSourceContextExcerpt survives non-string content shapes", () => {
+	const block = buildSourceContextExcerpt([
+		{ role: "user", content: [{ type: "text", text: "数组形态" }] },
+		{ role: "user", content: { text: "对象形态" } },
+	]);
+	assert.ok(block.includes("数组形态"));
+	assert.ok(block.includes("对象形态"));
+});
+
+test("the dispatch turn carries source context; follow-ups do not", async () => {
+	const context = "【来源会话近期上下文（用于理解指令中的指代，不要单独复述）】\n用户: 875055 是单号";
+	const { h, service } = harness({ service: { sourceContext: () => context } });
+	service.spawn({ instruction: "1. 查渠道\n\n[用户原始指令]\n查一下这笔流水", sourceConversation: "dt:single:m9", createdBy: "u1" });
+	service.start();
+	await flush();
+	assert.equal(h.sends.length, 1);
+	assert.equal(h.sends[0].message, `${context}\n\n【任务指令】\n1. 查渠道\n\n[用户原始指令]\n查一下这笔流水`, "context block precedes the instruction");
+	assert.ok(h.sends[0].message.indexOf("875055") < h.sends[0].message.indexOf("【任务指令】"), "context first, instruction last (recency)");
+	// A follow-up continues the worker's own session — no re-injection.
+	await service.inject("dt:single:m9", "结果呢", "u1");
+	await flush();
+	assert.equal(h.sends[1].message, "结果呢", "follow-ups are verbatim, not context-prefixed");
+});
+
+test("a null source context leaves the dispatch message byte-identical", async () => {
+	for (const sourceContext of [undefined, () => null]) {
+		const { h, service } = harness(sourceContext ? { service: { sourceContext } } : {});
+		const instruction = "1. 查渠道\n\n[用户原始指令]\n查一下这笔流水";
+		service.spawn({ instruction, sourceConversation: "dt:single:m10", createdBy: "u1" });
+		service.start();
+		await flush();
+		assert.equal(h.sends[0].message, instruction, "no block, no header, no drift");
+	}
 });
 
 test("a LIVE worker still receives bare tokens (verification-code flow, field 2026-11-07)", async () => {
