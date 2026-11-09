@@ -219,14 +219,12 @@ export class WorkItemStore {
 			.run(Math.max(0, Math.floor(streak)), id);
 	}
 
-	/** Consecutive wall-clock timeouts the window auto-deferred. Written
-	 * mid-window (status 'working'), so it is unguarded like fallback_streak —
-	 * the guard variants only run from the post-window persistence.
-	 *
-	 * The meter counts CONSECUTIVE timeouts: every close that is not the timeout
-	 * auto-defer resets it to 0 — done, a model-declared NEXT_CHECK, NEED_HUMAN,
-	 * a soft fallback, an execution error, an admin pause, and the circuit-breaker
-	 * pause itself (see WorkService.run's non-timeout close). */
+	/** LEGACY consecutive-timeout meter (the timeout auto-defer and its breaker
+	 * were deleted, design §8.2 删自动顺延复活). No service path writes it any
+	 * more; the column and this setter stay for schema compatibility, and
+	 * resume() clears it on legacy rows so nothing stale survives a resume.
+	 * Kept as a plain guarded write (not status-gated): it was written mid-window
+	 * while 'working'. */
 	setTimeoutStreak(id: string, streak: number): void {
 		this.db.prepare("UPDATE work_items SET timeout_streak = ? WHERE id = ?").run(Math.max(0, Math.floor(streak)), id);
 	}

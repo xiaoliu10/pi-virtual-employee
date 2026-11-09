@@ -234,7 +234,9 @@ test("wiring: the work service isAdmin gate uses the shared declared-admin autho
 	const mainSrc = readFileSync(join(root, "electron", "main.ts"), "utf8");
 	const at = mainSrc.indexOf("new WorkService(");
 	assert.ok(at > 0, "WorkService is constructed in main.ts");
-	const block = mainSrc.slice(at, at + 1200);
+	// 1600 (was 1200): the P1 恢复简报 wiring added a `ledger: contextStore`
+	// block ahead of the isAdmin closure — same contract, shifted offsets.
+	const block = mainSrc.slice(at, at + 1600);
 	assert.match(block, /isAdmin:\s*\(senderId\)\s*=>\s*isDeclaredAdmin\(config,\s*senderId\)/, "work gate delegates to isDeclaredAdmin (owner-tolerant)");
 	assert.ok(!block.includes('resolveRole(config, senderId) === "admin"'), "no owner-rejecting literal comparison remains");
 });
