@@ -25,7 +25,7 @@ await build({
 	stdin: { contents: `export * from "./src/im/triage.ts";`, resolveDir: root, loader: "ts" },
 	outfile: bundle, bundle: true, platform: "node", format: "esm", packages: "external", logLevel: "silent",
 });
-const { triageMessage, countPlanSteps, isQuestion, hasLongRunningVerb, isForegroundEscape, FOREGROUND_ESCAPE_HINT, isDeepTask } = await import(pathToFileURL(bundle).href);
+const { triageMessage, countPlanSteps, isQuestion, hasLongRunningVerb, isForegroundEscape, FOREGROUND_ESCAPE_HINT, isDeepTask, isBareContextToken } = await import(pathToFileURL(bundle).href);
 
 const configBundle = join(outDir, "config.mjs");
 await build({
@@ -331,4 +331,31 @@ test("a question-shaped short message with a task verb stays foreground (isQuest
 	const d = triageMessage({ text: "登录密码是什么", plan: undefined, looksLikeTask: true }, true);
 	assert.equal(d.dispatch, false, "Q&A must not be dispatched just because it carries a task verb");
 	assert.equal(d.reason, "question");
+});
+
+// ─── 2026-11-10: bare context tokens never dispatch (review 7ba60092 P1) ────
+// Field: 「875055」/「0002026110800003400」 reached a context-less worker (injected
+// into a DONE one, or spawned as a fresh one) that guessed and asked 「这是什么
+// 类型的编号？」. The manager's planless dispatch calls triageMessage with
+// looksLikeTask hardcoded TRUE — the guard must fire at exactly this seam,
+// otherwise the inject-gate fall-through loops back into a new worker.
+test("bare context tokens stay inline at the manager's decision seam", () => {
+	for (const t of ["875055", "0002026110800003400", "ORDER-2026-11-10-0001",
+		"550e8400-e29b-41d4-a716-446655440000", "875055。", " 004966 ", "A" + "9".repeat(63)]) {
+		const d = triageMessage({ text: t, plan: undefined, looksLikeTask: true }, true);
+		assert.equal(d.dispatch, false, `bare token must stay inline: ${t}`);
+	}
+	assert.equal(triageMessage({ text: "0002026110800003400", plan: undefined, looksLikeTask: true }, true).reason,
+		"reference", "long bare token routes as reference, not task");
+});
+
+test("isBareContextToken: cap boundary + CJK exclusion", () => {
+	// ≤64 chars is a token, 65+ is not (documents the arbitrary cap).
+	assert.equal(isBareContextToken("9".repeat(64)), true);
+	assert.equal(isBareContextToken("9".repeat(65)), false);
+	// CJK text is never a bare token — continuation words and mixed sentences
+	// keep their existing routes.
+	for (const t of ["重新执行", "继续", "结果呢", "查一下这笔流水 004966"]) {
+		assert.equal(isBareContextToken(t), false, `CJK text is not a bare token: ${t}`);
+	}
 });

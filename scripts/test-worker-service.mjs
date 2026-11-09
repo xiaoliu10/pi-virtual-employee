@@ -488,6 +488,10 @@ test("a FINISHED worker does not swallow a BARE context token — the foreground
 	// token was injected into it, and that session — born with its instruction
 	// only, no chat history — guessed 订单系统, found nothing, and asked
 	// 「这是什么类型的编号？」: the employee forgot a conversation it was part of.
+	// Review 7ba60092 P1: "falls through to the foreground" is provable END-TO-END —
+	// triageMessage carries the same shared guard (reason=reference, pinned in
+	// test-triage.mjs), so the planless dispatch cannot re-spawn a context-less
+	// worker for the token either.
 	const { h, service } = harness();
 	const past = Date.now() - 60 * 60_000;
 	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
@@ -496,9 +500,20 @@ test("a FINISHED worker does not swallow a BARE context token — the foreground
 	assert.equal(await service.inject("dt:single:m1", "A875055", "u1"), false, "prefixed codes too");
 	assert.equal(await service.inject("dt:single:m1", "0002026110800003400", "u1"), false, "19-digit serials too");
 	assert.equal(await service.inject("dt:single:m1", " 875055 ", "u1"), false, "surrounding whitespace does not matter");
+	assert.equal(await service.inject("dt:single:m1", "875055。", "u1"), false, "trailing CJK punctuation does not defeat the guard (review P2-1)");
+	assert.equal(await service.inject("dt:single:m1", "ORDER-2026-11-10-0001", "u1"), false, "order-id shape too");
 	// The continuation contract for worker-relative follow-ups is untouched.
 	assert.equal(await service.inject("dt:single:m1", "结果呢", "u1"), true, "「结果呢」 still continues the finished worker");
 	assert.equal(await service.inject("dt:single:m1", "继续", "u1"), true, "「继续」 still continues");
+});
+
+test("a CANCELLED worker gets the same bare-token guard (review P3-4)", async () => {
+	const { h, service } = harness();
+	const past = Date.now() - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
+		VALUES ('wcan', '发送短信后锁住页面，登录成功才能关', 'dt:single:m3', 'u1', 'cancelled', 'worker:wcan', ?, ?)`).run(past, past);
+	assert.equal(await service.inject("dt:single:m3", "ORDER-2026-11-10-0001", "u1"), false, "cancelled worker must not swallow a bare order id");
+	assert.equal(await service.inject("dt:single:m3", "结果呢", "u1"), true, "continuation still reaches the cancelled worker");
 });
 
 test("a LIVE worker still receives bare tokens (verification-code flow, field 2026-11-07)", async () => {

@@ -21,6 +21,7 @@
  */
 import { WorkerTaskStore, type WorkerTaskRow } from "./worker-tasks.js";
 import { looksLikeTask } from "../engine/task-planner.js";
+import { isBareContextToken } from "../im/triage.js";
 
 /** Injected durable-execution primitives (same shape WorkService uses — the
  * shared KERNEL below both infrastructures; nothing task-flavored crosses). */
@@ -57,11 +58,6 @@ export interface WorkerEngineDeps<Session> {
 	clock?: { now(): number; setTimeout(fn: () => void, ms: number): unknown };
 	onError?(err: unknown): void;
 }
-
-/** A bare alphanumeric token (≤32 chars, no CJK/punctuation): a verification
- * code, serial number, order id… Sent alone, it can ONLY be a reference into
- * the surrounding conversation — exactly what a finished worker lacks. */
-const BARE_CONTEXT_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._\-]{0,31}$/;
 
 export interface WorkerSpec {
 	instruction: string;
@@ -261,9 +257,12 @@ export class WorkerService<Session> {
 		// 「查了一下，875055 在订单系统里没匹配到…这是什么类型的编号？」— the type was
 		// established turns ago in the very conversation the message came from).
 		// Fall through to the foreground turn: it carries the full conversation
-		// history and can resolve the reference. LIVE workers are untouched — the
+		// history and can resolve the reference, and triageMessage has the SAME
+		// guard (shared isBareContextToken → reason=reference), so the planless
+		// dispatch cannot loop the token back into a freshly spawned context-less
+		// worker either (review 7ba60092 P1). LIVE workers are untouched — the
 		// verification-code flow (field 2026-11-07) is served above this gate.
-		if (!LIVE_STATUSES.has(recent.status) && BARE_CONTEXT_TOKEN_RE.test(message.trim())) {
+		if (!LIVE_STATUSES.has(recent.status) && isBareContextToken(message)) {
 			return false;
 		}
 		const session = await this.opts.open(recent.conversation_id);
