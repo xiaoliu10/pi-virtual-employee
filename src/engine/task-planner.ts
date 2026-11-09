@@ -40,6 +40,16 @@ export function looksLikeTask(message: string): boolean {
 	return multiStep || text.length >= 40;
 }
 
+/**
+ * Delivery-time notice appended when the narration guard's forced continuation
+ * STILL produced zero tool calls (field 2026-11-09: 「我来尝试登录…先检查工具」
+ * then silence — the user ruled process-narration replies unwanted). Shared by
+ * both kernels so the wording has one spelling; it is a runtime notice, not
+ * employee speech — the synthetic-fallback drop (durable import + startup
+ * sweep) keeps it from being replayed into a transcript and imitated.
+ */
+export const NARRATION_GUARD_NOTICE = "⚠️ 已尝试继续执行但模型没有实际动作；如需前台亲自执行请回复『前台执行』。";
+
 /** The plan prompt: short, numbered, verifiable steps; nothing else. */
 export const PLAN_PROMPT_HEADER =
 	"请判断下面这条消息是否是一个需要多步骤执行的任务。如果是，输出以下四部分；如果只是简单问答或单步操作，只输出 NO_PLAN。\n" +

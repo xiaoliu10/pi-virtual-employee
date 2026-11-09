@@ -27,6 +27,10 @@ const LONG_RUNNING_VERBS: readonly string[] = [
 	"全量", "重跑", "回放", "迁移", "备份", "归档",
 	"跑完", "跑一遍", "跑测试", "编译", "构建", "打包",
 	"下载全部", "下载所有", "逐条", "逐个",
+	// Field 2026-11-09: 「继续 登录生产后台管理」 died as foreground narration —
+	// 登录 was a task verb (task-planner looksLikeTask) but absent from this list.
+	// Same conservative rule as the 盯/爬 probe below: multi-character forms only.
+	"登录", "登陆", "检查", "验证", "打开", "访问", "上传", "同步", "重启",
 ];
 // Review probe 2026-11-04: 「老板天天盯着我们」「周末去爬山」 + a 2-step plan
 // both mis-dispatched because the single characters 盯/爬 match casual chat.

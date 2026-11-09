@@ -299,7 +299,7 @@ export class HistoryStore {
 		const normalized = (text: string) => (text ?? "").replace(/\s+/g, "").trim();
 		// Same distinctive-fragment rule as the durable import: a reworded notice must
 		// not silently stop being swept.
-		const doomed = rows.filter((row) => /执行已暂停|模型没有返回任何内容|请检查恢复状态/.test(normalized(row.content))).map((row) => row.id);
+		const doomed = rows.filter((row) => /执行已暂停|模型没有返回任何内容|请检查恢复状态|已尝试继续执行但模型没有实际动作/.test(normalized(row.content))).map((row) => row.id);
 		if (doomed.length === 0) return 0;
 		const del = this.db.prepare("DELETE FROM messages WHERE id = ?");
 		for (const id of doomed) del.run(id);

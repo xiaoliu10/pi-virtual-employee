@@ -11,8 +11,8 @@ import { Type } from 'typebox';
 import { Harness } from '@earendil-works/pi-durable';
 const dir=await mkdtemp(join(process.cwd(),'node_modules/.durable-runtime-'));
 after(()=>rm(dir,{recursive:true,force:true}));
-await build({stdin:{contents:'export { DurableRuntime } from "./src/engine/durable/runtime.ts"; export { HistoryStore } from "./src/db/history-store.ts";',resolveDir:process.cwd(),loader:'ts'},outfile:join(dir,'runtime.mjs'),bundle:true,platform:'node',format:'esm',packages:'external'});
-const {DurableRuntime,HistoryStore}=await import(pathToFileURL(join(dir,'runtime.mjs')));
+await build({stdin:{contents:'export { DurableRuntime } from "./src/engine/durable/runtime.ts"; export { HistoryStore } from "./src/db/history-store.ts"; export { NARRATION_GUARD_NOTICE } from "./src/engine/task-planner.ts";',resolveDir:process.cwd(),loader:'ts'},outfile:join(dir,'runtime.mjs'),bundle:true,platform:'node',format:'esm',packages:'external'});
+const {DurableRuntime,HistoryStore,NARRATION_GUARD_NOTICE}=await import(pathToFileURL(join(dir,'runtime.mjs')));
 
 function makeHistory(t){
  const db=new DatabaseSync(':memory:');
@@ -160,6 +160,7 @@ test('persisted fallback notices are not replayed into the durable transcript', 
  history.appendMessage('conv-notice','user','帮我查对账');
  history.appendMessage('conv-notice','assistant','执行已暂停，请检查恢复状态。'); // 历史里的投递通知
  history.appendMessage('conv-notice','assistant','本轮执行已结束，但模型没有返回任何内容（网关可能中断了响应）。请重新描述你的需求，我会再执行一次。');
+ history.appendMessage('conv-notice','assistant',NARRATION_GUARD_NOTICE); // 叙述守卫的如实说明也是投递通知
  const faux=fauxProvider();
  const sessions=new Map();
  const session=id=>{ if(!sessions.has(id)) sessions.set(id,new Agent({streamFn:faux.provider.streamSimple,sessionId:id,initialState:{model:faux.provider.getModels()[0],systemPrompt:'test'}})); return sessions.get(id); };
@@ -170,6 +171,7 @@ test('persisted fallback notices are not replayed into the durable transcript', 
   const tx=JSON.stringify(messages);
   assert(!tx.includes('执行已暂停，请检查恢复状态'),'fallback notice must not be imported');
   assert(!tx.includes('模型没有返回任何内容'),'empty-answer notice must not be imported');
+  assert(!tx.includes('已尝试继续执行但模型没有实际动作'),'narration-guard notice must not be imported');
   assert(tx.includes('帮我查对账'),'the user question must stay');
   return faux.provider.streamSimple(faux.provider.getModels()[0],{messages},opts);
  },withActor:async(id,ctx,text,run)=>run(),onRecovered:async()=>{}});
@@ -189,7 +191,8 @@ test('sweepSyntheticFallbackReplies removes persisted notices idempotently', t =
  store.appendMessage('c1','assistant','执行已暂停，请检查恢复状态。');
  store.appendMessage('c1','assistant','正常答复：已完成');
  store.appendMessage('c1','assistant','\n\n执行已暂停，请检查恢复状态。'); // 带空白的同一句
- assert.equal(store.sweepSyntheticFallbackReplies(),2);
+ store.appendMessage('c1','assistant',NARRATION_GUARD_NOTICE); // 叙述守卫通知同属投递通知类
+ assert.equal(store.sweepSyntheticFallbackReplies(),3);
  assert.equal(store.sweepSyntheticFallbackReplies(),0,'idempotent');
  assert.deepEqual(store.listMessages('c1').map(m=>m.content),['问题','正常答复：已完成'],'user question and real reply survive');
  db.close();
@@ -253,4 +256,88 @@ test("recovered delivery occurrence id varies per submission", async () => {
 	const args = call[1];
 	assert.match(args, /state\?\.id|\$\{state/, `the occurrence id must include the per-run submission id, got: ${args}`);
 	assert.doesNotMatch(args, /`durable:\$\{conv\.id\}:answer`/, "a constant per-conversation key would dedupe every later turn away");
+});
+
+// ── Narration guard (field 2026-11-09) ──────────────────────────────────────
+// 「继续 登录生产后台管理」 was answered with pure process narration and ZERO
+// tool calls; the run settled done and nothing executed ("先检查一下当前环境
+// 可用的工具" then silence). A task-shaped zero-tool turn must force exactly
+// ONE continue; if the continuation still takes no action, the delivered text
+// carries the honest notice. Never a loop (flood-loop lesson).
+
+/** Task-shaped entry message: 登录 (task verb) + 然后 (multi-step evidence). */
+const NARRATION_TASK = '登录生产后台管理系统，然后检查环境并验证登录状态';
+
+function narrationSetup(t, subdir, responses, tools = () => []) {
+	const history = makeHistory(t);
+	const faux = fauxProvider();
+	const sessions = new Map();
+	const session = id => { if (!sessions.has(id)) sessions.set(id, new Agent({streamFn:faux.provider.streamSimple,sessionId:id,initialState:{model:faux.provider.getModels()[0],systemPrompt:'test'}})); return sessions.get(id); };
+	let modelCalls = 0;
+	faux.setResponses(responses);
+	const opened = DurableRuntime.open({userDataDir:join(dir,subdir),history,session,tools,
+		stream:(id,opts,messages)=>{modelCalls++;return faux.provider.streamSimple(faux.provider.getModels()[0],{messages},opts);},
+		withActor:async(id,ctx,text,run)=>run(),onRecovered:async()=>{}});
+	return { history, session, opened, calls: () => modelCalls };
+}
+
+test('narration guard: zero-tool task turn forces ONE nudge; still zero tools → new answer + honest notice', async t => {
+	const { history, session, opened, calls } = narrationSetup(t, 'narrate-once', [
+		fauxAssistantMessage('我来尝试登录生产后台管理。先检查一下当前环境可用的工具。'),
+		fauxAssistantMessage('我需要先了解当前环境，然后再继续。'),
+	]);
+	const runtime = await opened;
+	try {
+		const result = await runtime.send(session('conv-narrate-once'), NARRATION_TASK);
+		assert.ok(result.reply.startsWith('我需要先了解当前环境'), 'the continuation answer replaces the first narration');
+		assert.ok(result.reply.endsWith(NARRATION_GUARD_NOTICE), 'a continuation with zero tool calls carries the honest notice — a success claim without tool evidence is exactly the field bug');
+		assert.equal(calls(), 2, 'exactly one nudge even when the continuation narrates again — never a loop');
+		assert.deepEqual(history.listMessages('conv-narrate-once').filter(m=>m.role==='assistant').map(m=>m.content), [result.reply], 'only the final delivered text is projected into history');
+	} finally { await runtime.close(); }
+});
+
+test('narration guard: a continuation that USES tools delivers without the notice (per-run evidence)', async t => {
+	const tools = () => [{name:'get_current_time',label:'clock',description:'clock',parameters:Type.Object({}),execute:async()=>({content:[{type:'text',text:'2026-11-09'}]})}];
+	const { session, opened, calls } = narrationSetup(t, 'narrate-then-tool', [
+		fauxAssistantMessage('我来尝试登录，先检查当前可用的工具。'),
+		fauxAssistantMessage(fauxToolCall('get_current_time',{}),{stopReason:'toolUse'}),
+		fauxAssistantMessage('登录完成，时间已核对。'),
+	], tools);
+	const runtime = await opened;
+	try {
+		const result = await runtime.send(session('conv-narrate-then-tool'), NARRATION_TASK);
+		assert.equal(result.reply, '登录完成，时间已核对。');
+		assert.ok(!result.reply.includes(NARRATION_GUARD_NOTICE), 'the continuation earned tool evidence — no notice');
+		assert.equal(calls(), 3, 'first round + continuation tool round + final answer, nothing more');
+	} finally { await runtime.close(); }
+});
+
+test('narration guard: a turn that already used tools is never continued', async t => {
+	let toolCalls = 0;
+	const tools = () => [{name:'get_current_time',label:'clock',description:'clock',parameters:Type.Object({}),execute:async()=>{toolCalls++;return {content:[{type:'text',text:'2026-11-09'}]};}}];
+	const { session, opened, calls } = narrationSetup(t, 'narrate-with-tools', [
+		fauxAssistantMessage(fauxToolCall('get_current_time',{}),{stopReason:'toolUse'}),
+		fauxAssistantMessage('登录完成，时间已核对。'),
+	], tools);
+	const runtime = await opened;
+	try {
+		const result = await runtime.send(session('conv-narrate-with-tools'), NARRATION_TASK);
+		assert.equal(result.reply, '登录完成，时间已核对。');
+		assert.equal(toolCalls, 1);
+		assert.equal(calls(), 2, 'tool evidence in the first round must not trigger the guard');
+	} finally { await runtime.close(); }
+});
+
+test('narration guard: a bare single-step command is not task-shaped — no forced continue', async t => {
+	const { session, opened, calls } = narrationSetup(t, 'narrate-not-task', [
+		fauxAssistantMessage('登录入口在设置页。'),
+	]);
+	const runtime = await opened;
+	try {
+		// looksLikeTask("登录") is false (single verb, no multi-step evidence):
+		// the guard must not fire on quick commands/questions.
+		const result = await runtime.send(session('conv-narrate-not-task'), '登录');
+		assert.equal(result.reply, '登录入口在设置页。');
+		assert.equal(calls(), 1, 'no continuation for a non-task-shaped message');
+	} finally { await runtime.close(); }
 });
