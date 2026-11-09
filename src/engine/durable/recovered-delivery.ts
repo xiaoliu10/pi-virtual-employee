@@ -21,11 +21,12 @@
  * fixes; the routing — not the recovery — was broken.
  */
 
+import { WORK_CONVERSATION_PREFIX } from "../../context/records.js";
 /** Console-side window conversations and how to resolve their human target.
  * The `work:` spelling lives ONCE in the CCL ledger module (the partition is
- * the load-bearing concept there); this re-export keeps the established
- * durable-side import path working without a second definition. */
-export { WORK_CONVERSATION_PREFIX } from "../context/records.js";
+ * the load-bearing concept there); re-exported so the established durable-side
+ * import path keeps working without a second definition. */
+export { WORK_CONVERSATION_PREFIX };
 export const SCHEDULED_CONVERSATION_PREFIX = "sched:";
 
 export type RecoveredDeliveryPlan =

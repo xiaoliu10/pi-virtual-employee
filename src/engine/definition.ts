@@ -166,8 +166,13 @@ export interface ToolSetOptions {
 	 * Called after every tool call with its outcome. This is the only place that
 	 * sees each call exactly once, so the telemetry wrapper lives here rather than
 	 * inside each tool (a newly added tool is then covered by construction).
+	 *
+	 * `argsBrief`/`resultBrief` (WorkSession P1 wiring): bounded, secret-masked
+	 * one-liners collected HERE — the wrapper already holds params and result in
+	 * hand, so no tool is pierced for collection. Optional: an event without
+	 * them still yields a valid degraded digest (name + cost + outcome).
 	 */
-	onToolEvent?: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string }) => void;
+	onToolEvent?: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string; argsBrief?: string; resultBrief?: string }) => void;
 	/** Telemetry store for the self-inspection tool (my_stats). */
 	telemetry?: TelemetryStore;
 	/** Proposal store (self-improvement loop output: propose_improvement). */
@@ -573,12 +578,15 @@ export function stubDuplicateResult<T>(
 
 export function withTelemetry(
 	tool: AgentTool<any>,
-	onEvent: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string }) => void,
+	onEvent: (event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string; argsBrief?: string; resultBrief?: string }) => void,
 ): AgentTool<any> {
 	return {
 		...tool,
 		async execute(toolCallId, params, signal, onUpdate) {
 			const started = Date.now();
+			// WorkSession digest briefs: collected ONCE here (bounded + masked below)
+			// and carried on both the success and the failure event.
+			const argsBrief = briefToolArgs(params);
 			try {
 				const result = await tool.execute(toolCallId, params, signal, onUpdate);
 				const details = (result as { details?: { refused?: boolean; capability?: string } } | undefined)?.details;
@@ -587,7 +595,7 @@ export function withTelemetry(
 				// tool + normalized params + result digest. Computed here — the
 				// OUTERMOST wrapper — so both kernels and every capability feed it.
 				const fingerprint = computeToolFingerprint(tool.name, params, result);
-				onEvent({ name: tool.name, durationMs: Date.now() - started, ok: !refused, refused, refusedCapability: details?.capability, fingerprint });
+				onEvent({ name: tool.name, durationMs: Date.now() - started, ok: !refused, refused, refusedCapability: details?.capability, fingerprint, argsBrief, resultBrief: briefToolResult(result) });
 				// Duplicate-result stub (Hermes tool_guardrails, ported 2026-11-06):
 				// a polling loop that reads the SAME unchanged payload every round
 				// otherwise pushes the whole thing into the context each time. From
@@ -596,17 +604,75 @@ export function withTelemetry(
 				// deduplicated, so polling semantics survive.
 				return stubDuplicateResult(tool.name, toolCallId, params, result, refused);
 			} catch (err) {
+				const error = err instanceof Error ? err.message : String(err);
 				onEvent({
 					name: tool.name,
 					durationMs: Date.now() - started,
 					ok: false,
-					error: err instanceof Error ? err.message : String(err),
+					error,
+					argsBrief,
+					resultBrief: briefText(error),
 					// A throwing tool still carries a fingerprint: the same tool with
 					// the same params throwing the same error every round IS a loop.
-					fingerprint: computeToolFingerprint(tool.name, params, err instanceof Error ? err.message : String(err)),
+					fingerprint: computeToolFingerprint(tool.name, params, error),
 				});
 				throw err;
 			}
 		},
 	};
+}
+
+// ── WorkSession digest brief collection (bounded truncation + secret masking).
+// These live next to withTelemetry because the wrapper is the ONE place that
+// sees params and result together; tests pin them THROUGH withTelemetry.
+
+/** The digest rides every later window and the recovery brief — its two
+ * free-text fields must stay one-liners, never full payloads. */
+const DIGEST_BRIEF_MAX_CHARS = 240;
+
+/** Leaf values under these keys never enter the (permanent, replayed) ledger:
+ * tool args can carry credentials, and truncation alone would still leak the
+ * secret itself when it sits inside the first 240 chars. */
+const DIGEST_SECRET_KEY_RE = /pass|pwd|secret|token|api_?key|authorization|cookie|credential|otp|验证码|密码|密钥/i;
+
+function briefText(raw: string): string {
+	const text = raw.replace(/\s+/g, " ").trim();
+	return text.length > DIGEST_BRIEF_MAX_CHARS ? `${text.slice(0, DIGEST_BRIEF_MAX_CHARS)}…（截断）` : text;
+}
+
+function maskSecrets(value: unknown, key = ""): unknown {
+	if (Array.isArray(value)) return value.map((item) => maskSecrets(item));
+	if (value && typeof value === "object") {
+		const out: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = maskSecrets(v, k);
+		return out;
+	}
+	if (typeof value === "string" && key && DIGEST_SECRET_KEY_RE.test(key)) return "***";
+	return value;
+}
+
+function briefToolArgs(params: unknown): string {
+	try {
+		const masked = maskSecrets(params);
+		return briefText(typeof masked === "string" ? masked : JSON.stringify(masked) ?? "");
+	} catch {
+		return "<unserializable args>";
+	}
+}
+
+/** Tool results are `{ content: [{ type: "text", text }] }` envelopes; flatten
+ * the text blocks. Non-text blocks (images, …) degrade to a marker — the digest
+ * stays honest about what the tool produced without inlining it. */
+function briefToolResult(result: unknown): string {
+	const blocks = (result as { content?: Array<{ type?: string; text?: string }> } | undefined)?.content;
+	if (!Array.isArray(blocks)) return "（无文本结果）";
+	const texts: string[] = [];
+	let nonText = 0;
+	for (const block of blocks) {
+		if (block?.type === "text" && typeof block.text === "string" && block.text.trim()) texts.push(block.text);
+		else if (block?.type && block.type !== "text") nonText += 1;
+	}
+	const text = texts.join("\n");
+	if (!text.trim()) return nonText > 0 ? `（无文本结果，含 ${nonText} 个非文本块）` : "（无文本结果）";
+	return briefText(text);
 }
