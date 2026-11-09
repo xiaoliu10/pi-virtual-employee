@@ -289,6 +289,27 @@ test("built-in pi-auto-research skill ships, parses, and teaches the full loop",
 	assert.ok(!research.disableModelInvocation, "the skill is active by default");
 });
 
+test("built-in 运维脚本 skill ships and teaches the four iron laws with both templates", async () => {
+	const { skills } = await new SkillLoader(
+		join(root, "resources", "skills"),
+		join(dataDir, "unused-user"),
+	).list();
+	const ops = skills.find((skill) => skill.name === "运维脚本");
+	assert.ok(ops, "运维脚本 must be discoverable from resources/skills");
+	for (const law of ["目标先行", "默认演练", "持有检查", "契约登记"]) {
+		assert.ok(ops.description.includes(law), "description names iron law: " + law);
+	}
+	// P1-1 (review 54681519): the pipe criterion is THE fix for the field incident —
+	// Playwright's Chromium defaults to --remote-debugging-pipe, not port.
+	for (const marker of ["remote-debugging-pipe", "ParentProcessId", "run_script", "manage_process"]) {
+		assert.ok(ops.content.includes(marker), "content carries the load-bearing detail: " + marker);
+	}
+	// The absorbed windows-script-automation body must be present (merge, not loss).
+	for (const inherited of ["chcp 65001", "EncodedCommand", "ExecutionPolicy", "background=True"]) {
+		assert.ok(ops.content.includes(inherited), "inherited syntax-坑 survived the merge: " + inherited);
+	}
+});
+
 test("both built-in skills have valid, unique frontmatter", async () => {
 	const loader = new SkillLoader(join(root, "resources", "skills"), join(dataDir, "unused-user"));
 	const { skills, info } = await loader.list();
