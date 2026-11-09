@@ -183,6 +183,72 @@ test("store: pruneOlderThan drops only rows past the cutoff", () => {
 	assert.deepEqual(s.listTurns("c1").map((r) => r.text), ["新"]);
 });
 
+// ── appendNext（review P2-4 闭环）：账本原子分配 seq，消灭 lastSeq+1 读后写竞态 ──
+
+test("store.appendNext: seq allocation is atomic and strictly consecutive under loop attempts", () => {
+	const s = store();
+	// 循环模拟并发语义：单线程内 JS 无法真正并发，但若分配仍是「读 lastSeq 再写」，
+	// 任何交错（例如手工插入抢号）都会断号或撞 UNIQUE；单语句分配则严格连续。
+	const seqs = [];
+	for (let i = 0; i < 200; i++) seqs.push(s.appendNext("c1", { kind: "request", text: `第${i}轮`, ts: i }).seq);
+	assert.deepEqual(seqs, Array.from({ length: 200 }, (_, i) => i + 1), "200 appends → seqs exactly 1..200, no gaps/dups");
+	assert.equal(s.lastSeq("c1"), 200);
+	assert.deepEqual(s.listTurns("c1", { limit: 3 }).map((r) => r.text), ["第197轮", "第198轮", "第199轮"]);
+});
+
+test("store.appendNext: continues above an explicitly-written max; partitions stay independent; digest round-trips", () => {
+	const s = store();
+	s.appendTurn(rec("c1", 5, "reply", "显式写到 seq5"));
+	const next = s.appendNext("c1", { kind: "request", text: "追加", ts: 1 });
+	assert.equal(next.seq, 6, "allocation rides MAX(seq), not row count");
+	s.appendNext("c1", { kind: "tool-digest", text: "", ts: 2, toolDigest: { name: "web.search", argsBrief: "q=天气", resultBrief: "晴", durationMs: 12 } });
+	const [, digest] = s.listTurns("c1").slice(-2);
+	assert.equal(digest.seq, 7);
+	assert.deepEqual(digest.toolDigest, { name: "web.search", argsBrief: "q=天气", resultBrief: "晴", durationMs: 12 });
+	// Another partition starts at 1 — allocation is per-partition, never global.
+	assert.equal(s.appendNext("c2", { kind: "request", text: "别的分区", ts: 3 }).seq, 1);
+});
+
+// ── replaceHead（review 确认的落账缺口）：压缩回写单事务、要么全成要么原样 ──
+
+test("store.replaceHead: swaps head for a summary in ONE transaction — the rebuilt list is what listTurns returns", async () => {
+	const s = store();
+	for (const row of pairRows("c1", 1, 6)) s.appendTurn(row); // seq 1..12
+	const records = s.listTurns("c1");
+	const outcome = await compactIfNeeded(records, {
+		keepRecentTokens: 250,
+		budgetTokens: 500,
+		summarize: async () => "第一轮摘要：问过天气",
+		conversationId: "c1",
+	});
+	assert.equal(outcome.compacted, true);
+	// 实现者契约：重建列表与原列表的差集就是两个参数（identity 差集）。
+	const kept = new Set(outcome.records);
+	const removeSeqs = records.filter((r) => !kept.has(r)).map((r) => r.seq);
+	const insertRecords = outcome.records.filter((r) => !records.includes(r));
+	s.replaceHead("c1", removeSeqs, insertRecords);
+	// JSON-normalize: freshly built rows (the summary) lack the optional keys that
+	// a row READ back through the store always carries as undefined.
+	const normalize = (rows) => JSON.parse(JSON.stringify(rows.map((r) => ({ seq: r.seq, kind: r.kind, text: r.text, toolDigest: r.toolDigest, refs: r.refs }))));
+	assert.deepEqual(normalize(s.listTurns("c1")), normalize(outcome.records), "the ledger now equals the rebuilt list, byte for byte");
+	assert.equal(s.lastSeq("c1"), 12, "kept rows keep their positions; only the diff moved");
+});
+
+test("store.replaceHead: a failing insert rolls the WHOLE write-back back — never a half-swapped ledger", () => {
+	const s = store();
+	for (let i = 1; i <= 6; i++) s.appendTurn(rec("c1", i, "request", `第${i}轮`));
+	const before = s.listTurns("c1");
+	// The replacement row's seq collides with a KEPT row (seq 5 stays): the
+	// insert must throw UNIQUE inside the transaction and the delete must NOT
+	// have landed — a half-swapped head is exactly the corruption this guards.
+	assert.throws(() => s.replaceHead("c1", [1, 2, 3, 4], [{ ...rec("c1", 5, "system", "撞号摘要"), ts: 1 }]));
+	assert.deepEqual(s.listTurns("c1"), before, "the ledger is byte-identical after the failed write-back");
+
+	// Empty diffs are legal no-ops (nothing to do, no transaction harm).
+	s.replaceHead("c1", [], []);
+	assert.deepEqual(s.listTurns("c1"), before);
+});
+
 // ============================================================================
 // buildBundle: budget assembly
 // ============================================================================

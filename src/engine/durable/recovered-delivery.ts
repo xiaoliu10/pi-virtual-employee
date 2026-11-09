@@ -21,8 +21,11 @@
  * fixes; the routing — not the recovery — was broken.
  */
 
-/** Console-side window conversations and how to resolve their human target. */
-export const WORK_CONVERSATION_PREFIX = "work:";
+/** Console-side window conversations and how to resolve their human target.
+ * The `work:` spelling lives ONCE in the CCL ledger module (the partition is
+ * the load-bearing concept there); this re-export keeps the established
+ * durable-side import path working without a second definition. */
+export { WORK_CONVERSATION_PREFIX } from "../context/records.js";
 export const SCHEDULED_CONVERSATION_PREFIX = "sched:";
 
 export type RecoveredDeliveryPlan =
