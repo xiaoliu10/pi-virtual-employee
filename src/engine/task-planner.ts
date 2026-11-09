@@ -108,6 +108,11 @@ export interface ParsedPlan {
 export function parseDurationMinutes(raw: string | undefined): number {
 	const t = (raw ?? "").trim();
 	if (!t) return 0;
+	// User ruling 2026-11-10 (review 1ce0eb90 P2-1): 「不确定」 must WIN over any
+	// co-occurring number — a hedged "不确定，最多30分钟" is NOT an estimate, and
+	// parsing the embedded 30 would re-arm the exact misleading ⏱ card this
+	// rigor pass exists to kill.
+	if (t.includes("不确定")) return 0;
 	if (/半\s*(个)?\s*小时/.test(t)) return 30;
 	const m = /(\d+(?:\.\d+)?)\s*(分钟|分|小时|个小时|h|hr|hrs|hour|hours|天|day|days)/i.exec(t);
 	if (!m) return 0;

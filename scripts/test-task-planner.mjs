@@ -23,7 +23,8 @@ mkdirSync(outDir, { recursive: true });
 const bundle = join(outDir, "b.mjs");
 await build({
 	stdin: {
-		contents: `export { looksLikeTask, parsePlan, formatPlanMessage, PLAN_PROMPT_HEADER, parseDurationMinutes, shouldPushPlanToChat, formatPlanForTurn, formatDuration, PLAN_CHAT_THRESHOLD_MIN } from "./src/engine/task-planner.ts";`,
+		contents: `export { looksLikeTask, parsePlan, formatPlanMessage, PLAN_PROMPT_HEADER, parseDurationMinutes, shouldPushPlanToChat, formatPlanForTurn, formatDuration, PLAN_CHAT_THRESHOLD_MIN } from "./src/engine/task-planner.ts";
+			export { countPlanSteps } from "./src/im/triage.ts";`,
 		resolveDir: root, loader: "ts",
 	},
 	outfile: bundle, bundle: true, platform: "node", format: "esm", packages: "external", logLevel: "silent",
@@ -126,6 +127,10 @@ test("an uncertain estimate stays invisible: no ⏱ line, no plan push (user rul
 	assert.ok(!msg.includes("不确定"), "the raw word does not leak into the chat card either");
 	assert.ok(msg.includes("登录后台核对配置"), "goal and flow still render");
 	assert.equal(m.shouldPushPlanToChat(plan), false, "an unknown duration never proves 'long' — no push");
+	// Review 1ce0eb90 P3-1: pin the dispatch-side half — an uncertain plan is
+	// still a PLAN: steps survive parsing, so triage routes/executes it exactly
+	// like a plan with a numeric eta (only the chat card is suppressed).
+	assert.equal(m.countPlanSteps(plan.steps), 2, "uncertain plans stay dispatchable — the eta gate never blocks execution");
 });
 
 test("the prompt header demands rigor: a number only with a reliable basis, machine time only", () => {
@@ -184,6 +189,12 @@ test("duration parsing handles the shapes a model actually writes", () => {
 	// never to a fabricated number.
 	assert.equal(parseDurationMinutes("不确定"), 0);
 	assert.equal(parseDurationMinutes("不确定（需要等验证码）"), 0);
+	// Review 1ce0eb90 P2-1: hedged lines must NOT leak the embedded number —
+	// "不确定，最多30分钟" parsing to 30 would re-arm the ≥30min push gate and
+	// the misleading ⏱ card returns.
+	assert.equal(parseDurationMinutes("不确定，最多30分钟"), 0);
+	assert.equal(parseDurationMinutes("不确定（可能超过1小时）"), 0);
+	assert.equal(parseDurationMinutes("不确定, 预计 2 天左右"), 0);
 	// Unknown / empty must be 0 — callers treat 0 as "not proven long".
 	for (const t of ["", "不确定", "一会儿", undefined]) assert.equal(parseDurationMinutes(t), 0, `should be 0: ${t}`);
 });
