@@ -1,64 +1,80 @@
 /**
- * Field regression 2026-11-04: a monitor script kept running after the task
- * result was already pushed — nothing told the user, and silent strays read as
- * delivery bugs. The turn-settle inventory must:
- *  - push a ⚠️ inventory note 5s AFTER the result lands (async, never blocking)
- *  - stay silent when no background process is running for the conversation
+ * Field regression 2026-11-08 (user ruling): the old settle inventory PUSHED a
+ * ⚠️ note listing stray background processes and told the user to run
+ * `manage_process poll/kill` themselves — internal tool names leaked to the
+ * user and cleanup was left as the user's job. The new contract:
+ *  - settle sweeps TERMINATE strays automatically (audited cascade_kill)
+ *  - a clean sweep is SILENT (no push at all)
+ *  - only processes that refused to die surface a short Chinese note
  */
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-
-// The manager types are heavyweight; the contract under test is small enough to
-// pin via a behavioral shim mirroring the real wiring (scheduleBackgroundInventory
-// + pushBackgroundInventory + settle finally hook). Kept in sync by the wiring
-// assertion below against manager source.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 const managerSrc = readFileSync(join(process.cwd(), "src", "im", "manager.ts"), "utf-8");
 
-test("wiring: settle finally schedules the inventory (async, 5s grace)", () => {
+test("wiring: settle finally schedules the sweep (async, 5s grace)", () => {
 	const fin = managerSrc.indexOf("if (watchdog) watchdog.stop();");
 	const settleWindow = managerSrc.slice(fin, fin + 600);
 	assert.match(settleWindow, /scheduleBackgroundInventory\(msg\.conversationId\)/,
-		"settle finally schedules the async inventory");
+		"settle finally schedules the async sweep");
 	assert.match(settleWindow, /Fire-and-forget/, "the async-by-design ruling is recorded at the hook");
-	assert.match(managerSrc, /setTimeout\(\(\) => \{\n\s*this\.inventoryTimers\.delete/, "5s deferred, fire-and-forget");
 });
 
-test("wiring: inventory reads through engine and pushes only when running", () => {
-	assert.match(managerSrc, /const inventory = this\.engine\.inventoryBackgroundProcesses\(conversationId\);/);
-	assert.match(managerSrc, /if \(!inventory\.length\) return;/, "silent when nothing is running");
-	assert.match(managerSrc, /回合收尾盘点/, "the note names itself so users learn the mechanic");
+test("wiring: the sweep TERMINATES strays via the engine, then verifies", () => {
+	assert.match(managerSrc, /const killed = this\.engine\.stopBackgroundProcessesFor\(conversationId\);/,
+		"the sweep kills, it does not just list");
+	assert.match(managerSrc, /const remaining = this\.engine\.inventoryBackgroundProcesses\(conversationId\);/,
+		"and verifies what survived");
 });
 
-test("behavioral shim: 5s-deferred note pushed once, result lands first", async () => {
-	// Simulated in the same shape the manager wires it: settle → schedule → 5s → push.
+test("wiring: internal tool names never reach the user (field 23:44 wording banned)", () => {
+	assert.doesNotMatch(managerSrc, /manage_process poll/, "poll guidance must be gone");
+	assert.doesNotMatch(managerSrc, /需要立即终止用 manage_process kill/, "kill guidance must be gone");
+	assert.doesNotMatch(managerSrc, /回合收尾盘点/, "the inventory-note mechanic must be gone");
+});
+
+test("behavioral shim: strays are killed silently — no push on a clean sweep", async () => {
 	const pushed = [];
-	const order = [];
-	const engine = { inventoryBackgroundProcesses: () => [{ sessionId: "abcdef12-3456", pid: 4321, command: "python monitor.py" }] };
-	const pushToConversation = async (cid, text) => { order.push("push"); pushed.push(text); };
-	const schedule = (cb) => { order.push("schedule"); setTimeout(cb, 20); }; // compressed 5s
-
-	// settle: result lands first, then schedule
-	order.push("result");
-	schedule(() => {
-		const inventory = engine.inventoryBackgroundProcesses("c1");
-		if (inventory.length) void pushToConversation("c1", `⚠️ 回合收尾盘点 ${inventory[0].sessionId.slice(0, 8)}`);
-	});
-	await new Promise((r) => setTimeout(r, 80));
-	assert.deepEqual(order, ["result", "schedule", "push"], "result before inventory push");
-	assert.equal(pushed.length, 1);
-	assert.match(pushed[0], /abcdef12/);
+	const swept = [];
+	const engine = {
+		inventoryBackgroundProcesses: (() => {
+			// first call finds strays; after the sweep, none remain
+			let calls = 0;
+			return () => (calls++ === 0 ? [{ sessionId: "abcdef12-3456", pid: 4321, command: "python sls_drv.py" }] : []);
+		})(),
+		stopBackgroundProcessesFor: (cid) => { swept.push(cid); return [{ sessionId: "abcdef12-3456", pid: 4321, command: "python sls_drv.py" }]; },
+	};
+	const pushToConversation = async (cid, text) => { pushed.push(text); };
+	const inventory = engine.inventoryBackgroundProcesses("c1");
+	if (inventory.length) {
+		const killed = engine.stopBackgroundProcessesFor("c1");
+		const remaining = engine.inventoryBackgroundProcesses("c1");
+		console.log(`settle sweep c1: found=${inventory.length} killed=${killed.length} remaining=${remaining.length}`);
+		if (remaining.length === 0) return; // silent
+		void pushToConversation("c1", "should not happen");
+	}
+	await new Promise((r) => setTimeout(r, 10));
+	assert.deepEqual(swept, ["c1"], "the sweep terminated the stray");
+	assert.equal(pushed.length, 0, "a clean sweep is SILENT");
 });
 
-test("behavioral shim: no running process → no push", async () => {
-	const engine = { inventoryBackgroundProcesses: () => [] };
-	let pushedCount = 0;
-	const cb = () => {
-		const inventory = engine.inventoryBackgroundProcesses("c1");
-		if (inventory.length) pushedCount += 1;
+test("behavioral shim: a process that refuses to die surfaces ONE short Chinese note", async () => {
+	const pushed = [];
+	const engine = {
+		inventoryBackgroundProcesses: () => [{ sessionId: "abcdef12-3456", pid: 4321, command: "python sls_drv.py" }],
+		stopBackgroundProcessesFor: () => [], // sweep fails to kill anything
 	};
-	cb();
-	await new Promise((r) => setTimeout(r, 10));
-	assert.equal(pushedCount, 0, "silent when nothing is running");
+	const pushToConversation = async (cid, text) => { pushed.push(text); };
+	const inventory = engine.inventoryBackgroundProcesses("c1");
+	if (inventory.length) {
+		engine.stopBackgroundProcessesFor("c1");
+		const remaining = engine.inventoryBackgroundProcesses("c1");
+		if (remaining.length === 0) return;
+		await pushToConversation("c1", `⚠️ 收尾时未能停止本会话的 ${remaining.length} 个后台脚本（已尝试自动清理）`);
+	}
+	assert.equal(pushed.length, 1, "exactly one note");
+	assert.match(pushed[0], /未能停止/, "names the failure honestly");
+	assert.doesNotMatch(pushed[0], /manage_process/, "no internal tool names");
+	assert.ok(!/[a-zA-Z]{4,}/.test(pushed[0].replace("python", "").replace(/pid=\d+/, "").replace(/[a-f0-9-]{8}/g, "")), "no English leaks beyond ids");
 });

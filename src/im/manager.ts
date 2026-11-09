@@ -428,9 +428,19 @@ export class IMAdapterManager {
 	private async pushBackgroundInventory(conversationId: string): Promise<void> {
 		const inventory = this.engine.inventoryBackgroundProcesses(conversationId);
 		if (!inventory.length) return;
-		const lines = inventory.map((p) => `- \`${p.sessionId.slice(0, 8)}\` pid=${p.pid ?? "?"} ${p.command}`);
-		const text = `⚠️ **回合收尾盘点**：本会话仍有 ${inventory.length} 个后台进程在运行：\n${lines.join("\n")}\n\n完成后用 manage_process poll 确认退出码；需要立即终止用 manage_process kill。`;
-		await this.pushToConversation(conversationId, text);
+		// 用户裁定 2026-11-08：收尾不回复盘点——默认把收尾工作做完。回合结束
+		// 仍在前台跑的后台脚本自动终止（审计 cascade_kill，与 abort 路径一致）；
+		// 清理干净就静默——内部工具名（进程轮询/终止指令）绝不暴露给用户。
+		// 只有杀不掉的残留才推一条简短中文通知（异常才可见）。
+		const killed = this.engine.stopBackgroundProcessesFor(conversationId);
+		const remaining = this.engine.inventoryBackgroundProcesses(conversationId);
+		console.log(`[im] settle sweep ${conversationId}: found=${inventory.length} killed=${killed.length} remaining=${remaining.length}`);
+		if (remaining.length === 0) return;
+		const lines = remaining.map((p) => `- \`${p.sessionId.slice(0, 8)}\` pid=${p.pid ?? "?"} ${p.command}`);
+		await this.pushToConversation(
+			conversationId,
+			`⚠️ 收尾时未能停止本会话的 ${remaining.length} 个后台脚本（已尝试自动清理）：\n${lines.join("\n")}\n\n需要我再次尝试终止的话请告诉我。`,
+		);
 	}
 
 	async pushToConversation(conversationId: string, text: string, opts: PushOptions = {}): Promise<PushResult> {

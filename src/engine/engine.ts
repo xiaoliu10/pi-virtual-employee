@@ -3413,6 +3413,15 @@ export class EmployeeEngine implements EmployeeRuntime {
 		return runningBackgroundProcesses(this.config, conversationId);
 	}
 
+	/** Terminate every background process still running for this conversation
+	 * (user ruling 2026-11-08: settle sweeps CLEAN UP by default — the old
+	 * behavior pushed an inventory note and left the kill to the user, which
+	 * leaked internal tool names and made cleanup the user's job). Audited as
+	 * cascade_kill, same as the abort path. */
+	stopBackgroundProcessesFor(conversationId: string): Array<{ sessionId: string; pid: number | null; command: string }> {
+		return stopBackgroundProcesses(this.config, conversationId, this.paths.shellAuditLogPath);
+	}
+
 	/**
 	 * Plan-ahead side pass.
 	 *
