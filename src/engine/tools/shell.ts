@@ -34,6 +34,7 @@ import type { ConfigStore } from "../../db/config-store.js";
 import { MAX_TIMEOUT_SEC } from "../../shared/timeouts.js";
 import { CommandSession } from "../command-session.js";
 import { maskId, refuse, isSchedulerActor, isExplicitConfirmation, type ActorContext } from "./admin.js";
+import { gateDangerousKillForCommand, handleProcessHygieneAction, type ProcessHygieneParams } from "./process-hygiene.js";
 import { effectiveActorRole, resolveRole, ROLE_RANK, type Role } from "../../security/permissions.js";
 
 /**
@@ -92,6 +93,12 @@ export interface ShellToolDeps {
 	conversationId: string;
 	/** Persistent audit log (usually userData/logs/shell-audit.log). */
 	auditLogPath?: string;
+	/**
+	 * Process-hygiene contract ledger (<profileDir>/process-contracts.json).
+	 * Absent = the register/list/remove contract actions refuse; scans run
+	 * without the contract hold-check.
+	 */
+	processContractsPath?: string;
 }
 
 /** Best-effort append-only audit; command output is deliberately never persisted. */
@@ -451,6 +458,20 @@ export async function executeCommand(
 			if (!raw) return refuse("command 不能为空。");
 			if (raw.length > 2000) return refuse("命令过长（>2000 字符），拒绝执行。");
 
+			// Process-hygiene execution gate (user ruling 2026-11-10). Checks the raw
+			// command AND the content of any referenced script file (.ps1/.sh/.py/
+			// .cmd/.bat — the 2026-11-10 incident travelled as `powershell -File
+			// kill_pw_chrome.ps1`, invisible on the command line itself). Role-
+			// independent and before any authorization: even admin full-shell must
+			// not silently run incident-shaped cleanup scripts. Every rejection is
+			// audited (the gate-silence lesson from v0.2.173).
+			const hygieneReason = gateDangerousKillForCommand(raw, { workingDir: (workingDir ?? "").trim() });
+			if (hygieneReason) {
+				audit(deps.auditLogPath, { event: "hygiene_gate_reject", command: raw });
+				console.log(`[shell] hygiene gate rejected: ${raw.slice(0, 200)}`);
+				return refuse(hygieneReason);
+			}
+
 			const gate = gateCommandRole(deps);
 			if ("content" in gate) return gate;
 
@@ -532,7 +553,8 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 			"采集逻辑先写入 .ps1/.py 脚本，命令只用 powershell -File xxx.ps1 或 python xxx.py，参数通过本地文件传递；脚本先输出 observer start 与时间戳，首次 poll/log 检查启动日志，不能把返回 sessionId 当成任务完成。会话由本应用托管，应用退出会终止进程，重启后不可续接；不要再用 nohup 或自制脱管 launcher。" +
 			"powershell/node/npx 等解释器需管理员显式加入白名单（admin 角色无需）；安装 Chromium 请改用 manage_capabilities setup_browser。" +
 			"安全规则：默认关闭；operator 每次执行需在消息中明确包含「确认」/confirm/yes/ok；admin（平台验证身份）发起即授权，直接执行，全部审计留痕。命令以当前应用用户权限运行，不会自动提权。" +
-			"可选 workingDir：命令的工作目录（绝对路径，如 C:\Users\me\project），脚本用相对路径读写数据文件时需要；不影响可执行文件白名单。定时任务无人值守执行时，run_command 以任务创建者身份放行（按该用户当前角色定级），无需消息内含「确认」，但 operator 的白名单校验照常生效。",
+			"可选 workingDir：命令的工作目录（绝对路径，如 C:\Users\me\project），脚本用相对路径读写数据文件时需要；不影响可执行文件白名单。定时任务无人值守执行时，run_command 以任务创建者身份放行（按该用户当前角色定级），无需消息内含「确认」，但 operator 的白名单校验照常生效。" +
+			"执行闸：命令文本及引用的脚本文件内容（.ps1/.sh/.py/.cmd/.bat）命中「ms-playwright/chrome-headless-shell + 杀进程原语」或 killall / pkill -f / Stop-Process -Name / taskkill /im|/t 时直接拒绝，并指路 manage_process scan→kill_pid 两段式；显式 taskkill /pid <n>（无 /im、无 /t）按 PID 定点杀，不受影响。",
 		parameters: obj({
 			command: str({ description: `要执行的命令，如「tasklist /FI "PID eq 19060"」「taskkill /PID 19060 /F」「python scripts/gen_report.py」。跑脚本直接给脚本文件路径，不要用 python -c 内联代码（括号会被拦截）。` }),
 			workingDir: opt(str({ description: "可选：命令的工作目录绝对路径，如 C:\Users\admin\project。脚本按相对路径找数据文件时必填。" })),
@@ -552,6 +574,10 @@ function confirmsProcessStop(text: string): boolean {
 }
 
 /** Inspect only the caller's sessions in this conversation; mutations remain confirmed. */
+
+/** The five process-hygiene actions dispatched to tools/process-hygiene.ts. */
+const HYGIENE_ACTIONS = new Set(["scan", "kill_pid", "register_contract", "list_contracts", "remove_contract"]);
+
 export function createManageProcessTool(deps: ShellToolDeps): AgentTool {
 	return {
 		name: "manage_process",
@@ -560,20 +586,42 @@ export function createManageProcessTool(deps: ShellToolDeps): AgentTool {
 			"管理 run_command 创建的进程会话：list 列出当前会话中的命令；poll 阻塞等到进程结束或单次等待超时；log 立即读日志；kill 终止进程树（管理员当前消息需「确认」）。" +
 			"poll/log/list 无需重复确认，但每次都校验当前管理员身份，只能访问自己在当前对话启动的命令。定时任务可跟踪自身会话。关闭 shell 开关后仍可查询和终止已有会话。" +
 			"poll 的 waitSec 仅控制此次等待，默认 capabilities.shell.pollTimeoutSec（30 秒），0=立即返回；无论等待超时还是取消等待，都不会终止后台进程。长等待可提高 waitSec（如 840 秒），避免连续短轮询。" +
-			"log/poll 返回 stdout+stderr 与 nextOffset；下次传 offset=nextOffset 只读新增输出。未传 offset 默认显示最新一页，每页最多 32KB，内存保留最近 256KB；完整结果请脚本写文件。先确认 observer start 启动日志，再持续跟踪到退出并核对退出码，不能把 running 当作成功。等待期间用 log 跟踪脚本打印的进度：一旦输出表明需要人参与（等待验证码/确认/输入等），立即前台提问，不要等脚本退出才交互。应用退出会终止进程，重启后会话失效。",
+			"log/poll 返回 stdout+stderr 与 nextOffset；下次传 offset=nextOffset 只读新增输出。未传 offset 默认显示最新一页，每页最多 32KB，内存保留最近 256KB；完整结果请脚本写文件。先确认 observer start 启动日志，再持续跟踪到退出并核对退出码，不能把 running 当作成功。等待期间用 log 跟踪脚本打印的进度：一旦输出表明需要人参与（等待验证码/确认/输入等），立即前台提问，不要等脚本退出才交互。应用退出会终止进程，重启后会话失效。" +
+			"进程卫生（2026-11-10 事故裁定，结构性强制）：清理残留浏览器/杀非本会话进程必须走内置两段式，不要手写清理脚本（含 ms-playwright+Kill/Stop-Process/taskkill /im/killall/pkill -f 的命令或脚本会被执行闸拦截）。" +
+			"scan（pattern 默认 chrome*，同时覆盖 chrome-headless-shell；minAgeMin 默认 10）跨平台扫描并按权威度做四道持有判定：调试通道（port|pipe）/父进程存活/年龄/契约在册，输出 SKIP/CANDIDATE 候选表和 10 分钟有效的 ticket。" +
+			"kill_pid（ticket+pid 必填）在 kill 前重新判定（TOCTOU），状态已变化则拒绝并要求重新 scan；TERM 5 秒无效才升级强杀，无树杀。" +
+			"长任务（超过 2 分钟）启动时 register_contract(pid, purpose, expectedMinutes, killConditions) 登记，结束时 remove_contract(pid) 注销，list_contracts 查看——在册 pid 会被 scan 判 SKIP。",
 		parameters: obj({
-			action: union([lit("list"), lit("poll"), lit("log"), lit("kill")]),
+			action: union([lit("list"), lit("poll"), lit("log"), lit("kill"), lit("scan"), lit("kill_pid"), lit("register_contract"), lit("list_contracts"), lit("remove_contract")]),
 			sessionId: opt(str({ description: "poll/log/kill 必填：run_command 返回的 sessionId。" })),
 			waitSec: opt(int({ minimum: 0, maximum: MAX_TIMEOUT_SEC, description: "仅 poll：单次最长等待秒数，默认读配置（30 秒），0=立即返回；不影响命令运行时限。" })),
 			offset: opt(int({ minimum: 0, description: "日志字节游标，传上次 nextOffset 读取增量；0 从保留日志开头读取，省略显示最新一页。" })),
+			pattern: opt(str({ maxLength: 200, description: "仅 scan：进程名通配（chrome* 同时覆盖 chrome-headless-shell）或路径/命令行子串；默认 chrome*。" })),
+			minAgeMin: opt(int({ minimum: 0, maximum: 1440, description: "仅 scan：启动不足该分钟数视为活跃（判 SKIP），默认 10。" })),
+			ticket: opt(str({ description: "仅 kill_pid：scan 返回的 ticket。" })),
+			pid: opt(int({ minimum: 1, description: "kill_pid/register_contract/remove_contract 必填：目标进程 PID。" })),
+			purpose: opt(str({ maxLength: 500, description: "仅 register_contract：任务用途（必填）。" })),
+			expectedMinutes: opt(int({ minimum: 0, description: "仅 register_contract：预期运行分钟数。" })),
+			killConditions: opt(str({ maxLength: 500, description: "仅 register_contract：什么条件下可以终止。" })),
 		}, { open: true }),
 		async execute(_toolCallId, params, signal) {
 			const { action, sessionId, waitSec, offset } = params as { action: string; sessionId?: string; waitSec?: number; offset?: number };
-			if (!["list", "poll", "log", "kill"].includes(action)) return refuse("action 必须是 list/poll/log/kill。");
+			if (!["list", "poll", "log", "kill", ...HYGIENE_ACTIONS].includes(action)) {
+				return refuse("action 必须是 list/poll/log/kill/scan/kill_pid/register_contract/list_contracts/remove_contract。");
+			}
 			const gate = gateCommandRole(deps, { needConfirmation: false });
 			if ("content" in gate) return gate;
 			if (action === "kill" && !isSchedulerActor(gate.actor) && !confirmsProcessStop(gate.actor.text)) {
 				return refuse("终止命令进程树需要管理员在当前消息中明确确认，例如「确认终止这个任务」。");
+			}
+			// Process-hygiene actions (scan / kill_pid / contract ledger) dispatch to
+			// the dedicated module; authorization already ran above. The list/poll/
+			// log/kill semantics below are untouched by it.
+			if (HYGIENE_ACTIONS.has(action)) {
+				return handleProcessHygieneAction(deps, params as ProcessHygieneParams, {
+					actorId: gate.actor.senderId,
+					channel: gate.actor.channel,
+				}) as never;
 			}
 			const own = (entry: SessionEntry) => entry.ownerId === gate.actor.senderId && entry.channel === gate.actor.channel && entry.conversationId === deps.conversationId;
 			const sessions = sessionsFor(deps.config);

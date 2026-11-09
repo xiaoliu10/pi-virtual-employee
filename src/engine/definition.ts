@@ -17,6 +17,7 @@ import type { ConfigStore } from "../db/config-store.js";
 import type { WorkItemStore } from "../db/work-item-store.js";
 import { createWorkTools } from "./tools/work.js";
 import { stopBackgroundProcesses } from "./tools/shell.js";
+import { join } from "node:path";
 import type { TelemetryStore } from "../db/telemetry-store.js";
 import { createMyStatsTool } from "./tools/telemetry.js";
 import { createProposeImprovementTool } from "./tools/proposals.js";
@@ -435,6 +436,9 @@ export function buildTools(input: ToolSetOptions): AgentTool<any>[] {
 		onConfigChanged: options.onConfigChanged,
 		conversationId: options.conversationId,
 		auditLogPath: options.shellAuditLogPath,
+		// Process-hygiene contract ledger lives in the profile dir (same root the
+		// engine already hands to run_script for its parameter files).
+		processContractsPath: options.userDataDir ? join(options.userDataDir, "process-contracts.json") : undefined,
 	};
 	tools.push(createRunCommandTool(shellDeps), createManageProcessTool(shellDeps));
 	// `run_script`: the same executor, but arguments travel in a JSON file so the
