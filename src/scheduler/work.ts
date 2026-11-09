@@ -297,6 +297,11 @@ export interface WorkItemWindowContext {
 	 * reference unregistered tools; undefined = enabled (tests/legacy). */
 	kbSearchEnabled?: boolean;
 	kbLearnEnabled?: boolean;
+	/** 【恢复简报】 block (P1, design §9): the interrupted task's recent tool
+	 * digests + the verify-before-repeat guard, built by WorkService from the
+	 * CCL ledger for the first window after recoverWorking(). Absent (empty
+	 * ledger) → the prefix stays byte-identical to before. */
+	recoveryBrief?: string;
 	/** The real current time (epoch ms). Rendered as 【当前时间】 so the model
 	 * never infers "today" from history anchors: a long-lived chain whose
 	 * transcript is full of late-September dates reported "现在是 2026-09-30，
@@ -315,6 +320,7 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 	if (ctx.conditions?.trim()) memory.push(`【执行条件（务必遵守）】\n${ctx.conditions.trim()}`);
 	if (ctx.progress?.trim()) memory.push(`【此前进展】\n${ctx.progress.trim()}`);
 	if (ctx.lessons?.length) memory.push(`【踩坑记录（别再踩）】\n${ctx.lessons.map((l) => `- ${l}`).join("\n")}`);
+	if (ctx.recoveryBrief?.trim()) memory.push(ctx.recoveryBrief.trim());
 	if (ctx.firstWindow && ctx.turn === 0) memory.push(FIRST_WINDOW_PLAN);
 	const head = ctx.turn === 0 ? "【工作窗口开始】" : `【工作窗口继续 · 本窗第 ${ctx.turn + 1} 轮】`;
 	const t = beijingNow(ctx.now ? new Date(ctx.now) : new Date());
@@ -353,7 +359,7 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 	const segmentRule = `- 长任务请自行分段推进：先把扫描跑完（结果写到文件，关键发现和进度用 manage_work 记下），再逐项处理，最后一次性给出结论。任一时点估计剩余时间装不下未完部分，就写 ${AUTONOMOUS_NEXT_CHECK_MARK} 顺延到下一窗口继续——不要自己把半成品结论发给群（引擎每轮会推送阶段进展，那是交接信息，不是结论）。「不要因假想轮数草草收尾」指的是别为想象中的轮数上限提前收工；时间真的不够且能干净交接时，就该按这里写 NEXT_CHECK 分段。`;
 	const protocol = [
 		`窗口规则：`,
-		`- ${turnRule}，请优先推进关键路径，并把重要发现写入进展/踩坑。超时会自动顺延到下一窗口继续（连续 2 次仍完不成会暂停，请管理员调大本任务的 maxMinutes 或收窄范围/拆分任务）；执行出错或需要人协助会暂停等管理员明确恢复，不自动重试；写不出合法跟进时间时会按默认 1 小时顺延（连续 3 次除外）而不会暂停。`,
+		`- ${turnRule}，请优先推进关键路径，并把重要发现写入进展/踩坑。时间上限一到窗口就暂停等管理员明确恢复（不会自动续期）——估计剩余时间装不下未完成部分时，提前用 NEXT_CHECK 干净交接，不要拖到被硬停；执行出错或需要人协助同样暂停等管理员明确恢复，不自动重试；写不出合法跟进时间时会按默认 1 小时顺延（连续 3 次除外）而不会暂停。`,
 		segmentRule,
 		`- 收尾顺序：先写完所有正文（进展、发现、汇报），最后一行才是结束标记（${AUTONOMOUS_DONE_MARK} / ${AUTONOMOUS_HUMAN_MARK} / ${AUTONOMOUS_NEXT_CHECK_MARK}）。标记行被输出截断等于没有收尾，窗口会空转到时间上限。`,
 		...(ctx.resident

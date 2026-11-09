@@ -20,11 +20,18 @@ export type TurnKind = "request" | "reply" | "tool-digest" | "steer" | "delivery
 
 /** A tool call reduced to what a LATER window needs to re-judge the situation.
  * Deliberately lossy on purpose (Inline & Spill): the briefs are the inline part,
- * `artifacts` are the spill pointers the model can follow with a tool. */
+ * `artifacts` are the spill pointers the model can follow with a tool.
+ *
+ * `durationMs` is mandatory at collection time (WorkSession P1 wiring: a digest
+ * must carry name + cost + outcome so a later window can tell a 2ms cache read
+ * from a 40s page scrape); optional in the TYPE only so older rows and
+ * hand-built test records render unchanged.
+ */
 export interface ToolDigest {
 	name: string;
 	argsBrief: string;
 	resultBrief: string;
+	durationMs?: number;
 	artifacts?: string[];
 }
 
@@ -80,10 +87,21 @@ export function recordText(record: TurnRecord): string {
 	const parts: string[] = [];
 	if (record.toolDigest) {
 		const d = record.toolDigest;
-		parts.push(`[工具] ${d.name} 参数:${d.argsBrief} → 结果:${d.resultBrief}`);
+		const cost = typeof d.durationMs === "number" ? `（${d.durationMs}ms）` : "";
+		parts.push(`[工具] ${d.name}${cost} 参数:${d.argsBrief} → 结果:${d.resultBrief}`);
 		if (d.artifacts && d.artifacts.length > 0) parts.push(`产物:${d.artifacts.join("、")}`);
 	}
 	if (record.text) parts.push(record.text);
 	if (record.refs && record.refs.length > 0) parts.push(`关联:${record.refs.join("、")}`);
 	return parts.join("\n");
+}
+
+/** Ledger partition prefix of a WorkSession: one WorkItem's permanent
+ * conversation (`work:<itemId>`). The colon delimits the prefix, so the durable
+ * WorkerService's `worker:<id>` partitions never match. */
+export const WORK_CONVERSATION_PREFIX = "work:";
+
+/** True for a WorkSession partition (the ONLY partition the P1 wiring rewires). */
+export function isWorkConversation(conversationId: string): boolean {
+	return conversationId.startsWith(WORK_CONVERSATION_PREFIX);
 }

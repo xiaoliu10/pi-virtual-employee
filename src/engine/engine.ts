@@ -109,6 +109,12 @@ import { createMcpManager, type McpManager } from "./tools/mcp.js";
 import { renderSessionDetail } from "./tools/session-detail.js";
 import { normalizeMcpServers } from "../shared/mcp.js";
 import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, recentAssistantVisibleTexts, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, substantialAnchorOf, SUMMARIZER_RETRY, taskAnchorOf, truncateToFit, usableContextWindow, turnMemoryPrefix } from "./context.js";
+// P1 WorkSession wiring (router-worker-core.md §6.4/§11): the CCL ledger owns a
+// work:<id> session's cross-turn context.
+import { buildBundle, recordsToMessages, type ContextBundle } from "../context/bundle.js";
+import { compactIfNeeded, type CompactOutcome as LedgerCompact } from "../context/compact.js";
+import type { ContextStore } from "../context/store.js";
+import { isWorkConversation, replaceHeadDiff, toolDigestDraft, workLedgerBudgetTokens, workRequestText } from "./work-ledger.js";
 import { extractProgressFromTexts, formatDeterministicBrief, standardizeProgressReport } from "./progress.js";
 import { fetchModelInfo, resolveEffectiveLimits, type RemoteModelInfo } from "./model-info.js";
 
@@ -333,6 +339,12 @@ export interface EngineOptions {
 	/** worker_task_detail second hop (context-management P2): full record behind
 	 * the prefix's worker:<id>. Registered under the telemetry capability. */
 	workerTaskDetail?: (id: string) => { id: string; instruction: string; source_conversation: string; created_by: string; status: string; result: string | null; error: string | null; max_minutes: number; created_at: number; started_at: number | null; finished_at: number | null } | undefined;
+	/** CCL ledger (P1 WorkSession wiring): work:<id> sessions assemble their
+	 * context from TurnRecords (buildBundle), commit request/reply/tool-digest
+	 * rows per turn, and compact against the ledger instead of the transcript.
+	 * Absent (tests, scripts) → work sessions keep the legacy rehydrate path
+	 * unchanged; IM/console behavior never depends on it (that is PR-4). */
+	contextStore?: ContextStore;
 }
 
 /**
@@ -374,7 +386,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * the pi agent dir's auth.json (shared with the pi CLI), so account logins
 	 * work everywhere; injectable for tests. */
 	private readonly credentialStore: CredentialStore;
-	private readonly opts: { timeoutMs: number; streamFn?: StreamFn; retrySleepFn?: (ms: number) => Promise<void>; kernel: "legacy" | "pi-session" | "durable" };
+	private readonly opts: { timeoutMs: number; streamFn?: StreamFn; retrySleepFn?: (ms: number) => Promise<void>; kernel: "legacy" | "pi-session" | "durable"; contextStore?: ContextStore };
 	/** worker_tasks read side for the conversation-context prefix (P1). */
 	private readonly workerTaskSource?: EngineOptions["workerTaskSource"];
 	/** scratch session → originating IM conversation (see resolveOriginConversation). */
@@ -487,6 +499,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 	/** Per-conversation in-flight LLM request count + last call start — an
 	 * in-flight request counts as life even before its first event arrives. */
 	private readonly llmInFlight = new Map<string, number>();
+	/** Tool-digest drafts buffered during the CURRENT work:<id> turn. Committed
+	 * with the turn's request/reply rows (appendNext preserves call order as
+	 * ledger order); cleared at turn start so an aborted commit-less turn can
+	 * never leak drafts into the next one. */
+	private readonly workToolDigests = new Map<string, ReturnType<typeof toolDigestDraft>[]>();
 	private readonly lastLlmCallAt = new Map<string, number>();
 	/** First stream event per in-flight request — a request that has produced
 	 * ANY event is alive however slow; one that never will is the hung case. */
@@ -507,7 +524,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		private readonly paths: { builtinSkillsDir: string; userSkillsDir: string; shellAuditLogPath?: string; proposalsDir?: string; userDataDir?: string },
 		options: EngineOptions = {},
 	) {
-		this.opts = { timeoutMs: options.timeoutMs ?? 0, streamFn: options.streamFn, retrySleepFn: options.retrySleepFn, kernel: options.kernel ?? "legacy" };
+		this.opts = { timeoutMs: options.timeoutMs ?? 0, streamFn: options.streamFn, retrySleepFn: options.retrySleepFn, kernel: options.kernel ?? "legacy", contextStore: options.contextStore };
 		this.workerTaskSource = options.workerTaskSource;
 		this.resolveOriginConversation = options.resolveOriginConversation;
 		this.workerTaskDetail = options.workerTaskDetail;
@@ -1513,10 +1530,20 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 		const { supplier, modelId } = this.resolveForConversation(conversationId);
 		const cfg = this.config.all();
-			const agent = new Agent({
-				initialState: {
-					systemPrompt: buildSystemPrompt(this.promptPartsFor(conversationId)),
-				model: this.resolveModel(supplier, modelId),
+		const systemPrompt = buildSystemPrompt(this.promptPartsFor(conversationId));
+		const model = this.resolveModel(supplier, modelId);
+		// P1 WorkSession: a work:<id> session's opening transcript comes from the
+		// CCL ledger (summary chain + recent verbatim window + tool digests) — NOT
+		// the 40-line messages tail, whose rehydrate cap silently dropped every
+		// tool trajectory across restarts/windows (design §6.3; IM/console keep
+		// rehydrate until PR-4). Without a ledger (tests) → the legacy path.
+		const workBundle = isWorkConversation(conversationId)
+			? this.workSessionBundle(conversationId, systemPrompt, model)
+			: undefined;
+		const agent = new Agent({
+			initialState: {
+				systemPrompt,
+				model,
 				tools: this.buildToolSetFor(conversationId),
 				// Main-turn thinking level follows the per-model declaration (single
 				// source with the progress side pass); absent → off (old behavior).
@@ -1525,7 +1552,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 				thinkingLevel: (supplier.modelThinkingLevel?.[modelId] ?? "off") as ThinkingLevel,
 				// Rebuild the transcript from persisted history so the conversation
 				// keeps its context across app restarts (bounded tail, turn-aligned).
-				messages: rehydrateMessages(this.history.listMessages(conversationId)),
+				// Work sessions build from the ledger bundle instead (above).
+				messages: workBundle ? workBundle.messages : rehydrateMessages(this.history.listMessages(conversationId)),
 			},
 			// Harness converter: renders compaction-summary (and other custom)
 			// messages to the model — the Agent default would drop them.
@@ -1540,6 +1568,107 @@ export class EmployeeEngine implements EmployeeRuntime {
 		(agent as Agent & { __skillsRevision?: number }).__skillsRevision = revision;
 		this.sessions.set(conversationId, agent);
 		return agent;
+	}
+
+	/** CCL bundle for one work:<id> session (undefined without a ledger — tests
+	 * and headless scripts keep the legacy rehydrate path). The budget is the
+	 * ledger-only ceiling: usable window minus the system prompt and the
+	 * non-ledger reserves the caller of compact must subtract (compact.ts's
+	 * MEASUREMENT SCOPE note). */
+	private workSessionBundle(conversationId: string, systemPrompt: string, model: Model<Api>): ContextBundle | undefined {
+		const store = this.opts.contextStore;
+		if (!store) return undefined;
+		return buildBundle(store, {
+			conversationId,
+			systemPrompt,
+			keepRecentTokens: DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
+			budgetTokens: workLedgerBudgetTokens(systemPrompt, model.contextWindow || FALLBACK_CONTEXT_WINDOW, model.maxTokens),
+		});
+	}
+
+	/**
+	 * P1 WorkSession: ledger commit for one work:<id> turn — the request row
+	 * (task identity after scaffold stripping), the turn's buffered tool digests
+	 * in call order, the final reply — then the ledger's own compaction pass.
+	 *
+	 * Never throws: the ledger serves the NEXT window, and a write failure must
+	 * not turn an already-delivered reply into an error.
+	 */
+	private async commitWorkTurn(conversationId: string, message: string, reply: string, agent: Agent, deterministic: boolean): Promise<void> {
+		const store = this.opts.contextStore;
+		if (!store) return;
+		const digests = this.workToolDigests.get(conversationId) ?? [];
+		this.workToolDigests.delete(conversationId);
+		try {
+			// Review 9b41e5ba P3-2: request/digests/reply is ONE turn — write it in
+			// ONE transaction so a mid-turn failure cannot leave a half turn (a
+			// request without its reply) replaying into every later window.
+			const ts = Date.now();
+			const records: Array<Omit<TurnRecord, "seq">> = [
+				{ conversationId, kind: "request", text: workRequestText(message), ts },
+				...digests,
+			];
+			// A deterministic failure template ("模型服务中断…") is not the task's
+			// outcome — in the ledger it degrades to a delivery notice so later
+			// windows never replay the boilerplate as the reply.
+			if (reply.trim() && !deterministic) records.push({ conversationId, kind: "reply", text: reply, ts });
+			else if (deterministic) records.push({ conversationId, kind: "delivery", text: "（本轮因模型服务中断未产出结果，任务未完成）", ts });
+			store.appendNextMany(conversationId, records);
+		} catch (err) {
+			console.warn("[engine] work ledger commit failed:", err instanceof Error ? err.message : err);
+			return;
+		}
+		await this.compactWorkLedger(conversationId, agent);
+	}
+
+	/**
+	 * Ledger compaction for a work:<id> partition: compactIfNeeded over the
+	 * ledger rows with the SAME summarizer pipeline the transcript compaction
+	 * uses (side-call registered as watchdog life, bounded by the engine's
+	 * request timeout), then a single replaceHead transaction for the diff.
+	 * Best-effort by construction — compactIfNeeded already returns the ledger
+	 * untouched on a failed summary, and replaceHead rolls back atomically.
+	 */
+	private async compactWorkLedger(conversationId: string, agent: Agent): Promise<void> {
+		const store = this.opts.contextStore;
+		if (!store) return;
+		try {
+			const records = store.listTurns(conversationId);
+			const model = agent.state.model;
+			const budget = workLedgerBudgetTokens(agent.state.systemPrompt, model.contextWindow || FALLBACK_CONTEXT_WINDOW, model.maxTokens);
+			const signal = this.beginSideLlmCall(conversationId);
+			let outcome: LedgerCompact;
+			try {
+				outcome = await compactIfNeeded(records, {
+					keepRecentTokens: DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
+					budgetTokens: budget,
+					conversationId,
+					now: Date.now(),
+					summarize: async (rows, previousSummary) =>
+						generateSummary(
+							recordsToMessages(rows),
+							model,
+							DEFAULT_COMPACTION_SETTINGS.reserveTokens,
+							undefined,
+							signal,
+							undefined,
+							previousSummary,
+							undefined,
+							this.rawStreamFn,
+							undefined,
+							SUMMARIZER_RETRY,
+							conversationId,
+						),
+				});
+			} finally {
+				this.endSideLlmCall(conversationId);
+			}
+			if (!outcome.compacted) return;
+			const { removeSeqs, insertRecords } = replaceHeadDiff(records, outcome.records);
+			store.replaceHead(conversationId, removeSeqs, insertRecords);
+		} catch (err) {
+			console.warn("[engine] work ledger compaction failed:", err instanceof Error ? err.message : err);
+		}
 	}
 
 	/**
@@ -2737,6 +2866,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 	}
 
 	async send(agent: Agent, message: string, ctx?: SendCtx): Promise<SendResult> {
+		const conversationId = agent.sessionId ?? "default";
+		// P1 WorkSession wiring (design §11: "work:<id> 直驱 pi-agent-core Agent，
+		// 替换 durable work 路径"): work sessions bypass the durable runtime and
+		// run the bare Agent with CCL-ledger context below. The durable kernel
+		// keeps owning EVERY other conversation exactly as before — recovery for
+		// work is WorkService's recoverWorking + 恢复简报, not durable redrive.
+		const isWork = isWorkConversation(conversationId);
 		// NOTE: beginTurn deliberately does NOT run before this branch. Under
 		// durable, `send` is queue admission: a second message for the same
 		// conversation waits for the running turn, so resetting here would erase
@@ -2744,11 +2880,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// budget. Durable opens/closes the window in its execute() hooks.
 		// Legacy / pi-session have no such queue: `send` IS the execution, so the
 		// window opens here and closes when the turn settles below.
-		if (this.opts.kernel === "durable" && !ctx?.ephemeral) {
+		if (this.opts.kernel === "durable" && !ctx?.ephemeral && !isWork) {
 			if (!this.durableRuntime) throw new Error("Durable runtime is unavailable; refusing to replay through legacy");
 			return this.durableRuntime.send(agent, message, ctx);
 		}
-		const conversationId = agent.sessionId ?? "default";
 		this.progress.beginTurn(conversationId);
 
 		const existing = this.history.getConversation(conversationId);
@@ -2799,6 +2934,19 @@ export class EmployeeEngine implements EmployeeRuntime {
 		this.turnMemorySaved.set(conversationId, { ...memoryCtx });
 		// First sign of life for the stall watchdog — every event below refreshes it.
 		this.touchActivity(conversationId);
+		// P1 WorkSession: the ledger owns cross-turn memory — reseed the transcript
+		// from the ledger bundle so an in-process session never accumulates turns
+		// (design §6.4: the transcript is ONE turn's execution site). Also drops
+		// any stale digest buffer a previous commit-less turn could have left.
+		if (isWork && this.opts.contextStore) {
+			this.workToolDigests.delete(conversationId);
+			try {
+				const bundle = this.workSessionBundle(conversationId, agent.state.systemPrompt, agent.state.model);
+				if (bundle) agent.state.messages = bundle.messages;
+			} catch (err) {
+				console.warn("[engine] work bundle assembly failed:", err instanceof Error ? err.message : err);
+			}
+		}
 
 		// Telemetry: one row per turn, written when the turn settles below. The id is
 		// minted here so tool calls made during this turn can be linked to it.
@@ -3022,6 +3170,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 			this.history.appendMessage(conversationId, "assistant", reply);
 			ctx?.onPersist?.(conversationId); // assistant reply now persisted → refresh this conversation live
 		}
+		// P1 WorkSession: commit the turn to the ledger (request + buffered tool
+		// digests + reply), then let the ledger compact itself. Best-effort — the
+		// ledger is the NEXT window's context, never this reply's delivery path.
+		if (isWork && !ctx?.ephemeral) {
+			await this.commitWorkTurn(conversationId, message, reply, agent, deterministic);
+		}
 
 		// Context management: summarize old turns once the transcript approaches
 		// the model's context window (IM chats run indefinitely). Best-effort —
@@ -3076,16 +3230,31 @@ export class EmployeeEngine implements EmployeeRuntime {
 		return { reply, error: outError, deterministic };
 	}
 
-	/** One tool call, linked to the turn that made it. Never throws. */
+	/** One tool call, linked to the turn that made it. Never throws. On a
+	 * work:<id> conversation it also appends to the buffered digest drafts
+	 * (work-ledger.ts toolDigestDraft): the turn-end commit writes them as
+	 * tool-digest rows in call order. */
 	private recordToolTelemetry(
 		conversationId: string,
-		event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string },
+		event: { name: string; durationMs: number; ok: boolean; refused?: boolean; refusedCapability?: string; error?: string; fingerprint?: string; argsBrief?: string; resultBrief?: string },
 	): void {
 		this.touchActivity(conversationId); // tool start/end — life, even without telemetry
 		if (event.fingerprint) this.noteToolProgress(conversationId, event.fingerprint, event.name);
 		// The turn's tool count is turn bookkeeping (the narration guard reads it
 		// to prove zero action), not telemetry — count even without a store.
 		this.turnToolCalls.set(conversationId, (this.turnToolCalls.get(conversationId) ?? 0) + 1);
+		// P1 WorkSession: every tool call on a work:<id> turn becomes a digest
+		// draft. The wrapper layer already bounded+masked the briefs; collection
+		// failures are swallowed — a digest must never break the call it observes.
+		if (isWorkConversation(conversationId) && this.opts.contextStore) {
+			try {
+				const buffer = this.workToolDigests.get(conversationId) ?? [];
+				buffer.push(toolDigestDraft(conversationId, Date.now(), event));
+				this.workToolDigests.set(conversationId, buffer);
+			} catch (err) {
+				console.warn("[engine] work tool digest buffering failed:", err instanceof Error ? err.message : err);
+			}
+		}
 		if (!this.telemetry) return;
 		try {
 			this.telemetry.recordTool({ ...event, conversationId, turnId: this.turnIds.get(conversationId) });
@@ -3896,7 +4065,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// both the progress watchdog and tool-event telemetry (independent
 			// review: a durable MCP call fired recordToolTelemetry ZERO times).
 			const guarded = guardTool("mcp", tool, guardOptions);
-			return withTelemetry(guarded, (e) => this.recordToolTelemetry(conversationId, e));
+			// Review 9b41e5ba P3-1: brief collection deep-copies and stringifies the
+			// whole params/result — only work+contextStore sessions ever consume the
+			// briefs, so other conversations pass undefined and skip that cost.
+			const wantBriefs = isWorkConversation(conversationId) && Boolean(this.opts.contextStore);
+			return withTelemetry(guarded, (e) => this.recordToolTelemetry(conversationId, e), wantBriefs ? undefined : { noBriefs: true });
 		});
 	}
 

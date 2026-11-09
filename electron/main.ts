@@ -25,6 +25,7 @@ import { WorkerService } from "../src/router/worker-service.js";
 import { openDatabase, closeDatabase } from "../src/db/sqlite.js";
 import { ConfigStore, normalizeModelConfig, type ExternalProviderConfig, type Supplier } from "../src/db/config-store.js";
 import { HistoryStore } from "../src/db/history-store.js";
+import { ContextStore } from "../src/context/store.js";
 import { KnowledgeService } from "../src/knowledge/knowledge-service.js";
 import { BrowserService } from "../src/browser/browser-service.js";
 import { ComputerService } from "../src/computer/computer-service.js";
@@ -455,6 +456,9 @@ async function main(): Promise<void> {
 	const db = openDatabase(path.join(userData, "pi-employee.sqlite"), sqliteBinding);
 	const config = new ConfigStore(db);
 	const history = new HistoryStore(db);
+	// CCL ledger (P1 WorkSession wiring): the engine commits work:<id> turns and
+	// assembles their context from it; the work service reads the recovery brief.
+	const contextStore = new ContextStore(db);
 	const knowledge = new KnowledgeService(db, config, vecExtension);
 	const browser = new BrowserService(config, userData);
 	const computer = new ComputerService(config, userData);
@@ -586,6 +590,10 @@ async function main(): Promise<void> {
 	}, {
 		timeoutMs: (initialCfg.general.requestTimeoutMin || 0) * 60_000,
 		kernel,
+		// P1 WorkSession (router-worker-core.md §11): work:<id> sessions drive the
+		// bare Agent with CCL-ledger context; IM/console keep the durable/legacy
+		// paths until PR-4.
+		contextStore,
 		// Context-management P1: the engine inlines recent worker task summaries
 		// into the conversation-context prefix. The store is created later (in
 		// the workerService block) — resolve through the holder lazily.
@@ -1042,6 +1050,9 @@ ${tailForProgress(decision.text)}`;
 	 */
 	const workService = new WorkService({
 		store: workItemStore,
+		// 恢复简报 read side (P1, design §9): the interrupted task's recent tool
+		// digests ride the first window's prefix after recoverWorking().
+		ledger: contextStore,
 		// Watchdog soft-stop sliding-window counter — drives the postpone gate
 		// (a watchdog-killed window must not re-arm the next one by itself).
 		runawayCount: (id) => engine.runawayCount(id),

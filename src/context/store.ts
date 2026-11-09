@@ -84,6 +84,121 @@ export class ContextStore {
 		return record;
 	}
 
+	/**
+	 * Append one row and let the STORE allocate the ledger position atomically.
+	 *
+	 * `seq` allocation used to be the caller's `lastSeq() + 1` — a read-then-write
+	 * race (review P2-4, 2026-11-09): two writers appending "at the end" could
+	 * read the same max and the loser died on the UNIQUE index. Here allocation
+	 * and write are ONE `INSERT … SELECT COALESCE(MAX(seq),0)+1` statement, which
+	 * SQLite executes atomically; the UNIQUE (conversation_id, seq) index stays
+	 * as the cross-writer integrity backstop. This is the entry point for the
+	 * engine's turn commits (request / reply / tool digests); {@link appendTurn}
+	 * remains for explicit-position writes (compaction write-back, tests).
+	 */
+	/** Review 9b41e5ba P3-2: one turn = request + digests + reply in ONE
+	 * transaction (commitWorkTurn must never leave a half turn behind). Same
+	 * atomic INSERT…SELECT seq allocation per row — inside the transaction each
+	 * statement sees the previous row, so MAX(seq)+1 allocates consecutively. */
+	appendNextMany(conversationId: string, records: Array<Omit<TurnRecord, "seq">>): void {
+		if (records.length === 0) return;
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			const insert = this.db.prepare(
+				"INSERT INTO context_entries (conversation_id, seq, kind, text, tool_digest_json, refs_json, created_at) " +
+					"SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ? FROM context_entries WHERE conversation_id = ?",
+			);
+			for (const record of records) {
+				insert.run(
+					conversationId,
+					record.kind,
+					record.text,
+					record.toolDigest ? JSON.stringify(record.toolDigest) : null,
+					record.refs ? JSON.stringify(record.refs) : null,
+					record.ts,
+					conversationId,
+				);
+			}
+			this.db.exec("COMMIT");
+		} catch (err) {
+			this.db.exec("ROLLBACK");
+			throw err;
+		}
+	}
+
+	appendNext(conversationId: string, record: Omit<TurnRecord, "seq">): TurnRecord {
+		const result = this.db
+			.prepare(
+				"INSERT INTO context_entries (conversation_id, seq, kind, text, tool_digest_json, refs_json, created_at) " +
+					"SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ? FROM context_entries WHERE conversation_id = ?",
+			)
+			.run(
+				conversationId,
+				record.kind,
+				record.text,
+				record.toolDigest ? JSON.stringify(record.toolDigest) : null,
+				record.refs ? JSON.stringify(record.refs) : null,
+				record.ts,
+				conversationId,
+			);
+		const row = this.db
+			.prepare("SELECT * FROM context_entries WHERE id = ?")
+			.get(Number(result.lastInsertRowid)) as ContextEntryRow | undefined;
+		if (!row) throw new Error("context_entries: appended row vanished (driver returned no rowid)");
+		return toTurnRecord(row);
+	}
+
+	/**
+	 * Compaction write-back (the review-confirmed ledger gap): ONE transaction
+	 * that deletes the summarized head and inserts its replacement rows (the new
+	 * summary / discard note, plus any kept row re-anchored at the seam). Never
+	 * partial — a failed write-back leaves the ledger byte-identical, so a
+	 * compaction can never lose the head without recording its replacement.
+	 *
+	 * The params are exactly the DIFF compactIfNeeded produces: `removeSeqs` =
+	 * seqs present before but absent from the rebuilt list; `insertRecords` =
+	 * rebuilt rows that are new objects (see replaceHeadDiff in
+	 * engine/work-ledger.ts — kept rows are re-appended VERBATIM by identity, so
+	 * the diff is object identity, never a deep compare).
+	 */
+	replaceHead(conversationId: string, removeSeqs: number[], insertRecords: TurnRecord[]): void {
+		// Explicit transaction (not driver .transaction()): the app's test suites
+		// run this store on both better-sqlite3 and node:sqlite, and only BEGIN/
+		// COMMIT via exec works on both.
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			if (removeSeqs.length > 0) {
+				const del = this.db.prepare("DELETE FROM context_entries WHERE conversation_id = ? AND seq = ?");
+				for (const seq of removeSeqs) del.run(conversationId, seq);
+			}
+			const insert = this.db.prepare(
+				"INSERT INTO context_entries (conversation_id, seq, kind, text, tool_digest_json, refs_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			);
+			for (const record of insertRecords) {
+				// Review 9b41e5ba P3-3: the partition is the caller's argument — a
+				// record carrying a different conversationId must never cross-write
+				// into another partition (contract-level defense; compactIfNeeded
+				// preserves identity today, but the store must not trust that).
+				if (record.conversationId !== conversationId) {
+					throw new Error(`replaceHead: record conversationId ${record.conversationId} does not match partition ${conversationId}`);
+				}
+				insert.run(
+					conversationId,
+					record.seq,
+					record.kind,
+					record.text,
+					record.toolDigest ? JSON.stringify(record.toolDigest) : null,
+					record.refs ? JSON.stringify(record.refs) : null,
+					record.ts,
+				);
+			}
+			this.db.exec("COMMIT");
+		} catch (err) {
+			this.db.exec("ROLLBACK");
+			throw err;
+		}
+	}
+
 	/** Latest ledger position in a partition (0 when it has no rows). */
 	lastSeq(conversationId: string): number {
 		const row = this.db

@@ -302,7 +302,7 @@ test("unlimited-turn window prompt: no turn count, explicit no-early-stop rule, 
 	assert.match(prefix, /时长上限 30 分钟/);
 });
 
-test("window prompt teaches segmentation and the auto-defer behaviour (2026-10-23 ruling)", () => {
+test("window prompt teaches segmentation and the honest budget stop (design §8.2: no auto-defer)", () => {
 	const prefix = buildWorkWindowPrefix({ title: "spay 巡检", goal: "7 天对账巡检", turn: 0, budget: { maxTurns: 0, maxMinutes: 90 } });
 	assert.match(prefix, /长任务请自行分段推进/, "the model is told to segment long work");
 	assert.match(prefix, /先把扫描跑完（结果写到文件/, "scan-then-fix-then-push order is explicit");
@@ -310,11 +310,25 @@ test("window prompt teaches segmentation and the auto-defer behaviour (2026-10-2
 	assert.match(prefix, /不要自己把半成品结论发给群/, "half-done conclusions must not be pushed");
 	assert.match(prefix, /引擎每轮会推送阶段进展/, "…while the engine's own handover push is distinguished");
 	assert.match(prefix, /时间真的不够且能干净交接时，就该按这里写/, "no conflict with the no-early-stop rule");
-	assert.match(prefix, /超时会自动顺延到下一窗口继续/, "the defer behaviour is stated honestly");
-	assert.match(prefix, /连续 2 次仍完不成会暂停/, "the circuit breaker is stated too");
-	// The breaker's only ops exit must be a REAL knob (subagent review P1).
-	assert.match(prefix, /调大本任务的 maxMinutes/, "the breaker names the per-item knob that now exists");
-	assert.match(prefix, /收窄范围\/拆分任务/, "…and the range-narrowing alternative");
+	// The 2026-10-23 auto-defer ruling is DELETED (flood-loop 2026-11-06 root
+	// cause): the prompt must teach the truthful budget stop + early handover.
+	assert.match(prefix, /时间上限一到窗口就暂停等管理员明确恢复/, "the budget stop is stated honestly");
+	assert.match(prefix, /提前用 NEXT_CHECK 干净交接/, "…and clean handover is the model's own exit");
+	assert.doesNotMatch(prefix, /超时会自动顺延/, "no stale auto-defer promise may survive in the prompt");
+});
+
+test("recovery brief block: rendered verbatim in the prefix memory section; absent → byte-identical prefix", () => {
+	const base = { title: "中断的巡检", goal: "巡检", turn: 0, budget: { maxTurns: 0, maxMinutes: 30 } };
+	const without = buildWorkWindowPrefix(base);
+	const brief = "【恢复简报】以下为中断前进度，先核对现场（文件、浏览器、远端会话）再重复任何外部动作。\n- browser.open（800ms） 参数:url=… → 结果:登录页已打开";
+	const withBrief = buildWorkWindowPrefix({ ...base, recoveryBrief: brief });
+	assert.ok(withBrief.includes(brief), "the brief block rides the prefix verbatim");
+	// The rest of the prefix is untouched — the brief is an inserted block, not a
+	// rewrite (spot-check the load-bearing sections are still present).
+	for (const section of ["【目标】巡检", "窗口规则：", "收尾标记或时间上限"]) {
+		assert.ok(without.includes(section) && withBrief.includes(section), `section survives: ${section}`);
+	}
+	assert.doesNotMatch(without, /【恢复简报】/, "no brief block without one");
 });
 
 test("positive maxTurns keeps the classic turn-count wording (explicit budgets still cap)", () => {

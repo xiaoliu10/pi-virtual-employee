@@ -77,7 +77,7 @@ export function buildBundle(store: ContextStore, opts: BuildBundleOptions): Cont
 	for (let i = body.length - 1; i >= 0; i--) {
 		if (recordRole(body[i]) === "user") { lastUser = i; break; }
 	}
-	let messages = toMessages([...head, ...body.slice(start)]);
+	let messages = recordsToMessages([...head, ...body.slice(start)]);
 	let estimated = estimateBundleTokens(opts.systemPrompt, opts.memoryPrefix, messages);
 	// Budget enforcement: drop WHOLE TURNS, never single rows — advancing by a
 	// row could shed the newest turn's request and keep only its reply (a
@@ -91,7 +91,7 @@ export function buildBundle(store: ContextStore, opts: BuildBundleOptions): Cont
 		let next = start + 1;
 		while (next < lastUser && recordRole(body[next]) !== "user") next += 1;
 		start = next >= lastUser ? lastUser : next;
-		messages = toMessages([...head, ...body.slice(start)]);
+		messages = recordsToMessages([...head, ...body.slice(start)]);
 		estimated = estimateBundleTokens(opts.systemPrompt, opts.memoryPrefix, messages);
 	}
 	return {
@@ -115,8 +115,12 @@ function estimateBundleTokens(systemPrompt: string, memoryPrefix: string | undef
  * followed by steering, a reply by tool digests) — providers reject consecutive
  * same-role messages, and engine's rehydrateMessages applies the same merge to
  * the very same end.
+ *
+ * Exported for the engine's WorkSession summarizer: compactIfNeeded's injected
+ * `summarize` must feed the SAME representation assembly uses (one conversion,
+ * never two) into pi's generateSummary.
  */
-function toMessages(records: TurnRecord[]): AgentMessage[] {
+export function recordsToMessages(records: TurnRecord[]): AgentMessage[] {
 	const out: AgentMessage[] = [];
 	for (const record of records) {
 		const text = recordText(record);
