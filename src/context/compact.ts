@@ -73,6 +73,14 @@ export interface CompactOptions {
  * recent rows stay verbatim, only the old head is summarized. Returns
  * `compacted: false` with the reason when there was nothing to do (below
  * threshold, ledger too short to split); failures leave the ledger untouched.
+ *
+ * MEASUREMENT SCOPE (review P2-2, 2026-11-09): the threshold measures LEDGER
+ * ROWS ONLY. Non-ledger injections — the system prompt, the memory prefix,
+ * tool declarations — are NOT counted here; the CALLER must subtract their
+ * reserves from `budgetTokens` before passing it (buildBundle counts them, so
+ * a caller using both must pass compact the ledger-only ceiling). Aligning the
+ * two measurements on one number is P2 wiring work (replaceHead + one shared
+ * measurement).
  */
 export async function compactIfNeeded(records: TurnRecord[], opts: CompactOptions): Promise<CompactOutcome> {
 	const settings = { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: opts.keepRecentTokens };
@@ -143,9 +151,14 @@ export async function compactIfNeeded(records: TurnRecord[], opts: CompactOption
 
 	const summaryRecord: TurnRecord = {
 		conversationId: opts.conversationId ?? records[0].conversationId,
-		// Head position: the summarized rows are gone, so their first position is
-		// free and the chain must stay at the front of the ledger.
-		seq: records[0].seq,
+		// Head position: ONE BELOW the first KEPT row. In the normal path the old
+		// head is deleted on write-back, so any position below recent[0] is free;
+		// in the FORCED path keepIndex=0 KEEPS records[0] alive, and reusing its
+		// seq produced a duplicate — write-back threw UNIQUE (review P1-1,
+		// 2026-11-09: forced/truncate both yielded [summary, task, …] with the
+		// task's own seq). Seq gaps are fine: this is an append-only ledger,
+		// ordering is all that matters.
+		seq: recent[0].seq - 1,
 		kind: "system",
 		text: `${COMPACTION_SUMMARY_MARK}\n${summary.trim()}`,
 		ts: opts.now ?? Date.now(),
@@ -214,8 +227,12 @@ export function findForcedCompactionCut(records: TurnRecord[], keepRecentTokens:
 		kept += estimateTurnTokens(records[cut]);
 	}
 	// The kept tail must not open on a tool digest whose request was summarized
-	// away — the same orphan hazard as the transcript version's toolResult rule.
-	while (cut < records.length && records[cut].kind === "tool-digest") cut++;
+		// away — the same orphan hazard as the transcript version's toolResult rule.
+		// Ledger digests are self-sufficient though (no toolCall pairing), so cap
+		// the skip at the LAST row: walking to the end would give up on exactly the
+		// digest-heavy single-turn ledgers worth compacting (review P3-4/P1-1,
+		// 2026-11-09).
+		while (cut < records.length - 1 && records[cut].kind === "tool-digest") cut++;
 	if (cut <= keepIndex + 1) return null;
 	return { cut, keepIndex };
 }
@@ -276,8 +293,11 @@ export function truncateToFit(
 		taskAnchor = body.findIndex((r) => recordRole(r) === "user");
 		if (taskAnchor < 0 || taskAnchor >= walkBack) return null;
 		cut = walkBack;
-		// The kept tail must not open on a tool digest whose request was dropped.
-		while (cut < body.length && body[cut].kind === "tool-digest") cut++;
+		// The kept tail must not open on a tool digest whose summarizer prompt
+		// would lose its request — but never past the last row: ledger digests are
+		// self-sufficient, there is no orphan pairing for providers to reject
+		// (review P3-4, 2026-11-09).
+		while (cut < body.length - 1 && body[cut].kind === "tool-digest") cut++;
 	}
 	if (cut === 0 || cut >= body.length) return null;
 	const dropped = taskAnchor >= 0 ? cut - 1 : cut;
@@ -285,7 +305,10 @@ export function truncateToFit(
 	const keptRecords = taskAnchor >= 0 ? [body[taskAnchor], ...body.slice(cut)] : body.slice(cut);
 	const note: TurnRecord = {
 		conversationId: records[0].conversationId,
-		seq: body[0].seq,
+		// Head position: ONE BELOW the first KEPT row (review P1-1 2026-11-09 —
+		// reusing body[0].seq collided with the kept task statement when
+		// taskAnchor === 0, i.e. single-turn ledgers; gaps are allowed).
+		seq: keptRecords[0].seq - 1,
 		kind: "system",
 		text: `${TRUNCATE_NOTE_PREFIX}，本次请求已丢弃更早的 ${dropped} 条记录以继续；完整历史仍可在会话记录中查看。）`,
 		ts: now,

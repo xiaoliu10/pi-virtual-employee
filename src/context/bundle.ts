@@ -52,8 +52,12 @@ export interface BuildBundleOptions {
  *    (findCompactionCut), so a bundle after compaction and a bundle of a fresh
  *    ledger agree on where the recent window starts.
  * 3. If the result still exceeds `budgetTokens`, the oldest window rows are
- *    dropped (chain head and newest turn survive) — spending less context than
- *    the ceiling is always preferable to a rejected request.
+ *    dropped WHOLE TURNS (chain head and newest turn survive — review P2-1,
+ *    2026-11-09: row-by-row shedding could shed the newest turn's REQUEST and
+ *    keep only its reply, a user-less bundle providers reject) — spending less
+ *    context than the ceiling is always preferable to a rejected request.
+ *    `budget.window` is the USABLE ceiling (already window − output reserve −
+ *    non-ledger reserves as computed by the caller), not the raw model window.
  */
 export function buildBundle(store: ContextStore, opts: BuildBundleOptions): ContextBundle {
 	const records = store.listTurns(opts.conversationId);
@@ -68,16 +72,25 @@ export function buildBundle(store: ContextStore, opts: BuildBundleOptions): Cont
 
 	const cut = findCompactionCut(body, opts.keepRecentTokens);
 	let start = cut;
+	// The newest turn's request row: the shed loop may never drop past it.
+	let lastUser = -1;
+	for (let i = body.length - 1; i >= 0; i--) {
+		if (recordRole(body[i]) === "user") { lastUser = i; break; }
+	}
 	let messages = toMessages([...head, ...body.slice(start)]);
 	let estimated = estimateBundleTokens(opts.systemPrompt, opts.memoryPrefix, messages);
-	// Budget enforcement: drop oldest window rows one by one. `start <
-	// body.length - 1` keeps the newest row (a bundle without the current turn
-	// would be answerable to nothing); the chain head never drops.
+	// Budget enforcement: drop WHOLE TURNS, never single rows — advancing by a
+	// row could shed the newest turn's request and keep only its reply (a
+	// user-less bundle gets provider-rejected; review P2-1 2026-11-09). Walk
+	// `start` to the next user boundary, never past the newest request row, so
+	// the window always opens on a request. The chain head never drops.
 	// HONEST LIMIT: if even that minimal bundle exceeds the ceiling (an enormous
 	// system prompt or memory prefix), the real estimate is reported instead of
 	// pretending it fits — the caller decides what to do, we never lie.
-	while (estimated > opts.budgetTokens && start < body.length - 1) {
-		start += 1;
+	while (estimated > opts.budgetTokens && start < lastUser) {
+		let next = start + 1;
+		while (next < lastUser && recordRole(body[next]) !== "user") next += 1;
+		start = next >= lastUser ? lastUser : next;
 		messages = toMessages([...head, ...body.slice(start)]);
 		estimated = estimateBundleTokens(opts.systemPrompt, opts.memoryPrefix, messages);
 	}

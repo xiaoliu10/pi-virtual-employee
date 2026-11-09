@@ -31,7 +31,9 @@ export interface ToolDigest {
 export interface TurnRecord {
 	/** Ledger partition: trigger identity or `work:<id>`. */
 	conversationId: string;
-	/** Position inside this conversation's ledger (1-based, gapless). */
+	/** Position inside this conversation's ledger (caller-allocated order key;
+	 * 1-based in normal appends. Compaction/prune may leave gaps or shift the
+	 * head below 1 — ordering is all that matters, never contiguity). */
 	seq: number;
 	kind: TurnKind;
 	/** The user's own words / the final reply / a delivery notice / the summary. */

@@ -10,8 +10,10 @@
  * assembles from — including tool digests, steering and delivery rows that never
  * belonged in the chat list.
  *
- * Partitioning is the load-bearing property (design §6.5): EVERY query filters
+ * Partitioning is the load-bearing property (design §6.5): EVERY QUERY filters
  * on `conversation_id`, so one trigger's session can never read another's rows.
+ * The one deliberate exception is `pruneOlderThan` — retention deletes by age
+ * across partitions by design (never a read path).
  */
 import type { DB } from "../db/sqlite.js";
 import type { TurnRecord } from "./records.js";
@@ -93,21 +95,30 @@ export class ContextStore {
 	/**
 	 * Rows of ONE partition, oldest→newest (the order the ledger was written).
 	 * `limit` keeps the newest N; `sinceSeq` skips everything up to and including
-	 * that position. Both compose (newest N after a cursor).
+	 * that position (an EXPLICIT cursor — incremental reads). Without `sinceSeq`
+	 * there is NO lower bound: head rows may sit at seq ≤ 0 (compaction places
+	 * the summary one below the first kept row, review P1-1 2026-11-09), and a
+	 * default `seq > 0` would silently hide them.
 	 */
 	listTurns(conversationId: string, opts: ListTurnsOptions = {}): TurnRecord[] {
-		const since = opts.sinceSeq ?? 0;
-		const limit = opts.limit !== undefined ? Math.max(0, Math.floor(opts.limit)) : undefined;
+		const since = opts.sinceSeq;
+		// NaN limit would reach sqlite as NaN and throw "datatype mismatch" — treat
+		// any non-finite limit as unlimited (review P3-2, 2026-11-09).
+		const limit = typeof opts.limit === "number" && Number.isFinite(opts.limit)
+			? Math.max(0, Math.floor(opts.limit))
+			: undefined;
+		const where = since === undefined ? "conversation_id = ?" : "conversation_id = ? AND seq > ?";
+		const args = since === undefined ? [conversationId] : [conversationId, since];
 		const rows = (
 			limit === undefined
 				? this.db
-						.prepare("SELECT * FROM context_entries WHERE conversation_id = ? AND seq > ? ORDER BY seq ASC")
-						.all(conversationId, since)
+						.prepare(`SELECT * FROM context_entries WHERE ${where} ORDER BY seq ASC`)
+						.all(...args)
 				: this.db
 						.prepare(
-							"SELECT * FROM (SELECT * FROM context_entries WHERE conversation_id = ? AND seq > ? ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC",
+							`SELECT * FROM (SELECT * FROM context_entries WHERE ${where} ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC`,
 						)
-						.all(conversationId, since, limit)
+						.all(...args, limit)
 		) as ContextEntryRow[];
 		return rows.map(toTurnRecord);
 	}

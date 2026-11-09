@@ -260,7 +260,7 @@ test("compact: below threshold it does nothing; an empty ledger has nothing to c
 	assert.equal(nothing.skipReason, "nothing_to_cut");
 });
 
-test("compact: summarizes the old head, keeps a verbatim tail, summary row lands at the head position", async () => {
+test("compact: summarizes the old head, keeps a verbatim tail, summary lands just before the first kept row", async () => {
 	const s = store();
 	for (const row of pairRows("c1", 1, 6)) s.appendTurn(row); // seq 1..12, ~600 tokens
 	const records = s.listTurns("c1");
@@ -283,7 +283,10 @@ test("compact: summarizes the old head, keeps a verbatim tail, summary row lands
 	const [head, ...tail] = out.records;
 	assert.equal(isSummaryRecord(head), true);
 	assert.equal(head.kind, "system");
-	assert.equal(head.seq, 1, "the summary takes the head position");
+	// Review P1-1 (2026-11-09): the summary must NEVER reuse a KEPT row's seq —
+	// forced single-turn reuse made write-back throw UNIQUE. Position = first
+	// kept row's seq minus one (8 = seq 9 minus 1; rows 1..8 are the deleted head).
+	assert.equal(head.seq, 8, "the summary sits just before the first kept row");
 	assert.equal(summaryTextOf(head), "第一轮摘要：问过天气");
 	assert.deepEqual(tail.map((r) => r.seq), records.slice(-4).map((r) => r.seq), "the tail is verbatim");
 });
@@ -314,7 +317,8 @@ test("compact: a second pass chains onto the previous summary instead of re-summ
 	assert.equal(seen[0].previousSummary, "第一轮摘要：问过天气", "the previous summary chains in");
 	assert.ok(!seen[0].old.some(isSummaryRecord), "the old summary row is never fed to the summarizer twice");
 	const [head] = second.records;
-	assert.equal(head.seq, 1, "the chain stays at the head position");
+	// Review P1-1: position = first kept row (seq 17) minus one.
+	assert.equal(head.seq, 16, "the new summary sits just before the first kept row");
 	assert.equal(summaryTextOf(head), "第二轮摘要：加上了后续追问");
 	assert.ok(second.records.slice(1).every((r) => r.seq >= 17), "the tail stays verbatim");
 });
@@ -385,4 +389,84 @@ test("serializeTurns: rows flatten with kinds and seqs for the summarizer prompt
 	const text = serializeTurns(rows);
 	assert.ok(text.includes("request#1"), "kind and seq must label each row");
 	assert.ok(text.includes("[工具] web.search"), "digest must be inline");
+});
+
+// ── Review 闭环（2026-11-09）：P1-1 重复 seq / P2-1 整轮丢弃 / P3-2 NaN limit ──
+
+test("review P1-1: forced compaction on a single-turn ledger yields unique seqs", async () => {
+	const s = store();
+	// 单轮账本：request(seq1) + 一串 tool-digest + reply —— force 压缩走
+	// findForcedCompactionCut，keepIndex=0 的任务陈述被保留。回归钉死：摘要行
+	// 不得复用被保留行的 seq（曾产出 [summary(seq1), task(seq1), …]，回写抛 UNIQUE）。
+	s.appendTurn(rec("c1", 1, "request", CN100 + "任务陈述"));
+	for (let i = 2; i <= 6; i++) s.appendTurn(rec("c1", i, "tool-digest", CN100 + `步骤${i}`));
+	s.appendTurn(rec("c1", 7, "reply", CN100 + "结论"));
+	const outcome = await compactIfNeeded([...s.listTurns("c1")], {
+		keepRecentTokens: 100,
+		budgetTokens: 100_000,
+		summarize: async () => "任务摘要：查天气并汇总",
+		force: true,
+		conversationId: "c1",
+	});
+	assert.equal(outcome.compacted, true);
+	const seqs = outcome.records.map((r) => r.seq);
+	assert.equal(new Set(seqs).size, seqs.length, `seqs must be unique, got ${JSON.stringify(seqs)}`);
+	// 回写不炸：产出列表逐条落进新 store 不得触发 UNIQUE。
+	const s2 = store();
+	for (const r of outcome.records) s2.appendTurn(r);
+	assert.equal(s2.listTurns("c1").length, outcome.records.length);
+});
+
+test("review P1-1: truncateToFit on a single-turn ledger yields unique seqs", () => {
+	const s = store();
+	s.appendTurn(rec("c1", 1, "request", CN100 + "任务陈述"));
+	for (let i = 2; i <= 6; i++) s.appendTurn(rec("c1", i, "tool-digest", CN100 + `步骤${i}`));
+	const records = s.listTurns("c1");
+	const out = truncateToFit(records, 120);
+	assert.ok(out, "must be able to drop");
+	const seqs = out.records.map((r) => r.seq);
+	assert.equal(new Set(seqs).size, seqs.length, `seqs must be unique, got ${JSON.stringify(seqs)}`);
+	assert.ok(seqs.every((v, i) => i === 0 || seqs[i - 1] < v), "order must stay ascending");
+});
+
+test("review P1-1: chained compaction yields unique seqs (new summary over an old summary row)", async () => {
+	const s = store();
+	s.appendTurn(rec("c1", 1, "system", `${COMPACTION_SUMMARY_MARK}\n第一轮摘要`));
+	for (const row of pairRows("c1", 2, 6)) s.appendTurn(row);
+	const first = await compactIfNeeded([...s.listTurns("c1")], {
+		keepRecentTokens: 100,
+		budgetTokens: 500, // reserveTokens(16384) > budget → threshold trivially passed
+		summarize: async (rows, prev) => `二轮摘要（prev=${prev ? "有" : "无"}）：${rows.length} 行`,
+		conversationId: "c1",
+	});
+	assert.equal(first.compacted, true);
+	const seqs = first.records.map((r) => r.seq);
+	assert.equal(new Set(seqs).size, seqs.length, `seqs must be unique, got ${JSON.stringify(seqs)}`);
+});
+
+test("review P2-1: over-budget multi-row turns shed whole turns, newest request survives", () => {
+	const s = store();
+	// 每轮 = request + reply 两行（打破测试里"行=轮"的旧假设）
+	for (let i = 1; i <= 5; i++) {
+		s.appendTurn(rec("c1", (i - 1) * 2 + 1, "request", CN100 + `问${i}`));
+		s.appendTurn(rec("c1", (i - 1) * 2 + 2, "reply", CN100 + `答${i}`));
+	}
+	const out = buildBundle(s, {
+		conversationId: "c1",
+		systemPrompt: "你是员工的助手。",
+		keepRecentTokens: 100_000,
+		budgetTokens: 350, // 逼到只剩最新一轮
+	});
+	const flat = JSON.stringify(out.messages);
+	assert.ok(flat.includes("问5"), "the newest turn's REQUEST must survive");
+	assert.ok(flat.includes("答5"), "the newest turn's reply should survive");
+	assert.ok(!flat.includes("问4"), "older turns are shed whole");
+	assert.equal(out.messages[0].role, "user", "the window must OPEN on a user row (no head here)");
+});
+
+test("review P3-2: listTurns with a NaN limit does not throw and reads the partition", () => {
+	const s = store();
+	s.appendTurn(rec("c1", 1, "request", `${CN100} 甲问`));
+	const rows = s.listTurns("c1", { limit: NaN });
+	assert.equal(rows.length, 1, "non-finite limit is treated as unlimited");
 });
