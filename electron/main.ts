@@ -1642,7 +1642,12 @@ ${tailForProgress(decision.text)}`;
 		// group stream every member already sees), read at execute time.
 		sourceContext: (sourceConversation) => {
 			try {
-				const rows = history.listMessages(sourceConversation);
+				// BOUNDED read (review 0bcb32c4 P2-2): the excerpt only ever looks
+				// at the last ~24 rendered messages, so pulling a long-lived group
+				// chat's whole history on every dispatch (and every retry) was a
+				// needless full materialisation. 200 rows comfortably saturates the
+				// window even after synthetic/forged rows are filtered out.
+				const rows = history.listMessagesTail(sourceConversation, 200);
 				return buildSourceContextExcerpt(rows);
 			} catch (err) {
 				console.warn("[worker] source context lookup failed (worker starts with instruction only):", err instanceof Error ? err.message : err);
