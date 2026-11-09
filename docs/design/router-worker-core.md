@@ -113,6 +113,25 @@ CCL（Conversation Context Layer，src/context/，新）
 6. **资源预算**：worker slots=5（既有）+ 回合 maxMinutes（既有）+ Pause 开关（新增，§8.5）。后台脚本随回合收尾清理（0.2.213 已落）。
 7. **Router 不亲自执行**：RouterSession 不配长活工具（对齐两级架构基准）；直接回答仅限无需工具链的问答/查询。
 
+### 5.3 群聊 / 单聊分叉（同一骨架的两种 profile）
+
+**总原则**：不是两套机制——triage → 直接回答/派发 → WorkItem → CCL 主干完全共用，分叉只在门槛与注入点上；做成两套代码 = 重蹈 kernel 矩阵覆辙。
+
+**平台事实（钉钉，2026-11-09 确认）**：群聊机器人**只能收到 @ 它的消息**（Stream 模式投递策略，非代码选择；adapter 无群消息过滤，`normalizeInboundText` 仅剥离 @ 前缀）；单聊收到全部消息。此差异由 Source 的 event 定义吸收（dsh："Source defines what counts as an event"），Router 不感知；未来飞书（可配置收全量）经同一抽象接入，Source 声明 `receivesAllMessages` 能力位。
+
+| 维度 | 单聊 | 群聊 |
+|---|---|---|
+| 进入门槛 | 全部消息到达，全进 | 平台 @-only，**到达即相关**，Router 无过滤逻辑 |
+| 判定批 | 单 actor，批=1 | **按 actor 分组合并**：同人重发/补充合并为一个请求；跨人不合并请求、同批多 Decision |
+| 长任务阻塞 | — | **不阻塞他人消息**：判断走批快路径，执行在 worker（废除会话级串行对群聊的阻塞——router-worker.md 的原始痛点在此消除） |
+| 直接回答 | 主模型、详尽 | @ 才答、短答优先；轻模型做成 per-conversation 配置（重要群可配主模型，待拍板） |
+| 追问/中途指令 | 直接说 | 必须再 @；指向判断（工单号/关键词/回复进度消息）+ RBAC：owner/admin 才能改/停，他人只读进度（角色下限待拍板，推荐 viewer） |
+| done 复活 | 创建人续单 | 创建人续单按当前角色复验 Mandate（降权立即生效既有语义）；他人仅只读查询 |
+| 记忆 | person+conversation 全量注入 | conversation 共享 + person 仅该 actor 回合注入，带披露护栏（§7 打通契约） |
+| 播报 | 诚实详尽 | speaks-only-when：失败/需人才开口；进度按泵节奏；短答 |
+
+**半盲边界（设计提醒）**：群聊里机器人看不到成员之间的对话——「按刚才说的改」类指代必须靠用户 @ 时把结论带上，或靠工单标题/结论 inline 与任务边界简报补偿（context-management.md 断链清单）。补充通道：回执/进度模板显式引导「补充信息请继续 @我」；AI 卡片输入组件、钉钉群历史拉取合规性为后置调研项（未查证，不承诺）。
+
 ## 6. 上下文层（CCL）
 
 ### 6.1 定位与两个原语
@@ -164,6 +183,16 @@ agent.prompt(...)；回合结束 → ccl.commitTurn(conversationId, turnRecord);
 
 pi-agent-core `Agent` 每回合由 bundle 种入 `initialState.messages`；进程内 transcript 不再跨回合积累（它只是本回合的执行现场），跨回合记忆完全由账本+装配决定——**丢历史问题在这一步结构性消失**，且未来任何执行器替换都不再改变对话行为。
 
+### 6.5 上下文分区与隔离（铁律）
+
+**上下文按 trigger 硬分区，对象按权限软共享，跨会话只走显式引用。**
+
+- 单聊 `dt:<staffId>` 与群聊 `dt:group:<cid>` 是不同 trigger 身份 → 不同 RouterSession → 不同账本分区 → 各自装配的 ContextBundle。「一个 Router」指逻辑层一套规则，**不是**所有对话共享一个大 transcript——隔离由结构保证（账本分区 + 装配按分区读），不靠模型自觉。dsh 对照：其 Main Session 物理上全局一个，但 Eval 是无状态裁决（只喂当前 Thread 快照 + 本批 Trigger + 工单列表）——隔离靠输入结构化；VE 的形态 A（每 trigger 一个会话）比它更硬一层。
+- **对话流**（聊天历史、压缩摘要、回合工具轨迹）：严格 per-trigger，跨会话零共享。
+- **工作对象**（工单、任务结果、记忆、知识）：按权限全局可查，跨会话仅经**显式引用**（工单号/任务名解析）进入当前回合，绝不沉淀进其他会话的账本。dsh 规则采纳：*Correlation adds context; never routes*。
+- Router 判断的输入只带本 trigger 的在办工单（含创建人）；「我的工单」跨 trigger 只读查询是显式动作（WorkItemStore 全局表，既有）。
+- 典型场景校验：用户在单聊说「把群里那个对账任务停了」——单聊 RouterSession 看不到群的**对话**（正常），但可通过跨会话工单查询定位并操作**工单**（权限校验后执行）。
+
 ## 7. 记忆管理
 
 1. **三级贯通，注入点统一在 CCL**：
@@ -172,6 +201,9 @@ pi-agent-core `Agent` 每回合由 bundle 种入 `initialState.messages`；进�
    - **task 级（新）**：WorkItem 完成/暂停时，`{taskId, 标题, 一行结论}` 写入来源 trigger 的可检索层——「上次那个对账」从此有第一跳抓手（context-management.md 已立项的断链 2/3）。
 2. **写入触发**：worker 收尾 learn 回路（既有）+ router 在直接回答中判定的 remember 请求（既有 remember 工具），全部经 CCL 的记忆服务，规则不分叉。
 3. **预算纪律**：每级注入块常量化预算（MEMORY_RECALL_LIMIT 模式），超限按局部性裁剪（当前消息相关性 > 时间相邻 > 空间相邻）。
+4. **人级记忆跨单聊/群聊打通（2026-11-09 裁定：打通，落地为契约）**：person 记忆 owner 键 = `person:<渠道族>:<staffId>`（memory-scope.ts），不含会话维度——单聊写、群聊召回（反向同理）**现有实现即如此**；本设计把它从「顺带正确」升级为有测试钉住的契约：
+   - 契约测试：单聊写 → 群召回；群写 → 单聊召回；他人记忆零泄漏；群回复披露护栏断言。
+   - 边界明示：owner 键含渠道族——钉钉与 widget 记忆不互通（身份族不同）；双 profile 同 staffId 现状互通，与「双 agent 独立」裁定的冲突见 §12 开放问题。
 
 ## 8. 任务处理细则
 
@@ -239,4 +271,6 @@ crash-recovery.md 选 pi-durable 的论据是「工具调用不落库，崩溃�
 3. **记忆注入 token 预算**：三级记忆 + 成员摘要 + 工单标题行同回合注入，总预算上限与裁剪优先级要在 P2 定参（context-management.md 的 Spill 纪律）。
 4. **迁移期行为切换**：P3 上线即切，不做双跑（双跑=第二套语义，正是本设计要消灭的）；盒子切换走发布窗口 + 当次确认（惯例）。
 5. **durable sqlite 存档**：历史审计数据保留但不再读取；P4 决定保留期。
-6. **群聊多发送者 × RouterSession 身份**：trigger=群会话，同人/群记忆前缀已按发送者区分（既有 deriveMemoryContext），批合并时须保留各 Trigger 的 actor 元数据（dsh：person 是 Trigger 的 metadata，不是 domain 实体——采纳）。
+6. ~~群聊多发送者 × RouterSession 身份~~ **已收敛**（2026-11-09）：actor 是 Trigger 的 metadata（dsh 语义采纳），分叉规则见 §5.3，分区铁律见 §6.5，记忆打通契约见 §7。
+7. **群聊轻模型与只读权限细则（待拍板）**：直接回答降轻模型建议做成 per-conversation 配置（重要群配主模型）；群内非创建人只读进度的角色下限推荐 viewer 即可。
+8. **双 profile 记忆互通边界（待拍板）**：personOwner 无 robotCode 维度，同 staffId 两个 profile 间记忆互通——与「双 agent 独立」裁定的关系需 P2 前定（加维度 = 隔离，维持现状 = 打通）。
