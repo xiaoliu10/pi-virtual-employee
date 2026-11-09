@@ -10,7 +10,7 @@
  *    still fire THROUGH the session-wrapped registry, and pi's built-in
  *    coding tools do not leak into the agent's toolset;
  *  - kernel "legacy" (explicit): zero hosts — no session shells; note the
- *    DEFAULT kernel is "durable" since v0.2.167 (see test-kernel-fallback.mjs).
+ *    DEFAULT kernel is "legacy" (agent-core) since the 2026-11-09 ruling (see test-kernel-fallback.mjs).
  *  - dropSession disposes the host (no leaked session shells).
  */
 import assert from "node:assert/strict";

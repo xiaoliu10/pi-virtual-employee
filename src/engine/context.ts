@@ -9,6 +9,12 @@
  *    indefinitely) from outgrowing the model's context window: once usage
  *    passes pi's compaction threshold, older turns are summarized into a
  *    single compaction-summary message while a recent tail is kept verbatim.
+ *
+ * The token ESTIMATION half of this module moved to `src/context/estimate.ts`
+ * (CCL P1 收编): one accounting shared by the engine and the context layer, so a
+ * new kernel can never again re-introduce the non-CJK-aware estimator that made
+ * compaction fire late. This module re-exports it so every existing import path
+ * and test keeps working unchanged.
  */
 import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, RetryPolicy, TextContent, Usage } from "@earendil-works/pi-ai";
@@ -17,8 +23,6 @@ import type { AssistantMessage, RetryPolicy, TextContent, Usage } from "@earendi
 import {
 	createCompactionSummaryMessage,
 	DEFAULT_COMPACTION_SETTINGS,
-	estimateContextTokens,
-	estimateTokens,
 	generateSummary,
 	shouldCompact,
 } from "./pi-compaction.js";
@@ -26,17 +30,27 @@ import {
 // branchSummary roles on AgentMessage via declaration merging.
 import type { MessageRow } from "../db/history-store.js";
 import { isCompactionTemplateReport } from "./progress.js";
+import {
+	estimateMessageTokens,
+	estimateTokensSafe,
+	FALLBACK_CONTEXT_WINDOW,
+	messageText,
+	usableContextWindow,
+} from "../context/estimate.js";
+
+// 估算口径唯一化（router-worker-core.md §6.3）：实现已收编到 src/context/estimate.ts，
+// 这里只 re-export，既有 import 路径（engine.ts、scripts/test-context.mjs）不破。
+export {
+	estimateMessageTokens,
+	estimateTokensSafe,
+	FALLBACK_CONTEXT_WINDOW,
+	messageText,
+	usableContextWindow,
+};
 
 /** Bound on persisted messages replayed into a fresh session. Older turns stay
  * visible in the UI; the transcript re-grows (and re-compacts) naturally. */
 const REHYDRATE_MAX_MESSAGES = 40;
-
-/** Fallback when a model reports no context window. 200k: modern mainstream
- * models are 128k–200k+, and the 0.2.68-era 128k guess mislabeled real-200k
- * relay models (litellm qwen), tripping the budget gate ~40k tokens too early
- * and then never compacting (field incident 2026-09-17). Relay/alias models
- * should now also set the per-model override in the settings UI. */
-export const FALLBACK_CONTEXT_WINDOW = 200_000;
 
 /** Bounded retry for harness-side summarizer calls (compaction + heartbeat
  * progress brief). They run unattended, and without a policy a SINGLE transient
@@ -113,97 +127,6 @@ function contentText(content: string | { type: string; text?: string }[]): strin
 		.join("");
 }
 
-
-/**
- * Token estimate that does NOT assume English.
- *
- * pi's `estimateTokens` divides characters by 4 — a decent heuristic for English
- * and badly wrong for Chinese, where a character costs about one token
- * (Qwen/GPT-class tokenizers). A Chinese deployment therefore UNDER-counts by
- * 3–5×, `shouldCompact` never fires, and the request only fails at the
- * provider's hard limit. Field report:
- *   `ContextWindowExceededError … maximum context length is 204800 tokens`
- *   on a qwen relay, after which the whole turn was lost — a conversation that
- *   the app believed was ~50k tokens was really over 200k.
- *
- * So: count CJK (and Hangul/Kana) at 1 token per character, everything else at
- * the English rate of 4 chars/token, and take the LARGER of that and pi's own
- * estimate — under-counting is what causes the outage; over-counting only makes
- * compaction run a little earlier, which is cheap.
- */
-export function estimateTokensSafe(messages: AgentMessage[]): number {
-	let tokens = 0;
-	for (const m of messages) tokens += estimateMessageTokens(m);
-	return Math.max(tokens, estimateContextTokens(messages).tokens);
-}
-
-/**
- * The input-token ceiling the provider will actually accept for this model:
- * the raw context window MINUS the output reservation. Providers reject
- * `input + max_output > window` — field 2026-09-23: a litellm qwen relay
- * rejected a request with 73729 input tokens because 131072 output tokens
- * were ALSO requested (73729 + 131072 = 204801 > 204800), so the compaction
- * gates must measure against window − output, not the raw window.
- *
- * Floored at a quarter of the window so a bogus (over-large) maxTokens can
- * never shrink the usable budget to zero. Shared by maybeCompact and the
- * engine's mid-turn budget gate so both measure the same ceiling.
- */
-export function usableContextWindow(contextWindow: number, maxTokens?: number): number {
-	const reserve = typeof maxTokens === "number" && maxTokens > 0 ? Math.floor(maxTokens) : 0;
-	return Math.max(contextWindow - reserve, Math.floor(contextWindow / 4));
-}
-
-/** Same rule as estimateTokensSafe, for a single message. */
-export function estimateMessageTokens(message: AgentMessage): number {
-	const text = messageText(message);
-	let cjk = 0;
-	for (const ch of text) {
-		const code = ch.codePointAt(0) ?? 0;
-		// CJK Unified Ideographs + extensions, CJK punctuation, Kana, Hangul.
-		if (
-			(code >= 0x3000 && code <= 0x30ff) ||
-			(code >= 0x3400 && code <= 0x4dbf) ||
-			(code >= 0x4e00 && code <= 0x9fff) ||
-			(code >= 0xf900 && code <= 0xfaff) ||
-			(code >= 0xac00 && code <= 0xd7af) ||
-			(code >= 0x20000 && code <= 0x2ebef)
-		) {
-			cjk += 1;
-		}
-	}
-	const other = text.length - cjk;
-	return Math.max(cjk + Math.ceil(other / 4), estimateTokens(message));
-}
-
-/** Flatten any message shape to its text (tool args/results included). */
-function messageText(message: AgentMessage): string {
-	const parts: string[] = [];
-	const push = (v: unknown) => {
-		if (typeof v === "string") parts.push(v);
-		else if (v !== null && v !== undefined) {
-			try {
-				parts.push(JSON.stringify(v));
-			} catch {
-				/* circular — ignore */
-			}
-		}
-	};
-	const any = message as unknown as { content?: unknown; summary?: unknown; output?: unknown; result?: unknown };
-	if (typeof any.content === "string") push(any.content);
-	else if (Array.isArray(any.content)) {
-		for (const block of any.content as { type?: string; text?: unknown; thinking?: unknown; name?: unknown; arguments?: unknown; content?: unknown }[]) {
-			push(block.text ?? block.thinking ?? "");
-			push(block.name ?? "");
-			push(block.arguments ?? "");
-			push(block.content ?? "");
-		}
-	}
-	push(any.summary ?? "");
-	push(any.output ?? "");
-	push(any.result ?? "");
-	return parts.join("");
-}
 
 /**
  * True for the provider's "input too long" rejection, however it is phrased by
@@ -734,7 +657,7 @@ export function progressContextSlice(messages: AgentMessage[], keepRecentTokens 
  * not fold "summary generation failed" into "no need" (field bug 2026-09-18:
  * a forced /compact below the threshold always printed 无需压缩 even when the
  * summarizer itself had failed). */
-export type CompactSkipReason = "below_threshold" | "nothing_to_cut" | "empty_head" | "summary_failed";
+export type CompactSkipReason = "below_threshold" | "nothing_to_cut" | "empty_head" | "summary_failed" | "no_reduction";
 
 export interface CompactOutcome {
 	compacted: boolean;
@@ -835,11 +758,25 @@ export async function maybeCompact(
 			return { compacted: false, skipReason: "summary_failed" };
 		}
 		// previousSummary remains the first conversational message on re-compaction.
-		agent.state.messages = [
+		const rebuilt = [
 			...(systemHead ? [systemHead] : []),
 			createCompactionSummaryMessage(summary, tokensBefore, new Date().toISOString()),
 			...recent.map(stripStaleUsage),
 		];
+		// Verification anchor (docs/design/handoff-worker-context-20261109.md §三),
+		// ported to the LEGACY path (review 06814b70 P2-2): under the agent-core
+		// default kernel THIS maybeCompact is the production compaction — a summary
+		// that does not reduce the transcript (the model echoing its input back)
+		// must be dropped, not applied. The box's 6-failure loop was compact→still
+		// over→compact; the invariant breaks that class at the core.
+		const tokensAfter = estimateTokensSafe(rebuilt);
+		if (tokensAfter >= tokensBefore) {
+			console.warn(
+				`[engine] compaction produced NO reduction for ${agent.sessionId ?? "?"}: ${old.length} turns (~${tokensBefore} → ~${tokensAfter} tokens) — transcript kept`,
+			);
+			return { compacted: false, skipReason: "no_reduction" };
+		}
+		agent.state.messages = rebuilt;
 	} catch (err) {
 		console.warn("[engine] compaction summary failed:", err instanceof Error ? err.message : err);
 		return { compacted: false, skipReason: "summary_failed" };
