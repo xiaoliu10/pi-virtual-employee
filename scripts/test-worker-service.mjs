@@ -482,6 +482,33 @@ test("a FINISHED worker no longer swallows a NEW task request — triage decides
 	assert.equal(await service.inject("dt:group:g1", "继续", "ma1"), true, "「继续」 still continues");
 });
 
+test("a FINISHED worker does not swallow a BARE context token — the foreground history resolves it (field 2026-11-10)", async () => {
+	// Field 2026-11-10, single chat: the user sent 「875055」 (a number the chat
+	// had contextualized turns ago). The most recent worker was DONE; the bare
+	// token was injected into it, and that session — born with its instruction
+	// only, no chat history — guessed 订单系统, found nothing, and asked
+	// 「这是什么类型的编号？」: the employee forgot a conversation it was part of.
+	const { h, service } = harness();
+	const past = Date.now() - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
+		VALUES ('wbare', '发送短信后锁住页面，登录成功才能关', 'dt:single:m1', 'u1', 'done', 'worker:wbare', ?, ?)`).run(past, past);
+	assert.equal(await service.inject("dt:single:m1", "875055", "u1"), false, "bare digits fall through to the foreground (which has the chat context)");
+	assert.equal(await service.inject("dt:single:m1", "A875055", "u1"), false, "prefixed codes too");
+	assert.equal(await service.inject("dt:single:m1", "0002026110800003400", "u1"), false, "19-digit serials too");
+	assert.equal(await service.inject("dt:single:m1", " 875055 ", "u1"), false, "surrounding whitespace does not matter");
+	// The continuation contract for worker-relative follow-ups is untouched.
+	assert.equal(await service.inject("dt:single:m1", "结果呢", "u1"), true, "「结果呢」 still continues the finished worker");
+	assert.equal(await service.inject("dt:single:m1", "继续", "u1"), true, "「继续」 still continues");
+});
+
+test("a LIVE worker still receives bare tokens (verification-code flow, field 2026-11-07)", async () => {
+	const { h, service } = harness();
+	const now = Date.now();
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
+		VALUES ('wcode', '发送短信后锁住页面，登录成功才能关', 'dt:single:m1', 'u1', 'running', 'worker:wcode', ?, ?)`).run(now, now);
+	assert.equal(await service.inject("dt:single:m1", "875055", "u1"), true, "the worker asked for the code — a running worker owns it unconditionally");
+});
+
 test("a LIVE worker still owns the dialogue unconditionally", async () => {
 	const { h, service } = harness();
 	const now = Date.now();
