@@ -163,7 +163,7 @@ test("config: absent declaration stays absent (inherit semantics preserved)", ()
 });
 
 test("wiring: durable bridge forwards the declared level incl. off", () => {
-	// Durable is the DEFAULT kernel — the Agent's thinkingLevel never reaches the
+	// The durable kernel drives the harness, so the Agent's thinkingLevel never reaches the
 	// harness request without this bridge (Copilot round 1).
 	const i = engineSrc.indexOf("async openDurableRuntime");
 	const bridge = engineSrc.slice(i, i + 1800);

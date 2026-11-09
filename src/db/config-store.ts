@@ -229,10 +229,15 @@ export interface AppConfig {
 	general: {
 		autostart: boolean;
 		/** Conversation kernel (migration gray switch, design doc §12).
-		 * "legacy"    = bare-Agent driving (current field behavior)
+		 * "legacy"    = bare pi-agent-core Agent driving — the DEFAULT again since
+		 *               the 2026-11-09 single-kernel ruling (product name: agent-core,
+		 *               docs/design/router-worker-core.md §0/§1).
 		 * "pi-session"= Agent wrapped in a pi AgentSession (extension runtime / plugins)
 		 * "durable"   = pi-durable Harness (crash recovery: a restarted process
 		 *               resumes the run instead of losing it — docs/design/crash-recovery.md).
+		 *               Opt-in only: its redrive-per-submission recovery caused the
+		 *               2026-11 recovery storm, and its per-turn conversation import
+		 *               dropped tool history between turns.
 		 * Still a per-instance switch, not per-conversation: durable ownership of a
 		 * storage is single-process, and mixing kernels inside one conversation would
 		 * double-write its transcript. */
@@ -241,6 +246,12 @@ export interface AppConfig {
 		 * (written by update(), or the migration itself) so the legacy→durable
 		 * bump never overrides a deliberate "legacy". */
 		engineKernelCarried?: boolean;
+		/** 2026-11-09 user ruling (docs/design/router-worker-core.md §0/§1): one-time
+		 * REVERSE migration marker — a stored "durable" (the 0.2.167–0.2.213 default,
+		 * materialized in almost every persisted blob) is reset to "legacy" exactly
+		 * once. After the marker is set, an explicit "durable" written by update()
+		 * is the user's choice and sticks. */
+		engineKernelReset202611?: boolean;
 		/** npm registry for the pi runtime bootstrap (default chain:
 		 * npmmirror → Gitee mirror → npmjs). Empty = default chain. */
 		piRegistryUrl?: string;
@@ -631,7 +642,7 @@ export const DEFAULTS: AppConfig = {
 	identity: { name: "客服小派", role: "虚拟客服", duty: "在线为客户提供专业、礼貌、高效的服务", serviceHours: "7×24h" },
 	im: { enabled: false, channels: [], ack: { enabled: true, text: "👍 收到，正在处理…" } },
 	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 15, taskProgressMin: 30, turnTimeoutMin: 20, maxToolSteps: 0,
-			progressWatchdog: { enabled: true, stallWindowMs: 300_000, windowSize: 32, softStopAfterWindows: 2, hungRequestCapMs: 600_000 }, taskPlanning: { enabled: true }, chatDispatch: { enabled: true }, autoUpdate: true, oneOffRetentionDays: 30, messageRetentionDays: 30, engineKernel: "durable" as const, piRegistryUrl: "" },
+			progressWatchdog: { enabled: true, stallWindowMs: 300_000, windowSize: 32, softStopAfterWindows: 2, hungRequestCapMs: 600_000 }, taskPlanning: { enabled: true }, chatDispatch: { enabled: true }, autoUpdate: true, oneOffRetentionDays: 30, messageRetentionDays: 30, engineKernel: "legacy" as const, piRegistryUrl: "" },
 	browser: { enabled: false, headless: true, allowedDomains: [], downloadHost: "", useRealProfile: false },
 	computer: DEFAULT_COMPUTER_CONFIG,
 	scheduler: { enabled: true },
@@ -1194,9 +1205,26 @@ export class ConfigStore {
 				// A stored "legacy" WITHOUT the carry marker is treated as the
 				// materialized old default and bumped to "durable"; the marker then
 				// makes any LATER explicit "legacy" (deliberate opt-out) stick.
-				if (merged.general.engineKernel === "legacy" && !merged.general.engineKernelCarried) {
+				// Retired by the 2026-11-09 ruling below: once the reverse migration has
+				// run, nothing may bump a stored "legacy" back to "durable".
+				if (merged.general.engineKernel === "legacy" && !merged.general.engineKernelCarried && !merged.general.engineKernelReset202611) {
 					merged.general.engineKernel = "durable";
 					merged.general.engineKernelCarried = true;
+				}
+				// One-time REVERSE migration (2026-11-09 user ruling,
+				// docs/design/router-worker-core.md §0/§1/§11): durable is no longer the
+				// default — its per-submission redrive produced a recovery storm, and its
+				// per-turn conversation import lost tool history between turns. Runs
+				// AFTER the carry-forward above so a blob holding the materialized old
+				// "legacy" default (bumped to "durable" in this same read) also lands on
+				// "legacy". Both markers are written: the reset marker makes this
+				// idempotent, and the carry marker keeps the retired bump from resurrecting
+				// "durable" on the next read. An explicit "durable" written by update()
+				// AFTER this migration is a user decision and is left alone.
+				if (merged.general.engineKernel === "durable" && !merged.general.engineKernelReset202611) {
+					merged.general.engineKernel = "legacy";
+					merged.general.engineKernelCarried = true;
+					merged.general.engineKernelReset202611 = true;
 				}
 				const normalized = {
 					...merged,
@@ -1271,9 +1299,15 @@ export class ConfigStore {
 	update(patch: DeepPartial<AppConfig>): AppConfig {
 		// NOTE: kb.research legacy migration runs lazily on the next all() read — no need to duplicate it here.
 		// An explicit engineKernel write is a user decision, not a materialized
-		// default — mark it so the v0.2.167 carry-forward never flips it back.
+		// default — mark it so NEITHER migration undoes it: the v0.2.167
+		// carry-forward must never flip it back, AND the 2026-11-09 reverse
+		// migration keys off its own marker, so an explicit write here (including
+		// "durable") is never reset by it. Review P1 2026-11-09: installs whose
+		// stored kernel is NOT "durable" (0.2.167-era deliberate legacy opt-outs,
+		// explicit pi-session) never ran the reset migration — without stamping
+		// the marker here their FIRST explicit "durable" was eaten on the next read.
 		if (patch.general && patch.general.engineKernel != null) {
-			patch = { ...patch, general: { ...patch.general, engineKernelCarried: true } };
+			patch = { ...patch, general: { ...patch.general, engineKernelCarried: true, engineKernelReset202611: true } };
 		}
 	const merged = deepMerge(this.all(), patch);
 		const normalized = {
@@ -1293,6 +1327,13 @@ export class ConfigStore {
 	 * Fully replace config from an imported employee package. Unlike `update`
 	 * (which merges onto the current config), this treats `cfg` as the whole
 	 * new config: deep-merged onto DEFAULTS only, normalized, then persisted.
+	 *
+	 * Kernel note (2026-11-09): an imported engineKernel carries no migration
+	 * markers, so an imported "durable" — demoted to opt-in by the
+	 * single-kernel ruling — is deliberately reset to "legacy" by the next
+	 * all() read, exactly like the stored pre-ruling default. An import must
+	 * not silently re-arm the retired kernel; re-enable durable explicitly
+	 * through update()/settings after import if actually wanted.
 	 */
 	replaceAll(cfg: unknown): AppConfig {
 		const parsed = (cfg && typeof cfg === "object" ? cfg : {}) as DeepPartial<AppConfig>;

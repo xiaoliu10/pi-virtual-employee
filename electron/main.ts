@@ -539,11 +539,13 @@ async function main(): Promise<void> {
 	// "pi-session" needs the pi runtime installed+verified before the engine
 	// exists — a failed bootstrap keeps the app on the legacy kernel (loud log,
 	// settings surface the state) instead of bricking the profile.
-	let kernel: "legacy" | "pi-session" | "durable" = initialCfg.general.engineKernel ?? "durable";
+	let kernel: "legacy" | "pi-session" | "durable" = initialCfg.general.engineKernel ?? "legacy";
 	// "durable" (crash recovery, docs/design/crash-recovery.md) needs NO runtime
-	// bootstrap: pi-durable is an ordinary dependency. It rolls back to legacy if
-	// its host cannot open (e.g. the storage file is owned by another instance) —
-	// a failed recovery path must never brick the profile.
+	// bootstrap: pi-durable is an ordinary dependency. It is OPT-IN since the
+	// 2026-11-09 single-kernel ruling (docs/design/router-worker-core.md §0/§1) —
+	// legacy (agent-core) is the default again. It rolls back to legacy if its host
+	// cannot open (e.g. the storage file is owned by another instance) — a failed
+	// recovery path must never brick the profile.
 	if (kernel === "pi-session") {
 		const { ensurePiRuntime } = await import("../src/runtime/bootstrap.js");
 		const result = await ensurePiRuntime({
@@ -773,7 +775,8 @@ async function main(): Promise<void> {
 		//                         the worker bridge below.
 		//
 		// "Is a turn in flight?" must NOT come from agent.state.isStreaming: on the
-		// durable kernel (default since v0.2.167) engine.send returns through
+		// durable kernel (default 0.2.167–0.2.213; opt-in since the 2026-11-09
+		// single-kernel ruling) engine.send returns through
 		// durableRuntime.send and the harness is driven directly, so that flag is
 		// never set — the whole heartbeat was dead and silent (subagent review
 		// P1-1, same root cause as v0.2.173's two call sites). durableRuntime.busy
@@ -1198,7 +1201,8 @@ ${tailForProgress(decision.text)}`;
 			console.log("[durable] execution runtime restored and ready");
 		} catch (err) {
 			console.error(`[durable] runtime unavailable; unfinished work will remain parked: ${err instanceof Error ? err.message : err}`);
-			// "durable" is the default kernel since v0.2.167 — an environment that
+			// "durable" was the default kernel 0.2.167–0.2.213 (opt-in since the
+			// 2026-11-09 single-kernel ruling) — an environment that
 			// cannot open the durable storage must fall back to a WORKING legacy
 			// pipeline, not a bot that throws on every send.
 			durableStartupFailed = true;
