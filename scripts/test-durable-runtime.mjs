@@ -328,16 +328,34 @@ test('narration guard: a turn that already used tools is never continued', async
 	} finally { await runtime.close(); }
 });
 
-test('narration guard: a bare single-step command is not task-shaped — no forced continue', async t => {
+test('narration guard: a question-shaped message is never continued', async t => {
 	const { session, opened, calls } = narrationSetup(t, 'narrate-not-task', [
 		fauxAssistantMessage('登录入口在设置页。'),
 	]);
 	const runtime = await opened;
 	try {
-		// looksLikeTask("登录") is false (single verb, no multi-step evidence):
-		// the guard must not fire on quick commands/questions.
-		const result = await runtime.send(session('conv-narrate-not-task'), '登录');
+		// 「登录密码是什么」 carries a task verb but is question-shaped:
+		// looksLikeImperative rejects it — a legit text answer must not be nudged.
+		const result = await runtime.send(session('conv-narrate-not-task'), '登录密码是什么');
 		assert.equal(result.reply, '登录入口在设置页。');
-		assert.equal(calls(), 1, 'no continuation for a non-task-shaped message');
+		assert.equal(calls(), 1, 'no continuation for a question');
+	} finally { await runtime.close(); }
+});
+
+test('narration guard: a short imperative task (looksLikeTask=false) IS continued (field 2026-11-09 literal)', async t => {
+	const tools = () => [{name:'get_current_time',label:'clock',description:'clock',parameters:Type.Object({}),execute:async()=>({content:[{type:'text',text:'2026-11-09'}]})}];
+	const { session, opened, calls } = narrationSetup(t, 'narrate-imperative', [
+		fauxAssistantMessage('我来尝试登录生产后台管理。先检查一下当前环境可用的工具。'),
+		fauxAssistantMessage(fauxToolCall('get_current_time',{}),{stopReason:'toolUse'}),
+		fauxAssistantMessage('登录完成。'),
+	], tools);
+	const runtime = await opened;
+	try {
+		// The literal field message: 11 chars, task verb, no multi-step evidence —
+		// looksLikeTask=false, looksLikeImperative=true. The guard must fire.
+		const result = await runtime.send(session('conv-narrate-imperative'), '继续 登录生产后台管理');
+		assert.equal(result.reply, '登录完成。');
+		assert.ok(!result.reply.includes(NARRATION_GUARD_NOTICE), 'the continuation earned tool evidence — no notice');
+		assert.equal(calls(), 3, 'first round + nudge tool round + final answer, nothing more');
 	} finally { await runtime.close(); }
 });

@@ -29,7 +29,7 @@ await build({
 	stdin: {
 		contents: `
 			export { EmployeeEngine, TRANSIENT_RETRIES } from "./src/engine/engine.ts";
-			export { looksLikeTask, NARRATION_GUARD_NOTICE } from "./src/engine/task-planner.ts";
+			export { looksLikeImperative, looksLikeTask, NARRATION_GUARD_NOTICE } from "./src/engine/task-planner.ts";
 			export { ConfigStore } from "./src/db/config-store.ts";
 			export { HistoryStore } from "./src/db/history-store.ts";
 			export { FileCredentialStore } from "./src/engine/credential-store.ts";
@@ -126,7 +126,7 @@ await build({
 		},
 	],
 });
-const { EmployeeEngine, TRANSIENT_RETRIES, looksLikeTask, NARRATION_GUARD_NOTICE, ConfigStore, HistoryStore, FileCredentialStore } = await import(pathToFileURL(bundle).href);
+const { EmployeeEngine, TRANSIENT_RETRIES, looksLikeImperative, looksLikeTask, NARRATION_GUARD_NOTICE, ConfigStore, HistoryStore, FileCredentialStore } = await import(pathToFileURL(bundle).href);
 
 /** Real engine + scripted provider (same harness shape as test-engine-retry). */
 function makeEngine(t, { streamFn, retrySleepFn } = {}) {
@@ -306,4 +306,35 @@ test("an ephemeral side pass is never continued", async (t) => {
 	const result = await engine.send(agent, TASK, { ephemeral: true });
 	assert.equal(runs, 1, "eval/learn side passes are not user turns");
 	assert.equal(result.reply, NARRATION);
+});
+// ── The looksLikeImperative seam (field 2026-11-09 literal message) ───────
+// 「继续 登录生产后台管理」 (11 chars, no punctuation) carries a task verb but no
+// multi-step evidence, so looksLikeTask is false — and before the imperative
+// detector the turn answered with pure narration and silently ended. The guard
+// must fire for it; question-shaped texts must stay Q&A.
+
+const FIELD_MESSAGE = "继续 登录生产后台管理";
+
+test("the field message is an imperative though not task-shaped", () => {
+	assert.equal(looksLikeTask(FIELD_MESSAGE), false, "no multi-step evidence — the very seam");
+	assert.equal(looksLikeImperative(FIELD_MESSAGE), true, "task verb + imperative lead");
+	assert.equal(looksLikeImperative("登录密码是什么"), false, "question shape stays Q&A");
+	assert.equal(looksLikeImperative("你好"), false);
+});
+
+test("zero-tool short imperative turn: the guard fires for the literal field message", async (t) => {
+	let runs = 0;
+	let noteTool;
+	const { engine, config } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		if (runs === 2) noteTool?.(); // the continuation actually executes a tool
+		return textReply(runs === 1 ? NARRATION : "登录完成，后台管理已可用。");
+	} });
+	noteTool = () => engine.recordToolTelemetry("conv-field-imperative", { name: "browser", durationMs: 5, ok: true });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-field-imperative");
+	const result = await engine.send(agent, FIELD_MESSAGE);
+	assert.equal(result.reply, "登录完成，后台管理已可用。", "the continuation reply replaces the narration");
+	assert.ok(!result.reply.includes(NARRATION_GUARD_NOTICE));
+	assert.equal(runs, 2, "exactly one forced continuation");
 });

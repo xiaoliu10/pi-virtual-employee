@@ -314,3 +314,14 @@ test(`dispatch WIRING: spawns a worker with flag ${JSON.stringify(chatDispatch)}
 
 }
 
+
+test("a short imperative task routes even when looksLikeTask is false (field 2026-11-09 literal)", () => {
+	const d = triageMessage({ text: "继续 登录生产后台管理", plan: undefined, looksLikeTask: false }, true);
+	assert.equal(d.dispatch, true, "「继续 登录生产后台管理」 is an imperative task, not chat — it used to fall to a foreground narration turn that silently ended");
+});
+
+test("a question-shaped short message with a task verb stays foreground", () => {
+	const d = triageMessage({ text: "登录密码是什么", plan: undefined, looksLikeTask: false }, true);
+	assert.equal(d.dispatch, false, "Q&A must not be dispatched just because it carries a task verb");
+	assert.equal(d.reason, "not-task");
+});

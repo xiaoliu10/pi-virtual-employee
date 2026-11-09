@@ -19,7 +19,7 @@ import { sidePassMaxTokens } from "./side-pass-budget.js";
 import { runningBackgroundProcesses, stopBackgroundProcesses } from "./tools/shell.js";
 import type { Skill } from "./skills/types.js";
 import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "./pi-compaction.js";
-import { formatPlanForTurn, formatPlanMessage, looksLikeTask, NARRATION_GUARD_NOTICE, parsePlan, PLAN_PROMPT_HEADER, shouldPushPlanToChat } from "./task-planner.js";
+import { formatPlanForTurn, formatPlanMessage, looksLikeImperative, looksLikeTask, NARRATION_GUARD_NOTICE, parsePlan, PLAN_PROMPT_HEADER, shouldPushPlanToChat } from "./task-planner.js";
 import { createModels, normalizeContext, ModelsError } from "@earendil-works/pi-ai";
 import { SIDE_PASS_DEFAULT_LEVEL, applyThinkingDeclaration } from "../shared/thinking.js";
 
@@ -2932,7 +2932,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// ephemeral side passes (eval/learn) are not user turns at all.
 		if (!ctx?.ephemeral && !hardError && !deterministic && !capHit && !contextBudgetHit
 			&& !this.turnAborts.has(conversationId)
-			&& looksLikeTask(message) && (this.turnToolCalls.get(conversationId) ?? 0) === 0) {
+			&& (looksLikeTask(message) || looksLikeImperative(message)) && (this.turnToolCalls.get(conversationId) ?? 0) === 0) {
 			console.warn(`[engine] narration guard: task turn for ${conversationId} ended with zero tool calls — continuing once`);
 			let continuedReply = "";
 			const guardUnsubscribe = agent.subscribe((event: AgentEvent) => {

@@ -19,18 +19,42 @@
  * floor silently dropped most of them). What qualifies is STRUCTURE: a task
  * verb plus multi-step evidence (sequencing words, a numbered list, several
  * sentences). Doubt stays unplanned — a false plan on a question is noise. */
+export const TASK_VERBS = [
+		"登录", "抓取", "爬", "下载", "整理", "汇总", "生成", "监控", "巡检", "对账", "采集",
+		"导出", "推送", "部署", "排查", "分析", "批量", "自动化", "跟踪", "核对", "注册", "配置",
+		"打开", "访问", "上传", "同步", "重启",
+		"write", "build", "deploy", "scrape", "crawl", "download", "generate", "monitor", "automate", "analyze",
+	];
+
+/**
+ * Question-shaped endings — 「登录密码是什么」 is Q&A, never an imperative, even
+ * though it carries a task verb.
+ */
+const QUESTION_SHAPE_RE = /(在哪|是什么|什么意思|为什么|怎么回事|怎么样|吗|呢)[？?？]?\s*$/;
+const IMPERATIVE_LEAD_RE = /^(继续|接着|然后|帮我|帮忙|请|麻烦|开始|执行|先|去|再|尝试)/;
+/**
+ * Short imperative task commands the shape detectors miss: 「继续 登录生产后台
+ * 管理」 (11 chars) carries a task verb but no multi-step evidence, so
+ * looksLikeTask is false and the message used to fall to a FOREGROUND turn
+ * whose pure-narration reply ("我来尝试登录…") got delivered as the final
+ * answer while the task never ran (field 2026-11-09). Question-shaped texts
+ * (「登录密码是什么」) stay Q&A.
+ */
+export function looksLikeImperative(text: string): boolean {
+	const t = (text ?? "").trim();
+	if (!t) return false;
+	if (QUESTION_SHAPE_RE.test(t)) return false;
+	if (!TASK_VERBS.some((v) => t.toLowerCase().includes(v))) return false;
+	return IMPERATIVE_LEAD_RE.test(t) || TASK_VERBS.some((v) => t.startsWith(v));
+}
+
 export function looksLikeTask(message: string): boolean {
 	const text = message.trim();
 	if (!text) return false;
 	if (text.length > 4_000) return true; // a 4KB brief is a task by construction
 	// Task verbs (zh/en) — logging in, downloading, organizing, generating, monitoring, writing...
-	const taskVerbs = [
-		"登录", "抓取", "爬", "下载", "整理", "汇总", "生成", "监控", "巡检", "对账", "采集",
-		"导出", "推送", "部署", "排查", "分析", "批量", "自动化", "跟踪", "核对", "注册", "配置",
-		"write", "build", "deploy", "scrape", "crawl", "download", "generate", "monitor", "automate", "analyze",
-	];
 	const lower = text.toLowerCase();
-	const hits = taskVerbs.filter((v) => lower.includes(v)).length;
+	const hits = TASK_VERBS.filter((v) => lower.includes(v)).length;
 	if (hits === 0) return false;
 	// Multi-step evidence: numbered list, several sentences, or sequencing words.
 	const multiStep = /\n|。|；|;|然后|接着|之后|再|并且|同时|以及|最后|第一步|第[一二三]|\d+[.、）)]|，.*(然后|接着|之后|并且|同时)/.test(text);

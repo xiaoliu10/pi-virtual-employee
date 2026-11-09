@@ -5,7 +5,7 @@ import { defineDoc, ProviderDoc, type Conversation, type ConversationId, type Cu
 import type { Agent, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
 import type { SendCtx, SendResult, TurnProcessEvent } from "../engine.js";
 import type { HistoryStore } from "../../db/history-store.js";
-import { looksLikeTask, NARRATION_GUARD_NOTICE } from "../task-planner.js";
+import { looksLikeImperative, looksLikeTask, NARRATION_GUARD_NOTICE } from "../task-planner.js";
 import { openDurableHost, type DurableHost } from "./harness-host.js";
 import { toDurableTool } from "./ve-tools.js";
 
@@ -453,7 +453,7 @@ export class DurableRuntime {
 			// if the continuation still takes no action, deliver it WITH the honest
 			// notice. Exactly once — never a loop (flood-loop lesson). Failure notices
 			// (result.error) are already honest outcomes and are left alone.
-			if (!result.error && looksLikeTask(text) && !(await this.hadToolAction(conv))) {
+			if (!result.error && (looksLikeTask(text) || looksLikeImperative(text)) && !(await this.hadToolAction(conv))) {
 				console.warn(`[durable] narration guard: zero-tool task turn → forced continue via input (conv=${id})`);
 				const priorEntries = await this.entryIdSnapshot(conv);
 				try {
