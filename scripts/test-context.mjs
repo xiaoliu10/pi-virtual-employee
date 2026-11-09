@@ -471,6 +471,33 @@ test("maybeCompact forwards the abort signal to the summarizer request", async (
 	assert.equal(agent.state.messages.length, messages.length, "a failed pass leaves the transcript untouched");
 });
 
+// Review 06814b70 P2-2 (handoff §三 anchor 1, ported to the LEGACY path — under
+// the agent-core default kernel this maybeCompact IS the production compaction):
+// a pathological summary that does not reduce the transcript must be dropped,
+// not applied. The box's 6-failure loop (compact→still-over→compact→400) dies
+// at the core; /compact reports the honest skipReason instead of a fake success.
+test("maybeCompact drops a summary that does not reduce the transcript (no_reduction)", async () => {
+	const messages = [user("任务：统计对账异常")];
+	for (let i = 0; i < 30; i += 1) messages.push(assistant("执行。" + "执".repeat(2400)));
+	const agent = { sessionId: "conv-huge-summary", state: { messages: [...messages], model: { id: "test", contextWindow: 200_000, maxTokens: 131_072 } } };
+	// Pathological summarizer: echoes back a "summary" far larger than the head it
+	// replaces (the model regurgitating its input).
+	const huge = async () => ({ result: async () => ({ role: "assistant", content: [{ type: "text", text: "摘".repeat(400_000) }], stopReason: "stop" }) });
+	const outcome = await maybeCompact(agent, true, undefined, huge);
+	assert.equal(outcome.compacted, false);
+	assert.equal(outcome.skipReason, "no_reduction");
+	assert.equal(agent.state.messages.length, messages.length, "transcript untouched — the useless summary is never applied");
+	// Repeated attempts are stable (no drift, no deeper hole).
+	const again = await maybeCompact(agent, true, undefined, huge);
+	assert.equal(again.skipReason, "no_reduction");
+	assert.equal(agent.state.messages.length, messages.length);
+	// Positive control: a small summary still compacts.
+	const small = async () => ({ result: async () => ({ role: "assistant", content: [{ type: "text", text: "小摘要：对账异常 3 条" }], stopReason: "stop" }) });
+	const fine = await maybeCompact(agent, true, undefined, small);
+	assert.equal(fine.compacted, true);
+	assert.ok(agent.state.messages.length < messages.length, "the healthy path still shrinks the transcript");
+});
+
 // Field incident 2026-09-24 (SLS task): killed with "recovery could not free
 // room (~158293 ≥ 156416)" — the SAME 158293 appeared as both the before-drop
 // and after-drop number. truncateToFit kept the tail verbatim, including the

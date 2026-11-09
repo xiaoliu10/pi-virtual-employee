@@ -657,7 +657,7 @@ export function progressContextSlice(messages: AgentMessage[], keepRecentTokens 
  * not fold "summary generation failed" into "no need" (field bug 2026-09-18:
  * a forced /compact below the threshold always printed 无需压缩 even when the
  * summarizer itself had failed). */
-export type CompactSkipReason = "below_threshold" | "nothing_to_cut" | "empty_head" | "summary_failed";
+export type CompactSkipReason = "below_threshold" | "nothing_to_cut" | "empty_head" | "summary_failed" | "no_reduction";
 
 export interface CompactOutcome {
 	compacted: boolean;
@@ -758,11 +758,25 @@ export async function maybeCompact(
 			return { compacted: false, skipReason: "summary_failed" };
 		}
 		// previousSummary remains the first conversational message on re-compaction.
-		agent.state.messages = [
+		const rebuilt = [
 			...(systemHead ? [systemHead] : []),
 			createCompactionSummaryMessage(summary, tokensBefore, new Date().toISOString()),
 			...recent.map(stripStaleUsage),
 		];
+		// Verification anchor (docs/design/handoff-worker-context-20261109.md §三),
+		// ported to the LEGACY path (review 06814b70 P2-2): under the agent-core
+		// default kernel THIS maybeCompact is the production compaction — a summary
+		// that does not reduce the transcript (the model echoing its input back)
+		// must be dropped, not applied. The box's 6-failure loop was compact→still
+		// over→compact; the invariant breaks that class at the core.
+		const tokensAfter = estimateTokensSafe(rebuilt);
+		if (tokensAfter >= tokensBefore) {
+			console.warn(
+				`[engine] compaction produced NO reduction for ${agent.sessionId ?? "?"}: ${old.length} turns (~${tokensBefore} → ~${tokensAfter} tokens) — transcript kept`,
+			);
+			return { compacted: false, skipReason: "no_reduction" };
+		}
+		agent.state.messages = rebuilt;
 	} catch (err) {
 		console.warn("[engine] compaction summary failed:", err instanceof Error ? err.message : err);
 		return { compacted: false, skipReason: "summary_failed" };

@@ -168,12 +168,15 @@ export async function compactIfNeeded(records: TurnRecord[], opts: CompactOption
 	// a compaction that does not REDUCE the ledger (pathological huge summary —
 	// the model echoing its input back) must be dropped, not written back. The
 	// box's 6-failure loop was compact→still-over→compact again; the invariant
-	// breaks that class at the core: no reduction → honest skip, ledger intact
-	// (bundle-time truncateToFit still enforces the request budget).
+	// breaks that class at the core: no reduction → honest skip, ledger intact.
+	// (Request-budget enforcement lives in buildBundle's whole-turn shed loop; a
+	// SINGLE turn larger than the budget exits that loop honestly over-budget and
+	// surfaces via the provider-400 recovery path — truncateToFit is NOT part of
+	// bundle assembly. Review 06814b70 P2-1.)
 	const after = totalTokens(rebuilt);
 	if (after >= total) {
 		console.warn(
-			`[context] compaction produced NO reduction (~${total} → ~${after} tokens) — ledger kept, not written back`,
+			`[context] compaction produced NO reduction for ${summaryRecord.conversationId}: ${old.length} turns (~${total} → ~${after} tokens) — ledger kept, not written back`,
 		);
 		return { compacted: false, skipReason: "no_reduction", records };
 	}

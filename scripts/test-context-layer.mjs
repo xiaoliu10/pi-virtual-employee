@@ -362,6 +362,22 @@ test("compact: a summary that does NOT reduce the ledger is dropped (handoff §�
 	assert.equal(huge.skipReason, "no_reduction");
 	assert.equal(huge.records, records, "ledger untouched — the useless summary is never written back");
 	assert.ok(!huge.records.some(isSummaryRecord), "no summary row landed");
+	// Forced path is equally guarded (review 06814b70 P3-2): an explicit /compact
+	// with a pathological summary must also be dropped.
+	const hugeForced = await compactIfNeeded(records, {
+		keepRecentTokens: 250,
+		budgetTokens: 200_000,
+		force: true,
+		summarize: async () => CN100.repeat(50),
+	});
+	assert.equal(hugeForced.compacted, false);
+	assert.equal(hugeForced.skipReason, "no_reduction");
+	assert.equal(hugeForced.records, records, "forced path: ledger untouched too");
+	// Repeated attempts are stable: a rejected pass never mutates the ledger, so
+	// retrying cannot dig a deeper hole (the box's 6-failure loop shape).
+	const again = await compactIfNeeded(records, { keepRecentTokens: 250, budgetTokens: 500, summarize: async () => CN100.repeat(50) });
+	assert.equal(again.skipReason, "no_reduction");
+	assert.equal(again.records, records);
 	// Positive control: a normal small summary still compacts.
 	const fine = await compactIfNeeded(records, { keepRecentTokens: 250, budgetTokens: 500, summarize: async () => "小摘要" });
 	assert.equal(fine.compacted, true);
