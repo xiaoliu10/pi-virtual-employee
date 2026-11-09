@@ -12,7 +12,11 @@
  *  - a fresh config (key never set) resolves engineKernel to "legacy";
  *  - the one-time reverse migration: a stored "durable" becomes "legacy" once,
  *    is persisted, and is idempotent across reads;
- *  - an explicit engineKernel write (including "durable") after the reset sticks;
+ *  - an explicit engineKernel write (including "durable") sticks on ANY install
+ *    state — including installs the reset migration never ran on (legacy/
+ *    pi-session opt-outs): update() stamps the reset marker itself;
+ *  - an imported (replaceAll) "durable" deliberately resets to legacy on the
+ *    next read — an import must not silently re-arm the retired kernel;
  *  - an explicit "pi-session" is never touched by either migration;
  *  - kernel "durable" WITHOUT an opened durable runtime → send() throws
  *    (fail-loud, unchanged semantics for a degraded-but-undeclared engine);
@@ -184,6 +188,51 @@ test("reverse migration: a durable written AFTER the reset is the user's choice 
 	assert.equal(config.all().general.engineKernel, "durable", "an explicit durable must not be reset again");
 	assert.equal(config.all().general.engineKernel, "durable");
 	assert.equal(storedGeneral(db).engineKernel, "durable");
+});
+
+test("an explicit durable opt-in sticks on installs the reset migration never ran on", (t) => {
+	// Review P1 (2026-11-09): installs whose stored kernel is NOT "durable" — a
+	// 0.2.167-era deliberate "legacy" opt-out (legacy + carried) or an explicit
+	// "pi-session" — never ran the reverse migration, so nothing had set the
+	// reset marker. update() must stamp it, or the FIRST explicit "durable" is
+	// eaten by the reset migration on the next all() read.
+	const optedOut = new DatabaseSync(":memory:");
+	const piSession = new DatabaseSync(":memory:");
+	const fresh = new DatabaseSync(":memory:");
+	t.after(() => { optedOut.close(); piSession.close(); fresh.close(); });
+
+	const legacyOptOut = seedConfigBlob(optedOut, { engineKernel: "legacy", engineKernelCarried: true });
+	assert.equal(legacyOptOut.all().general.engineKernel, "legacy");
+	legacyOptOut.update({ general: { engineKernel: "durable" } });
+	assert.equal(legacyOptOut.all().general.engineKernel, "durable", "explicit durable on a legacy+carried install must stick");
+	assert.equal(legacyOptOut.all().general.engineKernel, "durable");
+	assert.equal(storedGeneral(optedOut).engineKernelReset202611, true, "update() must stamp the reset marker");
+
+	const pi = seedConfigBlob(piSession, { engineKernel: "pi-session", engineKernelCarried: true });
+	assert.equal(pi.all().general.engineKernel, "pi-session");
+	pi.update({ general: { engineKernel: "durable" } });
+	assert.equal(pi.all().general.engineKernel, "durable", "explicit durable on a pi-session install must stick");
+	assert.equal(pi.all().general.engineKernel, "durable");
+
+	// Empty DB: update(durable) as the VERY FIRST operation must stick too.
+	fresh.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
+	const first = new ConfigStore(fresh);
+	first.update({ general: { engineKernel: "durable" } });
+	assert.equal(first.all().general.engineKernel, "durable", "explicit durable as the first-ever write must stick");
+	assert.equal(first.all().general.engineKernel, "durable");
+});
+
+test("an imported (replaceAll) durable resets to legacy on the next read — import semantics pin", (t) => {
+	// Review P3: replaceAll does not stamp the migration markers, so an imported
+	// engineKernel:"durable" — demoted to opt-in by the 2026-11-09 ruling — is
+	// deliberately reset to "legacy" by the next all() read, exactly like the
+	// stored pre-ruling default. An import must not silently re-arm the retired
+	// kernel; re-enable durable explicitly through update() after import.
+	const db = new DatabaseSync(":memory:");
+	t.after(() => db.close());
+	const config = seedConfigBlob(db, {});
+	config.replaceAll({ general: { engineKernel: "durable" } });
+	assert.equal(config.all().general.engineKernel, "legacy", "an imported durable must not re-arm the retired kernel");
 });
 
 test("reverse migration: an explicit legacy written after the reset sticks", (t) => {

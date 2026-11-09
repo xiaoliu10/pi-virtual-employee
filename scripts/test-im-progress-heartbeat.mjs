@@ -5,7 +5,8 @@
  * v0.2.173 fixed THREE gates that read `agent.state.isStreaming` (scheduled
  * runs, work windows, the autonomous heartbeat). The IM chat heartbeat in
  * src/im/manager.ts was a FOURTH instance of the same defect and was missed:
- * under the durable kernel (default since v0.2.167) that flag is never set, so
+ * under the durable kernel (default 0.2.167–0.2.213; opt-in since the
+ * 2026-11-09 ruling) that flag is never set, so
  * every beat returned early and nothing was logged — indistinguishable from a
  * feature that was never wired.
  *

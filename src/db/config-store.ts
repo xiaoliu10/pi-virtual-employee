@@ -1299,11 +1299,15 @@ export class ConfigStore {
 	update(patch: DeepPartial<AppConfig>): AppConfig {
 		// NOTE: kb.research legacy migration runs lazily on the next all() read — no need to duplicate it here.
 		// An explicit engineKernel write is a user decision, not a materialized
-		// default — mark it so the v0.2.167 carry-forward never flips it back. The
-		// 2026-11-09 reverse migration keys off its own marker, so an explicit write
-		// here (including "durable") is never undone by it.
+		// default — mark it so NEITHER migration undoes it: the v0.2.167
+		// carry-forward must never flip it back, AND the 2026-11-09 reverse
+		// migration keys off its own marker, so an explicit write here (including
+		// "durable") is never reset by it. Review P1 2026-11-09: installs whose
+		// stored kernel is NOT "durable" (0.2.167-era deliberate legacy opt-outs,
+		// explicit pi-session) never ran the reset migration — without stamping
+		// the marker here their FIRST explicit "durable" was eaten on the next read.
 		if (patch.general && patch.general.engineKernel != null) {
-			patch = { ...patch, general: { ...patch.general, engineKernelCarried: true } };
+			patch = { ...patch, general: { ...patch.general, engineKernelCarried: true, engineKernelReset202611: true } };
 		}
 	const merged = deepMerge(this.all(), patch);
 		const normalized = {
@@ -1323,6 +1327,13 @@ export class ConfigStore {
 	 * Fully replace config from an imported employee package. Unlike `update`
 	 * (which merges onto the current config), this treats `cfg` as the whole
 	 * new config: deep-merged onto DEFAULTS only, normalized, then persisted.
+	 *
+	 * Kernel note (2026-11-09): an imported engineKernel carries no migration
+	 * markers, so an imported "durable" — demoted to opt-in by the
+	 * single-kernel ruling — is deliberately reset to "legacy" by the next
+	 * all() read, exactly like the stored pre-ruling default. An import must
+	 * not silently re-arm the retired kernel; re-enable durable explicitly
+	 * through update()/settings after import if actually wanted.
 	 */
 	replaceAll(cfg: unknown): AppConfig {
 		const parsed = (cfg && typeof cfg === "object" ? cfg : {}) as DeepPartial<AppConfig>;

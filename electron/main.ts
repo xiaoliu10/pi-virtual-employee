@@ -775,7 +775,8 @@ async function main(): Promise<void> {
 		//                         the worker bridge below.
 		//
 		// "Is a turn in flight?" must NOT come from agent.state.isStreaming: on the
-		// durable kernel (default since v0.2.167) engine.send returns through
+		// durable kernel (default 0.2.167–0.2.213; opt-in since the 2026-11-09
+		// single-kernel ruling) engine.send returns through
 		// durableRuntime.send and the harness is driven directly, so that flag is
 		// never set — the whole heartbeat was dead and silent (subagent review
 		// P1-1, same root cause as v0.2.173's two call sites). durableRuntime.busy
@@ -1200,7 +1201,8 @@ ${tailForProgress(decision.text)}`;
 			console.log("[durable] execution runtime restored and ready");
 		} catch (err) {
 			console.error(`[durable] runtime unavailable; unfinished work will remain parked: ${err instanceof Error ? err.message : err}`);
-			// "durable" is the default kernel since v0.2.167 — an environment that
+			// "durable" was the default kernel 0.2.167–0.2.213 (opt-in since the
+			// 2026-11-09 single-kernel ruling) — an environment that
 			// cannot open the durable storage must fall back to a WORKING legacy
 			// pipeline, not a bot that throws on every send.
 			durableStartupFailed = true;

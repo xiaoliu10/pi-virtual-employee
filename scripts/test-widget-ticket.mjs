@@ -561,7 +561,7 @@ test("a throwing subscribe must not wedge inFlight (round-2 heartbeat probe A)",
 });
 
 test("durable kernel streams through the sink even though subscribe sees nothing", async (t) => {
-	// Field report: v0.2.167+ defaults to durable, where agent.subscribe observes
+	// Field report: v0.2.167–0.2.213 defaulted to durable, where agent.subscribe observes
 	// zero events, so the widget fell back to JSON and users stared at an empty
 	// bubble for the whole generation. The sink must carry the same process events.
 	const runtime = makeDurableRuntime({
