@@ -346,6 +346,28 @@ test("compact: an EMPTY or failed summary never lands in the ledger (现场事�
 	assert.equal(thrown.records, records);
 });
 
+test("compact: a summary that does NOT reduce the ledger is dropped (handoff §三 verification anchor)", async () => {
+	const s = store();
+	for (const row of pairRows("c1", 1, 6)) s.appendTurn(row);
+	const records = s.listTurns("c1");
+	// Pathological summarizer: echoes back a "summary" bigger than the whole
+	// ledger (the model regurgitating its input). The box's 6-failure loop was
+	// compact→still-over→compact; the invariant must break it at the core.
+	const huge = await compactIfNeeded(records, {
+		keepRecentTokens: 250,
+		budgetTokens: 500,
+		summarize: async () => CN100.repeat(50),
+	});
+	assert.equal(huge.compacted, false);
+	assert.equal(huge.skipReason, "no_reduction");
+	assert.equal(huge.records, records, "ledger untouched — the useless summary is never written back");
+	assert.ok(!huge.records.some(isSummaryRecord), "no summary row landed");
+	// Positive control: a normal small summary still compacts.
+	const fine = await compactIfNeeded(records, { keepRecentTokens: 250, budgetTokens: 500, summarize: async () => "小摘要" });
+	assert.equal(fine.compacted, true);
+	assert.ok(fine.records.some(isSummaryRecord));
+});
+
 test("compact: forced single-turn ledger keeps the task statement and summarizes the middle", async () => {
 	const records = [rec("c1", 1, "request", CN100 + "任务"), ...Array.from({ length: 8 }, (_, i) => rec("c1", i + 2, "tool-digest", CN100, { toolDigest: { name: "t", argsBrief: "a", resultBrief: "r" } })), rec("c1", 10, "reply", CN100 + "完"), rec("c1", 11, "reply", CN100 + "毕")];
 	const forced = findForcedCompactionCut(records, 250);

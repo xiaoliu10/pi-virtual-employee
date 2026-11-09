@@ -36,7 +36,7 @@ import {
  * not fold "summary generation failed" into "no need" (field bug 2026-09-18:
  * a forced /compact below the threshold always printed 无需压缩 even when the
  * summarizer itself had failed). */
-export type CompactSkipReason = "below_threshold" | "nothing_to_cut" | "empty_head" | "summary_failed";
+export type CompactSkipReason = "below_threshold" | "nothing_to_cut" | "empty_head" | "summary_failed" | "no_reduction";
 
 export interface CompactOutcome {
 	compacted: boolean;
@@ -163,10 +163,24 @@ export async function compactIfNeeded(records: TurnRecord[], opts: CompactOption
 		text: `${COMPACTION_SUMMARY_MARK}\n${summary.trim()}`,
 		ts: opts.now ?? Date.now(),
 	};
+	const rebuilt: TurnRecord[] = [summaryRecord, ...recent];
+	// Verification anchor (docs/design/handoff-worker-context-20261109.md §三):
+	// a compaction that does not REDUCE the ledger (pathological huge summary —
+	// the model echoing its input back) must be dropped, not written back. The
+	// box's 6-failure loop was compact→still-over→compact again; the invariant
+	// breaks that class at the core: no reduction → honest skip, ledger intact
+	// (bundle-time truncateToFit still enforces the request budget).
+	const after = totalTokens(rebuilt);
+	if (after >= total) {
+		console.warn(
+			`[context] compaction produced NO reduction (~${total} → ~${after} tokens) — ledger kept, not written back`,
+		);
+		return { compacted: false, skipReason: "no_reduction", records };
+	}
 	console.log(
 		`[context] compacted ${summaryRecord.conversationId}: ${old.length} turns → summary (~${total} tokens before)`,
 	);
-	return { compacted: true, records: [summaryRecord, ...recent] };
+	return { compacted: true, records: rebuilt };
 }
 
 /** CJK-aware size of a whole ledger, for the threshold gate. */
