@@ -539,11 +539,13 @@ async function main(): Promise<void> {
 	// "pi-session" needs the pi runtime installed+verified before the engine
 	// exists — a failed bootstrap keeps the app on the legacy kernel (loud log,
 	// settings surface the state) instead of bricking the profile.
-	let kernel: "legacy" | "pi-session" | "durable" = initialCfg.general.engineKernel ?? "durable";
+	let kernel: "legacy" | "pi-session" | "durable" = initialCfg.general.engineKernel ?? "legacy";
 	// "durable" (crash recovery, docs/design/crash-recovery.md) needs NO runtime
-	// bootstrap: pi-durable is an ordinary dependency. It rolls back to legacy if
-	// its host cannot open (e.g. the storage file is owned by another instance) —
-	// a failed recovery path must never brick the profile.
+	// bootstrap: pi-durable is an ordinary dependency. It is OPT-IN since the
+	// 2026-11-09 single-kernel ruling (docs/design/router-worker-core.md §0/§1) —
+	// legacy (agent-core) is the default again. It rolls back to legacy if its host
+	// cannot open (e.g. the storage file is owned by another instance) — a failed
+	// recovery path must never brick the profile.
 	if (kernel === "pi-session") {
 		const { ensurePiRuntime } = await import("../src/runtime/bootstrap.js");
 		const result = await ensurePiRuntime({

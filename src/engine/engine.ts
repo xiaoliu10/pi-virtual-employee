@@ -810,9 +810,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * calls this from the openDurableRuntime catch). The engine was CONSTRUCTED
 	 * with kernel:"durable"; without this, every send() throws "refusing to
 	 * replay through legacy" and the bot goes dark until the storage problem is
-	 * fixed. Since v0.2.167 "durable" is the DEFAULT kernel, so an environment
-	 * that cannot open the durable storage (permissions, another instance) must
-	 * fall back to a working legacy pipeline, not a dead bot.
+	 * fixed. "durable" is opt-in since the 2026-11-09 single-kernel ruling
+	 * (docs/design/router-worker-core.md), so an environment that cannot open the
+	 * durable storage (permissions, another instance) must fall back to a working
+	 * legacy pipeline, not a dead bot.
 	 */
 	degradeToLegacyKernel(reason: string): void {
 		if (this.opts.kernel !== "durable") return;
@@ -832,7 +833,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			stream: (id, options, messages) => {
 				const { supplier, modelId } = this.resolveForConversation(id);
 				const model = this.resolveModel(supplier, modelId);
-				// Durable is the DEFAULT kernel and drives the harness pipeline, so the
+				// The durable kernel drives the harness pipeline, so the
 				// Agent's own thinkingLevel never reaches the request here (Copilot
 				// review 2026-11-02). Apply the per-model declared level explicitly —
 				// otherwise a configured low/high changed only the side pass and the
@@ -1961,7 +1962,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * The composed turn input (task brief + memory prefix) — the SAME
 	 * composition the legacy/pi-session path applies inline. Durable turns call
 	 * this from the runtime boundary (review 1796f433 #1: the brief was
-	 * legacy-only while durable is the DEFAULT kernel, so the fix never ran on
+	 * legacy-only while durable was the DEFAULT kernel, so the fix never ran on
 	 * a default deployment). The raw text keeps reaching appendMessage —
 	 * prefixes are prompt-only and never persisted.
 	 */

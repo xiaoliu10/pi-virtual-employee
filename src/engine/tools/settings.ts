@@ -62,7 +62,7 @@ export const ROOT_CATALOG: Record<string, string> = {
 	general: "通用（autostart/language/requestTimeoutMin/longTaskProgressMin=聊天轮进度提醒间隔分钟（群内/单聊直接发起的任务型回合，用户在场看着，默认 10；0=关闭）/taskProgressMin=定时任务与自主任务执行期的进度汇报间隔分钟（任务自行长跑，最终报告才是交付物，默认 30；0=关闭）——两者语义不同，勿混用/maxToolSteps=每回合工具调用步数上限，0=无限制（默认；回合超时与进度看门狗仍是兜底，不会无限空转）/autoUpdate/oneOffRetentionDays；一次性会话保留天数：定时任务/自主任务/评测会话停止更新超过该天数自动删除，0=不清理，IM 与控制台会话永不自动删）；messageRetentionDays（对话记录保留天数，默认 30，0=不清理）：超龄的消息正文与 turn/tool 遥测自动删除，会话条目保留）",
 	browser: "浏览器自动化（enabled/headless/allowedDomains）",
 	computer: "Cua 桌面控制（enabled/driverPath/allowedApps/allowForeground/allowScheduled/connectTimeoutSec/actionTimeoutSec/sessionTimeoutSec；单位秒，总时限 0=不限时；allowedApps 空数组=拒绝全部，*=全部应用）",
-	environmentKernel: "会话内核（general.engineKernel）：durable=持久执行内核（默认；崩溃/升级中断后自动接续任务，恢复执行期间按当前权限实时重鉴权、撤权立即生效），legacy=旧裸 Agent 直驱（durable 存储打不开时的自动回退，也可显式指定），pi-session=Agent 外包 pi AgentSession 会话壳（扩展运行时/插件宿主，需 pi runtime 已安装）",
+	environmentKernel: "会话内核（general.engineKernel）：legacy=pi-agent-core 裸 Agent 直驱（产品语义 agent-core，默认；2026-11-09 裁定回退单内核路线，见 docs/design/router-worker-core.md），durable=持久执行内核（不再是默认，需显式开启；崩溃/升级中断后按 submission 逐个恢复接续任务——该恢复语义与丢工具历史的取舍见设计文档，恢复执行期间按当前权限实时重鉴权、撤权立即生效），pi-session=Agent 外包 pi AgentSession 会话壳（扩展运行时/插件宿主，需 pi runtime 已安装）",
 	scheduler: "定时任务总开关（scheduler.enabled）",
 	prompt: "提示词追加（prompt.extra/prompt.rules；rules 为空时用内置默认）",
 	kb: "知识库（kb.enabled/kb.mode/kb.local.*/kb.embedding.* 等）",

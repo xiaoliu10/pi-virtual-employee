@@ -1,10 +1,19 @@
 /**
- * Kernel default flip (v0.2.167): "durable" is now the DEFAULT engineKernel,
- * and a durable-host open failure must degrade to a WORKING legacy pipeline —
- * not a bot that throws on every send.
+ * Kernel default + fallback contract.
+ *
+ * v0.2.167 flipped the default to "durable"; the 2026-11-09 user ruling
+ * (docs/design/router-worker-core.md §0/§1/§11) flipped it BACK to "legacy"
+ * (= bare pi-agent-core Agent, product name agent-core): durable's
+ * per-submission redrive caused a recovery storm and its per-turn conversation
+ * import dropped tool history between turns. A durable-host open failure must
+ * still degrade to a WORKING legacy pipeline — not a bot that throws on every send.
  *
  * What this pins:
- *  - a fresh config (key never set) resolves engineKernel to "durable";
+ *  - a fresh config (key never set) resolves engineKernel to "legacy";
+ *  - the one-time reverse migration: a stored "durable" becomes "legacy" once,
+ *    is persisted, and is idempotent across reads;
+ *  - an explicit engineKernel write (including "durable") after the reset sticks;
+ *  - an explicit "pi-session" is never touched by either migration;
  *  - kernel "durable" WITHOUT an opened durable runtime → send() throws
  *    (fail-loud, unchanged semantics for a degraded-but-undeclared engine);
  *  - after degradeToLegacyKernel() → send() runs the legacy pipeline and the
@@ -89,11 +98,28 @@ const okStreamFn = async () => ({
 	}),
 });
 
-test("default config resolves engineKernel to durable (flip verified)", () => {
+/** A persisted config blob, shaped like the ones all()/update() write back. */
+function seedConfigBlob(db, general) {
+	db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
+	const blob = JSON.stringify({ general, model: {}, im: {}, kb: {}, security: {}, capabilities: {}, computer: {} });
+	db.prepare("INSERT INTO config (key, value) VALUES ('appconfig', ?)").run(blob);
+	return new ConfigStore(db);
+}
+
+/** The persisted general section — migrations must be durable, not in-memory only. */
+function storedGeneral(db) {
+	return JSON.parse(db.prepare("SELECT value FROM config WHERE key = 'appconfig'").get().value).general;
+}
+
+test("default config resolves engineKernel to legacy (agent-core, 2026-11-09 ruling)", () => {
 	const db = new DatabaseSync(":memory:");
 	db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
 	const config = new ConfigStore(db);
-	assert.equal(config.all().general.engineKernel, "durable");
+	assert.equal(config.all().general.engineKernel, "legacy");
+	// A fresh install must STAY on legacy across reads: the retired v0.2.167
+	// carry-forward would otherwise bump the materialized default to durable.
+	assert.equal(config.all().general.engineKernel, "legacy");
+	assert.equal(storedGeneral(db).engineKernel, "legacy");
 	db.close();
 });
 
@@ -129,40 +155,78 @@ test("degrading a legacy engine is a no-op", async (t) => {
 	assert.equal(result.reply, "legacy 管线答复");
 });
 
-test("carry-forward: persisted old-default legacy bumps to durable once", (t) => {
+test("reverse migration: a stored durable flips to legacy once and is persisted", (t) => {
 	const db = new DatabaseSync(":memory:");
-	db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
 	t.after(() => db.close());
-	// Every install that ever ran ≤0.2.166 has the OLD default materialized:
-	const legacyBlob = JSON.stringify({ general: { engineKernel: "legacy" }, model: {}, im: {}, kb: {}, security: {}, capabilities: {}, computer: {} });
-	db.prepare("INSERT INTO config (key, value) VALUES ('appconfig', ?)").run(legacyBlob);
-	const config = new ConfigStore(db);
-	assert.equal(config.all().general.engineKernel, "durable");
-	assert.equal(config.all().general.engineKernelCarried, true);
-	// and the migration is persisted, not just in-memory:
-	const stored = JSON.parse(db.prepare("SELECT value FROM config WHERE key = 'appconfig'").get().value);
-	assert.equal(stored.general.engineKernel, "durable");
-	assert.equal(stored.general.engineKernelCarried, true);
+	// Every install that ran 0.2.167–0.2.213 has "durable" materialized in its blob.
+	const config = seedConfigBlob(db, { engineKernel: "durable" });
+	assert.equal(config.all().general.engineKernel, "legacy");
+	assert.equal(config.all().general.engineKernelReset202611, true);
+	assert.equal(storedGeneral(db).engineKernel, "legacy", "the reset must be persisted, not just in-memory");
+	assert.equal(storedGeneral(db).engineKernelReset202611, true);
 });
 
-test("carry-forward respects an explicit legacy (marker present)", (t) => {
+test("reverse migration is idempotent across repeated reads", (t) => {
 	const db = new DatabaseSync(":memory:");
-	db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
 	t.after(() => db.close());
-	const explicitBlob = JSON.stringify({ general: { engineKernel: "legacy", engineKernelCarried: true }, model: {}, im: {}, kb: {}, security: {}, capabilities: {}, computer: {} });
-	db.prepare("INSERT INTO config (key, value) VALUES ('appconfig', ?)").run(explicitBlob);
-	const config = new ConfigStore(db);
+	const config = seedConfigBlob(db, { engineKernel: "durable" });
+	const first = JSON.stringify(config.all().general);
+	for (let i = 0; i < 3; i++) assert.equal(JSON.stringify(config.all().general), first, "re-reads must not re-migrate or churn the blob");
 	assert.equal(config.all().general.engineKernel, "legacy");
 });
 
-test("carry-forward: an explicit update(engineKernel) after migration is respected", (t) => {
+test("reverse migration: a durable written AFTER the reset is the user's choice and sticks", (t) => {
 	const db = new DatabaseSync(":memory:");
-	db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
 	t.after(() => db.close());
-	const legacyBlob = JSON.stringify({ general: { engineKernel: "legacy" }, model: {}, im: {}, kb: {}, security: {}, capabilities: {}, computer: {} });
-	db.prepare("INSERT INTO config (key, value) VALUES ('appconfig', ?)").run(legacyBlob);
-	const config = new ConfigStore(db);
-	assert.equal(config.all().general.engineKernel, "durable"); // migrated
-	config.update({ general: { engineKernel: "legacy" } }); // deliberate opt-out
-	assert.equal(config.all().general.engineKernel, "legacy"); // sticks
+	const config = seedConfigBlob(db, { engineKernel: "durable" });
+	assert.equal(config.all().general.engineKernel, "legacy"); // migrated
+	config.update({ general: { engineKernel: "durable" } }); // deliberate opt-in
+	assert.equal(config.all().general.engineKernel, "durable", "an explicit durable must not be reset again");
+	assert.equal(config.all().general.engineKernel, "durable");
+	assert.equal(storedGeneral(db).engineKernel, "durable");
+});
+
+test("reverse migration: an explicit legacy written after the reset sticks", (t) => {
+	const db = new DatabaseSync(":memory:");
+	t.after(() => db.close());
+	const config = seedConfigBlob(db, { engineKernel: "durable" });
+	assert.equal(config.all().general.engineKernel, "legacy"); // migrated
+	config.update({ general: { engineKernel: "legacy" } });
+	assert.equal(config.all().general.engineKernel, "legacy", "the retired carry-forward must not resurrect durable");
+});
+
+test("neither migration touches an explicit pi-session", (t) => {
+	const db = new DatabaseSync(":memory:");
+	const optedIn = new DatabaseSync(":memory:");
+	t.after(() => { db.close(); optedIn.close(); });
+	const config = seedConfigBlob(db, { engineKernel: "pi-session", engineKernelCarried: true });
+	assert.equal(config.all().general.engineKernel, "pi-session");
+	assert.equal(config.all().general.engineKernel, "pi-session");
+	assert.equal(storedGeneral(db).engineKernel, "pi-session");
+	// …also when written through update() on an already-reset install.
+	const reset = seedConfigBlob(optedIn, { engineKernel: "durable" });
+	assert.equal(reset.all().general.engineKernel, "legacy");
+	reset.update({ general: { engineKernel: "pi-session" } });
+	assert.equal(reset.all().general.engineKernel, "pi-session");
+	assert.equal(reset.all().general.engineKernel, "pi-session");
+});
+
+test("materialized old-default legacy stays legacy (carry-forward then reset)", (t) => {
+	const db = new DatabaseSync(":memory:");
+	t.after(() => db.close());
+	// ≤0.2.166 installs carry the OLD default with no marker: the retired bump
+	// would flip it to durable in this very read, and the reset must land it back.
+	const config = seedConfigBlob(db, { engineKernel: "legacy" });
+	assert.equal(config.all().general.engineKernel, "legacy");
+	assert.equal(config.all().general.engineKernelCarried, true);
+	assert.equal(config.all().general.engineKernel, "legacy", "later reads must not resurrect durable");
+	assert.equal(storedGeneral(db).engineKernel, "legacy");
+});
+
+test("an explicit legacy with the v0.2.167 carry marker is left alone", (t) => {
+	const db = new DatabaseSync(":memory:");
+	t.after(() => db.close());
+	const config = seedConfigBlob(db, { engineKernel: "legacy", engineKernelCarried: true });
+	assert.equal(config.all().general.engineKernel, "legacy");
+	assert.equal(config.all().general.engineKernelReset202611, undefined, "nothing to reset — no marker churn");
 });

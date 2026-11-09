@@ -1,7 +1,7 @@
 /**
  * Durable-kernel process events (field requirement, 2026-11-02).
  *
- * The durable kernel (the DEFAULT since v0.2.167) never calls agent.prompt, so
+ * The durable kernel (opt-in since the 2026-11-09 ruling) never calls agent.prompt, so
  * `agent.subscribe` observes nothing and the widget fell back to plain JSON:
  * every embedding business system showed "spinner → whole answer at once", with
  * the first token arriving only after the entire generation finished. The
