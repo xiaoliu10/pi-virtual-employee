@@ -440,7 +440,12 @@ export function buildTools(input: ToolSetOptions): AgentTool<any>[] {
 		// engine already hands to run_script for its parameter files).
 		processContractsPath: options.userDataDir ? join(options.userDataDir, "process-contracts.json") : undefined,
 	};
-	tools.push(createRunCommandTool(shellDeps), createManageProcessTool(shellDeps));
+	// Restricted shell execution for headless-server ops (process inspect/kill,
+	// system/network checks). RBAC first: both tools sit behind the "shell"
+	// capability gate (review 05421c05 P1-2) so the role floors and per-
+	// conversation floors actually apply — the inner gates (whitelist,
+	// confirmation, hygiene) stack on top, they do not replace this layer.
+	tools.push(...guardAll("shell", [createRunCommandTool(shellDeps), createManageProcessTool(shellDeps)]));
 	// `run_script`: the same executor, but arguments travel in a JSON file so the
 	// command line carries no user data. This is the fix for Windows argv
 	// re-tokenization / quoting / GBK mangling — see tools/run-script.ts.

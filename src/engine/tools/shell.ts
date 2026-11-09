@@ -458,26 +458,33 @@ export async function executeCommand(
 			if (!raw) return refuse("command 不能为空。");
 			if (raw.length > 2000) return refuse("命令过长（>2000 字符），拒绝执行。");
 
-			// Process-hygiene execution gate (user ruling 2026-11-10). Checks the raw
-			// command AND the content of any referenced script file (.ps1/.sh/.py/
-			// .cmd/.bat — the 2026-11-10 incident travelled as `powershell -File
-			// kill_pw_chrome.ps1`, invisible on the command line itself). Role-
-			// independent and before any authorization: even admin full-shell must
-			// not silently run incident-shaped cleanup scripts. Every rejection is
-			// audited (the gate-silence lesson from v0.2.173).
-			const hygieneReason = gateDangerousKillForCommand(raw, { workingDir: (workingDir ?? "").trim() });
-			if (hygieneReason) {
-				audit(deps.auditLogPath, { event: "hygiene_gate_reject", command: raw });
-				console.log(`[shell] hygiene gate rejected: ${raw.slice(0, 200)}`);
-				return refuse(hygieneReason);
-			}
-
 			const gate = gateCommandRole(deps);
 			if ("content" in gate) return gate;
 
 			const shell = deps.config.all().capabilities?.shell;
 			if (!shell?.enabled) {
 				return refuse("受限命令执行能力未开启。管理员可在单聊使用 manage_capabilities set shell true 开启（需确认），或在设置页开启。");
+			}
+
+			// Process-hygiene execution gate (user ruling 2026-11-10). Checks the raw
+			// command AND the content of any referenced script file (.ps1/.sh/.py/
+			// .cmd/.bat/.js… — the 2026-11-10 incident travelled as `powershell -File
+			// kill_pw_chrome.ps1`, invisible on the command line itself). Runs AFTER
+			// the role gate (review 05421c05 P3-2: a viewer sees the role refusal,
+			// not the incident narrative) but BEFORE the whitelist and any other
+			// authorization: even admin full-shell must not silently run
+			// incident-shaped cleanup scripts. Every rejection AND every unreadable
+			// script skip is audited (the gate-silence lesson from v0.2.173).
+			const hygieneReason = gateDangerousKillForCommand(raw, {
+				workingDir: (workingDir ?? "").trim(),
+				onUnreadable: (resolvedPath) => {
+					audit(deps.auditLogPath, { event: "hygiene_gate_script_unreadable", command: raw, path: resolvedPath });
+				},
+			});
+			if (hygieneReason) {
+				audit(deps.auditLogPath, { event: "hygiene_gate_reject", command: raw });
+				console.log(`[shell] hygiene gate rejected: ${raw.slice(0, 200)}`);
+				return refuse(hygieneReason);
 			}
 			// Operator: allowlist + composition-free single command (the original
 			// restricted-shell contract). Admin: full shell — the jump box is a
@@ -554,7 +561,7 @@ export function createRunCommandTool(deps: ShellToolDeps): AgentTool {
 			"powershell/node/npx 等解释器需管理员显式加入白名单（admin 角色无需）；安装 Chromium 请改用 manage_capabilities setup_browser。" +
 			"安全规则：默认关闭；operator 每次执行需在消息中明确包含「确认」/confirm/yes/ok；admin（平台验证身份）发起即授权，直接执行，全部审计留痕。命令以当前应用用户权限运行，不会自动提权。" +
 			"可选 workingDir：命令的工作目录（绝对路径，如 C:\Users\me\project），脚本用相对路径读写数据文件时需要；不影响可执行文件白名单。定时任务无人值守执行时，run_command 以任务创建者身份放行（按该用户当前角色定级），无需消息内含「确认」，但 operator 的白名单校验照常生效。" +
-			"执行闸：命令文本及引用的脚本文件内容（.ps1/.sh/.py/.cmd/.bat）命中「ms-playwright/chrome-headless-shell + 杀进程原语」或 killall / pkill -f / Stop-Process -Name / taskkill /im|/t 时直接拒绝，并指路 manage_process scan→kill_pid 两段式；显式 taskkill /pid <n>（无 /im、无 /t）按 PID 定点杀，不受影响。",
+			"执行闸：命令文本及引用的脚本文件内容（.ps1/.sh/.py/.cmd/.bat/.js/.mjs/.cjs）命中「ms-playwright/chrome-headless-shell + 杀进程原语」或 killall / pkill / Stop-Process -Name / 管道 Stop-Process / 管道 $_.Kill() / taskkill /im|/t 时直接拒绝，并指路 manage_process scan→kill_pid 两段式；显式 taskkill /pid <n>（无 /im、无 /t）按 PID 定点杀，不受影响。只读排查内容误中时，改写为纯查询输出或改用 taskkill /pid 定点。",
 		parameters: obj({
 			command: str({ description: `要执行的命令，如「tasklist /FI "PID eq 19060"」「taskkill /PID 19060 /F」「python scripts/gen_report.py」。跑脚本直接给脚本文件路径，不要用 python -c 内联代码（括号会被拦截）。` }),
 			workingDir: opt(str({ description: "可选：命令的工作目录绝对路径，如 C:\Users\admin\project。脚本按相对路径找数据文件时必填。" })),
@@ -587,7 +594,7 @@ export function createManageProcessTool(deps: ShellToolDeps): AgentTool {
 			"poll/log/list 无需重复确认，但每次都校验当前管理员身份，只能访问自己在当前对话启动的命令。定时任务可跟踪自身会话。关闭 shell 开关后仍可查询和终止已有会话。" +
 			"poll 的 waitSec 仅控制此次等待，默认 capabilities.shell.pollTimeoutSec（30 秒），0=立即返回；无论等待超时还是取消等待，都不会终止后台进程。长等待可提高 waitSec（如 840 秒），避免连续短轮询。" +
 			"log/poll 返回 stdout+stderr 与 nextOffset；下次传 offset=nextOffset 只读新增输出。未传 offset 默认显示最新一页，每页最多 32KB，内存保留最近 256KB；完整结果请脚本写文件。先确认 observer start 启动日志，再持续跟踪到退出并核对退出码，不能把 running 当作成功。等待期间用 log 跟踪脚本打印的进度：一旦输出表明需要人参与（等待验证码/确认/输入等），立即前台提问，不要等脚本退出才交互。应用退出会终止进程，重启后会话失效。" +
-			"进程卫生（2026-11-10 事故裁定，结构性强制）：清理残留浏览器/杀非本会话进程必须走内置两段式，不要手写清理脚本（含 ms-playwright+Kill/Stop-Process/taskkill /im/killall/pkill -f 的命令或脚本会被执行闸拦截）。" +
+			"进程卫生（2026-11-10 事故裁定，结构性强制）：清理残留浏览器/杀非本会话进程必须走内置两段式，不要手写清理脚本——命令或脚本文件内容命中 ms-playwright/chrome-headless-shell + 杀进程原语、killall/pkill（含裸 pkill）、Stop-Process -Name、管道 Stop-Process、管道 $_.Kill()、taskkill /im|/t 时会被执行闸拦截（.ps1/.sh/.py/.cmd/.bat/.js/.mjs/.cjs 内容都扫）。" +
 			"scan（pattern 默认 chrome*，同时覆盖 chrome-headless-shell；minAgeMin 默认 10）跨平台扫描并按权威度做四道持有判定：调试通道（port|pipe）/父进程存活/年龄/契约在册，输出 SKIP/CANDIDATE 候选表和 10 分钟有效的 ticket。" +
 			"kill_pid（ticket+pid 必填）在 kill 前重新判定（TOCTOU），状态已变化则拒绝并要求重新 scan；TERM 5 秒无效才升级强杀，无树杀。" +
 			"长任务（超过 2 分钟）启动时 register_contract(pid, purpose, expectedMinutes, killConditions) 登记，结束时 remove_contract(pid) 注销，list_contracts 查看——在册 pid 会被 scan 判 SKIP。",
@@ -614,10 +621,25 @@ export function createManageProcessTool(deps: ShellToolDeps): AgentTool {
 			if (action === "kill" && !isSchedulerActor(gate.actor) && !confirmsProcessStop(gate.actor.text)) {
 				return refuse("终止命令进程树需要管理员在当前消息中明确确认，例如「确认终止这个任务」。");
 			}
-			// Process-hygiene actions (scan / kill_pid / contract ledger) dispatch to
-			// the dedicated module; authorization already ran above. The list/poll/
-			// log/kill semantics below are untouched by it.
+			// Process-hygiene actions (scan / kill_pid / contract ledger). Dispatched
+			// to the dedicated module after authorization already ran above. Two
+			// gates the handler cannot see live here (review 05421c05 P1-2):
+			//  - the shell capability switch: hygiene actions are process-hygiene
+			//    EXECUTION, not session bookkeeping — the existing list/poll/log/kill
+			//    keep working with the switch off (documented contract), the new
+			//    actions do not;
+			//  - the kill_pid message confirmation: ticket+TOCTOU are MISTAKE
+			//    prevention, the 确认 gate is AUTHORIZATION — they stack, they do
+			//    not substitute (parent ruling). Same semantics as the old kill:
+			//    scheduler actors (unattended, creator identity re-attached) stay
+			//    exempt; every ROLE including admin must confirm in the message.
 			if (HYGIENE_ACTIONS.has(action)) {
+				if (!deps.config.all().capabilities?.shell?.enabled) {
+					return refuse("进程卫生动作（scan/kill_pid/契约）属于命令执行能力，当前 capabilities.shell.enabled 关闭；请管理员开启后再用（manage_capabilities set shell true，需确认）。已有的 list/poll/log/kill 不受影响。");
+				}
+				if (action === "kill_pid" && !isSchedulerActor(gate.actor) && !confirmsProcessStop(gate.actor.text)) {
+					return refuse("kill_pid 结束非本会话进程需要当前消息中明确确认（例如「确认终止这个残留进程」）——ticket 只证明 scan 发生过，不替代授权；任何角色（含管理员）都需要确认。");
+				}
 				return handleProcessHygieneAction(deps, params as ProcessHygieneParams, {
 					actorId: gate.actor.senderId,
 					channel: gate.actor.channel,

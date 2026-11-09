@@ -38,11 +38,12 @@
  */
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, type Dirent } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, type Dirent } from "node:fs";
 import { readFile, readdir, readlink, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { maskId, refuse, type AdminRefusal } from "./admin.js";
 import type { ConfigStore } from "../../db/config-store.js";
+import { SCRIPT_EXTENSIONS } from "./run-script.js";
 import type { ShellToolDeps } from "./shell.js";
 
 /** Kill tickets live this long after their scan (task spec: 10 minutes). */
@@ -129,6 +130,21 @@ export function processNameOf(rec: { exe_path: string | null; command_line: stri
 }
 
 /**
+ * Is the parent of `rec` alive in this snapshot? Platform-aware because the OS
+ * decides what a parentless process looks like (review 05421c05 P2-2):
+ *  - win32 keeps literal PPID semantics: Windows does NOT re-parent orphans, so
+ *    a listed ppid that exists in the snapshot means the parent still runs.
+ *  - POSIX (Linux/macOS) re-parents orphans to init/subreaper (pid 1, which is
+ *    ALWAYS in the snapshot) — there a ppid of 1 means "parent is DEAD". Treating
+ *    it as alive made every Linux orphan SKIP forever with a lying reason.
+ */
+export function parentAliveOn(platform: string, rec: ProcessRecord, records: ProcessRecord[]): boolean {
+	if (rec.ppid === null || rec.ppid <= 0) return false;
+	if (platform !== "win32" && rec.ppid === 1) return false;
+	return records.some((other) => other.pid === rec.ppid);
+}
+
+/**
  * pattern semantics: containing * or ? → wildcard match against the process
  * NAME ("chrome*" covers chrome AND chrome-headless-shell); otherwise a
  * case-insensitive substring match against name, exe path, or command line.
@@ -150,16 +166,37 @@ export function matchesPattern(pattern: string, rec: { exe_path: string | null; 
 // ── Windows snapshot: parse (pure, fixture-tested) ──────────────────────────
 
 /**
- * DMTF datetime from Get-CimInstance (e.g. "20261109080000.123456+480") → epoch
- * ms. The trailing offset is MINUTES from UTC (1-3 digits; UTC+8 = +480);
- * components are machine-local. Unparseable → null (drifts to SKIP 年龄未知,
- * never toward kill).
+ * Process start time from whatever the snapshot handed us. Three REAL formats
+ * reach this parser (review 05421c05 P1-1: the old DMTF-only fixture shipped a
+ * scan that could never produce a candidate on the primary deployment OS):
+ *  1. Windows PowerShell 5.1 ConvertTo-Json (the System32 powershell.exe this
+ *     scanner always spawns): "/Date(1794217736983)/" — epoch ms. FIRST priority;
+ *     optional backslashes survive double-escaping, the optional ±HHMM suffix is
+ *     serialization metadata (the number is already UTC epoch ms).
+ *  2. PS 7+ (pwsh) ConvertTo-Json: ISO-8601, e.g. "2026-11-09T22:50:53.745805+08:00".
+ *  3. Raw DMTF from CIM: "20261109080000.123456+480" — components are
+ *     machine-local, trailing offset is MINUTES from UTC (1-3 digits; UTC+8 = +480).
+ * Unparseable → null (drifts to SKIP 年龄未知, never toward kill).
+ * DMTF 小数秒截断使年龄偏大 ≤1 秒（review P3-5，方向安全不修：对持有判定的影响在噪声以下）。
  */
-export function parseDmtfDate(raw: string | null | undefined): number | null {
+export function parseProcessStartTime(raw: string | null | undefined): number | null {
 	if (!raw) return null;
-	const m = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/.exec(raw.trim());
+	const text = raw.trim();
+	// 1. PS 5.1 /Date(epochMs)/
+	const dotNet = /\\?\/Date\((-?\d+)(?:[+-]\d{4})?\)\\?\//.exec(text);
+	if (dotNet) {
+		const ms = Number(dotNet[1]);
+		return Number.isFinite(ms) ? ms : null;
+	}
+	// 2. ISO-8601 (PS7)
+	if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:/.test(text)) {
+		const ms = Date.parse(text);
+		return Number.isFinite(ms) ? ms : null;
+	}
+	// 3. DMTF compact
+	const m = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/.exec(text);
 	if (!m) return null;
-	const off = /([+-])(\d{1,3})\s*$/.exec(raw);
+	const off = /([+-])(\d{1,3})\s*$/.exec(text);
 	const offMin = off ? (off[1] === "-" ? -1 : 1) * Number(off[2]) : 0;
 	const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6])) - offMin * 60_000;
 	return Number.isFinite(ms) ? ms : null;
@@ -191,7 +228,7 @@ export function parseWin32CimProcessList(jsonText: string): ProcessRecord[] {
 			ppid: Number.isInteger(ppid) && ppid > 0 ? ppid : null,
 			command_line: typeof r.CommandLine === "string" ? r.CommandLine : "",
 			exe_path: typeof r.ExecutablePath === "string" && r.ExecutablePath ? r.ExecutablePath : null,
-			started_at_ms: parseDmtfDate(typeof r.CreationDate === "string" ? r.CreationDate : null),
+			started_at_ms: parseProcessStartTime(typeof r.CreationDate === "string" ? r.CreationDate : null),
 		});
 	}
 	return out;
@@ -374,28 +411,48 @@ export interface ProcessContract {
 	registered_at: string;
 }
 
-function readContracts(path: string | undefined): ProcessContract[] {
-	if (!path || !existsSync(path)) return [];
+interface ContractLedger {
+	entries: ProcessContract[];
+	/** Ledger exists but is unreadable (half-written on crash / corrupt JSON) —
+	 * every caller must degrade LOUDLY, not silently lose the hold-check
+	 * (review 05421c05 P2-4). */
+	corrupted: boolean;
+}
+
+function readContracts(path: string | undefined): ContractLedger {
+	if (!path || !existsSync(path)) return { entries: [], corrupted: false };
 	try {
 		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-		if (!Array.isArray(parsed)) return [];
-		return parsed.filter((e): e is ProcessContract =>
-			!!e && typeof e === "object" && typeof (e as ProcessContract).pid === "number");
-	} catch {
-		return [];
+		if (!Array.isArray(parsed)) return { entries: [], corrupted: true };
+		return {
+			entries: parsed.filter((e): e is ProcessContract =>
+				!!e && typeof e === "object" && typeof (e as ProcessContract).pid === "number"),
+			corrupted: false,
+		};
+	} catch (err) {
+		console.error("[process-hygiene] contract ledger unreadable (hold-check degraded):", err instanceof Error ? err.message : String(err));
+		return { entries: [], corrupted: true };
 	}
 }
 
+/** tmp+rename so a crash mid-write cannot corrupt the ledger into silent
+ * protection loss (review 05421c05 P2-4). Same-directory rename is atomic on
+ * POSIX; Node's rename over an existing file maps to MoveFileEx(REPLACE_EXISTING) on Windows. */
 function writeContracts(path: string, entries: ProcessContract[]): void {
-	mkdirSync(join(path, ".."), { recursive: true });
-	writeFileSync(path, `${JSON.stringify(entries, null, "\t")}\n`, "utf8");
+	mkdirSync(dirname(path), { recursive: true });
+	const tmp = `${path}.tmp`;
+	writeFileSync(tmp, `${JSON.stringify(entries, null, "\t")}\n`, "utf8");
+	renameSync(tmp, path);
 }
 
 // ── Kill tickets ─────────────────────────────────────────────────────────────
 
 interface KillTicket {
 	token: string;
-	pids: number[];
+	/** Scan-time identity anchors, per candidate PID (review 05421c05 P2-1:
+	 * tickets that only lock PIDs can be hijacked by PID reuse inside the TTL).
+	 * A kill re-judge must match BOTH the holds AND this identity. */
+	anchors: Map<number, { exe_path: string | null; started_at_ms: number | null }>;
 	pattern: string;
 	min_age_min: number;
 	created_at: number;
@@ -436,11 +493,15 @@ const KILL_PRIMITIVE =
 /** The exemption: an explicit by-PID taskkill (no /im, no /t) is a targeted kill. */
 const TASKKILL_BY_PID_EXEMPT = /\btaskkill\s+\/pid\s+\d+(?:\s+\/f)?\b/gi;
 
-/** By-name batch killers refused on the command line alone (line-scoped; flag order tolerated). */
+/** By-name/pipeline batch killers refused on the command line alone (line-scoped;
+ * flag order tolerated; review 05421c05 P2-3 added bare pkill, piped
+ * Stop-Process, and the `| % { $_.Kill() }` loop — all incident-class shapes). */
 const BY_NAME_KILLERS: Array<[RegExp, string]> = [
 	[/\bkillall\b/i, "killall（按进程名批量杀）"],
-	[/\bpkill\s+-f\b/i, "pkill -f（按命令行模式批量杀）"],
+	[/\bpkill\b/i, "pkill（按模式批量杀）"],
 	[/\bStop-Process\b[^|\r\n;]*-\s*Name\b/i, "Stop-Process -Name（按进程名批量杀）"],
+	[/\|\s*Stop-Process\b/i, "管道 Stop-Process（Get-Process | Stop-Process 批量杀）"],
+	[/\$(?:_|PSItem)\s*\.\s*Kill\s*\(/i, "管道 .Kill()（| % { $_.Kill() } 循环杀）"],
 	[/\btaskkill\b[^|\r\n;]*\/im\b/i, "taskkill /im（按进程名杀）"],
 	[/\btaskkill\b[^|\r\n;]*\/t(?:\s|$)/i, "taskkill /t（树杀，连带子进程）"],
 ];
@@ -449,7 +510,7 @@ function dangerousKillReason(hits: string[]): string {
 	return `命令/脚本命中危险清理模式（${[...new Set(hits)].join("、")}）。`
 		+ "2026-11-10 盒子事故：kill_pw_chrome.ps1 按 ms-playwright 前缀 foreach .Kill() 无差别杀浏览器，把正在运行的 spay 登录任务连杀两次（49s/62s）——手写批量清理脚本不再放行。"
 		+ "请改用内置两段式：先 manage_process(action=\"scan\") 做四道持有判定（调试通道/父进程/年龄/契约）并返回 ticket，再凭 ticket 用 manage_process(action=\"kill_pid\", ticket=…, pid=…) 定点结束。"
-		+ "显式 taskkill /pid <n>（无 /im、无 /t）按 PID 定点杀，不在拦截范围。";
+		+ "显式 taskkill /pid <n>（无 /im、无 /t）按 PID 定点杀，不在拦截范围；如是只读排查（并非要杀进程），请让管理员改用 taskkill /pid 定点或把脚本改为纯查询输出。";
 }
 
 /**
@@ -478,46 +539,71 @@ export function detectDangerousKill(text: string): string | null {
 }
 
 /**
- * Script-file candidates referenced by a command line (quoted or bare tokens
- * ending in a script extension). Content of these files is what the gate scans
- * — the 2026-11-10 incident travelled as `powershell -File kill_pw_chrome.ps1`,
- * invisible on the command line itself.
+ * Script-file candidates referenced by a command line (double- or single-quoted
+ * or bare tokens ending in a run_script script extension). Content of these
+ * files is what the gate scans — the 2026-11-10 incident travelled as
+ * `powershell -File kill_pw_chrome.ps1`, invisible on the command line itself.
+ *
+ * The extension list is run-script.ts's SCRIPT_EXTENSIONS verbatim (review
+ * 05421c05 P2-3: a runtime run_script accepts is a runtime the gate must scan;
+ * the old inline ps1|sh|py|cmd|bat list let .js/.mjs/.cjs killers run). The
+ * bare-token branch carries a lookahead so `params.json` is never read as a
+ * `.js` script (review P3-1: quoted-with-spaces paths, single-quoted ones too).
  */
+const SCRIPT_PATH_RE = (() => {
+	const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const ext = SCRIPT_EXTENSIONS.map(esc).join("|");
+	return new RegExp(`"([^"]+(?:${ext}))"|'([^']+(?:${ext}))'|(\\S+(?:${ext}))(?=\\s|$)`, "gi");
+})();
+
 export function extractScriptPaths(command: string): string[] {
 	const out: string[] = [];
-	const re = /"([^"]+\.(?:ps1|sh|py|cmd|bat))"|(\S+\.(?:ps1|sh|py|cmd|bat))/gi;
-	for (const m of (command ?? "").matchAll(re)) out.push(m[1] ?? m[2]);
+	for (const m of (command ?? "").matchAll(SCRIPT_PATH_RE)) out.push(m[1] ?? m[2] ?? m[3]);
 	return out;
 }
 
-function readScriptForGate(path: string, workingDir: string, readFile?: (p: string) => string | null): string | null {
+function readScriptForGate(
+	path: string,
+	workingDir: string,
+	readFile?: (p: string) => string | null,
+	onUnreadable?: (resolvedPath: string) => void,
+): string | null {
 	// isAbsolute follows the RUNNING platform: a Windows-style path on macOS
 	// (where tests run) is not absolute, so with no workingDir we pass the raw
 	// path through and let the reader decide (a real-fs miss → null → skip).
 	const abs = isAbsolute(path) ? path : workingDir ? join(workingDir, path) : path;
-	if (readFile) return readFile(abs);
+	if (readFile) {
+		const content = readFile(abs);
+		if (content === null) onUnreadable?.(abs);
+		return content;
+	}
 	try {
 		// Detection needs the head of the file, not the whole thing.
 		return readFileSync(abs, "utf8").slice(0, 1_000_000);
 	} catch {
-		return null; // unreadable/missing → skip content scan (宁漏勿误伤)
+		// Unreadable/missing scripts are logged by the caller (audit), then
+		// skipped — 宁漏勿误伤, but never silently (gate-silence lesson).
+		onUnreadable?.(abs);
+		return null;
 	}
 }
 
 /**
  * The gate itself: command text + every referenced script file's content.
- * Returns the refusal reason or null. Synchronous — runs inside
- * executeCommand before any authorization, role-independent.
+ * Returns the refusal reason or null. Synchronous; runs inside executeCommand
+ * after the role gate (review P3-2) and before the whitelist/authorization.
+ * `onUnreadable` observes script files that could not be read for the content
+ * scan (review P3-1: silent skips are invisible coverage gaps).
  */
 export function gateDangerousKillForCommand(
 	command: string,
-	opts: { workingDir?: string; readFile?: (p: string) => string | null } = {},
+	opts: { workingDir?: string; readFile?: (p: string) => string | null; onUnreadable?: (resolvedPath: string) => void } = {},
 ): string | null {
 	const reason = detectDangerousKill(command);
 	if (reason) return reason;
 	const workingDir = (opts.workingDir ?? "").trim();
 	for (const path of extractScriptPaths(command)) {
-		const content = readScriptForGate(path, workingDir, opts.readFile);
+		const content = readScriptForGate(path, workingDir, opts.readFile, opts.onUnreadable);
 		if (content === null) continue;
 		const contentReason = detectDangerousKill(content);
 		if (contentReason) return `${contentReason}\n（检出位置：脚本文件 ${path}）`;
@@ -538,13 +624,15 @@ export interface ProcessHygieneParams {
 	killConditions?: string;
 }
 
-/** Context injected by the manage_process dispatch (audit identity). */
+/** Context injected by the manage_process dispatch (audit identity; platform
+ * steers the POSIX vs win32 parent-alive semantics — review 05421c05 P2-2). */
 export interface HygieneInject {
 	scanner?: ProcessScanner;
 	now?: () => number;
 	kill?: KillOps;
 	actorId?: string;
 	channel?: string;
+	platform?: string;
 }
 
 export interface HygieneResult {
@@ -583,15 +671,23 @@ async function scanAction(deps: ShellToolDeps, params: ProcessHygieneParams, inj
 	try {
 		records = await scanSnapshot(inject);
 	} catch (err) {
+		// Scan failures are audited, never silent (review 05421c05 P3-3).
+		audit(deps.auditLogPath, { event: "hygiene_scan", actor: maskId(inject.actorId ?? ""), channel: inject.channel ?? "", ok: false, error: truncate(String(err instanceof Error ? err.message : err), 200) });
 		return refuse(`进程扫描失败：${err instanceof Error ? err.message : String(err)}`);
 	}
 
-	const contracts = readContracts(deps.processContractsPath);
-	const registered = new Set(contracts.map((c) => c.pid));
+	const platform = inject.platform ?? process.platform;
+	const ledger = readContracts(deps.processContractsPath);
+	if (ledger.corrupted) {
+		// The hold-check just lost its fourth leg: warn in-band AND in the audit
+		// log, never silently (review 05421c05 P2-4).
+		audit(deps.auditLogPath, { event: "hygiene_contracts_corrupt", actor: maskId(inject.actorId ?? ""), path: deps.processContractsPath ?? "" });
+	}
+	const registered = new Set(ledger.entries.map((c) => c.pid));
 	const matched = records.filter((r) => matchesPattern(pattern, r));
 	const rows: ScanRow[] = matched.map((r) => {
 		const debug_channel = hasDebugChannel(r.command_line);
-		const parent_alive = r.ppid !== null && r.ppid > 0 && records.some((other) => other.pid === r.ppid);
+		const parent_alive = parentAliveOn(platform, r, records);
 		const age_min = r.started_at_ms === null ? null : (nowMs - r.started_at_ms) / 60_000;
 		const contract_registered = registered.has(r.pid);
 		const v = verdictFor({ debug_channel, parent_alive, age_min, contract_registered, min_age_min: minAge });
@@ -601,14 +697,19 @@ async function scanAction(deps: ShellToolDeps, params: ProcessHygieneParams, inj
 
 	audit(deps.auditLogPath, {
 		event: "hygiene_scan", actor: maskId(inject.actorId ?? ""), channel: inject.channel ?? "",
-		pattern, min_age_min: minAge, matched: rows.length, candidates: candidates.length,
+		ok: true, pattern, min_age_min: minAge, matched: rows.length, candidates: candidates.length,
 	});
 
-	const header = `scan（pattern=${pattern}，minAgeMin=${minAge}）：匹配 ${rows.length} 个进程，候选 ${candidates.length} 个。`;
+	// Corruption warning rides FIRST so it cannot be cut off by long tables
+	// (review 05421c05 P2-4).
+	const corruptNote = ledger.corrupted
+		? "⚠️ 契约台账损坏（process-contracts.json 无法解析）：本轮「契约在册」判据失效，结果可能把在册任务误判为候选；请人工检查该文件后重试。\n"
+		: "";
+	const header = `${corruptNote}scan（pattern=${pattern}，minAgeMin=${minAge}）：匹配 ${rows.length} 个进程，候选 ${candidates.length} 个。`;
 	if (!rows.length) {
 		return {
 			content: [{ type: "text", text: `${header}\n没有匹配的进程，没有需要清理的目标。` }],
-			details: { pattern, min_age_min: minAge, matched: 0, candidate_count: 0, rows: [], ticket: null, expires_at: null },
+			details: { pattern, min_age_min: minAge, matched: 0, candidate_count: 0, rows: [], ticket: null, expires_at: null, contracts_corrupted: ledger.corrupted },
 		};
 	}
 
@@ -629,7 +730,9 @@ async function scanAction(deps: ShellToolDeps, params: ProcessHygieneParams, inj
 		sweepTickets(store, nowMs);
 		ticket = {
 			token: randomUUID(),
-			pids: candidates.map((c) => c.pid),
+			// Identity anchors (review 05421c05 P2-1): a PID alone is re-usable
+			// inside the TTL; the kill re-judge must see the SAME process.
+			anchors: new Map(candidates.map((c) => [c.pid, { exe_path: c.exe_path, started_at_ms: c.started_at_ms }])),
 			pattern,
 			min_age_min: minAge,
 			created_at: nowMs,
@@ -637,15 +740,16 @@ async function scanAction(deps: ShellToolDeps, params: ProcessHygieneParams, inj
 		};
 		store.set(ticket.token, ticket);
 		expires_at = ticket.expires_at;
-		ticketText = `\n\nticket=${ticket.token}（10 分钟内有效；覆盖候选 PID：${ticket.pids.join(", ")}）`
-			+ `\n下一步：manage_process(action="kill_pid", ticket="${ticket.token}", pid=<PID>) 逐个定点结束；kill 前会重新判定（调试通道/父进程/契约），状态已变化会被拒绝并要求重新 scan。`;
+		const candidatePids = [...ticket.anchors.keys()];
+		ticketText = `\n\nticket=${ticket.token}（10 分钟内有效；覆盖候选 PID：${candidatePids.join(", ")}）`
+			+ `\n下一步：manage_process(action="kill_pid", ticket="${ticket.token}", pid=<PID>) 逐个定点结束；kill 前会重新判定（身份锚点/调试通道/父进程/契约），状态已变化会被拒绝并要求重新 scan。`;
 	} else {
 		ticketText = "\n没有可清理的候选——全部被持有判定挡下（都可能有主）。不要手写脚本强杀；如确属残留，等它超过 minAgeMin 后重新 scan。";
 	}
 
 	return {
 		content: [{ type: "text", text: `${header}\n${shown.map(render).join("\n")}${overflowNote}${ticketText}` }],
-		details: { pattern, min_age_min: minAge, matched: rows.length, candidate_count: candidates.length, rows, ticket: ticket?.token ?? null, expires_at },
+		details: { pattern, min_age_min: minAge, matched: rows.length, candidate_count: candidates.length, rows, ticket: ticket?.token ?? null, expires_at, contracts_corrupted: ledger.corrupted },
 	};
 }
 
@@ -661,8 +765,10 @@ async function killPidAction(deps: ShellToolDeps, params: ProcessHygieneParams, 
 	const ticket = store.get(token);
 	if (!ticket) return refuse("ticket 不存在或已过期，请重新 scan 获取新 ticket。");
 
-	if (!ticket.pids.includes(pid as number)) {
-		return refuse(`pid=${pid} 不在该 ticket 名单内（名单：${ticket.pids.join(", ")}）。请重新 scan 后按新票操作。`);
+	const anchor = ticket.anchors.get(pid as number);
+	if (!anchor) {
+		const known = [...ticket.anchors.keys()];
+		return refuse(`pid=${pid} 不在该 ticket 名单内（名单：${known.join(", ")}）。请重新 scan 后按新票操作。`);
 	}
 
 	// TOCTOU re-judge: the scan verdict is minutes old; the ONLY authoritative
@@ -671,19 +777,42 @@ async function killPidAction(deps: ShellToolDeps, params: ProcessHygieneParams, 
 	try {
 		records = await scanSnapshot(inject);
 	} catch (err) {
+		// Scan failures are audited, never silent (review 05421c05 P3-3).
+		audit(deps.auditLogPath, { event: "hygiene_kill_pid", actor: maskId(inject.actorId ?? ""), channel: inject.channel ?? "", pid, ok: false, error: truncate(String(err instanceof Error ? err.message : err), 200) });
 		return refuse(`kill 前重新扫描失败：${err instanceof Error ? err.message : String(err)}`);
 	}
 	const target = records.find((r) => r.pid === pid);
 	if (!target) {
+		// Honest no-op — still audited so kill attempts are fully traceable
+		// (review 05421c05 P3-3).
+		audit(deps.auditLogPath, { event: "hygiene_kill_pid", actor: maskId(inject.actorId ?? ""), channel: inject.channel ?? "", pid, ok: true, already_gone: true });
 		return {
 			content: [{ type: "text", text: `PID ${pid} 已退出（scan 后自行结束），无需处理。` }],
 			details: { pid, already_gone: true, ok: true },
 		};
 	}
 	const changed: string[] = [];
+	// Identity anchor (review 05421c05 P2-1): a reused PID inside the TTL must
+	// never inherit the ticket — same pid, different process = refuse.
+	const sameStart = anchor.started_at_ms === null || target.started_at_ms === null || anchor.started_at_ms === target.started_at_ms;
+	const sameExe = anchor.exe_path === null || target.exe_path === null
+		|| target.exe_path === anchor.exe_path
+		|| target.exe_path.startsWith(anchor.exe_path)
+		|| anchor.exe_path.startsWith(target.exe_path);
+	if (!sameStart || !sameExe) {
+		audit(deps.auditLogPath, { event: "hygiene_kill_pid", actor: maskId(inject.actorId ?? ""), channel: inject.channel ?? "", pid, ok: false, identity_mismatch: true });
+		return refuse(`PID ${pid} 身份不符（疑似 PID 复用）：scan 时锚点 exe=${anchor.exe_path ?? "?"} started=${anchor.started_at_ms ?? "?"}，当前是 exe=${target.exe_path ?? "?"} started=${target.started_at_ms ?? "?"}。拒绝杀；请重新 scan 获取反映当前进程的新 ticket。`);
+	}
 	if (hasDebugChannel(target.command_line)) changed.push("调试通道占用中（driver 在连）");
-	if (target.ppid !== null && target.ppid > 0 && records.some((other) => other.pid === target.ppid)) changed.push("父进程存活（driver/宿主在跑）");
-	if (readContracts(deps.processContractsPath).some((c) => c.pid === pid)) changed.push("契约登记在册");
+	if (parentAliveOn(inject.platform ?? process.platform, target, records)) changed.push("父进程存活（driver/宿主在跑）");
+	const ledger = readContracts(deps.processContractsPath);
+	if (ledger.corrupted) {
+		// The ledger is the authority on "registered"; unreadable = unknown hold
+		// state = refuse rather than guess (review 05421c05 P2-4).
+		audit(deps.auditLogPath, { event: "hygiene_contracts_corrupt", actor: maskId(inject.actorId ?? ""), path: deps.processContractsPath ?? "" });
+		return refuse(`契约台账损坏（${deps.processContractsPath} 无法解析），无法确认该 pid 是否登记在册；kill 拒绝。请人工修复台账后重新 scan。`);
+	}
+	if (ledger.entries.some((c) => c.pid === pid)) changed.push("契约登记在册");
 	if (changed.length) {
 		return refuse(`PID ${pid} 状态已变化（${changed.join("；")}），不能杀。请重新 scan 获取反映当前状态的新 ticket。`);
 	}
@@ -728,8 +857,15 @@ function registerContractAction(deps: ShellToolDeps, params: ProcessHygieneParam
 	const conditions = (params.killConditions ?? "").trim();
 	if (conditions.length > 500) return refuse("killConditions 最长 500 字符。");
 	if (!deps.processContractsPath) return refuse("契约文件路径未配置（profile 目录缺失），无法登记。");
+	// 陈旧契约+PID 复用（review 05421c05 P3-4，方向安全不修）：pid 键模型下，无关新进程
+	// 可能继承旧免杀保护、remove 按 pid 盲注销——保护性偏置（多放不杀少），自洽不升级。
 
-	const entries = readContracts(deps.processContractsPath);
+	const ledger = readContracts(deps.processContractsPath);
+	if (ledger.corrupted) {
+		audit(deps.auditLogPath, { event: "hygiene_contracts_corrupt", actor: maskId(inject.actorId ?? ""), path: deps.processContractsPath });
+		return refuse(`契约台账损坏（${deps.processContractsPath} 无法解析），拒绝在未知状态的台账上追加；请人工修复后重试。`);
+	}
+	const entries = ledger.entries;
 	if (entries.some((c) => c.pid === pid)) {
 		return refuse(`pid=${pid} 已有登记。先 remove_contract(pid=${pid}) 注销旧的，再重新登记。`);
 	}
@@ -749,19 +885,26 @@ function registerContractAction(deps: ShellToolDeps, params: ProcessHygieneParam
 }
 
 function listContractsAction(deps: ShellToolDeps): HygieneResult {
-	const entries = readContracts(deps.processContractsPath);
-	const text = entries.length
+	const ledger = readContracts(deps.processContractsPath);
+	const corruptNote = ledger.corrupted ? "⚠️ 契约台账损坏，以下列表可能不完整；请人工检查 process-contracts.json。\n" : "";
+	const entries = ledger.entries;
+	const text = corruptNote + (entries.length
 		? `契约登记 ${entries.length} 条：\n${entries.map((c) =>
 			`PID ${c.pid}｜${c.purpose}${c.expected_minutes !== null ? `｜预期 ${c.expected_minutes} 分钟` : ""}${c.kill_conditions ? `｜可终止条件：${c.kill_conditions}` : ""}｜登记于 ${c.registered_at}`).join("\n")}`
-		: "没有登记的契约。";
-	return { content: [{ type: "text", text }], details: { contracts: entries } };
+		: "没有登记的契约。");
+	return { content: [{ type: "text", text }], details: { contracts: entries, contracts_corrupted: ledger.corrupted } };
 }
 
 function removeContractAction(deps: ShellToolDeps, params: ProcessHygieneParams, inject: HygieneInject): HygieneResult | AdminRefusal {
 	const pid = params.pid;
 	if (!Number.isInteger(pid) || (pid as number) < 1) return refuse("remove_contract 需要 pid（正整数）。");
 	if (!deps.processContractsPath) return refuse("契约文件路径未配置（profile 目录缺失），无法注销。");
-	const entries = readContracts(deps.processContractsPath);
+	const ledger = readContracts(deps.processContractsPath);
+	if (ledger.corrupted) {
+		audit(deps.auditLogPath, { event: "hygiene_contracts_corrupt", actor: maskId(inject.actorId ?? ""), path: deps.processContractsPath });
+		return refuse(`契约台账损坏（${deps.processContractsPath} 无法解析），拒绝按 pid 盲注销（可能误删其他任务的登记）；请人工修复后重试。`);
+	}
+	const entries = ledger.entries;
 	const remaining = entries.filter((c) => c.pid !== pid);
 	if (remaining.length === entries.length) {
 		return { content: [{ type: "text", text: `没有 pid=${pid} 的登记。` }], details: { pid, removed: false, total: entries.length } };

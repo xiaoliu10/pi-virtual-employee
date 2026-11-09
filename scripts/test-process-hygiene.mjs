@@ -37,9 +37,11 @@ await build({
 		contents: `
 			export { ConfigStore } from "./src/db/config-store.ts";
 			export { createRunCommandTool, createManageProcessTool, disposeShellCommands } from "./src/engine/tools/shell.ts";
+			export { guardTool } from "./src/engine/definition.ts";
+			export { SCRIPT_EXTENSIONS } from "./src/engine/tools/run-script.ts";
 			export {
 				verdictFor, detectDangerousKill, matchesPattern, hasDebugChannel, processNameOf,
-				parseDmtfDate, parseWin32CimProcessList, scanLinuxProcesses,
+				parseProcessStartTime, parseWin32CimProcessList, scanLinuxProcesses, parentAliveOn,
 				handleProcessHygieneAction, gateDangerousKillForCommand, extractScriptPaths,
 				TICKET_TTL_MS,
 			} from "./src/engine/tools/process-hygiene.ts";
@@ -55,8 +57,9 @@ await build({
 });
 const {
 	ConfigStore, createRunCommandTool, createManageProcessTool, disposeShellCommands,
+	guardTool, SCRIPT_EXTENSIONS,
 	verdictFor, detectDangerousKill, matchesPattern, hasDebugChannel, processNameOf,
-	parseDmtfDate, parseWin32CimProcessList, scanLinuxProcesses,
+	parseProcessStartTime, parseWin32CimProcessList, scanLinuxProcesses, parentAliveOn,
 	handleProcessHygieneAction, gateDangerousKillForCommand, extractScriptPaths,
 	TICKET_TTL_MS,
 } = await import(pathToFileURL(join(workDir, "hygiene.mjs")).href);
@@ -162,8 +165,13 @@ test("detectDangerousKill: chrome-headless-shell + Stop-Process is refused", () 
 test("detectDangerousKill: by-name killers refused without any marker", () => {
 	for (const cmd of [
 		"killall chrome",
+		"pkill chrome",
+		"pkill -9 chrome",
 		"pkill -f ms-playwright",
 		"powershell -Command \"Stop-Process -Name chrome\"",
+		"Get-Process chrome | Stop-Process",
+		"Get-Process chrome | % { $_.Kill() }",
+		"Get-Process chrome | ForEach-Object { $PSItem.Kill() }",
 		"taskkill /im chrome.exe",
 		"taskkill /F /IM chrome.exe",
 		"taskkill /pid 5 /t",
@@ -172,6 +180,29 @@ test("detectDangerousKill: by-name killers refused without any marker", () => {
 		assert.ok(reason, `expected refusal for: ${cmd}`);
 		assert.match(reason, /scan/);
 	}
+});
+
+test("detectDangerousKill: refusal text carries the read-only-diagnostic guidance (P2-3 误伤面声明式取舍)", () => {
+	const reason = detectDangerousKill("dir ms-playwright && schtasks /query | findstr taskkill");
+	assert.ok(reason, "read-only diagnostics mentioning a killer stay blocked (precision-first)");
+	assert.match(reason, /只读排查/);
+	assert.match(reason, /taskkill \/pid/);
+});
+
+test("extractScriptPaths covers every run_script runtime incl. .js/.mjs/.cjs, and never mistakes .json (P2-3)", () => {
+	for (const ext of SCRIPT_EXTENSIONS) {
+		assert.ok(extractScriptPaths(`run f${ext}`).includes(`f${ext}`), `bare token f${ext} must be found`);
+		assert.deepEqual(extractScriptPaths(`run "dir with spaces/f${ext}"`), [`dir with spaces/f${ext}`], `quoted f${ext} must be found`);
+	}
+	assert.deepEqual(extractScriptPaths("python job.py --params-file p.json").filter((p) => p.endsWith(".json")), [], "params.json must NOT be read as a .js script");
+});
+
+test("extractScriptPaths supports single-quoted paths (P3-1)", () => {
+	assert.deepEqual(extractScriptPaths("bash '/tmp/a b/killer.sh'"), ["/tmp/a b/killer.sh"]);
+	const reason = gateDangerousKillForCommand("bash '/tmp/a b/killer.sh'", {
+		readFile: (p) => (p === "/tmp/a b/killer.sh" ? "killall chrome\n" : null),
+	});
+	assert.ok(reason, "single-quoted script content must be scanned, not silently skipped");
 });
 
 test("detectDangerousKill: explicit taskkill /pid <n> (no /im, no /t) is exempt", () => {
@@ -237,35 +268,52 @@ test("gate resolves relative script paths against workingDir", () => {
 
 // ── Windows parse fixtures ───────────────────────────────────────────────────
 
-test("parseDmtfDate: DMTF with offset → epoch ms", () => {
-	const ms = parseDmtfDate("20261109080000.123456+480");
+test("parseProcessStartTime: PS 5.1 /Date(epochMs)/ is FIRST priority (the System32 powershell reality)", () => {
+	assert.equal(parseProcessStartTime("/Date(1794217736983)/"), 1794217736983);
+	assert.equal(parseProcessStartTime("\\/Date(1794217736983)\\/"), 1794217736983, "double-escaped JSON survives");
+	assert.equal(parseProcessStartTime("/Date(1794217736983+0800)/"), 1794217736983, "serialization offset is metadata; the number is already epoch ms");
+});
+
+const ISO_EXPECTED = Date.UTC(2026, 10, 9, 22, 50, 53, 745) - 8 * 3600_000;
+test("parseProcessStartTime: PS7 ISO-8601 → epoch ms", () => {
+	assert.equal(parseProcessStartTime("2026-11-09T22:50:53.745805+08:00"), ISO_EXPECTED);
+	assert.equal(parseProcessStartTime("2026-11-09T14:50:53.745Z"), Date.UTC(2026, 10, 9, 14, 50, 53, 745));
+});
+
+test("parseProcessStartTime: DMTF compact with offset → epoch ms", () => {
+	const ms = parseProcessStartTime("20261109080000.123456+480");
 	assert.equal(ms, Date.UTC(2026, 10, 9, 8, 0, 0) - 480 * MINUTE);
-	const neg = parseDmtfDate("20261109030000.000000-300");
+	const neg = parseProcessStartTime("20261109030000.000000-300");
 	assert.equal(neg, Date.UTC(2026, 10, 9, 3, 0, 0) + 300 * MINUTE);
 });
 
-test("parseDmtfDate: garbage → null (drifts to 年龄未知 SKIP, never toward kill)", () => {
-	assert.equal(parseDmtfDate(null), null);
-	assert.equal(parseDmtfDate(""), null);
-	assert.equal(parseDmtfDate("not-a-date"), null);
+test("parseProcessStartTime: garbage → null (drifts to 年龄未知 SKIP, never toward kill)", () => {
+	assert.equal(parseProcessStartTime(null), null);
+	assert.equal(parseProcessStartTime(""), null);
+	assert.equal(parseProcessStartTime("not-a-date"), null);
 });
 
-test("parseWin32CimProcessList: array form, single-object form, empty output", () => {
+test("parseWin32CimProcessList: array form, single-object form, empty output, all three date formats", () => {
 	const arr = JSON.stringify([
-		{ ProcessId: 4242, ParentProcessId: 88, CommandLine: "chrome --remote-debugging-pipe", ExecutablePath: "C:\\x\\ms-playwright\\chrome.exe", CreationDate: "20261109080000.000000+480" },
+		{ ProcessId: 4242, ParentProcessId: 88, CommandLine: "chrome --remote-debugging-pipe", ExecutablePath: "C:\\x\\ms-playwright\\chrome.exe", CreationDate: "\\/Date(1794217736983)\\/" },
 		{ ProcessId: 5, ParentProcessId: 0, CommandLine: null, ExecutablePath: null, CreationDate: "bogus" },
 	]);
 	const rows = parseWin32CimProcessList(arr);
 	assert.equal(rows.length, 2);
 	assert.equal(rows[0].pid, 4242);
 	assert.equal(rows[0].ppid, 88);
-	assert.equal(rows[0].started_at_ms, Date.UTC(2026, 10, 9, 8, 0, 0) - 480 * MINUTE);
+	assert.equal(rows[0].started_at_ms, 1794217736983, "PS 5.1 \/Date()\/ is the primary deployment format");
 	assert.equal(rows[1].ppid, null, "ppid 0 → null");
 	assert.equal(rows[1].command_line, "");
 	assert.equal(rows[1].started_at_ms, null);
 
-	const single = JSON.stringify({ ProcessId: 7, ParentProcessId: 1, CommandLine: "a", ExecutablePath: "b", CreationDate: null });
-	assert.equal(parseWin32CimProcessList(single).length, 1, "ConvertTo-Json unwraps 1-element arrays");
+	const iso = parseWin32CimProcessList(JSON.stringify({ ProcessId: 7, ParentProcessId: 1, CommandLine: "a", ExecutablePath: "b", CreationDate: "2026-11-09T22:50:53.745805+08:00" }));
+	assert.equal(iso.length, 1, "ConvertTo-Json unwraps 1-element arrays");
+	assert.equal(iso[0].started_at_ms, ISO_EXPECTED, "PS7 ISO-8601 parses");
+
+	const dmtf = parseWin32CimProcessList(JSON.stringify({ ProcessId: 9, ParentProcessId: 1, CommandLine: "a", ExecutablePath: "b", CreationDate: "20261109080000.000000+480" }));
+	assert.equal(dmtf[0].started_at_ms, Date.UTC(2026, 10, 9, 8, 0, 0) - 480 * MINUTE, "raw DMTF parses");
+
 	assert.deepEqual(parseWin32CimProcessList("   "), [], "no output → no processes");
 	assert.throws(() => parseWin32CimProcessList("{broken"), "bad JSON must throw (caller refuses honestly)");
 });
@@ -291,16 +339,21 @@ function writeProcProc(pid, opts) {
 
 before(() => {
 	procDir = mkdtempSync(join(tmpdir(), "pve-hygiene-proc-"));
-	// 101: old orphan playwright chrome → CANDIDATE
-	writeProcProc(101, { exe: "/root/.cache/ms-playwright/chrome-123/chrome", cmdline: "chrome --type=renderer", ppid: 9999, ageMin: 35 });
+	// POSIX 孤儿被 init/subreaper 收养（ppid 重挂到 1）——这是 Linux 现实语义
+	// （review 05421c05 P2-2：旧 mock 用 ppid 9999 是把 Windows 语义错编进 Linux 路径）。
+	// 101: old adopted orphan playwright chrome → CANDIDATE (ppid=1 means DEAD parent)
+	writeProcProc(101, { exe: "/root/.cache/ms-playwright/chrome-123/chrome", cmdline: "chrome --type=renderer", ppid: 1, ageMin: 35 });
 	// 102: pipe debug channel → SKIP even though old and parentless
-	writeProcProc(102, { exe: "/root/.cache/ms-playwright/chrome-123/chrome", cmdline: "chrome --remote-debugging-pipe", ppid: 9999, ageMin: 200 });
+	writeProcProc(102, { exe: "/root/.cache/ms-playwright/chrome-123/chrome", cmdline: "chrome --remote-debugging-pipe", ppid: 1, ageMin: 200 });
 	// 103: parent 101 is alive in the snapshot → SKIP
 	writeProcProc(103, { exe: "/root/.cache/ms-playwright/chrome-123/chrome", cmdline: "chrome --type=gpu", ppid: 101, ageMin: 200 });
-	// 104: young process → SKIP 启动仅 N 分钟
-	writeProcProc(104, { exe: "/root/.cache/ms-playwright/chrome-123/chrome", cmdline: "chrome --x", ppid: 9999, ageMin: 2 });
+	// 104: young adopted orphan → SKIP 启动仅 N 分钟
+	writeProcProc(104, { exe: "/root/.cache/ms-playwright/chrome-123/chrome", cmdline: "chrome --x", ppid: 1, ageMin: 2 });
 	// 105: does not match chrome* → filtered out
-	writeProcProc(105, { exe: "/usr/bin/node", cmdline: "node server.js", ppid: 9999, ageMin: 200 });
+	writeProcProc(105, { exe: "/usr/bin/node", cmdline: "node server.js", ppid: 1, ageMin: 200 });
+	// 106: ppid points to a pid ABSENT from the snapshot (subreaper died without
+	// re-parenting visible) → dead parent on every platform → CANDIDATE
+	writeProcProc(106, { exe: "/root/.cache/ms-playwright/chrome-123/chrome", cmdline: "chrome --y", ppid: 9999, ageMin: 40 });
 });
 
 after(() => rm(procDir, { recursive: true, force: true }));
@@ -308,21 +361,43 @@ after(() => rm(procDir, { recursive: true, force: true }));
 test("scanLinuxProcesses: verdicts follow the authority order over a mock /proc", async () => {
 	const records = await scanLinuxProcesses(procDir);
 	const byPid = new Map(records.map((r) => [r.pid, r]));
-	assert.equal(records.filter((r) => matchesPattern("chrome*", r)).length, 4, "node must be filtered by the pattern check");
-	assert.equal(byPid.get(101).ppid, 9999, "ppid parsed from stat field 4 (after the comm paren)");
+	assert.equal(records.filter((r) => matchesPattern("chrome*", r)).length, 5, "node must be filtered by the pattern check");
+	assert.equal(byPid.get(101).ppid, 1, "ppid parsed from stat field 4 (after the comm paren)");
 	assert.ok(byPid.get(101).started_at_ms, "dir mtime used as the start time");
 
+	// The verdict plumbing must use parentAliveOn with the LINUX semantics.
 	const mk = (r) => verdictFor({
 		debug_channel: hasDebugChannel(r.command_line),
-		parent_alive: r.ppid !== null && records.some((o) => o.pid === r.ppid),
+		parent_alive: parentAliveOn("linux", r, records),
 		age_min: r.started_at_ms === null ? null : (Date.now() - r.started_at_ms) / MINUTE,
 		contract_registered: false,
 		min_age_min: 10,
 	});
-	assert.deepEqual(mk(byPid.get(101)).verdict, "CANDIDATE");
+	assert.deepEqual(mk(byPid.get(101)).verdict, "CANDIDATE", "adopted orphan (ppid=1) is NOT a live parent on POSIX");
 	assert.match(mk(byPid.get(102)).reason, /调试通道/, "pipe must be caught (Playwright default)");
 	assert.match(mk(byPid.get(103)).reason, /父进程存活/);
 	assert.match(mk(byPid.get(104)).reason, /启动仅/);
+	assert.deepEqual(mk(byPid.get(106)).verdict, "CANDIDATE", "parent pid absent from the snapshot = dead parent");
+});
+
+test("parentAliveOn: platform split — pid-1 re-parenting is POSIX-only (review P2-2)", () => {
+	const rec = { pid: 10, ppid: 1, command_line: "chrome", exe_path: "/x", started_at_ms: 1 };
+	const snap = [rec]; // pid 1 itself is NOT in the snapshot here
+	assert.equal(parentAliveOn("linux", rec, snap), false, "ppid=1 on Linux = adopted orphan");
+	assert.equal(parentAliveOn("darwin", rec, snap), false);
+	assert.equal(parentAliveOn("win32", { ...rec, ppid: 9999 }, [{ ...rec, pid: 9999 }]), true, "win32 keeps literal PPID semantics");
+});
+
+test("handler-level: Linux orphan ppid=1 comes back as a CANDIDATE with a ticket (probe B2 regression)", async () => {
+	const { deps } = hygieneDeps();
+	const nowMs = 7_000_000;
+	const orphan = { pid: 4242, ppid: 1, command_line: "chrome --type=renderer", exe_path: "/root/.cache/ms-playwright/chrome", started_at_ms: nowMs - 60 * MINUTE };
+	const scan = await handleProcessHygieneAction(deps, { action: "scan" }, { scanner: async () => [orphan], now: () => nowMs, platform: "linux" });
+	const row = scan.details.rows.find((r) => r.pid === 4242);
+	assert.equal(row.verdict, "CANDIDATE", "ppid=1 must NOT read as 父进程存活 on linux");
+	assert.equal(row.parent_alive, false);
+	assert.ok(scan.details.ticket, "the Linux orphan must yield a kill ticket");
+	assert.doesNotMatch(scan.content[0].text, /父进程存活/);
 });
 
 // ── handleProcessHygieneAction: tickets, TOCTOU, contracts ──────────────────
@@ -404,6 +479,123 @@ test("TOCTOU: a contract registered after the scan is refused at kill time", asy
 	} finally {
 		await after();
 	}
+});
+
+
+test("P2-1 PID reuse: a different process behind the same pid is refused (probe B1 regression)", async () => {
+	const { deps } = hygieneDeps();
+	const t0 = 8_000_000;
+	let t = t0;
+	const now = () => t;
+	const chrome = CANDIDATE(4242, t0);
+	const scan = await handleProcessHygieneAction(deps, { action: "scan" }, { scanner: async () => [chrome], now });
+	// PID 4242 got reused by a young orphan mysqldump with no holds — still
+	// INSIDE the ticket TTL (the reuse window, not expiry, is what's under test).
+	const impostor = { pid: 4242, ppid: 1, command_line: "mysqldump --single-transaction", exe_path: "/usr/bin/mysqldump", started_at_ms: t0 + 5 * MINUTE };
+	t = t0 + 6 * MINUTE;
+	const refused = await handleProcessHygieneAction(deps, { action: "kill_pid", ticket: scan.details.ticket, pid: 4242 }, {
+		scanner: async () => [impostor], now,
+		kill: { terminate: async () => { throw new Error("must not reach terminate"); }, escalate: async () => { throw new Error("must not reach escalate"); }, isAlive: async () => false },
+	});
+	assert.equal(refused.details.refused, true, `text: ${refused.content[0].text}`);
+	assert.match(refused.content[0].text, /身份不符|PID 复用/);
+	assert.match(refused.content[0].text, /mysqldump|重新 scan/);
+});
+
+test("P2-1 identity match: the SAME process passes the anchor and kill proceeds (stub ops)", async () => {
+	const { deps } = hygieneDeps();
+	const t0 = 9_000_000;
+	let t = t0;
+	const now = () => t;
+	const chrome = CANDIDATE(4242, t0);
+	const scan = await handleProcessHygieneAction(deps, { action: "scan" }, { scanner: async () => [chrome], now });
+	const calls = [];
+	const killed = await handleProcessHygieneAction(deps, { action: "kill_pid", ticket: scan.details.ticket, pid: 4242 }, {
+		scanner: async () => [{ ...chrome }], now, // identical identity snapshot
+		kill: {
+			terminate: async (pid) => { calls.push(["terminate", pid]); return { ok: true, detail: "已发送" }; },
+			escalate: async (pid) => { calls.push(["escalate", pid]); return { ok: true, detail: "已发送" }; },
+			isAlive: async () => false, // gone right after TERM
+		},
+	});
+	assert.equal(killed.details.ok, true, `text: ${killed.content[0].text}`);
+	assert.equal(killed.details.escalated, false, "identity-matching pid dies on TERM without escalation");
+	assert.deepEqual(calls, [["terminate", 4242]]);
+});
+
+test("P2-4 corrupted ledger: scan warns in the first line, register/kill refuse (probe C1 regression)", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "pve-hygiene-corrupt-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const contractsPath = join(dir, "process-contracts.json");
+	const { deps } = hygieneDeps(contractsPath);
+	const t0 = 10_000_000;
+	const now = () => t0;
+	const scanner = async () => [CANDIDATE(4242, t0)];
+	// Half-written JSON (the crash-while-saving shape).
+	writeFileSync(contractsPath, '[{"pid": 5000, "purpose": "trunc', "utf8");
+
+	const scan = await handleProcessHygieneAction(deps, { action: "scan" }, { scanner, now });
+	assert.equal(scan.details.contracts_corrupted, true);
+	assert.match(scan.content[0].text.split("\n")[0], /契约台账损坏/, "the warning must be the FIRST line");
+	assert.equal(scan.details.candidate_count, 1, "protection degraded but verdicts still flow (with the warning)");
+	assert.ok(scan.details.ticket);
+
+	const reg = await handleProcessHygieneAction(deps, { action: "register_contract", pid: 4242, purpose: "x" }, { now });
+	assert.equal(reg.details.refused, true, "must not append to an unknown-state ledger");
+	assert.match(reg.content[0].text, /损坏/);
+	const rem = await handleProcessHygieneAction(deps, { action: "remove_contract", pid: 5000 }, { now });
+	assert.equal(rem.details.refused, true, "blind remove on a corrupt ledger refused");
+	const list = await handleProcessHygieneAction(deps, { action: "list_contracts" }, { now });
+	assert.match(list.content[0].text, /损坏/);
+});
+
+test("P2-4 corrupted ledger at kill time: contract hold-state unknown → refuse", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "pve-hygiene-corrupt-kill-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const contractsPath = join(dir, "process-contracts.json");
+	const { deps } = hygieneDeps(contractsPath);
+	const t0 = 11_000_000;
+	const now = () => t0;
+	const scanner = async () => [CANDIDATE(4242, t0)];
+	const scan = await handleProcessHygieneAction(deps, { action: "scan" }, { scanner, now });
+	writeFileSync(contractsPath, "not json at all", "utf8");
+	const refused = await handleProcessHygieneAction(deps, { action: "kill_pid", ticket: scan.details.ticket, pid: 4242 }, {
+		scanner, now,
+		kill: { terminate: async () => { throw new Error("must not reach terminate"); }, escalate: async () => ({ ok: true, detail: "" }), isAlive: async () => false },
+	});
+	assert.equal(refused.details.refused, true, `text: ${refused.content[0].text}`);
+	assert.match(refused.content[0].text, /台账损坏/);
+});
+
+test("P2-4 atomic write: no .tmp residue after register (crash-safe rename)", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "pve-hygiene-atomic-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const contractsPath = join(dir, "process-contracts.json");
+	const { deps } = hygieneDeps(contractsPath);
+	const reg = await handleProcessHygieneAction(deps, { action: "register_contract", pid: 4242, purpose: "atomic" }, {});
+	assert.match(reg.content[0].text, /已登记/);
+	assert.ok(existsSync(contractsPath));
+	assert.equal(existsSync(`${contractsPath}.tmp`), false, "tmp file must be renamed away, not left behind");
+});
+
+test("P3-3 audits: already_gone and scan-failure paths leave audit lines (gate-silence lesson)", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "pve-hygiene-audit-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const auditPath = join(dir, "shell-audit.log");
+	const config = new ConfigStore(new DatabaseSync(":memory:"));
+	const deps = {
+		config, resolveActor: () => ({ channel: "dingtalk", chatType: "single", senderId: "test-admin", text: "" }),
+		onConfigChanged: () => {}, conversationId: "test:hygiene-audit", auditLogPath: auditPath,
+	};
+	const t0 = 12_000_000;
+	const now = () => t0;
+	const emptyScan = await handleProcessHygieneAction(deps, { action: "scan" }, { scanner: async () => [CANDIDATE(4242, t0)], now });
+	await handleProcessHygieneAction(deps, { action: "kill_pid", ticket: emptyScan.details.ticket, pid: 4242 }, { scanner: async () => [], now });
+	const failScan = await handleProcessHygieneAction(deps, { action: "scan" }, { scanner: async () => { throw new Error("boom"); }, now });
+	assert.equal(failScan.details.refused, true);
+	const lines = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+	assert.ok(lines.some((l) => l.event === "hygiene_kill_pid" && l.already_gone === true), "vanished-pid kill must be audited");
+	assert.ok(lines.some((l) => l.event === "hygiene_scan" && l.ok === false), "scan failure must be audited");
 });
 
 test("kill_pid: vanished pid is an honest no-op; real kill escalates past a TERM-ignoring child (posix)", { skip: process.platform === "win32" }, async (t) => {
@@ -498,6 +690,123 @@ function toolFixture(contractsPath) {
 	return { db, config, deps, processTool: createManageProcessTool(deps) };
 }
 
+
+test("P1-2 kill_pid needs the message confirmation at EVERY role — operator without 确认 is refused", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pve-hygiene-confirm-"));
+	try {
+		const contractsPath = join(dir, "process-contracts.json");
+		const db = new DatabaseSync(":memory:");
+		db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+		const config = new ConfigStore(db);
+		cleanupConfigs.push({ db, config });
+		config.replaceAll({
+			security: { adminStaffIds: [], people: [{ staffId: "op", role: "operator" }], defaultRole: "viewer" },
+			capabilities: { shell: { enabled: true, allowedCommands: ["node"] } },
+		});
+		let actor = { channel: "dingtalk", chatType: "single", senderId: "op", text: "帮我清理一下残留" };
+		const deps = {
+			config, resolveActor: () => actor, onConfigChanged: () => {},
+			conversationId: "test:hygiene-confirm", processContractsPath: contractsPath,
+		};
+		const processTool = createManageProcessTool(deps);
+		const t0 = 13_000_000;
+		const scanner = async () => [CANDIDATE(4242, t0)];
+
+		// scan is read-only recon: operator needs NO confirmation (P1-2 ruling).
+		// The darwin platform check would refuse AFTER the gates; what matters here
+		// is that the refusal is NOT the confirmation gate.
+		const scan = await processTool.execute("t", { action: "scan" });
+		assert.doesNotMatch(scan.content[0].text, /需要当前消息中明确确认/);
+
+		// NOTE: the confirmation gate runs BEFORE the handler dispatch — the kill
+		// itself is never reached here (and could not run anyway: darwin platform check).
+		const refused = await processTool.execute("t", { action: "kill_pid", ticket: "whatever", pid: 4242 });
+		assert.equal(refused.details.refused, true, `text: ${refused.content[0].text}`);
+		assert.match(refused.content[0].text, /确认/);
+
+		// admin is NOT exempt either (parent ruling): switch the same actor to admin.
+		config.replaceAll({
+			security: { adminStaffIds: ["op"], people: [], defaultRole: "viewer" },
+			capabilities: { shell: { enabled: true, allowedCommands: ["node"] } },
+		});
+		const refusedAdmin = await processTool.execute("t", { action: "kill_pid", ticket: "whatever", pid: 4242 });
+		assert.equal(refusedAdmin.details.refused, true, "admin without 确认 must also be refused");
+		assert.match(refusedAdmin.content[0].text, /任何角色/);
+
+		// With the confirmation in the message, the operator path proceeds past
+		// the gate (and dies honestly on darwin's platform check, NOT on the gate).
+		actor = { ...actor, text: "确认终止这个残留进程" };
+		const platformGate = await processTool.execute("t", { action: "kill_pid", ticket: "whatever", pid: 4242 });
+		assert.doesNotMatch(platformGate.content[0].text, /需要当前消息中明确确认/, "确认 in the message must clear the confirmation gate");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("P1-2 shell.enabled=false: scan/kill_pid refused while list keeps working (session bookkeeping contract)", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pve-hygiene-disabled-"));
+	try {
+		const db = new DatabaseSync(":memory:");
+		db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+		const config = new ConfigStore(db);
+		cleanupConfigs.push({ db, config });
+		config.replaceAll({
+			security: { adminStaffIds: ["test-admin"] },
+			capabilities: { shell: { enabled: false, allowedCommands: ["node"] } },
+		});
+		const deps = {
+			config,
+			resolveActor: () => ({ channel: "dingtalk", chatType: "single", senderId: "test-admin", text: "确认" }),
+			onConfigChanged: () => {}, conversationId: "test:hygiene-disabled",
+		};
+		const processTool = createManageProcessTool(deps);
+		const scan = await processTool.execute("t", { action: "scan" });
+		assert.equal(scan.details.refused, true, `text: ${scan.content[0].text}`);
+		assert.match(scan.content[0].text, /shell\.enabled/);
+		const kill = await processTool.execute("t", { action: "kill_pid", ticket: "x", pid: 1 });
+		assert.equal(kill.details.refused, true);
+		const list = await processTool.execute("t", { action: "list" });
+		assert.doesNotMatch(list.content[0].text, /shell\.enabled/, "list/poll/log/keep must keep their off-switch contract");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("P1-2 guarded(\"shell\"): viewer hits the RBAC gate before anything else (floors live)", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pve-hygiene-rbac-"));
+	try {
+		const db = new DatabaseSync(":memory:");
+		db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+		const config = new ConfigStore(db);
+		cleanupConfigs.push({ db, config });
+		config.replaceAll({
+			security: { adminStaffIds: [], people: [], defaultRole: "viewer" },
+			capabilities: { shell: { enabled: true, allowedCommands: ["node"] } },
+		});
+		const deps = {
+			config,
+			resolveActor: () => ({ channel: "dingtalk", chatType: "single", senderId: "someone", text: "确认" }),
+			onConfigChanged: () => {}, conversationId: "test:hygiene-rbac",
+			processContractsPath: join(dir, "process-contracts.json"),
+		};
+		const guardedTool = guardTool("shell", createManageProcessTool(deps), {
+			config, conversationId: deps.conversationId, resolveActor: deps.resolveActor,
+		});
+		const refused = await guardedTool.execute("t", { action: "register_contract", pid: 4242, purpose: "x" });
+		assert.equal(refused.details.refused, true);
+		assert.match(refused.content[0].text, /权限/, `viewer must see the RBAC refusal: ${refused.content[0].text}`);
+
+		config.replaceAll({
+			security: { adminStaffIds: [], people: [{ staffId: "someone", role: "operator" }], defaultRole: "viewer" },
+			capabilities: { shell: { enabled: true, allowedCommands: ["node"] } },
+		});
+		const ok = await guardedTool.execute("t", { action: "register_contract", pid: 4242, purpose: "x" });
+		assert.match(ok.content[0].text, /已登记/, "operator passes the RBAC floor");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("manage_process accepts the new actions end-to-end (union + dispatch wiring)", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pve-hygiene-wiring-"));
 	try {
@@ -543,6 +852,55 @@ after(() => {
 		try { disposeShellCommands(config); } catch { /* already gone */ }
 		try { db.close(); } catch { /* already closed */ }
 	}
+});
+
+
+test("P3-2 gate ordering: a viewer with a dangerous command sees the ROLE refusal, not the incident narrative", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "pve-hygiene-order-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const scriptPath = join(dir, "kill_pw_chrome.ps1");
+	writeFileSync(scriptPath, INCIDENT_PS1, "utf8");
+	const db = new DatabaseSync(":memory:");
+	db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+	const config = new ConfigStore(db);
+	cleanupConfigs.push({ db, config });
+	config.replaceAll({
+		security: { adminStaffIds: [], people: [], defaultRole: "viewer" },
+		capabilities: { shell: { enabled: true, allowedCommands: ["node"] } },
+	});
+	const deps = {
+		config,
+		resolveActor: () => ({ channel: "dingtalk", chatType: "single", senderId: "whoever", text: "确认" }),
+		onConfigChanged: () => {}, conversationId: "test:hygiene-order",
+	};
+	const refused = await createRunCommandTool(deps).execute("t", { command: `powershell -NoProfile -ExecutionPolicy Bypass -File "${scriptPath}"` });
+	assert.equal(refused.details.refused, true);
+	assert.match(refused.content[0].text, /命令执行权限/, `viewer sees the role refusal: ${refused.content[0].text}`);
+	assert.doesNotMatch(refused.content[0].text, /2026-11-10/, "the incident narrative must NOT leak below the role gate");
+});
+
+test("P3-1 unreadable script files are audited, not silently skipped", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "pve-hygiene-unreadable-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const auditPath = join(dir, "shell-audit.log");
+	const db = new DatabaseSync(":memory:");
+	db.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+	const config = new ConfigStore(db);
+	cleanupConfigs.push({ db, config });
+	config.replaceAll({
+		security: { adminStaffIds: ["test-admin"] },
+		capabilities: { shell: { enabled: true, allowedCommands: ["node"] } },
+	});
+	const deps = {
+		config, auditLogPath: auditPath,
+		resolveActor: () => ({ channel: "dingtalk", chatType: "single", senderId: "test-admin", text: "确认" }),
+		onConfigChanged: () => {}, conversationId: "test:hygiene-unreadable",
+	};
+	// admin + whitelisted node → passes role/enabled/gate → whitelist ok → runs.
+	const result = await createRunCommandTool(deps).execute("t", { command: `node "/nonexistent/killer.js"` });
+	const lines = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+	assert.ok(lines.some((l) => l.event === "hygiene_gate_script_unreadable" && String(l.path).endsWith("killer.js")), `audit lines: ${JSON.stringify(lines.map((l) => l.event))}`);
+	assert.ok(!lines.some((l) => l.event === "hygiene_gate_reject"), "unreadable ≠ dangerous: no rejection");
 });
 
 test("run_command refuses a script file carrying the incident pattern, then a benign command still runs", async (t) => {
