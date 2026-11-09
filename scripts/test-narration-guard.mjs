@@ -322,6 +322,27 @@ test("the field message is an imperative though not task-shaped", () => {
 	assert.equal(looksLikeImperative("你好"), false);
 });
 
+test("review 94189d6f P2: mid-sentence question words are NOT imperatives", () => {
+	// These start like an imperative (帮我/请 + task verb) but ASK for an
+	// explanation — an unanchored question-word probe must reject them, or the
+	// narration guard would nudge a legitimate Q&A answer (one wasted LLM call,
+	// and on the durable side there is no isQuestion second gate).
+	for (const q of [
+		"帮我分析下为什么登录失败",
+		"请解释一下为什么登录失败",
+		"帮我看看怎么回事登录不上",
+		"请告诉我登录入口在哪里",
+		"登录密码是多少",
+		"帮我查一下是什么意思",
+	]) {
+		assert.equal(looksLikeImperative(q), false, `mid-sentence question must not be an imperative: ${q}`);
+	}
+	// Positive control: genuine imperatives still fire.
+	for (const t of ["继续 登录生产后台管理", "帮我登录后台", "请重启服务", "登录后台"]) {
+		assert.equal(looksLikeImperative(t), true, `genuine imperative must fire: ${t}`);
+	}
+});
+
 test("zero-tool short imperative turn: the guard fires for the literal field message", async (t) => {
 	let runs = 0;
 	let noteTool;
@@ -337,4 +358,36 @@ test("zero-tool short imperative turn: the guard fires for the literal field mes
 	assert.equal(result.reply, "登录完成，后台管理已可用。", "the continuation reply replaces the narration");
 	assert.ok(!result.reply.includes(NARRATION_GUARD_NOTICE));
 	assert.equal(runs, 2, "exactly one forced continuation");
+});
+
+
+test("review 94189d6f P3: the guard's continuation keeps the turn's RBAC identity (snapshot restore + cleanup)", async (t) => {
+	let runs = 0;
+	let actorDuringContinuation;
+	let noteTool;
+	const { engine, config } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		if (runs === 2) {
+			// The continuation runs AFTER the turn's finally deleted the turn-scoped
+			// maps — the guard must have re-registered the actor snapshot by now,
+			// or every tool in the continuation degrades to viewer RBAC.
+			actorDuringContinuation = engine.turnActor.get("conv-rbac");
+			noteTool?.();
+		}
+		return textReply(runs === 1 ? NARRATION : "登录完成。");
+	} });
+	noteTool = () => engine.recordToolTelemetry("conv-rbac", { name: "browser", durationMs: 5, ok: true });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-rbac");
+	const result = await engine.send(agent, FIELD_MESSAGE, {
+		actor: { senderId: "u1", senderName: "Jason", channel: "dingtalk", chatType: "single" },
+	});
+	assert.equal(result.reply, "登录完成。");
+	assert.ok(actorDuringContinuation, "turnActor must be live during the continuation");
+	assert.equal(actorDuringContinuation.senderId, "u1", "the continuation keeps the verified sender identity (RBAC does not degrade to viewer)");
+	assert.equal(actorDuringContinuation.text, FIELD_MESSAGE, "the snapshot carries the turn's original text");
+	// No per-conversation state survives the guard (idle processes stay clean).
+	assert.equal(engine.turnActor.size, 0, "turnActor cleaned after the guard");
+	assert.equal(engine.turnActorsSaved.size, 0, "snapshot map cleaned after the guard");
+	assert.equal(engine.turnMemorySaved.size, 0, "memory snapshot cleaned after the guard");
 });

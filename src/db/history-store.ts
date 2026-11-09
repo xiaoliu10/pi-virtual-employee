@@ -10,6 +10,24 @@
 import { randomUUID } from "node:crypto";
 import type { DB } from "./sqlite.js";
 
+/** Review 94189d6f P2: strip the notice segment from a merged reply+notice
+ * row; null when the row IS the notice (caller deletes it). Notices are
+ * synthetic paragraphs appended at the END (the reply and the notice are joined
+ * with a blank line), so split on paragraph breaks and drop the LAST paragraph
+ * when it carries a distinctive fragment — a real reply that merely mentions
+ * the words earlier in the text survives. Returns null only when nothing is
+ * left after stripping. */
+function stripNotice(content: string, noticeRe: RegExp): string | null {
+	const normalized = (text: string) => (text ?? "").replace(/\s+/g, "").trim();
+	if (!noticeRe.test(normalized(content))) return null;
+	const paragraphs = content.split(/\n\s*\n/);
+	while (paragraphs.length > 0 && noticeRe.test(normalized(paragraphs[paragraphs.length - 1]))) {
+		paragraphs.pop();
+	}
+	if (paragraphs.length === 0) return null;
+	return paragraphs.join("\n\n").trim() || null;
+}
+
 export interface ConversationRow {
 	id: string;
 	title: string | null;
@@ -298,12 +316,24 @@ export class HistoryStore {
 		const rows = this.db.prepare("SELECT id, content FROM messages WHERE role = 'assistant'").all() as { id: string; content: string }[];
 		const normalized = (text: string) => (text ?? "").replace(/\s+/g, "").trim();
 		// Same distinctive-fragment rule as the durable import: a reworded notice must
-		// not silently stop being swept.
-		const doomed = rows.filter((row) => /执行已暂停|模型没有返回任何内容|请检查恢复状态|已尝试继续执行但模型没有实际动作/.test(normalized(row.content))).map((row) => row.id);
-		if (doomed.length === 0) return 0;
+		// not silently stop being swept. Review 94189d6f P2: a row that MERGES a real
+		// reply with the notice must lose only the notice segment — deleting the whole
+		// row erased genuine answers from history/UI.
+		const noticeRe = /执行已暂停|模型没有返回任何内容|请检查恢复状态|已尝试继续执行但模型没有实际动作/;
+		let changed = 0;
+		const strip = this.db.prepare("UPDATE messages SET content = ? WHERE id = ?");
 		const del = this.db.prepare("DELETE FROM messages WHERE id = ?");
-		for (const id of doomed) del.run(id);
-		return doomed.length;
+		for (const row of rows) {
+			if (!noticeRe.test(normalized(row.content))) continue;
+			const stripped = stripNotice(row.content, noticeRe);
+			if (stripped === null) {
+				del.run(row.id); // pure notice — delete the row as before
+			} else if (stripped !== row.content) {
+				strip.run(stripped, row.id); // real answer survives, notice segment removed
+			}
+			changed += 1;
+		}
+		return changed;
 	}
 	appendMessageOnce(conversationId: string, role: "user" | "assistant", content: string, id: string): void {
 		this.db.prepare("INSERT OR IGNORE INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)").run(id, conversationId, role, content, Date.now());

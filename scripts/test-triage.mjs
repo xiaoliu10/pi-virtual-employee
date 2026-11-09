@@ -315,13 +315,20 @@ test(`dispatch WIRING: spawns a worker with flag ${JSON.stringify(chatDispatch)}
 }
 
 
-test("a short imperative task routes even when looksLikeTask is false (field 2026-11-09 literal)", () => {
-	const d = triageMessage({ text: "继续 登录生产后台管理", plan: undefined, looksLikeTask: false }, true);
-	assert.equal(d.dispatch, true, "「继续 登录生产后台管理」 is an imperative task, not chat — it used to fall to a foreground narration turn that silently ended");
+// NOTE (review 94189d6f P1 resolution): the production call site (manager.ts)
+// passes looksLikeTask:true for the planless dispatch path BY DESIGN (7457cdd
+// "Router 只路由"): the not-task gate is intentionally bypassed and
+// isQuestion/isSmallTalk are the real gatekeepers. Passing the real detector
+// there REGRESSES dispatch for genuine task messages lacking multi-step
+// evidence (verified: 「跑一下平阳数币今日金额监控」 stops routing). So these tests
+// pin the field message through the shape checks, as production does.
+test("the field message routes via the shape checks (production passes looksLikeTask:true)", () => {
+	const d = triageMessage({ text: "继续 登录生产后台管理", plan: undefined, looksLikeTask: true }, true);
+	assert.equal(d.dispatch, true, "「继续 登录生产后台管理」 is not a question (TASK_VERB_HINT carve-out) and not smalltalk → routed to a Worker");
 });
 
-test("a question-shaped short message with a task verb stays foreground", () => {
-	const d = triageMessage({ text: "登录密码是什么", plan: undefined, looksLikeTask: false }, true);
+test("a question-shaped short message with a task verb stays foreground (isQuestion)", () => {
+	const d = triageMessage({ text: "登录密码是什么", plan: undefined, looksLikeTask: true }, true);
 	assert.equal(d.dispatch, false, "Q&A must not be dispatched just because it carries a task verb");
-	assert.equal(d.reason, "not-task");
+	assert.equal(d.reason, "question");
 });

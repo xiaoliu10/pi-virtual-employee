@@ -1,5 +1,3 @@
-import { looksLikeImperative } from "../engine/task-planner.js";
-
 /**
  * Router triage — decides whether an IM message runs inline (foreground turn)
  * or is dispatched to a background work item (Worker).
@@ -175,12 +173,7 @@ export function hasLongRunningVerb(text: string): boolean {
 export function triageMessage(input: TriageInput, enabled: boolean): TriageDecision {
 	if (!enabled) return { dispatch: false, reason: "disabled", steps: 0 };
 	const text = input.text ?? "";
-	// Short imperative task commands carry no multi-step evidence, so the caller's
-	// looksLikeTask is false — but they are tasks: 「继续 登录生产后台管理」 fell to a
-	// foreground narration turn that delivered "let me try…" while the task never
-	// ran (field 2026-11-09). Question-shaped texts stay foreground (the
-	// looksLikeImperative detector itself rejects them).
-	if (!input.looksLikeTask && !looksLikeImperative(text)) return { dispatch: false, reason: "not-task", steps: 0 };
+	if (!input.looksLikeTask) return { dispatch: false, reason: "not-task", steps: 0 };
 	const steps = countPlanSteps(input.plan);
 	// ARCHITECTURE (docs/design/router-worker.md §3, user ruling 2026-11-06):
 	// the Router does not EXECUTE tasks — it routes them. Every task-shaped

@@ -268,7 +268,7 @@ test("recovered delivery occurrence id varies per submission", async () => {
 /** Task-shaped entry message: 登录 (task verb) + 然后 (multi-step evidence). */
 const NARRATION_TASK = '登录生产后台管理系统，然后检查环境并验证登录状态';
 
-function narrationSetup(t, subdir, responses, tools = () => []) {
+function narrationSetup(t, subdir, responses, tools = () => [], hooks = {}) {
 	const history = makeHistory(t);
 	const faux = fauxProvider();
 	const sessions = new Map();
@@ -276,7 +276,7 @@ function narrationSetup(t, subdir, responses, tools = () => []) {
 	let modelCalls = 0;
 	faux.setResponses(responses);
 	const opened = DurableRuntime.open({userDataDir:join(dir,subdir),history,session,tools,
-		stream:(id,opts,messages)=>{modelCalls++;return faux.provider.streamSimple(faux.provider.getModels()[0],{messages},opts);},
+		stream:(id,opts,messages)=>{modelCalls++;hooks.onStream?.(modelCalls);return faux.provider.streamSimple(faux.provider.getModels()[0],{messages},opts);},
 		withActor:async(id,ctx,text,run)=>run(),onRecovered:async()=>{}});
 	return { history, session, opened, calls: () => modelCalls };
 }
@@ -357,5 +357,38 @@ test('narration guard: a short imperative task (looksLikeTask=false) IS continue
 		assert.equal(result.reply, '登录完成。');
 		assert.ok(!result.reply.includes(NARRATION_GUARD_NOTICE), 'the continuation earned tool evidence — no notice');
 		assert.equal(calls(), 3, 'first round + nudge tool round + final answer, nothing more');
+	} finally { await runtime.close(); }
+});
+
+
+test('narration guard: an aborted turn never gets the nudge (review 94189d6f P3)', async t => {
+	// Abort lands DURING the first model call (the /stop or watchdog path): the
+	// guard must see the marker and skip the nudge entirely — no second billed
+	// LLM call for a turn the user already cancelled.
+	let rt;
+	const hooked = narrationSetup(t, 'narrate-abort', [
+		fauxAssistantMessage('我来尝试登录生产后台管理。先检查一下当前环境可用的工具。'),
+		fauxAssistantMessage('这段绝不应该被请求'),
+	], () => [], { onStream: (n) => { if (n === 1) rt.turnAbortIds.add('conv-narrate-abort'); } });
+	rt = await hooked.opened;
+	try {
+		const result = await rt.send(hooked.session('conv-narrate-abort'), NARRATION_TASK);
+		assert.equal(hooked.calls(), 1, 'an aborted turn gets NO nudge — exactly one model call');
+		assert.ok(!result.reply.includes(NARRATION_GUARD_NOTICE), 'the guard is skipped wholesale: no notice, no continuation');
+		assert.ok(result.reply.startsWith('我来尝试登录'), 'the first-round answer is delivered as-is');
+	} finally { await rt.close(); }
+});
+
+test('narration guard: a NEW turn clears the previous abort marker', async t => {
+	const { session, opened, calls } = narrationSetup(t, 'narrate-abort-clear', [
+		fauxAssistantMessage('我来尝试登录生产后台管理。先检查一下当前环境可用的工具。'),
+		fauxAssistantMessage('重试后：登录完成。'),
+	]);
+	const runtime = await opened;
+	try {
+		runtime.turnAbortIds.add('conv-narrate-abort-clear'); // a stale marker from a PREVIOUS turn
+		const result = await runtime.send(session('conv-narrate-abort-clear'), NARRATION_TASK);
+		assert.equal(calls(), 2, 'send() clears the stale marker at turn start — the guard fires normally');
+		assert.ok(result.reply.startsWith('重试后'), 'the continuation answer is delivered');
 	} finally { await runtime.close(); }
 });

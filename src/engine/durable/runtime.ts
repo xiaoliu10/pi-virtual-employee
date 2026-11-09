@@ -120,6 +120,9 @@ export class DurableRuntime {
 	private readonly tails = new Map<string, Promise<unknown>>();
 	private readonly tasks = new Set<Promise<unknown>>();
 	private closing = false;
+	/** Conversations aborted since their last send() — the narration guard checks
+	 * this before submitting its one nudge (review 94189d6f P3). */
+	private readonly turnAbortIds = new Set<string>();
 	private constructor(private readonly opts: RuntimeOptions) {}
 
 	static async open(opts: RuntimeOptions): Promise<DurableRuntime> {
@@ -361,6 +364,7 @@ export class DurableRuntime {
 		}
 	}
 	abort(id: string): boolean {
+		this.turnAbortIds.add(id); // the narration guard must not nudge an aborted turn
 		const set = this.active.get(id);
 		// background:true is THE fix (field 2026-11-06, the box): autonomous /
 		// work-window runs hang off BACKGROUND nodes, and pi-durable's walkDown
@@ -378,6 +382,7 @@ export class DurableRuntime {
 	async send(agent: Agent, text: string, ctx?: SendCtx): Promise<SendResult> {
 		if (this.closing) throw new Error("Durable runtime is closing");
 		const id = agent.sessionId ?? "default";
+		this.turnAbortIds.delete(id); // a NEW turn clears the previous turn's abort
 		// Keep current callbacks scoped to the submission and serialize same-chat
 		// admission; other chats continue independently.
 		const previous = this.tails.get(id) ?? Promise.resolve();
@@ -453,7 +458,11 @@ export class DurableRuntime {
 			// if the continuation still takes no action, deliver it WITH the honest
 			// notice. Exactly once — never a loop (flood-loop lesson). Failure notices
 			// (result.error) are already honest outcomes and are left alone.
-			if (!result.error && (looksLikeTask(text) || looksLikeImperative(text)) && !(await this.hadToolAction(conv))) {
+			// Review 94189d6f P3: an aborted turn must not get the nudge — /stop or
+			// a watchdog soft-stop landed mid-turn means the user cancelled it; one
+			// extra billed LLM call is exactly the wasted spend the guard avoids.
+			const abortedMidTurn = this.turnAbortIds.has(id);
+			if (!result.error && !abortedMidTurn && (looksLikeTask(text) || looksLikeImperative(text)) && !(await this.hadToolAction(conv))) {
 				console.warn(`[durable] narration guard: zero-tool task turn → forced continue via input (conv=${id})`);
 				const priorEntries = await this.entryIdSnapshot(conv);
 				try {

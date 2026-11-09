@@ -31,6 +31,10 @@ export const TASK_VERBS = [
  * though it carries a task verb.
  */
 const QUESTION_SHAPE_RE = /(在哪|是什么|什么意思|为什么|怎么回事|怎么样|吗|呢)[？?？]?\s*$/;
+/** Mid-sentence question words (review 94189d6f P2): 「帮我分析下为什么登录失败」
+ * starts like an imperative but asks for an explanation anywhere in the text —
+ * an unanchored probe rejects them wherever they appear. */
+const QUESTION_WORD_RE = /(为什么|怎么回事|怎么|什么意思|什么区别|是什么意思|如何|为何|哪些|哪里|哪儿|何处|多少|几|什么|在哪)/;
 const IMPERATIVE_LEAD_RE = /^(继续|接着|然后|帮我|帮忙|请|麻烦|开始|执行|先|去|再|尝试)/;
 /**
  * Short imperative task commands the shape detectors miss: 「继续 登录生产后台
@@ -43,7 +47,7 @@ const IMPERATIVE_LEAD_RE = /^(继续|接着|然后|帮我|帮忙|请|麻烦|开�
 export function looksLikeImperative(text: string): boolean {
 	const t = (text ?? "").trim();
 	if (!t) return false;
-	if (QUESTION_SHAPE_RE.test(t)) return false;
+	if (QUESTION_SHAPE_RE.test(t) || QUESTION_WORD_RE.test(t)) return false;
 	if (!TASK_VERBS.some((v) => t.toLowerCase().includes(v))) return false;
 	return IMPERATIVE_LEAD_RE.test(t) || TASK_VERBS.some((v) => t.startsWith(v));
 }
