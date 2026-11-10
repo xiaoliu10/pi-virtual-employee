@@ -400,6 +400,36 @@ test("P0-1b: the guard must THROW when it cannot resolve a path (never pass by o
 	// matching must not be fooled by a sibling that merely shares the name.
 	const sibling = `${allowed}-evil`;
 	const sneaky = join(sibling, "a", "b", "c", "evil.py");
-	await assert.rejects(() => fs.writeTextFile(sneaky, "PWNED", true), /不在允许访问的目录内|无法解析路径|拒绕访问/);
+	await assert.rejects(() => fs.writeTextFile(sneaky, "PWNED", true), /不在允许访问的目录内|无法解析路径|拒绕访问|拒绝访问/);
 	assert.equal(existsSync(sneaky), false);
+});
+
+test("P2: list_directory enumerates a sensitive DIR (read-only); writes/deletes keep the deny-list", async () => {
+	// Field 2026-11-11: 「列举失败：拒绝访问…skills/yiduyun-sls-query」 — listing a
+	// user-imported skill dir was refused, making every bundled-script skill
+	// undiscoverable. Listing is read-only metadata with zero escalation value
+	// (the FS service has no content-read method; content goes through
+	// run_command under OS permissions), so sensitive DIRS stay enumerable
+	// while writes/deletes keep the deny-list. Sensitive FILES stay fully
+	// off-limits.
+	const outer = join(work, "outer-ls");
+	const skills = join(outer, "profile-skills");
+	mkdirSync(join(skills, "yiduyun-sls-query"), { recursive: true });
+	writeFileSync(join(skills, "yiduyun-sls-query", "SKILL.md"), "# sls query");
+	const fs = service([outer]);
+	fs.addSensitiveDir(skills);
+	const listed = await fs.listDirectory(skills);
+	assert.ok(listed.entries.some((e) => e.name === "yiduyun-sls-query"), "enumeration of a sensitive dir succeeds");
+	const skillMd = join(skills, "yiduyun-sls-query", "SKILL.md");
+	await assert.rejects(() => fs.writeTextFile(join(skills, "new.md"), "x", true), /自身数据/, "write into a sensitive dir still refused");
+	// deleteFiles reports per-path (catches internally) — assert on the result entry.
+	const del = await fs.deleteFiles([skillMd], true);
+	assert.equal(del.results[0].ok, false, "delete inside a sensitive dir refused");
+	assert.match(del.results[0].error ?? "", /自身数据/, "refusal names the sensitive-dir deny-list");
+	assert.equal(readFileSync(skillMd, "utf8"), "# sls query", "the skill file is untouched");
+	// A sensitive FILE is never listable either — the resolved path equals the file.
+	const dbLike = join(outer, "pi-employee.sqlite");
+	writeFileSync(dbLike, "REAL");
+	fs.addSensitiveFile(dbLike);
+	await assert.rejects(() => fs.listDirectory(dbLike), /自身数据/, "a sensitive file path is refused even for listing");
 });

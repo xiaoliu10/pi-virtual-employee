@@ -69,8 +69,10 @@ export class FileSystemService {
 		return path.resolve(p);
 	}
 
-	/** Throw unless `absPath` is exactly an allowed dir or nested inside one. */
-	private assertAllowed(absPath: string): void {
+	/** Throw unless `absPath` is exactly an allowed dir or nested inside one.
+	 * `listing` marks READ-ONLY enumeration (list_directory): sensitive DIRS
+	 * stay enumerable, sensitive FILES never. */
+	private assertAllowed(absPath: string, opts: { listing?: boolean } = {}): void {
 		const resolved = path.resolve(this.expand(absPath));
 		const ok = this.allowedDirs().some((dir) => resolved === dir || resolved.startsWith(dir + path.sep));
 		if (!ok) throw new Error(`路径不在允许访问的目录内：${absPath}`);
@@ -78,7 +80,17 @@ export class FileSystemService {
 		// app-managed, but on Windows a junction/symlink inside one can point at
 		// the profile's database, config, skills or logs — a write there is
 		// self-escalation (RBAC lives in that DB). See assertAllowedReal below.
-		if (this.isSensitive(resolved)) throw new Error(`拒绕访问应用自身数据文件：${absPath}`);
+		//
+		// Listing (field 2026-11-11: 「列举失败：拒绝访问…skills/yiduyun-sls-query」)
+		// is read-only metadata enumeration with zero escalation value — and the
+		// FS service has no content-read method at all (content goes through
+		// run_command, which the OS already governs), so blocking lists on
+		// sensitive DIRS only made user-imported skills with bundled scripts
+		// undiscoverable. Sensitive FILES (databases/config) stay fully
+		// off-limits regardless.
+		if (this.isSensitive(resolved) && !(opts.listing && !this.isSensitiveFile(resolved))) {
+			throw new Error(`拒绝访问应用自身数据文件：${absPath}`);
+		}
 	}
 
 	/** Absolute paths the employee must never read-modify even inside a whitelist. */
@@ -106,8 +118,15 @@ export class FileSystemService {
 	}
 
 	private isSensitive(resolved: string): boolean {
+		return this.isSensitiveFile(resolved) || this.isSensitiveDir(resolved);
+	}
+
+	private isSensitiveFile(resolved: string): boolean {
+		return this.sensitiveFiles.includes(path.resolve(resolved));
+	}
+
+	private isSensitiveDir(resolved: string): boolean {
 		const target = path.resolve(resolved);
-		if (this.sensitiveFiles.includes(target)) return true;
 		return this.sensitiveDirs.some((dir) => target === dir || target.startsWith(dir + path.sep));
 	}
 
@@ -156,7 +175,7 @@ export class FileSystemService {
 			const allowedReal = await Promise.all(this.allowedDirs().map((dir) => this.resolveRealish(dir)));
 			const ok = allowedReal.some((dir) => final === dir || final.startsWith(dir + path.sep));
 			if (!ok) throw new Error(`路径不在允许访问的目录内（符号链接解析后）：${absPath}`);
-			if (this.isSensitive(final)) throw new Error(`拒绕访问应用自身数据文件：${absPath}`);
+			if (this.isSensitive(final)) throw new Error(`拒绝访问应用自身数据文件：${absPath}`);
 			return;
 		}
 	}
@@ -188,7 +207,7 @@ export class FileSystemService {
 	 * LIST_LIMIT; `truncated` flags when the cap was hit.
 	 */
 	async listDirectory(dirPath: string, recursive = false): Promise<{ entries: FileEntry[]; truncated: boolean }> {
-		this.assertAllowed(dirPath);
+		this.assertAllowed(dirPath, { listing: true });
 		const root = path.resolve(this.expand(dirPath));
 		const entries: FileEntry[] = [];
 		let truncated = false;
