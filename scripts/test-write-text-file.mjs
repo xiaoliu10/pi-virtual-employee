@@ -433,3 +433,49 @@ test("P2: list_directory enumerates a sensitive DIR (read-only); writes/deletes 
 	fs.addSensitiveFile(dbLike);
 	await assert.rejects(() => fs.listDirectory(dbLike), /自身数据/, "a sensitive file path is refused even for listing");
 });
+
+test("P3-a: listing a sensitive dir hides sensitive-FILE metadata; recursive pin stays", async () => {
+	const outer = join(work, "outer-meta");
+	const skills = join(outer, "profile-skills");
+	mkdirSync(join(skills, "yiduyun-sls-query"), { recursive: true });
+	writeFileSync(join(skills, "yiduyun-sls-query", "SKILL.md"), "# sls query");
+	const secretDb = join(skills, "pi-employee.sqlite");
+	writeFileSync(secretDb, "REAL");
+	const fs = service([outer]);
+	fs.addSensitiveDir(skills);
+	fs.addSensitiveFile(secretDb);
+	const flat = await fs.listDirectory(skills);
+	assert.ok(flat.entries.some((e) => e.name === "yiduyun-sls-query"), "skill dir still discoverable");
+	assert.ok(!flat.entries.some((e) => e.name === "pi-employee.sqlite"), "sensitive-file metadata is hidden");
+	const rec = await fs.listDirectory(skills, true);
+	assert.ok(rec.entries.some((e) => e.name === "SKILL.md"), "recursive enumeration pins the pre-existing allow");
+	assert.ok(!rec.entries.some((e) => e.path === secretDb), "recursive also hides the sensitive file");
+});
+
+test("P2-ce659aa2: a junction cannot launder a DELETE past the deny-list", async () => {
+	// Pre-existing hole (reproduced identically on main): deleteFiles walked the
+	// literal path only, so a workspace junction pointing at the profile let
+	// delete_files remove the REAL config.json (ok:true, file gone). Destructive
+	// paths resolve realpath like writes do.
+	const profile = join(work, "profile-del");
+	mkdirSync(profile, { recursive: true });
+	const cfg = join(profile, "config.json");
+	writeFileSync(cfg, '{"security":{"admin":["keeper"]}}');
+	const ws = join(work, "ws-del");
+	mkdirSync(ws, { recursive: true });
+	const fs = service([ws]);
+	fs.addSensitiveDir(profile);
+	fs.addSensitiveFile(cfg);
+	let linked = false;
+	try {
+		const { symlinkSync } = await import("node:fs");
+		symlinkSync(profile, join(ws, "link"), "junction");
+		linked = true;
+	} catch { /* no symlink privilege on this host */ }
+	if (linked) {
+		const del = await fs.deleteFiles([join(ws, "link", "config.json")], true);
+		assert.equal(del.results[0].ok, false, "delete through a junction refused");
+		assert.match(del.results[0].error ?? "", /自身数据|不在允许访问的目录|无法解析/, "refusal names a guard");
+		assert.equal(readFileSync(cfg, "utf8"), '{"security":{"admin":["keeper"]}}', "real config untouched");
+	}
+});

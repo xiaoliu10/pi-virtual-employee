@@ -251,8 +251,12 @@ export class FileSystemService {
 		};
 
 		await walk(root, 0);
-		entries.sort((a, b) => (a.isDir === b.isDir ? a.mtime - b.mtime : a.isDir ? 1 : -1));
-		return { entries, truncated };
+		// Review ce659aa2 P3-a: enumerating a sensitive dir must not hand out the
+		// metadata (name/size/mtime) of sensitive FILES inside it — the entries
+		// stay hidden the same way direct listing of their path is refused.
+		const visible = entries.filter((e) => !this.isSensitiveFile(e.path));
+		visible.sort((a, b) => (a.isDir === b.isDir ? a.mtime - b.mtime : a.isDir ? 1 : -1));
+		return { entries: visible, truncated };
 	}
 
 	/**
@@ -268,7 +272,11 @@ export class FileSystemService {
 		for (const p of paths) {
 			const abs = path.resolve(this.expand(p));
 			try {
-				this.assertAllowed(abs);
+				// realpath-resolved like every destructive/write path: a junction
+				// inside the workspace pointing at the profile must not launder a
+				// delete past the deny-list (review ce659aa2 P2 — pre-existing on
+				// main, reproduced: real config.json deleted ok:true through a link).
+				await this.assertAllowedReal(abs);
 				const st = await stat(abs);
 				if (st.isDirectory()) {
 					results.push({ path: abs, ok: false, error: "拒绝删除目录（仅允许删除文件）" });
