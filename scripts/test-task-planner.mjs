@@ -49,6 +49,22 @@ test("short but genuinely multi-step tasks ARE planned (a length floor dropped t
 	assert.equal(m.looksLikeTask("抓取这个页面的列表数据，然后批量下载附件，最后整理成表格"), true);
 });
 
+// Field 2026-11-10 21:24: 「帮我查一下这笔流水：0422026111000000654 的支付渠道下单日志」
+// is 39 chars with no sequencing words and 查 not in the verb list —
+// looksLikeTask=false routed it as conversational follow-up into a stale
+// worker's ~200k-token transcript instead of spawning a fresh worker; the turn
+// burned 61 minutes against the context wall and died. A long digit serial IS
+// task cargo (a concrete lookup target), and 查 is this deployment's most
+// common ops verb.
+test("a lookup task carrying a long serial IS a task (查 verbs + serial evidence)", () => {
+	assert.equal(m.looksLikeTask("帮我查一下这笔流水：0422026111000000654 的支付渠道下单日志"), true);
+	assert.equal(m.looksLikeTask("帮我查一下 0422026111000000654 的日志"), true);
+	// 查 without cargo evidence stays conversational (mirrors 「帮我看一下这个文件」=false).
+	assert.equal(m.looksLikeTask("帮我查一下这个文件"), false);
+	// A short serial is not cargo evidence; question shape stays Q&A.
+	assert.equal(m.looksLikeTask("查了一下，875055 在订单系统里没匹配到…这是什么类型的编号？"), false);
+});
+
 test("a bare single-step task verb is not planned", () => {
 	// 「登录」 alone (or with a target but no sequencing) is a one-shot command;
 	// planning it would add latency for zero information.
