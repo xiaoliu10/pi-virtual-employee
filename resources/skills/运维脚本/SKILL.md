@@ -4,6 +4,11 @@ description: 在部署机（Windows/Linux）上写、跑、排查脚本之前必
 ---
 # 运维脚本
 
+## 内置工具优先（结构性强制，2026-11-10 裁定）
+
+清理/杀进程**必须优先用内置工具**：`manage_process scan`（四道持有判定出候选）→ 凭 ticket `manage_process kill_pid` 定点结束（需当前消息含「确认」）；长任务启动时 `register_contract` 登记、结束时 `remove_contract` 注销。手写清理脚本只是**兑底**路径，且命中危险模式（ms-playwright + 杀进程原语、killall/pkill、Stop-Process -Name、管道 Stop-Process/管道 $_.Kill()、taskkill /im|/t）会被 run_command/run_script 的执行闸**直接拦截**（.ps1/.sh/.py/.cmd/.bat/.js/.mjs/.cjs 内容都扫）——不是靠自觉，是结构上过不去。
+下面的四铁律保留：它们是内置工具判定逻辑的「为什么」，也是内置工具不可用时手写兑底脚本的规范。
+
 这个技能回答两个问题：
 
 1. **写对了会不会误伤**（第一部分：安全四铁律）——每条对应一次真实事故

@@ -36,8 +36,11 @@ import type { ShellToolDeps } from "./shell.js";
 /** Where the parameter files live, relative to the app's user data dir. */
 export const PARAM_DIR = "script-params";
 
-/** Script extensions we accept; a path without one is rejected (see below). */
-const SCRIPT_EXTENSIONS = [".py", ".ps1", ".js", ".mjs", ".cjs", ".bat", ".cmd", ".sh"];
+/** Script extensions we accept; a path without one is rejected (see below). The
+ * process-hygiene execution gate reuses this exact list for its content scan —
+ * one spelling per concept: a runtime run_script accepts is a runtime the gate
+ * must scan (review 05421c05 P2-3: .js/.mjs/.cjs were a gate blind spot). */
+export const SCRIPT_EXTENSIONS = [".py", ".ps1", ".js", ".mjs", ".cjs", ".bat", ".cmd", ".sh"];
 
 /** The flag each runtime uses to receive a parameter file. */
 const PARAM_FLAG = "--params-file";
