@@ -92,7 +92,7 @@ const isDev = !!process.env.VITE_DEV_SERVER_URL;
  * and redirect BEFORE app.whenReady — everything reading userData depends on it.
  */
 const PROFILE_NAME_RE = /^[A-Za-z0-9_-]+$/;
-import { acquireProfileLock as coreAcquireProfileLock, LOCK_FILE } from "./profile-lock-core.js";
+import { acquireProfileLock as takeProfileLock, releaseProfileLock, type ProcessIdentity } from "./profile-lock.js";
 import { profileUserDataDir, resolveDataRoot, workspaceRoot } from "./data-root.js";
 
 /** Project the Electron updater state to the platform-agnostic tool status. */
@@ -121,22 +121,10 @@ function resolveProfile(argv: string[], env: NodeJS.ProcessEnv): string {
 	return name;
 }
 
-/**
- * Acquire an exclusive lock on the profile dir; quit if another live process holds it.
- *
- * Delegates to profile-lock-core: liveness is judged by an explicit probe and
- * anything not CLEARLY alive is reclaimed. FIELD 2026-11-04 (Orion): the old
- * inline code treated `process.kill(pid,0)` not throwing as "alive"; on Windows
- * that can resolve for a dead/recycled pid, so a leftover `.profile.lock` left
- * the profile unstartable for over an hour until the file was deleted by hand.
- */
-function acquireProfileLock(userDataDir: string): void {
-	const result = coreAcquireProfileLock(userDataDir, {
-		pid: process.pid,
-		log: (msg) => console.error(msg),
-	});
-	if (!result.acquired) app.quit();
-}
+/** Identity of the lock WE own; will-quit removes only our own file (field
+ * 2026-11-02: an unconditional unlink let a dying instance delete its
+ * successor's lock). Identity (`pid|startTime|token`) also defeats PID reuse. */
+let profileLock: ProcessIdentity | null = null;
 
 const activeProfile = resolveProfile(process.argv, process.env);
 // Data root: env PI_DATA_ROOT > pinned marker > legacy-data protection >
@@ -168,13 +156,19 @@ mkdirSync(app.getPath("userData"), { recursive: true });
 // App logs live with the profile data (not the packaged app-name dir Electron
 // would pick) — one known place for field diagnostics like im.log.
 app.setPath("logs", path.join(app.getPath("userData"), "logs"));
-acquireProfileLock(app.getPath("userData"));
+profileLock = takeProfileLock(
+	app.getPath("userData"),
+	() => {
+		// Another live instance owns this profile. app.quit() is asynchronous, so
+		// the rest of module init would otherwise keep running and open the SAME
+		// SQLite database — exactly the double-writer failure this lock prevents.
+		// Exit immediately; we never acquired any resource that needs cleanup.
+		app.exit(0);
+	},
+	{ log: (level, msg) => console[level === "INFO" ? "log" : level === "WARN" ? "warn" : "error"](msg) },
+);
 app.on("will-quit", () => {
-	try {
-		unlinkSync(path.join(app.getPath("userData"), LOCK_FILE));
-	} catch {
-		/* ignore */
-	}
+	if (profileLock) releaseProfileLock(app.getPath("userData"), profileLock);
 });
 
 let mainWindow: BrowserWindow | null = null;

@@ -23,7 +23,7 @@ durable conv (work/sched/dm)
 | 资产 | 位置 | 状态 | 说明 |
 |---|---|---|---|
 | **profile 复制隔离** | `src/browser/profile-isolation.ts` | **已建未接线（无调用方）** | FIELD 2026-11-04：母本只读 + 每次启动复制干净副本（剔除 `Singleton*` 锁文件与 Cache 类目录）+ context 关闭即删副本 + 崩溃残留清扫。注释原文即本问题的现场记录（"two work windows against the same persistent Chromium profile … exitCode=21 — the known persistent lock issue"） |
-| 应用单实例锁 | `electron/profile-lock-core.ts` | 已接线（VE 自身） | `.profile.lock` + WMI 存活探测 + 陈旧锁回收；解决的是 VE 自身 profile，不是业务脚本浏览器 |
+| 应用单实例锁 | `electron/profile-lock.ts` | 已接线（VE 自身） | `.profile.lock`（`pid|startTime|token` 三元身份）+ WMI/存活探测 + 陈旧锁回收；解决的是 VE 自身 profile，不是业务脚本浏览器 |
 | VE 托管浏览器 | `src/browser/browser-service.ts` | 已接线（browser 工具） | 持久 context，`:640` 关闭时 flush cookies——但**未用** profile-isolation 复制，同 profile 并发同样会撞 |
 | 144 盒子热补（临时） | `python-win/Lib/site-packages/ve_pw_profile_lock.py` + `.pth` | 已生效 | launch_persistent_context 包装：endpoint 存活→CDP attach（attach-only，v3.1）；否则裸启动 + 单例冲突快速失败 `PROFILE_BUSY`（明确报错，禁止循环重试/杀进程） |
 | 144 盒子热补（临时） | `Nova/shim/taskkill.cmd` + `start_nova.bat` + HKCU Run | 已生效 | 按镜像名杀浏览器（`/IM chrome.exe` 等）直接拒绝并留审计；按 PID 放行 |
@@ -185,7 +185,7 @@ durable conv
 - 变异：去掉 WHERE owner IS NULL → 必 RED；去掉 finally 释放 → 泄漏检测必须 RED。
 
 ### 4.6 风险与回滚
-- 风险：claim 泄漏（进程崩溃）→ 启动时按 conv 存活性回收（profile-lock-core 的存活探测思路复用）；闸门误判 → config 开关 + 审计日志。
+- 风险：claim 泄漏（进程崩溃）→ 启动时按 conv 存活性回收（profile-lock 的存活探测思路复用）；闸门误判 → config 开关 + 审计日志。
 - 回滚：闸门开关一键关闭，行为退回现状（`.pth` 快速失败仍兜底）。
 
 ## 5. 盲区与待拍板
