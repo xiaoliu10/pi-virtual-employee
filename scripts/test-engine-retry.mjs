@@ -860,12 +860,18 @@ test("F1: a compaction that reports success but cannot get under budget falls th
 		const before = estimateTokensSafe(agent.state.messages);
 		assert.ok(before > 47616, `fixture must really exceed the budget (got ${before})`);
 
-		// Simulate the field failure: compaction REPORTS success but leaves the
-		// transcript untouched (the over-large retained tail survives).
-		engine.compactWithLife = async () => ({ compacted: true });
+		// Simulate the field failure realistically: compaction SHRINKS the transcript
+		// (the real maybeCompact no_reduction guard rejects a zero-shrink pass) but the
+		// retained tail is still over the budget line.
+		const beforeCompact = agent.state.messages.length;
+		engine.compactWithLife = async () => {
+			agent.state.messages = agent.state.messages.slice(1); // drop just the oldest
+			return { compacted: true };
+		};
 
 		const recovered = await engine.recoverFromContextOverflow(agent);
 		const after = estimateTokensSafe(agent.state.messages);
+		assert.ok(agent.state.messages.length < beforeCompact, "the compaction pass really shrank the transcript");
 		assert.equal(recovered, true, "truncation still recovers the turn");
 		assert.ok(after < before, "the transcript must actually shrink");
 		assert.ok(after < 47616, `outright truncation must get under the budget line (got ${after})`);
@@ -875,6 +881,27 @@ test("F1: a compaction that reports success but cannot get under budget falls th
 		console.warn = origWarn;
 		console.log = origLog;
 	}
+});
+
+// P3-1 follow-up: when the transcript is already minimal (truncateToFit has nothing
+// it can drop) and still over budget, recovery must fail HONESTLY rather than claim
+// success and let the next request 400 against the same wall.
+test("F1b: fit failure with nothing left to truncate returns false, not a fake recovery", async (t) => {
+	const { engine, config } = makeEngine(t, {
+		streamFn: async () => { throw new Error("F1b recovery must not call the model"); },
+	});
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-f1-null");
+	// window 64000 → budget 47616. A single enormous user message leaves <=2
+	// non-system messages, so truncateToFit returns null (nothing splittable).
+	agent.state.model = { ...agent.state.model, contextWindow: 64000, maxTokens: undefined };
+	agent.state.messages = [{ role: "user", content: "字".repeat(60000) }];
+	assert.ok(estimateTokensSafe(agent.state.messages) > 47616, "fixture must really exceed the budget");
+	// Reports compaction success without shrinking — fit gate must reject it, then
+	// truncation must report there is nothing left to drop.
+	engine.compactWithLife = async () => ({ compacted: true });
+	const recovered = await engine.recoverFromContextOverflow(agent);
+	assert.equal(recovered, false, "no fake recovery when the transcript cannot be made to fit");
 });
 
 // F2 (field 2026-11-10): the same give-up must read as a CONTEXT-LENGTH problem,

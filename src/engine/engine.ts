@@ -100,15 +100,15 @@ import type { DownloadService } from "../downloads/download-service.js";
 import { buildSystemPrompt, buildTools, guardTool, withTelemetry } from "./definition.js";
 import type { UpdateOperations } from "./tools/update.js";
 import { hasActiveShellCommands } from "./tools/shell.js";
-import {effectiveAuthorizationRole, ROLE_RANK, checkPermission, isDeclaredAdmin, isLocalConversation, resolveRole} from "../security/permissions.js";
+import {effectiveAuthorizationRole, ROLE_RANK, checkPermission, isDeclaredAdmin, isLocalConversation} from "../security/permissions.js";
 import { maskId } from "./tools/admin.js";
-import { AuthorizationStore, AUTHORIZATION_TTL_MS, isAuthorizationPhrase } from "./authorization.js";
+import { AuthorizationStore, isAuthorizationPhrase } from "./authorization.js";
 import { computeStallIdleMs } from "../im/watchdog.js";
 import { ProgressWatchdog } from "./progress-watchdog.js";
 import { createMcpManager, type McpManager } from "./tools/mcp.js";
 import { renderSessionDetail } from "./tools/session-detail.js";
 import { normalizeMcpServers } from "../shared/mcp.js";
-import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, recentAssistantVisibleTexts, rehydrateMessages, stripDanglingAssistant, stripStaleUsage, substantialAnchorOf, SUMMARIZER_RETRY, taskAnchorOf, truncateToFit, usableContextWindow, turnMemoryPrefix } from "./context.js";
+import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, recentAssistantVisibleTexts, rehydrateMessages, stripDanglingAssistant, substantialAnchorOf, SUMMARIZER_RETRY, taskAnchorOf, truncateToFit, usableContextWindow, turnMemoryPrefix } from "./context.js";
 // P1 WorkSession wiring (router-worker-core.md §6.4/§11): the CCL ledger owns a
 // work:<id> session's cross-turn context.
 import { buildBundle, recordsToMessages, type ContextBundle } from "../context/bundle.js";
@@ -3088,6 +3088,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 				hardError ||
 				(errorMessage ? loginGuidanceOf(errorMessage) ?? errorMessage : undefined) ||
 				(lengthGiveUp ? LENGTH_EMPTY_OVERFLOW_CAUSE : undefined);
+			// Consume-on-read so a give-up that never sends again cannot leak the id
+			// (review P3-2); the next send resets it anyway, but eval/dropped turns do not.
+			if (lengthGiveUp) this.lengthEmptyGiveUps.delete(conversationId);
 			reply = this.deterministicFailure(cause);
 			console.warn(`[engine] no reply produced for ${conversationId}; emitted deterministic failure (${cause || "no error reported"})`);
 		}
@@ -3999,6 +4002,16 @@ export class EmployeeEngine implements EmployeeRuntime {
 			console.warn("[engine] context overflow: nothing left to drop (transcript already minimal)");
 			return false;
 		}
+		// Re-check the fit after truncation too (review P3-1): on a tiny window the
+		// truncate goal (≥4000) can itself sit at/above the budget line, and an
+		// over-large maxTokens reservation can push it past the provider's real input
+		// ceiling. Claiming recovery here would let the next request 400 anyway — fail
+		// honestly so the caller ends the turn with the overflow template instead.
+		const afterTruncate = estimateTokensSafe(agent.state.messages);
+		if (afterTruncate >= budget) {
+			console.warn(`[engine] truncation could not get under budget (~${afterTruncate} >= ${budget}); ending honestly`);
+			return false;
+		}
 		return true;
 	}
 
@@ -4050,6 +4063,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 		const agent = this.sessions.get(conversationId);
 		if (agent) agent.abort();
 		this.dropHost(conversationId);
+		// Release per-turn flags so a dropped conversation cannot leak state (review P3-2).
+		this.lengthEmptyGiveUps.delete(conversationId);
 		return this.sessions.delete(conversationId);
 	}
 
