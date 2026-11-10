@@ -524,7 +524,7 @@ test("the continuation contract EXPIRES: a worker settled outside the window is 
 	// history) or a fresh worker handles it.
 	assert.equal(await service.inject("dt:old", "结果呢", "ma1"), false, "「结果呢」 past the window → foreground answers from pushed results");
 	assert.equal(await service.inject("dt:old", "继续", "ma1"), false, "「继续」 past the window → falls through");
-	assert.equal(await service.inject("dt:old", "帮我查一下 0422026111000000654 的下单日志", "ma1"), false, "a fresh task spawns a fresh worker regardless of heuristics");
+	assert.equal(await service.inject("dt:old", "帮我查一下 0422026111000000654 的下单日志", "ma1"), false, "never lands in the stale worker — triage routes it fresh (spawn or bounded foreground turn)");
 	// Boundary: inside the window the contract lives.
 	const recent = Date.now() - 5 * 60_000;
 	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
