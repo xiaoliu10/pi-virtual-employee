@@ -247,11 +247,18 @@ export function stripDanglingAssistant(messages: AgentMessage[]): number {
 	let removed = 0;
 	const last = messages[messages.length - 1];
 	if (last && last.role === "assistant") {
-		const text = messageText(last).trim();
+		// Judge emptiness on VISIBLE text only. messageText() counts thinking blocks,
+		// so a thinking-only length-truncated message used to read as "content" and
+		// was kept — letting up to maxTokens of unrecoverable reasoning accumulate
+		// across retries (field 2026-11-10: a 200k-token worker piled thinking-only
+		// length runs on until the provider hard-rejected at 204800). Such a tail is
+		// not resumable and carries nothing the user can see, so strip it like any
+		// other empty assistant tail. assistantVisibleText ignores thinking parts.
+		const visible = assistantVisibleText(last).trim();
 		const content = (last as { content?: unknown }).content;
 		const parts = Array.isArray(content) ? (content as { type?: string }[]) : [];
 		const hasToolCalls = parts.some((p) => p.type === "toolCall");
-		if (!text || hasToolCalls) {
+		if (!visible || hasToolCalls) {
 			messages.pop();
 			removed += 1;
 		}

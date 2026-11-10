@@ -831,6 +831,104 @@ test("consecutive length-truncated empty runs: compact before the first retry, g
 	}
 });
 
+// F1 (field 2026-11-10): a 200k-token worker "compacted" three times yet measured
+// ~199k→210k — the retained recent tail was itself over budget. The old recovery
+// returned true on compacted=true WITHOUT verifying the fit, so the guaranteed
+// truncate never ran and every retry re-hit the same 204800 wall. Recovery must
+// only count when the transcript lands under the budget line; otherwise it falls
+// through to the outright truncation that CAN get under it.
+test("F1: a compaction that reports success but cannot get under budget falls through to outright truncation", async (t) => {
+	const warns = [];
+	const origWarn = console.warn;
+	const origLog = console.log;
+	console.warn = (...a) => { warns.push(a.join(" ")); };
+	console.log = (...a) => { warns.push(a.join(" ")); };
+	try {
+		const { engine, config } = makeEngine(t, {
+			streamFn: async () => { throw new Error("F1 recovery must not call the model"); },
+		});
+		supplierConfig(config);
+		const agent = engine.getOrCreateSession("conv-f1-fit");
+		// window 64000, no output reservation → usable 64000, budget 64000-16384=47616,
+		// truncate target usable/2=32000 (well under the budget, as in production).
+		agent.state.model = { ...agent.state.model, contextWindow: 64000, maxTokens: undefined };
+		const block = "对账明细、页面 DOM 与日志输出内容。".repeat(14); // ~224 CJK chars ≈ 224 tokens
+		for (let i = 0; i < 150; i++) {
+			agent.state.messages.push({ role: "user", content: `第 ${i} 步 ${block}` });
+			agent.state.messages.push({ role: "assistant", content: [{ type: "text", text: `结果 ${i} ${block}` }] });
+		}
+		const before = estimateTokensSafe(agent.state.messages);
+		assert.ok(before > 47616, `fixture must really exceed the budget (got ${before})`);
+
+		// Simulate the field failure realistically: compaction SHRINKS the transcript
+		// (the real maybeCompact no_reduction guard rejects a zero-shrink pass) but the
+		// retained tail is still over the budget line.
+		const beforeCompact = agent.state.messages.length;
+		engine.compactWithLife = async () => {
+			agent.state.messages = agent.state.messages.slice(1); // drop just the oldest
+			return { compacted: true };
+		};
+
+		const recovered = await engine.recoverFromContextOverflow(agent);
+		const after = estimateTokensSafe(agent.state.messages);
+		assert.ok(agent.state.messages.length < beforeCompact, "the compaction pass really shrank the transcript");
+		assert.equal(recovered, true, "truncation still recovers the turn");
+		assert.ok(after < before, "the transcript must actually shrink");
+		assert.ok(after < 47616, `outright truncation must get under the budget line (got ${after})`);
+		assert.ok(warns.some((w) => w.includes("still over budget")), "the failed-fit compaction is logged, not silently accepted");
+		assert.ok(warns.some((w) => w.includes("dropped") && w.includes("older messages")), "the hard truncation path ran");
+	} finally {
+		console.warn = origWarn;
+		console.log = origLog;
+	}
+});
+
+// P3-1 follow-up: when the transcript is already minimal (truncateToFit has nothing
+// it can drop) and still over budget, recovery must fail HONESTLY rather than claim
+// success and let the next request 400 against the same wall.
+test("F1b: fit failure with nothing left to truncate returns false, not a fake recovery", async (t) => {
+	const { engine, config } = makeEngine(t, {
+		streamFn: async () => { throw new Error("F1b recovery must not call the model"); },
+	});
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-f1-null");
+	// window 64000 → budget 47616. A single enormous user message leaves <=2
+	// non-system messages, so truncateToFit returns null (nothing splittable).
+	agent.state.model = { ...agent.state.model, contextWindow: 64000, maxTokens: undefined };
+	agent.state.messages = [{ role: "user", content: "字".repeat(60000) }];
+	assert.ok(estimateTokensSafe(agent.state.messages) > 47616, "fixture must really exceed the budget");
+	// Reports compaction success without shrinking — fit gate must reject it, then
+	// truncation must report there is nothing left to drop.
+	engine.compactWithLife = async () => ({ compacted: true });
+	const recovered = await engine.recoverFromContextOverflow(agent);
+	assert.equal(recovered, false, "no fake recovery when the transcript cannot be made to fit");
+});
+
+// F2 (field 2026-11-10): the same give-up must read as a CONTEXT-LENGTH problem,
+// not a model-service outage. There is no thrown error to classify, so the engine
+// records a synthetic overflow cause; the user gets /new guidance instead of the
+// misleading service-outage line (the service was healthy — the worker transcript
+// had crossed qwen's 204800 hard limit).
+test("F2: repeated length-truncated empty runs surface context-overflow guidance, not a service-outage line", async (t) => {
+	let runs = 0;
+	const { engine, config } = makeEngine(t, {
+		streamFn: async () => {
+			runs += 1;
+			return {
+				async *[Symbol.asyncIterator]() { /* no events */ },
+				result: async () => ({ role: "assistant", content: [{ type: "thinking", thinking: "……" }], stopReason: runs <= LENGTH_EMPTY_GIVE_UP ? "length" : "stop" }),
+			};
+		},
+	});
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-length-classify");
+	const result = await engine.send(agent, "hi");
+	assert.equal(result.deterministic, true);
+	assert.match(result.reply, /超出了模型能一次处理的长度上限/, "must use the context-overflow deterministic template");
+	assert.match(result.reply, /\/new/, "must point at the /new remedy");
+	assert.doesNotMatch(result.reply, /模型服务连续多次未返回内容/, "must not misreport a length stall as a service outage");
+});
+
 // Hermes iteration_budget port (2026-11-06): maxToolSteps caps ONE turn; a model
 // that keeps finishing and restarting turns runs unbounded. The RESET contract is
 // what keeps the cap per-user-turn instead of per-process — a stale entry would
