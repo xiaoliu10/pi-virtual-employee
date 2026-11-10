@@ -43,14 +43,17 @@
     "prepare:native:win": "node scripts/prepare-win-native.mjs",
     "prepare:native:mac": "node scripts/prepare-mac-native.mjs",
     "prepare:native:linux": "node scripts/prepare-linux-native.mjs",
-    "package:win": "npm run check:build-env && npm run typecheck && npm run build && npm run prepare:native:win && electron-builder --win nsis --x64 && npm run verify:asar",
-    "package:mac": "npm run check:build-env && npm run typecheck && npm run build && npm run prepare:native:mac && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg --arm64 && npm run verify:asar",
-    "package:linux": "npm run check:build-env && npm run typecheck && npm run build && npm run prepare:native:linux && electron-builder --linux AppImage --x64 && npm run verify:asar",
+    "package:win": "npm run check:build-env && npm run typecheck && npm run build && npm run prepare:native:win && electron-builder --win nsis --x64 && npm run verify:asar:win",
+    "package:mac": "npm run check:build-env && npm run typecheck && npm run build && npm run prepare:native:mac && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg --arm64 && npm run verify:asar:mac",
+    "package:linux": "npm run check:build-env && npm run typecheck && npm run build && npm run prepare:native:linux && electron-builder --linux AppImage --x64 && npm run verify:asar:linux",
     "release": "node scripts/publish.mjs",
     "release:dry": "node scripts/publish.mjs --dry-run",
     "postinstall": "electron-rebuild -f -w better-sqlite3",
     "check:build-env": "node scripts/check-build-env.mjs",
-    "verify:asar": "node scripts/verify-asar.mjs"
+    "verify:asar": "node scripts/verify-asar.mjs",
+    "verify:asar:win": "node scripts/verify-asar.mjs release/win-unpacked/resources/app.asar",
+    "verify:asar:mac": "node scripts/verify-asar.mjs \"release/mac-arm64/Pi Virtual Employee.app/Contents/resources/app.asar\"",
+    "verify:asar:linux": "node scripts/verify-asar.mjs release/linux-unpacked/resources/app.asar"
   },
   "dependencies": {
     "@earendil-works/chord": "1.5.0",
