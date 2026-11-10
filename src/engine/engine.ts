@@ -3996,10 +3996,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// carry screenshots whose vision tokens dominate the REAL request while
 		// compaction's keep-tail protects them — compaction can report success and
 		// the retry still exceeds the provider limit. Drop the old images
-		// deterministically (regardless of the compaction outcome) before falling
-		// through to truncation.
-		const stripped = stripImagesForOverflowRecovery(agent);
-		if (stripped > 0) return true;
+		// deterministically (regardless of the compaction outcome); the budget
+		// argument escalates into the protected tail when the empirical per-frame
+		// rate still underestimates what the provider charges (review a1a019c4 P1-1).
+		const stripped = stripImagesForOverflowRecovery(agent, 2, budget);
+		if (stripped > 0 && estimateTokensSafe(agent.state.messages) < budget) return true;
 		// Aim at half the USABLE window, not half of window − reserve: the goal
 		// must land BELOW the budget gate's line (usable − reserve), otherwise a
 		// successful drop still fails the re-check and the turn gets chopped anyway

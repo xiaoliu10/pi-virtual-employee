@@ -908,3 +908,30 @@ test("forced compaction frees an image-wedged single-turn transcript (the field 
 	assert.ok(afterImages <= 8, `the kept tail holds only recent screenshots, got ${afterImages}`);
 	assert.ok(estimateTokensSafe(agent.state.messages) < before / 2, "the request will fit the provider limit now");
 });
+
+// ── Review a1a019c4 closures ─────────────────────────────────────────────────
+test("an image-only toolResult costs exactly the vision rate — pi's flat baseline is REPLACED, not added (P2-3)", () => {
+	const img = { role: "toolResult", content: [{ type: "image", data: "A".repeat(400), mimeType: "image/png" }], timestamp: Date.now() };
+	// pi's estimateTokens charges this block its flat 1200; the estimator must
+	// subtract that baseline and charge VISION_TOKENS_PER_IMAGE once — 6000, not 7200.
+	assert.equal(estimateMessageTokens(img), VISION_TOKENS_PER_IMAGE);
+});
+
+test("strip escalates into the protected tail when a budget is given and the tail still overflows (P1-1)", () => {
+	const messages = [user("任务")];
+	for (let i = 0; i < 5; i += 1) messages.push(shot(`step ${i}`));
+	const agent = { state: { messages } };
+	// Budget no tail could ever meet → the ladder must walk 2 → 1 → 0.
+	const stripped = stripImagesForOverflowRecovery(agent, 2, 100);
+	assert.equal(stripped, 5, "escalation strips the live tail too when nothing fits");
+	assert.equal(agent.state.messages.reduce((a, m) => a + countImageParts(m), 0), 0);
+});
+
+test("strip stops escalating as soon as the budget is met (P1-1)", () => {
+	const messages = [user("任务"), shot("a"), shot("b"), shot("c")];
+	const agent = { state: { messages } };
+	// After the keep=2 pass one shot (~6k) remains, under the 8k budget → no escalation.
+	const stripped = stripImagesForOverflowRecovery(agent, 2, 8_000);
+	assert.equal(stripped, 2);
+	assert.equal(agent.state.messages.reduce((a, m) => a + countImageParts(m), 0), 1, "the fitting tail keeps its screenshot");
+});

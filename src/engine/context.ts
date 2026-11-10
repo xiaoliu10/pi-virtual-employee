@@ -159,7 +159,34 @@ export function isContextOverflowError(text: string): boolean {
  * statement is kept verbatim at the seam (mirrors findForcedCompactionCut).
  */
 export const IMAGE_STRIPPED_PLACEHOLDER = "[截图已省略：上下文超限恢复时释放空间；如仍需画面请重新截屏]";
-export function stripImagesForOverflowRecovery(agent: Agent, keepLastMessages = 2): number {
+/**
+ * Replace old image blocks with a text placeholder to free vision tokens.
+ *
+ * `budget` turns this into an escalation ladder (review a1a019c4 P1-1): the
+ * live tail (last `keepLastMessages` messages) is protected first, but the
+ * 6k/frame rate is empirical — a real frame can cost up to ~15k — so when the
+ * caller passes the provider-fit budget and the transcript STILL does not fit,
+ * protection narrows (2 → 1 → 0) until it does or every image is gone.
+ * Without a budget the behavior is the original single pass.
+ */
+export function stripImagesForOverflowRecovery(agent: Agent, keepLastMessages = 2, budget?: number): number {
+	const before = estimateTokensSafe(agent.state.messages);
+	let stripped = 0;
+	const fits = () => typeof budget !== "number" || estimateTokensSafe(agent.state.messages) < budget;
+	const ladder = [keepLastMessages, 1, 0].filter((v, i, a) => v >= 0 && v <= keepLastMessages && a.indexOf(v) === i);
+	for (const keep of ladder) {
+		stripped += stripImagesOutsideTail(agent, keep);
+		if (fits()) break;
+	}
+	if (stripped > 0) {
+		// Token view for field triage (review a1a019c4 P2-4): block counts alone
+		// cannot be cross-checked against the provider's limit.
+		console.warn(`[engine] overflow recovery: stripped ${stripped} image part(s) (estimated ~${before} → ~${estimateTokensSafe(agent.state.messages)} tokens${typeof budget === "number" ? `, budget ${budget}` : ""})`);
+	}
+	return stripped;
+}
+
+function stripImagesOutsideTail(agent: Agent, keepLastMessages: number): number {
 	let stripped = 0;
 	const msgs = agent.state.messages;
 	const last = Math.max(0, msgs.length - keepLastMessages);
@@ -172,6 +199,12 @@ export function stripImagesForOverflowRecovery(agent: Agent, keepLastMessages = 
 		let changed = false;
 		const next = (content as unknown[]).map((block) => {
 			const b = block as { type?: unknown; data?: unknown; mimeType?: unknown } | null;
+			// The `{data,mimeType}` OR-branch is deliberate shape-drift insurance:
+			// narrowing it to type==="image" only would re-blind the estimator the
+			// moment a producer loses the type field — the exact failure mode this
+			// fix closes. Audio/file blocks are flattened to text before entering
+			// transcripts (mcp.ts renderToolResult), so the branch cannot misfire
+			// today (review a1a019c4 P2-2: keep the fallback, documented).
 			if (b && typeof b === "object" && (b.type === "image" || (typeof b.data === "string" && typeof b.mimeType === "string"))) {
 				stripped += 1;
 				changed = true;
@@ -186,7 +219,6 @@ export function stripImagesForOverflowRecovery(agent: Agent, keepLastMessages = 
 			(msgs[i] as unknown as { content: unknown[] }).content = next;
 		}
 	}
-	if (stripped > 0) console.warn(`[engine] overflow recovery: stripped ${stripped} image part(s) outside the last ${keepLastMessages} message(s)`);
 	return stripped;
 }
 

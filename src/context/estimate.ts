@@ -110,6 +110,12 @@ export function countImageParts(message: AgentMessage): number {
 	let n = 0;
 	for (const block of content as { type?: unknown; data?: unknown; mimeType?: unknown }[]) {
 		if (!block || typeof block !== "object") continue;
+		// The `{data,mimeType}` OR-branch is deliberate shape-drift insurance
+		// (review a1a019c4 P2-2): narrowing it to type==="image" only would
+		// re-blind the estimator the moment a producer loses the type field —
+		// the exact failure mode this fix closes. Audio/file blocks are
+		// flattened to text before entering transcripts (mcp.ts
+		// renderToolResult), so the branch cannot misfire today.
 		if (block.type === "image" || (typeof block.data === "string" && typeof block.mimeType === "string")) n += 1;
 	}
 	return n;
