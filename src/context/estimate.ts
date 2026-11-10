@@ -66,7 +66,59 @@ export function usableContextWindow(contextWindow: number, maxTokens?: number): 
 
 /** Same rule as estimateTokensSafe, for a single message. */
 export function estimateMessageTokens(message: AgentMessage): number {
-	return Math.max(estimateTextTokens(messageText(message)), estimateTokens(message));
+	const images = countImageParts(message);
+	// pi's estimator already charges a FLAT 1_200 tokens per image part
+	// (ESTIMATED_IMAGE_CHARS=4800, ÷4) for user/system/toolResult messages — but
+	// a desktop screenshot really costs ~5–15k vision tokens at the provider
+	// (field 2026-11-10: ~30 frames measured 204_817 real tokens, i.e. ~6.8k a
+	// frame, while this flat rate saw the same transcript as ~3.8k). Subtract
+	// pi's flat baseline and replace it with the empirical rate below, so the
+	// same block is never counted twice and image-heavy transcripts compact
+	// before they hit the provider's hard limit.
+	const piWithoutImages = Math.max(0, estimateTokens(message) - images * PI_IMAGE_BASELINE_TOKENS);
+	return Math.max(estimateTextTokens(messageText(message)), piWithoutImages)
+		+ images * VISION_TOKENS_PER_IMAGE;
+}
+
+/** pi-agent-core's flat per-image guess (ESTIMATED_IMAGE_CHARS 4800 ÷ 4). */
+export const PI_IMAGE_BASELINE_TOKENS = 1_200;
+
+/**
+ * Vision-token cost assumed per image content part (field 2026-11-10, Nova:
+ * an X11 screen-automation worker wedged at the provider's 204800 limit while
+ * our estimate called the same transcript ~3.8k tokens — pi's flat 1_200 per
+ * frame under-counted desktop screenshots ~6×, so compaction never fired and
+ * every retry re-sent the whole ~200k vision payload; "forced compaction
+ * skipped: nothing to cut" was logged because the measured tail looked tiny).
+ *
+ * 6_000 is the field-derived mid-range for a 1920x1080 desktop frame
+ * (~6.8k measured). Over-counting only makes compaction fire a little earlier
+ * — the safe direction, exactly as with the CJK rate above. Under-counting is
+ * what wedged the box. The overflow recovery path additionally strips old
+ * image parts outright (keepLastMessages), so an estimate that is still low
+ * can never wedge the session again.
+ */
+export const VISION_TOKENS_PER_IMAGE = 6_000;
+
+/** Image content parts in one message — the payload text estimation ignores. */
+export function countImageParts(message: AgentMessage): number {
+	// SAFETY: AgentMessage's content union is not narrowed in pi's public types
+	// (toolResult/assistant messages carry heterogeneous block arrays at
+	// runtime); read it as unknown and validate every block shape below.
+	const content = (message as unknown as { content?: unknown }).content;
+	if (!Array.isArray(content)) return 0;
+	let n = 0;
+	for (const block of content as { type?: unknown; data?: unknown; mimeType?: unknown }[]) {
+		if (!block || typeof block !== "object") continue;
+		// The `{data,mimeType}` OR-branch is deliberate shape-drift insurance
+		// (review a1a019c4 P2-2): narrowing it to type==="image" only would
+		// re-blind the estimator the moment a producer loses the type field —
+		// the exact failure mode this fix closes. Audio/file blocks are
+		// flattened to text before entering transcripts (mcp.ts
+		// renderToolResult), so the branch cannot misfire today.
+		if (block.type === "image" || (typeof block.data === "string" && typeof block.mimeType === "string")) n += 1;
+	}
+	return n;
 }
 
 /**

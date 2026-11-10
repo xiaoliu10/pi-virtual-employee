@@ -25,7 +25,7 @@ const bundle = join(workDir, "context.mjs");
 await build({
 	stdin: {
 			contents: `
-				export { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, turnMemoryPrefix, TURN_MEMORY_TAIL, lastAssistantTailOf, recentAssistantVisibleTexts, isCompactionTemplateText } from "./src/engine/context.ts";
+				export { estimateTokensSafe, estimateMessageTokens, countImageParts, VISION_TOKENS_PER_IMAGE, stripImagesForOverflowRecovery, IMAGE_STRIPPED_PLACEHOLDER, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, usableContextWindow, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, turnMemoryPrefix, TURN_MEMORY_TAIL, lastAssistantTailOf, recentAssistantVisibleTexts, isCompactionTemplateText } from "./src/engine/context.ts";
 				// pi 1.x moved the compaction primitives to the coding-agent package;
 				// the app vendors them in src/engine/pi-compaction.ts.
 				export { shouldCompact, DEFAULT_COMPACTION_SETTINGS, estimateTokens } from "./src/engine/pi-compaction.ts";
@@ -39,7 +39,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { estimateTokensSafe, estimateMessageTokens, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, turnMemoryPrefix, TURN_MEMORY_TAIL, lastAssistantTailOf, recentAssistantVisibleTexts, isCompactionTemplateText } = await import(pathToFileURL(bundle).href);
+const { estimateTokensSafe, estimateMessageTokens, countImageParts, VISION_TOKENS_PER_IMAGE, stripImagesForOverflowRecovery, IMAGE_STRIPPED_PLACEHOLDER, isContextOverflowError, truncateToFit, findCompactionCut, findForcedCompactionCut, stripDanglingAssistant, stripStaleUsage, progressContextSlice, FALLBACK_CONTEXT_WINDOW, estimateTokens, usableContextWindow, shouldCompact, DEFAULT_COMPACTION_SETTINGS, FINAL_SUMMARY_PROMPT, isSyntheticUserMessage, taskAnchorOf, substantialAnchorOf, heartbeatGoalOf, maybeCompact, stripSyntheticPromptPrefix, turnMemoryPrefix, TURN_MEMORY_TAIL, lastAssistantTailOf, recentAssistantVisibleTexts, isCompactionTemplateText } = await import(pathToFileURL(bundle).href);
 
 const user = (text) => ({ role: "user", content: text, timestamp: Date.now() });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: Date.now() });
@@ -840,4 +840,98 @@ test("progressContextSlice 剥掉用户消息里的记忆前缀（侧信道不�
 	const out = progressContextSlice([vision]).find((m) => Array.isArray(m.content));
 	assert.equal(out.content.length, 2, "image part preserved");
 	assert.equal(out.content[0].text, request);
+});
+
+// ── Field 2026-11-10 (Nova): image-blind accounting wedged a screen-automation
+// worker at the provider's 204800 limit. Compaction ran three times yet every
+// retry re-sent ~200k vision tokens, because image parts counted ZERO here and
+// the keep-recent tail walk treated screenshots as free.
+const shot = (text) => ({
+	role: "toolResult",
+	content: [
+		{ type: "text", text },
+		{ type: "image", data: "iVBORw0KGgo=" + "A".repeat(200), mimeType: "image/png" },
+	],
+	timestamp: Date.now(),
+});
+
+test("image parts carry a conservative vision-token cost in the ONE estimator", () => {
+	const plain = { role: "toolResult", content: [{ type: "text", text: "截图完成" }], timestamp: Date.now() };
+	const withOne = shot("截图完成");
+	assert.equal(countImageParts(plain), 0);
+	assert.equal(countImageParts(withOne), 1);
+	assert.equal(estimateMessageTokens(withOne) - estimateMessageTokens(plain), VISION_TOKENS_PER_IMAGE,
+		"one image part must add exactly the vision cost");
+	const two = { ...withOne, content: [withOne.content[0], withOne.content[1], { ...withOne.content[1] }] };
+	assert.equal(countImageParts(two), 2);
+});
+
+test("the keep-recent tail walk stops at screenshots instead of hoarding them", () => {
+	const messages = [user("任务：X11 远程桌面逐键输入 19 位数字")];
+	for (let i = 0; i < 40; i += 1) messages.push(shot(`第 ${i} 键完成`));
+	messages.push(assistant("继续。"));
+	// A single-turn trace has no internal user boundary: the ordinary cut would
+	// rewind to index 0, so the FORCED cut is the one forced compaction uses
+	// (keeps the task statement verbatim, summarizes the middle, caps the tail).
+	const forced = findForcedCompactionCut(messages, 20_000);
+	assert.ok(forced, "a forced cut must exist for an image-heavy single-turn trace");
+	const cut = forced.cut;
+	assert.ok(cut > forced.keepIndex + 1 && cut < messages.length, `cut must split the trace (got ${cut})`);
+	const tailImages = messages.slice(cut).reduce((a, m) => a + countImageParts(m), 0);
+	assert.ok(tailImages <= 4, `at 6k/frame the 20k tail budget keeps ~3 screenshots, got ${tailImages}`);
+});
+
+test("stripImagesForOverflowRecovery drops old screenshots but protects the live tail", () => {
+	const messages = [user("任务")];
+	for (let i = 0; i < 10; i += 1) messages.push(shot(`step ${i}`));
+	const agent = { state: { messages } };
+	const stripped = stripImagesForOverflowRecovery(agent, 2);
+	assert.equal(stripped, 8, "9th/10th shots sit in the protected last-two-messages tail");
+	const imagesLeft = agent.state.messages.reduce((a, m) => a + countImageParts(m), 0);
+	assert.equal(imagesLeft, 2, "the protected tail keeps both of its screenshots");
+	assert.ok(JSON.stringify(agent.state.messages[1]).includes(IMAGE_STRIPPED_PLACEHOLDER), "the placeholder explains the drop to the model");
+	// Idempotent: a second pass finds nothing left to strip outside the tail.
+	assert.equal(stripImagesForOverflowRecovery(agent, 2), 0);
+});
+
+test("forced compaction frees an image-wedged single-turn transcript (the field wedge)", async () => {
+	const messages = [user("任务：X11 远程桌面逐键输入并核对回显")];
+	for (let i = 0; i < 40; i += 1) messages.push(shot(`第 ${i} 键`));
+	messages.push(assistant("继续输入。"));
+	const before = estimateTokensSafe(messages);
+	assert.ok(before > 100_000, `fixture must look oversized once images count (got ${before})`);
+	const agent = { sessionId: "conv-image-wedge", state: { messages: [...messages], model: { id: "test", contextWindow: 204_800, maxTokens: 32_000 } } };
+	const small = async () => ({ result: async () => ({ role: "assistant", content: [{ type: "text", text: "摘要：已输入前 30 键，回显正常。" }], stopReason: "stop" }) });
+	const outcome = await maybeCompact(agent, true, undefined, small);
+	assert.equal(outcome.compacted, true, "with images counted, the head (most screenshots) becomes summarizable");
+	const afterImages = agent.state.messages.reduce((a, m) => a + countImageParts(m), 0);
+	assert.ok(afterImages <= 8, `the kept tail holds only recent screenshots, got ${afterImages}`);
+	assert.ok(estimateTokensSafe(agent.state.messages) < before / 2, "the request will fit the provider limit now");
+});
+
+// ── Review a1a019c4 closures ─────────────────────────────────────────────────
+test("an image-only toolResult costs exactly the vision rate — pi's flat baseline is REPLACED, not added (P2-3)", () => {
+	const img = { role: "toolResult", content: [{ type: "image", data: "A".repeat(400), mimeType: "image/png" }], timestamp: Date.now() };
+	// pi's estimateTokens charges this block its flat 1200; the estimator must
+	// subtract that baseline and charge VISION_TOKENS_PER_IMAGE once — 6000, not 7200.
+	assert.equal(estimateMessageTokens(img), VISION_TOKENS_PER_IMAGE);
+});
+
+test("strip escalates into the protected tail when a budget is given and the tail still overflows (P1-1)", () => {
+	const messages = [user("任务")];
+	for (let i = 0; i < 5; i += 1) messages.push(shot(`step ${i}`));
+	const agent = { state: { messages } };
+	// Budget no tail could ever meet → the ladder must walk 2 → 1 → 0.
+	const stripped = stripImagesForOverflowRecovery(agent, 2, 100);
+	assert.equal(stripped, 5, "escalation strips the live tail too when nothing fits");
+	assert.equal(agent.state.messages.reduce((a, m) => a + countImageParts(m), 0), 0);
+});
+
+test("strip stops escalating as soon as the budget is met (P1-1)", () => {
+	const messages = [user("任务"), shot("a"), shot("b"), shot("c")];
+	const agent = { state: { messages } };
+	// After the keep=2 pass one shot (~6k) remains, under the 8k budget → no escalation.
+	const stripped = stripImagesForOverflowRecovery(agent, 2, 8_000);
+	assert.equal(stripped, 2);
+	assert.equal(agent.state.messages.reduce((a, m) => a + countImageParts(m), 0), 1, "the fitting tail keeps its screenshot");
 });
