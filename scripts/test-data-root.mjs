@@ -163,6 +163,40 @@ test("PI_DATA_ROOT absolute override wins; relative and unwritable targets are h
 	);
 });
 
+test("N3: bare drive root as PI_DATA_ROOT is rejected (no drive-relative workspace)", () => {
+	// "C:\\" / "D:/" hit the bare-root message; a drive letter with no path
+	// ("E:") fails the absolute check first. Either way it must throw.
+	for (const bare of ["C:\\", "D:/"]) {
+		assert.throws(
+			() => resolveDataRoot({ appData: APPDATA, platform: "win32", env: { PI_DATA_ROOT: bare }, fs: makeFs({ writable: [bare] }) }),
+			/裸盘根目录/,
+			`bare root ${bare} must be rejected`,
+		);
+	}
+	assert.throws(
+		() => resolveDataRoot({ appData: APPDATA, platform: "win32", env: { PI_DATA_ROOT: "E:" }, fs: makeFs() }),
+		DataRootUnavailableError,
+	);
+});
+
+test("N1: pinRoot detects a fingerprint/marker interleave (no poisoned pin)", () => {
+	// Simulate a concurrent launch: the fingerprint file on disk does NOT match
+	// the marker this instance writes. A healthy pin must throw rather than leave
+	// a marker whose fingerprint diverges from the volume file.
+	const fs = makeFs({ writable: [E] });
+	// Intercept writeText so the fingerprint file ends up holding a stale value
+	// different from whatever pinRoot records in the marker.
+	const baseWrite = fs.writeText.bind(fs);
+	fs.writeText = (p, content) => {
+		if (p.endsWith(ROOT_FINGERPRINT_FILE)) {
+			baseWrite(p, "stale-concurrent-fingerprint"); // another instance's value
+		} else {
+			baseWrite(p, content);
+		}
+	};
+	assert.throws(() => resolve(fs), /指纹写入冲突/);
+});
+
 test("path layout contract preserves the substring updater.ts relies on", () => {
 	// profileUserDataDir uses the HOST path.join (real win32 emits backslashes;
 	// this darwin runner emits a mixed form), so assert structurally, not by

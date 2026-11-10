@@ -223,6 +223,14 @@ function pinRoot(fs: FsPort, appData: string, root: string, fingerprint: string 
 	// Write-verify: a marker we cannot read back must not be treated as pinned.
 	const back = readMarker(fs, appData, platform);
 	if (!back || back.root !== canonicalRoot) throw new Error(`数据根标记写入失败：${markerPath(appData)}`);
+	// Concurrent first-launch guard (review 95d63207 N1): two instances pinning
+	// the same drive can interleave their fingerprint/marker writes and leave a
+	// marker whose fingerprint no longer matches the file on disk, which would
+	// hard-fail every later launch. Verify the fingerprint file agrees too; a
+	// mismatch here means another writer won — abort rather than poison the pin.
+	if (fingerprint && fs.readText(fingerprintPath(root))?.trim() !== fingerprint) {
+		throw new Error(`数据根指纹写入冲突（可能有另一个实例同时启动）：${root}`);
+	}
 }
 
 /**
@@ -242,6 +250,13 @@ export function resolveDataRoot(deps: DataRootDeps): string {
 	if (envRoot) {
 		if (!isAbsolutePath(envRoot, platform)) {
 			throw new DataRootUnavailableError(envRoot, "PI_DATA_ROOT 必须是绝对路径");
+		}
+		// Reject a bare drive root on Windows (review 95d63207 N3): normalizing
+		// "C:\\" strips the separator to "C:", after which the -workspace
+		// sibling becomes the drive-relative "C:-workspace" and the workspace
+		// resolves against an unknown cwd. Require a real subdirectory.
+		if (platform === "win32" && /^[A-Za-z]:[\\/]*$/.test(envRoot)) {
+			throw new DataRootUnavailableError(envRoot, "PI_DATA_ROOT 不能是裸盘根目录，请指定一个子目录");
 		}
 		// Host path.normalize is posix on non-win test runners; normalize explicitly
 		// for win32 so drive paths keep their backslash shape everywhere.

@@ -93,7 +93,7 @@ const isDev = !!process.env.VITE_DEV_SERVER_URL;
  */
 const PROFILE_NAME_RE = /^[A-Za-z0-9_-]+$/;
 import { acquireProfileLock as coreAcquireProfileLock, LOCK_FILE } from "./profile-lock-core.js";
-import { DataRootUnavailableError, profileUserDataDir, resolveDataRoot, workspaceRoot } from "./data-root.js";
+import { profileUserDataDir, resolveDataRoot, workspaceRoot } from "./data-root.js";
 
 /** Project the Electron updater state to the platform-agnostic tool status. */
 function toUpdateToolStatus(state: UpdateState): UpdateToolStatus {
@@ -146,21 +146,20 @@ let dataRoot: string;
 try {
 	dataRoot = resolveDataRoot({ appData: app.getPath("appData"), env: process.env });
 } catch (err) {
-	if (err instanceof DataRootUnavailableError) {
-		// This runs at module load, BEFORE app.whenReady — a whenReady().then()
-		// dialog is dead code because the top-level throw aborts app init before
-		// the ready phase (review 3bd05d8a P2-1, reproduced on Electron 37).
-		// showErrorBox is documented safe to call before ready; show it
-		// synchronously, then quit so the process never opens a DB on an empty
-		// fallback root. Starting anyway would orphan the real data.
-		console.error(`[main] ${err.message}`);
-		try {
-			dialog.showErrorBox("数据目录不可用", err.message);
-		} catch {
-			/* headless / no display: the console error above is the last resort */
-		}
-		app.quit();
+	// ANY failure in data-root resolution means we cannot safely locate the
+	// profile data — a plain marker-write/fs error is just as fatal as a
+	// DataRootUnavailableError (review 95d63207 N2: the instanceof guard used
+	// to let non-unavailable errors escape with a console-only module crash).
+	// showErrorBox is documented safe before ready; show synchronously, quit so
+	// the process never opens a DB on an undefined/empty fallback root.
+	const message = err instanceof Error ? err.message : String(err);
+	console.error(`[main] data-root resolution failed: ${message}`);
+	try {
+		dialog.showErrorBox("数据目录初始化失败", message);
+	} catch {
+		/* headless / no display: the console error above is the last resort */
 	}
+	app.quit();
 	throw err;
 }
 app.setPath("userData", profileUserDataDir(dataRoot, activeProfile));
