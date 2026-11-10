@@ -46,7 +46,7 @@ function harness(overrides = {}) {
 	const store = new WorkerTaskStore(db);
 	const h = {
 		db, store,
-		sessions: [], sends: [], pushes: [], errors: [],
+		sessions: [], sends: [], pushes: [], errors: [], settled: [],
 		open: async (cid) => { h.sessions.push(cid); return { cid }; },
 		send: async (session, message) => {
 			h.sends.push({ session, message });
@@ -56,6 +56,7 @@ function harness(overrides = {}) {
 	};
 	const service = new WorkerService(store, {
 		open: h.open, send: h.send, push: h.push,
+		onSettled: (task, outcome) => h.settled.push({ task, outcome }),
 		maxConcurrent: 3, clock: { now: () => Date.now(), setTimeout: (fn) => { h.wake = fn; return fn; } },
 		onError: (e) => h.errors.push(e),
 		...overrides.service,
@@ -685,4 +686,44 @@ test("a narration-suppressed FOLLOW-UP delivers the notice but never rewrites th
 	const pushed = h.pushes.filter((p) => p.cid === "dt:group:g1");
 	assert.equal(pushed.length, 1, "the notice is still delivered to the source conversation");
 	assert.equal(pushed[0].text, NARRATION_GUARD_NOTICE);
+});
+
+test("a narration-NOTED dispatch round settles as failure and is never archived as a task outcome (review adaf0751 P1-A)", async () => {
+	const MERGED = "我需要先了解当前环境，然后再继续。\n\n" + NARRATION_GUARD_NOTICE;
+	const { h, service } = harness({
+		reply: () => ({ reply: MERGED, narrationNoted: true }),
+	});
+	const w = service.spawn({ instruction: "查一下这笔流水的支付渠道下单日志", sourceConversation: "dt:group:g1", createdBy: "ma1" });
+	service.start();
+	await flush();
+	const row = h.store.get(w.id);
+	assert.equal(row.result, null, "zero action must never land in the result column");
+	assert.equal(row.error, MERGED, "the delivered text is recorded in the error column");
+	const pushed = h.pushes.filter((p) => p.cid === "dt:group:g1");
+	assert.equal(pushed.length, 1, "the human still sees the honest merged text");
+	assert.equal(pushed[0].text, MERGED);
+	assert.equal(h.settled.length, 0, "nothing executed → no knowledge-base outcome entry");
+});
+
+test("a suppressed reply WITHOUT the warning prefix is still corrected by the explicit flag", async () => {
+	// Mutation-proof (review adaf0751 P2-D): settlement must key on the kernel
+	// flag, not on sniffing the ⚠️ prefix.
+	const { h, service } = harness({
+		reply: () => ({ reply: "plain narration without prefix", narrationSuppressed: true }),
+	});
+	const w = service.spawn({ instruction: "查日志", sourceConversation: "dt:group:g1", createdBy: "ma1" });
+	service.start();
+	await flush();
+	const row = h.store.get(w.id);
+	assert.equal(row.result, null, "flag-based settlement, not prefix sniffing");
+	assert.equal(row.error, "plain narration without prefix");
+});
+
+test("source-context excerpt keeps a merged row's real answer (review adaf0751 P1-B)", () => {
+	const excerpt = buildSourceContextExcerpt([
+		{ role: "user", content: "帮我查对账" },
+		{ role: "assistant", content: "查完了，3 笔异常。\n\n" + NARRATION_GUARD_NOTICE },
+	]);
+	assert.ok(excerpt.includes("查完了，3 笔异常"), "the delivered answer must reach a fresh worker's context");
+	assert.ok(!excerpt.includes("已尝试继续执行但模型没有实际动作"), "the notice paragraph must not");
 });

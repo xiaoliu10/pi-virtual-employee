@@ -290,5 +290,11 @@ test("isDanglingNarration: only structurally certain mid-sentence lead-ins may r
 		"查到 3 笔异常，明细：1）a 2）b",
 		"登录成功，环境检查完成。",
 		"你好，有什么可以帮你？",
+		// Review adaf0751 P2-A: a colon-ended CLARIFICATION lead-in is a question
+		// the human must answer — suppressing it loses what the model wanted to ask.
+		"我需要先确认几个问题：",
+		"让我确认一下时间范围：",
+		"我先确认一下你的需求：",
+		"让我先问清楚：",
 	]) assert.equal(m.isDanglingNarration(text), false, `not dangling: ${text.slice(0, 30)}`);
 });

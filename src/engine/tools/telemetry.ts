@@ -37,6 +37,7 @@ const STATUS_LABEL: Record<string, string> = {
 	degenerate_reply: "退化输出（碎片已拦下）",
 	deterministic_failure: "彻底失败（兜底文案）",
 	narration_suppressed: "旁白已拦截（零工具未投递）",
+	narration_noted: "旁白附通知放行（零工具）",
 };
 
 const CLUSTER_LABEL: Record<FailureCluster["kind"], string> = {

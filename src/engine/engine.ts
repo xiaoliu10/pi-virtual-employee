@@ -147,6 +147,12 @@ export interface SendResult {
 	 * own the honest system notice (NARRATION_GUARD_NOTICE); this flag is how
 	 * they tell a suppressed turn apart from a genuine empty-reply failure. */
 	narrationSuppressed?: boolean;
+	/** True when a zero-tool turn ended on sentence-form process narration and
+	 * the fail-open ruling (2026-11-10: delivery quality first) delivered the
+	 * model text WITH the honest notice appended. The text reaches the human,
+	 * but the turn executed NOTHING: settlements must not record it as a
+	 * success result, archive it as a task outcome, or count it ok. */
+	narrationNoted?: boolean;
 }
 
 /** Delivers an image into the originating IM chat as an inline image message. */
@@ -1615,7 +1621,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * Never throws: the ledger serves the NEXT window, and a write failure must
 	 * not turn an already-delivered reply into an error.
 	 */
-	private async commitWorkTurn(conversationId: string, message: string, reply: string, agent: Agent, deterministic: boolean, narrationSuppressed = false): Promise<void> {
+	private async commitWorkTurn(conversationId: string, message: string, reply: string, agent: Agent, deterministic: boolean, narrationSuppressed = false, narrationNoted = false): Promise<void> {
 		const store = this.opts.contextStore;
 		if (!store) return;
 		const digests = this.workToolDigests.get(conversationId) ?? [];
@@ -1632,9 +1638,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// A deterministic failure template ("模型服务中断…") is not the task's
 			// outcome — in the ledger it degrades to a delivery notice so later
 			// windows never replay the boilerplate as the reply.
-			if (reply.trim() && !deterministic && !narrationSuppressed) records.push({ conversationId, kind: "reply", text: reply, ts });
+			if (reply.trim() && !deterministic && !narrationSuppressed && !narrationNoted) records.push({ conversationId, kind: "reply", text: reply, ts });
 			else if (deterministic) records.push({ conversationId, kind: "delivery", text: "（本轮因模型服务中断未产出结果，任务未完成）", ts });
 			else if (narrationSuppressed) records.push({ conversationId, kind: "delivery", text: "（本轮只产出过程叙述且未调用任何工具，已拦截未投递；任务未完成）", ts });
+			else if (narrationNoted) records.push({ conversationId, kind: "delivery", text: "（本轮只产出过程叙述且未调用任何工具，已附通知放行；任务未完成）", ts });
 			store.appendNextMany(conversationId, records);
 		} catch (err) {
 			console.warn("[engine] work ledger commit failed:", err instanceof Error ? err.message : err);
@@ -3138,6 +3145,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// cap/budget-paused, errored, or deliberately stopped stay untouched;
 		// ephemeral side passes (eval/learn) are not user turns at all.
 		let narrationSuppressed = false;
+		let narrationNoted = false;
 		if (!ctx?.ephemeral && !hardError && !deterministic && !capHit && !contextBudgetHit
 			&& !this.turnAborts.has(conversationId)
 			&& (this.turnToolCalls.get(conversationId) ?? 0) === 0 && isProcessNarration(reply)) {
@@ -3199,17 +3207,21 @@ export class EmployeeEngine implements EmployeeRuntime {
 				this.turnSendImageSaved.delete(conversationId);
 			}
 			if (continuedReply.trim()) reply = continuedReply;
-			if ((this.turnToolCalls.get(conversationId) ?? 0) === 0) {
+			// Review adaf0751 P2-C: an abort landing DURING the continuation owns
+			// the turn's delivery — neither narration branch may rewrite it.
+			if ((this.turnToolCalls.get(conversationId) ?? 0) === 0 && !this.turnAborts.has(conversationId)) {
 				// Still no action. User ruling 2026-11-10: narration is optional,
 				// the RESULT is what matters — the heuristic may force a retry but
 				// must never gamble a delivery. Only the structurally certain
 				// dangling shape (ends mid-sentence on 「…：」/「来执行」, so it can
 				// never BE a result) is suppressed; anything else is delivered with
-				// the honest notice appended, so a real blocker or answer survives.
+				// the honest notice appended (narrationNoted), so a real blocker or
+				// answer survives while settlements stay honest about zero action.
 				if (isDanglingNarration(reply)) {
 					narrationSuppressed = true;
 					reply = NARRATION_GUARD_NOTICE;
 				} else if (isProcessNarration(reply)) {
+					narrationNoted = true;
 					reply = `${reply}\n\n${NARRATION_GUARD_NOTICE}`;
 				}
 			}
@@ -3234,7 +3246,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// digests + reply), then let the ledger compact itself. Best-effort — the
 		// ledger is the NEXT window's context, never this reply's delivery path.
 		if (isWork && !ctx?.ephemeral) {
-			await this.commitWorkTurn(conversationId, message, reply, agent, deterministic, narrationSuppressed);
+			await this.commitWorkTurn(conversationId, message, reply, agent, deterministic, narrationSuppressed, narrationNoted);
 		}
 
 		// Context management: summarize old turns once the transcript approaches
@@ -3269,6 +3281,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			deterministic,
 			degenerate,
 			narrationSuppressed,
+			narrationNoted,
 			correction: turnCorrection,
 			actor: ctx?.actor,
 		});
@@ -3288,7 +3301,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			const described = describeAbortReason(abortReason);
 			if (described) outError = outError ? `${described}（系统错误：${outError}）` : described;
 		}
-		return { reply, error: outError, deterministic, narrationSuppressed };
+		return { reply, error: outError, deterministic, narrationSuppressed, narrationNoted };
 	}
 
 	/** One tool call, linked to the turn that made it. Never throws. On a
@@ -3395,6 +3408,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 		deterministic: boolean;
 		degenerate?: boolean;
 		narrationSuppressed?: boolean;
+		narrationNoted?: boolean;
 		correction: boolean;
 		actor?: InboundActor;
 	}): void {
@@ -3424,6 +3438,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 			else if (input.degenerate) status = "degenerate_reply";
 			else if (input.deterministic) status = "deterministic_failure";
 			else if (input.narrationSuppressed) status = "narration_suppressed";
+			else if (input.narrationNoted) status = "narration_noted";
 			else if (input.askedForSummary || emptyReply) status = "empty_reply";
 			this.telemetry.recordTurn({
 				turnId,

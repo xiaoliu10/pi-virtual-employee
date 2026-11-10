@@ -16,8 +16,10 @@ import type { DB } from "./sqlite.js";
  * with a blank line), so split on paragraph breaks and drop the LAST paragraph
  * when it carries a distinctive fragment — a real reply that merely mentions
  * the words earlier in the text survives. Returns null only when nothing is
- * left after stripping. */
-function stripNotice(content: string, noticeRe: RegExp): string | null {
+ * left after stripping. Shared with the durable import and the worker
+ * source-context excerpt (review adaf0751 P1-B): a MERGED row (real answer +
+ * appended notice) must keep its answer everywhere, not only in the sweep. */
+export function stripNotice(content: string, noticeRe: RegExp): string | null {
 	const normalized = (text: string) => (text ?? "").replace(/\s+/g, "").trim();
 	if (!noticeRe.test(normalized(content))) return null;
 	const paragraphs = content.split(/\n\s*\n/);

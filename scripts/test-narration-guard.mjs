@@ -216,6 +216,7 @@ test("still zero tools, sentence-form narration: delivered WITH the notice (fail
 	assert.ok(result.reply.startsWith("我需要先了解当前环境"), "the model text is delivered, not swallowed");
 	assert.ok(result.reply.endsWith(NARRATION_GUARD_NOTICE), "the no-action notice rides along");
 	assert.equal(result.narrationSuppressed, false);
+	assert.equal(result.narrationNoted, true, "zero action is flagged so settlements stay honest");
 	assert.equal(runs, 2, "the guard runs exactly once even when the continuation narrates again");
 	assert.equal(history.listMessages("conv-narrate-twice").filter((m) => m.role === "assistant").length, 1, "delivered text persists");
 });
@@ -445,6 +446,7 @@ test("field 2026-11-10: the old input gate misses this message, but the output g
 
 	assert.equal(runs, 2, "the output-side guard still forces exactly one continuation");
 	assert.equal(result.narrationSuppressed, false, "sentence-form narration is delivered, not swallowed");
+	assert.equal(result.narrationNoted, true);
 	assert.ok(result.reply.startsWith("我需要先确认环境"), "the continuation text reaches the user");
 	assert.ok(result.reply.endsWith(NARRATION_GUARD_NOTICE), "with the honest no-action notice");
 });
@@ -497,4 +499,27 @@ test("a continuation that returns a substantive zero-tool blocker is delivered, 
 	assert.equal(runs, 2, "one forced continuation still runs");
 	assert.equal(result.narrationSuppressed, false, "a substantive blocker is not narration");
 	assert.equal(result.reply, BLOCKER, "the blocker question reaches the user verbatim");
+});
+
+test("telemetry records the zero-action outcome, never ok (review adaf0751 P2-D)", async (t) => {
+	const caps = [];
+	// Dangling → narration_suppressed
+	{
+		let runs = 0;
+		const { engine, config } = makeEngine(t, { streamFn: async () => { runs += 1; return textReply(runs === 1 ? NARRATION : "让我先确认一下当前环境和可用工具："); } });
+		engine.setTelemetryStore({ recordTurn: (i) => caps.push(i), recordTool: () => {} });
+		supplierConfig(config);
+		const result = await engine.send(engine.getOrCreateSession("conv-tel-sup"), FIELD_MESSAGE);
+		assert.equal(result.narrationSuppressed, true);
+	}
+	// Sentence-form → narration_noted
+	{
+		let runs = 0;
+		const { engine, config } = makeEngine(t, { streamFn: async () => { runs += 1; return textReply(runs === 1 ? NARRATION : "我需要先了解当前环境，然后再继续。"); } });
+		engine.setTelemetryStore({ recordTurn: (i) => caps.push(i), recordTool: () => {} });
+		supplierConfig(config);
+		const result = await engine.send(engine.getOrCreateSession("conv-tel-not"), FIELD_MESSAGE);
+		assert.equal(result.narrationNoted, true);
+	}
+	assert.deepEqual(caps.map((c) => c.status), ["narration_suppressed", "narration_noted"], "zero-action turns must land as their own statuses, never ok");
 });

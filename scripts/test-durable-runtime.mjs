@@ -182,6 +182,24 @@ test('persisted fallback notices are not replayed into the durable transcript', 
  }finally{await runtime.close();}
 });
 
+test('a MERGED history row (real answer + notice) keeps its ANSWER on durable import (review adaf0751 P1-B)', async t => {
+	const history = makeHistory(t);
+	history.ensureConversation('conv-merged', '合并行会话');
+	history.appendMessage('conv-merged', 'user', '帮我查对账');
+	history.appendMessage('conv-merged', 'assistant', '对账完成：3 条异常，已导出。\n\n' + NARRATION_GUARD_NOTICE);
+	const faux = fauxProvider();
+	const sessions = new Map();
+	const session = id => { if (!sessions.has(id)) sessions.set(id, new Agent({ streamFn: faux.provider.streamSimple, sessionId: id, initialState: { model: faux.provider.getModels()[0], systemPrompt: 'test' } })); return sessions.get(id); };
+	faux.setResponses([fauxAssistantMessage('收到，继续下一步。')]);
+	let seenTx = '';
+	const runtime = await DurableRuntime.open({ userDataDir: join(dir, 'merged-import'), history, session, tools: () => [], stream: (id, opts, messages) => { seenTx = JSON.stringify(messages); return faux.provider.streamSimple(faux.provider.getModels()[0], { messages }, opts); }, withActor: async (id, ctx, text, run) => run(), onRecovered: async () => {} });
+	try {
+		await runtime.send(session('conv-merged'), '继续');
+		assert.ok(seenTx.includes('对账完成：3 条异常'), 'the delivered real answer must survive into the next turn context');
+		assert.ok(!seenTx.includes('已尝试继续执行但模型没有实际动作'), 'the notice paragraph must not be replayed');
+	} finally { await runtime.close(); }
+});
+
 test('sweepSyntheticFallbackReplies removes persisted notices idempotently', t => {
  const db=new DatabaseSync(':memory:');
  db.exec(`CREATE TABLE conversations (id TEXT PRIMARY KEY,title TEXT,created_at INTEGER,updated_at INTEGER,origin TEXT,model_supplier_id TEXT,model_model_id TEXT); CREATE TABLE messages (id TEXT PRIMARY KEY,conversation_id TEXT,role TEXT,content TEXT,created_at INTEGER);`);
@@ -292,6 +310,7 @@ test('narration guard: zero-tool nudge; sentence-form continuation delivered WIT
 		assert.ok(result.reply.startsWith('我需要先了解当前环境'), 'a complete sentence is delivered, not swallowed');
 		assert.ok(result.reply.endsWith(NARRATION_GUARD_NOTICE), 'the honest notice rides along');
 		assert.ok(!result.narrationSuppressed, 'the flag is true ONLY on suppression');
+		assert.equal(result.narrationNoted, true, 'zero action is flagged for honest settlements');
 		assert.equal(calls(), 2, 'exactly one nudge even when the continuation narrates again — never a loop');
 		assert.deepEqual(
 			history.listMessages('conv-narrate-once').filter(m => m.role === 'assistant').map(m => m.content),

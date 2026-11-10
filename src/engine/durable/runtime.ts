@@ -4,7 +4,7 @@ import { createModels, createProvider, createAssistantMessageEventStream, type M
 import { defineDoc, ProviderDoc, type Conversation, type ConversationId, type Cursor, type EntryRecord, type ToolRegistration } from "@earendil-works/pi-durable";
 import type { Agent, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
 import type { SendCtx, SendResult, TurnProcessEvent } from "../engine.js";
-import type { HistoryStore } from "../../db/history-store.js";
+import { stripNotice, SYNTHETIC_FALLBACK_FRAGMENTS_RE, type HistoryStore } from "../../db/history-store.js";
 import { isDanglingNarration, isProcessNarration, NARRATION_GUARD_NOTICE } from "../task-planner.js";
 import { openDurableHost, type DurableHost } from "./harness-host.js";
 import { toDurableTool } from "./ve-tools.js";
@@ -412,11 +412,20 @@ export class DurableRuntime {
 			Object.assign(route, { conversationId: id, requestId: `ve:${cid}`, staffId: ctx?.actor?.senderId ?? "", verifiedRole: ctx?.actor?.channel === "widget" ? ctx.actor.verifiedRole ?? "" : "", name: ctx?.actor?.senderName ?? "", channel: ctx?.actor?.channel ?? "", chatType: ctx?.actor?.chatType ?? "", text, memoryConversationId: (ctx?.actor as { memoryConversationId?: string } | undefined)?.memoryConversationId ?? "", memoryChannel: (ctx?.actor as { memoryChannel?: string } | undefined)?.memoryChannel ?? "" });
 			// Import only on a NEW execution; resumed executions use their complete
 			// stored tool transcript and never rehydrate lossy UI messages.
-			for (const row of this.opts.history.listMessages(id)) {
+			for (const rawRow of this.opts.history.listMessages(id)) {
 				// Delivery-time notices are not employee speech: importing them would
 				// teach the model to imitate the fallback (observed on the box). The
 				// user's own question stays, so the exchange keeps its context.
-				if (row.role === "assistant" && isSyntheticFallbackReply(row.content)) continue;
+				// Review adaf0751 P1-B: a MERGED row (real answer + appended notice)
+				// must keep its REAL answer — dropping the whole row erased delivered
+				// results from the next turn's context. Same strip-then-skip-if-empty
+				// semantics as sweepSyntheticFallbackReplies, one implementation.
+				let row = rawRow;
+				if (row.role === "assistant" && isSyntheticFallbackReply(row.content)) {
+					const kept = stripNotice(row.content, SYNTHETIC_FALLBACK_FRAGMENTS_RE);
+					if (!kept) continue;
+					row = { ...row, content: kept };
+				}
 				// The history table stores no usage; imported assistant messages must
 				// still satisfy the durable contract (see ZERO_USAGE above) so any
 				// usage aggregation over the transcript cannot trip on undefined.
@@ -465,7 +474,7 @@ export class DurableRuntime {
 			// and stay untouched. Review 94189d6f P3: an aborted turn never gets the
 			// nudge — /stop or a watchdog soft-stop landing mid-turn cancelled it.
 			const abortedMidTurn = this.turnAbortIds.has(id);
-			if (!result.error && !abortedMidTurn && !(await this.hadToolAction(conv)) && isProcessNarration(result.reply)) {
+			if (!ctx?.ephemeral && !result.error && !abortedMidTurn && !(await this.hadToolAction(conv)) && isProcessNarration(result.reply)) {
 				console.warn(`[durable] narration guard: zero-tool narration → forced continue via input (conv=${id})`);
 				const priorEntries = await this.entryIdSnapshot(conv);
 				try {
@@ -483,13 +492,15 @@ export class DurableRuntime {
 				// Only the CONTINUATION's entries count: the first round's (lack of)
 				// evidence must not leak into the second judgment. User ruling
 				// 2026-11-10 (delivery quality first): only the structurally certain
-				// dangling shape is suppressed; any other zero-tool reply is
-				// delivered with the honest notice appended.
-				if (!result.error && !(await this.hadToolAction(conv, priorEntries))) {
+				// dangling shape is suppressed; any other zero-tool narration is
+				// delivered with the honest notice appended (narrationNoted) so
+				// settlements never record zero action as success. Review adaf0751
+				// P2-C: an abort landing during the continuation owns the delivery.
+				if (!result.error && !this.turnAbortIds.has(id) && !(await this.hadToolAction(conv, priorEntries))) {
 					if (isDanglingNarration(result.reply)) {
 						result = { ...result, reply: NARRATION_GUARD_NOTICE, narrationSuppressed: true };
 					} else if (isProcessNarration(result.reply)) {
-						result = { ...result, reply: `${result.reply}\n\n${NARRATION_GUARD_NOTICE}` };
+						result = { ...result, reply: `${result.reply}\n\n${NARRATION_GUARD_NOTICE}`, narrationNoted: true };
 					}
 				}
 			}

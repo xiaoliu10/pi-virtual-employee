@@ -93,6 +93,13 @@ export const NARRATION_GUARD_NOTICE = "⚠️ 已尝试继续执行但模型没�
  * substance (results, data, blockers, questions) and fail at least one gate:
  * length, structure, or the absence of an intent phrase. Only invoked on turns
  * with zero tool evidence, which is itself a strong precondition.
+ *
+ * KNOWN MISSES (disclosed, review adaf0751 P2-E): 「让我看看现在有什么可用的
+ * 工具。」「我准备开始处理这个问题。」「好的，我这就去查。」 return false —
+ * sentence-ended intent without a prerequisite/dangling marker. After the
+ * fail-open ruling these misses are SAFE (no continuation, narration delivered
+ * as-is); widening the regex would re-open the false-positive surface that
+ * swallows real replies, so they stay misses on purpose.
  */
 const NARRATION_INTENT_RE = /(我来|让我|我这就|我现在|我先|我将|我需要先|我准备|马上|这就|接下来|先确认|先检查|先看一下|先看看|开始(?:查|处理|执行|登录|排查|分析|操作|查询))/;
 const NARRATION_DANGLING_RE = /[：:]\s*$|(来执行|来处理|来完成|来查询|来排查|来分析|来登录|来操作|来查|来看看|开始执行|开始处理|开始查询|开始排查)[。.！!]?\s*$/;
@@ -102,7 +109,12 @@ const NARRATION_PREREQUISITE_RE = /(先|开始|准备).{0,12}(确认|检查|看�
  *  实际状态」 names an actual target, while 「先确认一下当前环境和可用工具」 names
  *  nothing. Only consulted on the prerequisite branch — a dangling 「…：」 lead-in
  *  is narration even when it mentions a system (field 2026-11-10). */
-const NARRATION_CONCRETE_TARGET_RE = /[a-z][a-z0-9]*_[a-z0-9_]+|[A-Z]{2,}[0-9]*|[\w-]+\.(?:py|js|mjs|cjs|ts|json|log|exe|cmd|bat|txt|csv|xlsx)\b|[A-Za-z]:[\\/]/;
+const NARRATION_CONCRETE_TARGET_RE = /[a-z][a-z0-9]*_[a-z0-9_]+|[A-Z]{3,}[0-9]*|[\w-]+\.(?:py|js|mjs|cjs|ts|json|log|exe|cmd|bat|txt|csv|xlsx)\b|[A-Za-z]:[\\/]/;
+/** Clarification intent: a colon-ended lead-in that asks the HUMAN something
+ *  (「我需要先确认几个问题：」) is a real question, not execution throat-
+ *  clearing — suppressing it would lose what the model wanted to ask. The
+ *  field narration shapes name environments/tools, never 问题/需求. */
+const NARRATION_CLARIFY_RE = /(问题|需求|疑问|问清楚|想问|时间范围|参数|细节|口径)/;
 /** Substance markers: a reply that reports an outcome, data, or a concrete
  *  blocker is NOT pure narration even when short. */
 const NARRATION_SUBSTANCE_RE = /(成功|完成|失败|报错|错误|异常|原因|结果如下|查到|找到|未匹配|没有找到|共\s*\d+|\d+\s*笔|\d+\s*条|请回复|确认终止|验证码)/;
@@ -142,6 +154,9 @@ export function isDanglingNarration(raw: string): boolean {
 	// A real result quoted before the lead-in (「查到 3 笔：」) is substance — the
 	// colon then INTRODUCES data, not dangles. Require the narration shape.
 	if (NARRATION_SUBSTANCE_RE.test(text)) return false;
+	// A clarification lead-in is a question the human must answer — losing it
+	// costs the user a re-statement (review adaf0751 P2-A).
+	if (NARRATION_CLARIFY_RE.test(text)) return false;
 	return NARRATION_INTENT_RE.test(text) || NARRATION_PREREQUISITE_RE.test(text);
 }
 

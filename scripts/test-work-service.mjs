@@ -1426,3 +1426,13 @@ test("a time-budget stop lands in waiting_human even with the runaway counter se
 	assert.match(row.question ?? "", /时间上限（30 分钟）暂停/, "it is the budget stop, not the spin copy");
 	assert.ok(!/循环空转/.test(row.question ?? ""), "and must not be described as a spin");
 });
+
+test("a zero-action narration window pauses honestly instead of burning budget on continue (review adaf0751 P2-B)", async t => {
+	const NOTICE = "⚠️ 已尝试继续执行但模型没有实际动作；如需前台亲自执行请回复『前台执行』。";
+	const h = fixture(t, { send: () => ({ reply: NOTICE, narrationNoted: true }) });
+	const item = h.create(); h.service.start(); await flush();
+	assert.equal(h.store.get(item.id).status, "waiting_human", "zero action pauses for a human decision");
+	assert.match(h.store.get(item.id).question ?? "", /过程叙述/, "the pause explains what happened");
+	assert.equal(h.sends.length, 1, "the chain must not re-drive a turn that executed nothing");
+	assert.ok(!(h.store.get(item.id).progress ?? "").includes("已尝试继续执行"), "the notice must not pollute work_items.progress");
+});
