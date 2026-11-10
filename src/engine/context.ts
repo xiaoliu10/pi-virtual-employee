@@ -31,21 +31,25 @@ import {
 import type { MessageRow } from "../db/history-store.js";
 import { isCompactionTemplateReport } from "./progress.js";
 import {
+	countImageParts,
 	estimateMessageTokens,
 	estimateTokensSafe,
 	FALLBACK_CONTEXT_WINDOW,
 	messageText,
 	usableContextWindow,
+	VISION_TOKENS_PER_IMAGE,
 } from "../context/estimate.js";
 
 // 估算口径唯一化（router-worker-core.md §6.3）：实现已收编到 src/context/estimate.ts，
 // 这里只 re-export，既有 import 路径（engine.ts、scripts/test-context.mjs）不破。
 export {
+	countImageParts,
 	estimateMessageTokens,
 	estimateTokensSafe,
 	FALLBACK_CONTEXT_WINDOW,
 	messageText,
 	usableContextWindow,
+	VISION_TOKENS_PER_IMAGE,
 };
 
 /** Bound on persisted messages replayed into a fresh session. Older turns stay
@@ -154,6 +158,38 @@ export function isContextOverflowError(text: string): boolean {
  * is capped at half the transcript, and when no user boundary exists the task
  * statement is kept verbatim at the seam (mirrors findForcedCompactionCut).
  */
+export const IMAGE_STRIPPED_PLACEHOLDER = "[截图已省略：上下文超限恢复时释放空间；如仍需画面请重新截屏]";
+export function stripImagesForOverflowRecovery(agent: Agent, keepLastMessages = 2): number {
+	let stripped = 0;
+	const msgs = agent.state.messages;
+	const last = Math.max(0, msgs.length - keepLastMessages);
+	for (let i = 0; i < last; i += 1) {
+		// SAFETY: AgentMessage.content is a heterogeneous block array at runtime
+		// (toolResult/assistant carry image parts the public union does not
+		// narrow); validate each block shape before replacing.
+		const content = (msgs[i] as unknown as { content?: unknown }).content;
+		if (!Array.isArray(content)) continue;
+		let changed = false;
+		const next = (content as unknown[]).map((block) => {
+			const b = block as { type?: unknown; data?: unknown; mimeType?: unknown } | null;
+			if (b && typeof b === "object" && (b.type === "image" || (typeof b.data === "string" && typeof b.mimeType === "string"))) {
+				stripped += 1;
+				changed = true;
+				return { type: "text", text: IMAGE_STRIPPED_PLACEHOLDER };
+			}
+			return block;
+		});
+		if (changed) {
+			// SAFETY: msgs[i] is an in-memory AgentMessage this transcript owns;
+			// replacing its content array in place is the same mutation pattern
+			// stripStaleUsage/truncateToFit apply to the same structure.
+			(msgs[i] as unknown as { content: unknown[] }).content = next;
+		}
+	}
+	if (stripped > 0) console.warn(`[engine] overflow recovery: stripped ${stripped} image part(s) outside the last ${keepLastMessages} message(s)`);
+	return stripped;
+}
+
 export function truncateToFit(agent: Agent, targetTokens: number, now = new Date().toISOString()): number | null {
 	// Preserve the transcript's ORIGINAL leading system message (the prompt
 	// replay), not a getCurrentSystemMessage fold — the fold accumulates every

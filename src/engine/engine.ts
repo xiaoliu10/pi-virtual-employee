@@ -108,7 +108,7 @@ import { ProgressWatchdog } from "./progress-watchdog.js";
 import { createMcpManager, type McpManager } from "./tools/mcp.js";
 import { renderSessionDetail } from "./tools/session-detail.js";
 import { normalizeMcpServers } from "../shared/mcp.js";
-import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, recentAssistantVisibleTexts, rehydrateMessages, stripDanglingAssistant, substantialAnchorOf, SUMMARIZER_RETRY, taskAnchorOf, truncateToFit, usableContextWindow, turnMemoryPrefix } from "./context.js";
+import { type CompactOutcome, estimateTokensSafe, FALLBACK_CONTEXT_WINDOW, FINAL_SUMMARY_PROMPT, heartbeatGoalOf, isContextOverflowError, maybeCompact, progressContextSlice, recentAssistantVisibleTexts, rehydrateMessages, stripDanglingAssistant, stripImagesForOverflowRecovery, substantialAnchorOf, SUMMARIZER_RETRY, taskAnchorOf, truncateToFit, usableContextWindow, turnMemoryPrefix } from "./context.js";
 // P1 WorkSession wiring (router-worker-core.md §6.4/§11): the CCL ledger owns a
 // work:<id> session's cross-turn context.
 import { buildBundle, recordsToMessages, type ContextBundle } from "../context/bundle.js";
@@ -3987,11 +3987,19 @@ export class EmployeeEngine implements EmployeeRuntime {
 				// so every retry re-hit the same 204800 wall. Verify the fit; only a
 				// genuinely smaller transcript returns here.
 				if (after < budget) return true;
-				console.warn(`[engine] compaction ran but transcript still over budget (~${after} >= ${budget}); forcing outright truncation`);
+				console.warn(`[engine] compaction ran but transcript still over budget (~${after} >= ${budget}); forcing image strip + truncation`);
 			}
 		} catch (err) {
 			console.warn("[engine] overflow compaction failed:", err instanceof Error ? err.message : err);
 		}
+		// Image-blind accounting wedge (field 2026-11-10): screen-automation tails
+		// carry screenshots whose vision tokens dominate the REAL request while
+		// compaction's keep-tail protects them — compaction can report success and
+		// the retry still exceeds the provider limit. Drop the old images
+		// deterministically (regardless of the compaction outcome) before falling
+		// through to truncation.
+		const stripped = stripImagesForOverflowRecovery(agent);
+		if (stripped > 0) return true;
 		// Aim at half the USABLE window, not half of window − reserve: the goal
 		// must land BELOW the budget gate's line (usable − reserve), otherwise a
 		// successful drop still fails the re-check and the turn gets chopped anyway
