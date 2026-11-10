@@ -112,6 +112,12 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 	};
 
 	const start = () => {
+		// Re-entry guard (review 41758e23 P3-1, pre-existing): a second start()
+		// used to overwrite the timers and leak the old interval. No current
+		// caller double-starts (each run builds a fresh notifier), this is
+		// purely defensive — but a leaked interval firing no-op ticks until
+		// process end is exactly the silent slop this module exists to prevent.
+		if (timer || firstBeatTimer) return;
 		// No target (console-created task) or disabled: stay a no-op — never burn
 		// side LLM calls for a push that cannot happen. This MUST log: a notifier
 		// that silently installs no timer is indistinguishable from a feature that
