@@ -209,7 +209,7 @@ const CHANNEL_LABELS: Record<string, string> = {
 	echo: "Echo（测试通道）",
 };
 
-type Tab = "model" | "knowledge" | "content" | "skills" | "im" | "general" | "prompt" | "tasks" | "migrate";
+type Tab = "model" | "knowledge" | "content" | "skills" | "im" | "mcp" | "general" | "prompt" | "tasks" | "migrate";
 
 type ChannelStatus = Awaited<ReturnType<typeof api.imChannelStatuses>>[number];
 
@@ -325,6 +325,15 @@ const TABS: { id: Tab; label: string; icon: JSX.Element }[] = [
 		icon: (
 			<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" className="h-[19px] w-[19px]">
 				<path strokeLinecap="round" strokeLinejoin="round" d="M4 5h16a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H9l-4 4v-4H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z" />
+			</svg>
+		),
+	},
+	{
+		id: "mcp",
+		label: "MCP 外部工具",
+		icon: (
+			<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" className="h-[19px] w-[19px]">
+				<path strokeLinecap="round" strokeLinejoin="round" d="M9 3v3M15 3v3M7 11h10M7 15h10M9 18v3M15 18v3M5 6h14a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1Z" />
 			</svg>
 		),
 	},
@@ -782,8 +791,8 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 				<div className="flex min-w-0 flex-1 flex-col bg-white">
 					<header className="flex h-[82px] shrink-0 items-center justify-between border-b border-slate-100 px-8">
 						<div>
-							<h1 className="text-2xl font-semibold tracking-tight text-[#1d1d1f]">{tab === "model" ? "自定义模型" : tab === "knowledge" ? "知识库" : tab === "content" ? "内容中心" : tab === "skills" ? "技能" : tab === "im" ? "IM 机器人" : tab === "prompt" ? "提示词" : tab === "tasks" ? "定时任务与自主任务" : tab === "migrate" ? "迁移与复制" : "通用"}</h1>
-							{tab !== "model" && <p className="mt-1 text-xs text-[#a1a1a6]">{tab === "knowledge" ? "可配置、可插拔的知识库：内置混合检索 + 外接 RAG。" : tab === "content" ? "交付资料库（既有可复用资料）与任务产物（生成的带版本输出）统一在此管理。" : tab === "skills" ? "管理内置与导入的技能（SKILL.md），启停、导入、删除。技能以声明式指令注入提示词。" : tab === "im" ? "连接即时通讯渠道，让虚拟员工随时响应。" : tab === "prompt" ? "自定义员工的内置行为规则与追加指令，保存后新对话生效。" : tab === "tasks" ? "定时任务到点自动执行；自主任务由员工自行判断节奏持续跟进。两者均可在此查看与管理。" : tab === "migrate" ? "把当前员工打包导出（.pve），或导入员工包：克隆为新员工 / 覆盖当前员工，支持跨机器迁移。" : "管理员工身份与系统行为。"}</p>}
+							<h1 className="text-2xl font-semibold tracking-tight text-[#1d1d1f]">{tab === "model" ? "自定义模型" : tab === "knowledge" ? "知识库" : tab === "content" ? "内容中心" : tab === "skills" ? "技能" : tab === "im" ? "IM 机器人" : tab === "mcp" ? "MCP 外部工具" : tab === "prompt" ? "提示词" : tab === "tasks" ? "定时任务与自主任务" : tab === "migrate" ? "迁移与复制" : "通用"}</h1>
+							{tab !== "model" && <p className="mt-1 text-xs text-[#a1a1a6]">{tab === "knowledge" ? "可配置、可插拔的知识库：内置混合检索 + 外接 RAG。" : tab === "content" ? "交付资料库（既有可复用资料）与任务产物（生成的带版本输出）统一在此管理。" : tab === "skills" ? "管理内置与导入的技能（SKILL.md），启停、导入、删除。技能以声明式指令注入提示词。" : tab === "im" ? "连接即时通讯渠道，让虚拟员工随时响应。" : tab === "mcp" ? "接入 Model Context Protocol 服务器，把数据库查询、内部系统 API 等外部工具挂进员工工具箱。" : tab === "prompt" ? "自定义员工的内置行为规则与追加指令，保存后新对话生效。" : tab === "tasks" ? "定时任务到点自动执行；自主任务由员工自行判断节奏持续跟进。两者均可在此查看与管理。" : tab === "migrate" ? "把当前员工打包导出（.pve），或导入员工包：克隆为新员工 / 覆盖当前员工，支持跨机器迁移。" : "管理员工身份与系统行为。"}</p>}
 						</div>
 						<button type="button" onClick={cancel} className="rounded-xl p-2 text-2xl leading-none text-[#a1a1a6] transition hover:bg-black/[0.045] hover:text-[#1d1d1f]" aria-label="关闭设置">×</button>
 					</header>
@@ -1160,6 +1169,95 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 										</>
 									)}
 
+									{tab === "mcp" && (
+										<>
+											<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
+												<div className="text-sm font-medium text-slate-800">MCP 服务器（外部工具）</div>
+												<div className="mt-1 text-xs leading-relaxed text-slate-400">
+													接入 Model Context Protocol 服务器，把外部工具（数据库查询、浏览器自动化、内部系统 API……）挂进员工工具箱。工具以 mcp__服务器名__工具名 注入对话，与内置工具不冲突。保存后自动重连，工具面有变化会重建会话。env 与 headers 支持 ${'{ENV}'} 形式的环境变量引用。
+												</div>
+												<div className="mt-3 space-y-3">
+													<label className="flex cursor-pointer items-center justify-between rounded-xl border border-sky-200 bg-sky-50/50 px-4 py-3">
+														<div><div className="text-sm font-medium text-slate-800">启用 MCP 服务器</div><div className="mt-0.5 text-xs text-sky-700/70">关闭时不连接任何服务器，已挂载的外部工具从对话中移除（保存即生效）。</div></div>
+														<input type="checkbox" checked={draft.capabilities.mcp.enabled} onChange={(e) => setDraft((v) => v ? { ...v, capabilities: { ...v.capabilities, mcp: { ...v.capabilities.mcp, enabled: e.target.checked } } } : v)} className="h-5 w-5 accent-sky-500" />
+													</label>
+													{(mcpRows ?? []).map((row, idx) => (
+														<div key={row.uid} className="rounded-xl border border-slate-200 px-4 py-3">
+															<div className="flex items-center justify-between gap-2">
+																<input value={row.name} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, name: e.target.value.replace(/[^A-Za-z0-9_-]/g, "") } : r))} placeholder="服务器名（字母数字_-）" className="w-44 rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																<div className="flex items-center gap-3">
+																	<div className="flex overflow-hidden rounded-lg border border-slate-300 text-xs">
+																		<button type="button" onClick={() => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, transport: "stdio" } : r))} className={`px-2 py-1 ${row.transport === "stdio" ? "bg-sky-600 text-white" : "bg-white text-slate-500 hover:bg-slate-50"}`}>stdio</button>
+																		<button type="button" onClick={() => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, transport: "http" } : r))} className={`px-2 py-1 ${row.transport === "http" ? "bg-sky-600 text-white" : "bg-white text-slate-500 hover:bg-slate-50"}`}>HTTP</button>
+																	</div>
+																	<label className="flex items-center gap-1 text-xs text-slate-500"><input type="checkbox" checked={row.enabled} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, enabled: e.target.checked } : r))} className="h-4 w-4 accent-sky-500" />启用</label>
+																	<button type="button" onClick={() => { setMcpRows((rows) => (rows ?? []).filter((r) => r.uid !== row.uid)); setMcpTesting((prev) => { const next = { ...prev }; delete next[row.uid]; return next; }); }} className="rounded-lg px-2 py-1 text-xs text-rose-600 hover:bg-rose-50">删除</button>
+																</div>
+															</div>
+															{row.transport === "stdio" ? (
+																<div className="mt-2 space-y-2">
+																	<div className="grid grid-cols-[1fr_auto] gap-2">
+																		<input value={row.command} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, command: e.target.value } : r))} placeholder="stdio 传输：可执行文件（如 node / npx / uvx）" className="rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																		<input value={row.timeoutSecRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, timeoutSecRaw: e.target.value.replace(/[^0-9]/g, "") } : r))} placeholder="超时秒" className="w-24 rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																	</div>
+																	<input value={row.argsRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, argsRaw: e.target.value } : r))} placeholder={'参数 JSON 数组，如 ["-y", "server.js"]'} className="w-full rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																	<input value={row.cwd} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, cwd: e.target.value } : r))} placeholder="工作目录（可选，留空用应用当前目录）" className="w-full rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																	<textarea rows={2} value={row.envRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, envRaw: e.target.value } : r))} placeholder="env（每行 KEY=值，保存/测试时解析）" className="w-full rounded-lg border border-slate-300 px-2 py-1 font-mono text-[11px] outline-none focus:border-sky-400" />
+																</div>
+															) : (
+																<div className="mt-2 space-y-2">
+																	<div className="grid grid-cols-[1fr_auto] gap-2">
+																		<input value={row.url} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, url: e.target.value } : r))} placeholder="HTTP 传输：https://mcp.example.com/mcp" className="rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																		<input value={row.timeoutSecRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, timeoutSecRaw: e.target.value.replace(/[^0-9]/g, "") } : r))} placeholder="超时秒" className="w-24 rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
+																	</div>
+																	<textarea rows={2} value={row.headersRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, headersRaw: e.target.value } : r))} placeholder="headers（每行 Key: 值，如 Authorization: Bearer …）" className="w-full rounded-lg border border-slate-300 px-2 py-1 font-mono text-[11px] outline-none focus:border-sky-400" />
+																</div>
+															)}
+															<div className="mt-2 flex items-center gap-2">
+																<button type="button"
+																	disabled={mcpTesting[row.uid]?.busy === true}
+																	onClick={async () => {
+																		// Validate first: rowToServer() drops malformed args/env
+																		// lines, so probing without this tests a different config.
+																		const problems = validateRow(row);
+																		if (problems.length) {
+																			setMcpTesting((prev) => ({ ...prev, [row.uid]: { busy: false, ok: false, error: problems.join("；") } }));
+																			return;
+																		}
+																		const fingerprint = rowFingerprint(row);
+																		const seq = (probeSeq.current += 1);
+																		setMcpTesting((prev) => ({ ...prev, [row.uid]: { busy: true, fingerprint } }));
+																		try {
+																			const r = await api.testMcpServer(rowToServer(row));
+																			// Apply only if this is still the newest request AND the row
+																			// still holds the configuration that was tested.
+																			setMcpTesting((prev) => {
+																				if (seq !== probeSeq.current) return prev;
+																				if (prev[row.uid]?.fingerprint !== fingerprint) return prev;
+																				return { ...prev, [row.uid]: { busy: false, ok: r.ok, error: r.error, tools: r.tools, fingerprint } };
+																			});
+																		} catch {
+																			setMcpTesting((prev) => {
+																				if (seq !== probeSeq.current) return prev;
+																				return { ...prev, [row.uid]: { busy: false, ok: false, error: "测试请求失败", fingerprint } };
+																			});
+																		}
+																	}}
+																	className="rounded-lg border border-sky-300 px-2.5 py-1 text-xs text-sky-700 hover:bg-sky-50 disabled:opacity-50">测试连接</button>
+																{mcpTesting[row.uid] && mcpTesting[row.uid].fingerprint === rowFingerprint(row) && (
+																	<span className="min-w-0 flex-1 truncate text-xs text-slate-500" title={mcpTesting[row.uid].error ?? (mcpTesting[row.uid].tools ?? []).join("、")}>
+																		{mcpTesting[row.uid].busy ? "连接中…" : mcpTesting[row.uid].ok ? `连接成功，${mcpTesting[row.uid].tools?.length ?? 0} 个工具：${(mcpTesting[row.uid].tools ?? []).slice(0, 6).join("、")}${(mcpTesting[row.uid].tools?.length ?? 0) > 6 ? " …" : ""}` : `失败：${mcpTesting[row.uid].error}`}
+																	</span>
+																)}
+															</div>
+														</div>
+													))}
+													<button type="button" onClick={() => setMcpRows((rows) => [...(rows ?? []), serverToRow({ name: `server-${(rows?.length ?? 0) + 1}` })])} className="rounded-lg border border-dashed border-slate-300 px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-50">+ 添加服务器</button>
+												</div>
+											</div>
+										</>
+									)}
+
 									{tab === "general" && (
 										<>
 											<Field label="员工名称" hint="显示在对话页，并写入员工系统提示词。"><input value={draft.identity.name} onChange={(event) => setIdentity({ name: event.target.value })} placeholder="客服小派" className={inputCls} /></Field>
@@ -1398,92 +1496,6 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 													</div>
 												</div>
 											</div>
-
-											<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
-												<div className="text-sm font-medium text-slate-800">MCP 服务器（外部工具）</div>
-												<div className="mt-1 text-xs leading-relaxed text-slate-400">
-													接入 Model Context Protocol 服务器，把外部工具（数据库查询、浏览器自动化、内部系统 API……）挂进员工工具箱。工具以 mcp__服务器名__工具名 注入对话，与内置工具不冲突。保存后自动重连，工具面有变化会重建会话。env 与 headers 支持 ${'{ENV}'} 形式的环境变量引用。
-												</div>
-												<div className="mt-3 space-y-3">
-													<label className="flex cursor-pointer items-center justify-between rounded-xl border border-sky-200 bg-sky-50/50 px-4 py-3">
-														<div><div className="text-sm font-medium text-slate-800">启用 MCP 服务器</div><div className="mt-0.5 text-xs text-sky-700/70">关闭时不连接任何服务器，已挂载的外部工具从对话中移除（保存即生效）。</div></div>
-														<input type="checkbox" checked={draft.capabilities.mcp.enabled} onChange={(e) => setDraft((v) => v ? { ...v, capabilities: { ...v.capabilities, mcp: { ...v.capabilities.mcp, enabled: e.target.checked } } } : v)} className="h-5 w-5 accent-sky-500" />
-													</label>
-													{(mcpRows ?? []).map((row, idx) => (
-														<div key={row.uid} className="rounded-xl border border-slate-200 px-4 py-3">
-															<div className="flex items-center justify-between gap-2">
-																<input value={row.name} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, name: e.target.value.replace(/[^A-Za-z0-9_-]/g, "") } : r))} placeholder="服务器名（字母数字_-）" className="w-44 rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
-																<div className="flex items-center gap-3">
-																	<div className="flex overflow-hidden rounded-lg border border-slate-300 text-xs">
-																		<button type="button" onClick={() => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, transport: "stdio" } : r))} className={`px-2 py-1 ${row.transport === "stdio" ? "bg-sky-600 text-white" : "bg-white text-slate-500 hover:bg-slate-50"}`}>stdio</button>
-																		<button type="button" onClick={() => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, transport: "http" } : r))} className={`px-2 py-1 ${row.transport === "http" ? "bg-sky-600 text-white" : "bg-white text-slate-500 hover:bg-slate-50"}`}>HTTP</button>
-																	</div>
-																	<label className="flex items-center gap-1 text-xs text-slate-500"><input type="checkbox" checked={row.enabled} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, enabled: e.target.checked } : r))} className="h-4 w-4 accent-sky-500" />启用</label>
-																	<button type="button" onClick={() => { setMcpRows((rows) => (rows ?? []).filter((r) => r.uid !== row.uid)); setMcpTesting((prev) => { const next = { ...prev }; delete next[row.uid]; return next; }); }} className="rounded-lg px-2 py-1 text-xs text-rose-600 hover:bg-rose-50">删除</button>
-																</div>
-															</div>
-															{row.transport === "stdio" ? (
-																<div className="mt-2 space-y-2">
-																	<div className="grid grid-cols-[1fr_auto] gap-2">
-																		<input value={row.command} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, command: e.target.value } : r))} placeholder="stdio 传输：可执行文件（如 node / npx / uvx）" className="rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
-																		<input value={row.timeoutSecRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, timeoutSecRaw: e.target.value.replace(/[^0-9]/g, "") } : r))} placeholder="超时秒" className="w-24 rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
-																	</div>
-																	<input value={row.argsRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, argsRaw: e.target.value } : r))} placeholder={'参数 JSON 数组，如 ["-y", "server.js"]'} className="w-full rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
-																	<input value={row.cwd} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, cwd: e.target.value } : r))} placeholder="工作目录（可选，留空用应用当前目录）" className="w-full rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
-																	<textarea rows={2} value={row.envRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, envRaw: e.target.value } : r))} placeholder="env（每行 KEY=值，保存/测试时解析）" className="w-full rounded-lg border border-slate-300 px-2 py-1 font-mono text-[11px] outline-none focus:border-sky-400" />
-																</div>
-															) : (
-																<div className="mt-2 space-y-2">
-																	<div className="grid grid-cols-[1fr_auto] gap-2">
-																		<input value={row.url} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, url: e.target.value } : r))} placeholder="HTTP 传输：https://mcp.example.com/mcp" className="rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
-																		<input value={row.timeoutSecRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, timeoutSecRaw: e.target.value.replace(/[^0-9]/g, "") } : r))} placeholder="超时秒" className="w-24 rounded-lg border border-slate-300 px-2 py-1 font-mono text-xs outline-none focus:border-sky-400" />
-																	</div>
-																	<textarea rows={2} value={row.headersRaw} onChange={(e) => setMcpRows((rows) => (rows ?? []).map((r) => r.uid === row.uid ? { ...r, headersRaw: e.target.value } : r))} placeholder="headers（每行 Key: 值，如 Authorization: Bearer …）" className="w-full rounded-lg border border-slate-300 px-2 py-1 font-mono text-[11px] outline-none focus:border-sky-400" />
-																</div>
-															)}
-															<div className="mt-2 flex items-center gap-2">
-																<button type="button"
-																	disabled={mcpTesting[row.uid]?.busy === true}
-																	onClick={async () => {
-																		// Validate first: rowToServer() drops malformed args/env
-																		// lines, so probing without this tests a different config.
-																		const problems = validateRow(row);
-																		if (problems.length) {
-																			setMcpTesting((prev) => ({ ...prev, [row.uid]: { busy: false, ok: false, error: problems.join("；") } }));
-																			return;
-																		}
-																		const fingerprint = rowFingerprint(row);
-																		const seq = (probeSeq.current += 1);
-																		setMcpTesting((prev) => ({ ...prev, [row.uid]: { busy: true, fingerprint } }));
-																		try {
-																			const r = await api.testMcpServer(rowToServer(row));
-																			// Apply only if this is still the newest request AND the row
-																			// still holds the configuration that was tested.
-																			setMcpTesting((prev) => {
-																				if (seq !== probeSeq.current) return prev;
-																				if (prev[row.uid]?.fingerprint !== fingerprint) return prev;
-																				return { ...prev, [row.uid]: { busy: false, ok: r.ok, error: r.error, tools: r.tools, fingerprint } };
-																			});
-																		} catch {
-																			setMcpTesting((prev) => {
-																				if (seq !== probeSeq.current) return prev;
-																				return { ...prev, [row.uid]: { busy: false, ok: false, error: "测试请求失败", fingerprint } };
-																			});
-																		}
-																	}}
-																	className="rounded-lg border border-sky-300 px-2.5 py-1 text-xs text-sky-700 hover:bg-sky-50 disabled:opacity-50">测试连接</button>
-																{mcpTesting[row.uid] && mcpTesting[row.uid].fingerprint === rowFingerprint(row) && (
-																	<span className="min-w-0 flex-1 truncate text-xs text-slate-500" title={mcpTesting[row.uid].error ?? (mcpTesting[row.uid].tools ?? []).join("、")}>
-																		{mcpTesting[row.uid].busy ? "连接中…" : mcpTesting[row.uid].ok ? `连接成功，${mcpTesting[row.uid].tools?.length ?? 0} 个工具：${(mcpTesting[row.uid].tools ?? []).slice(0, 6).join("、")}${(mcpTesting[row.uid].tools?.length ?? 0) > 6 ? " …" : ""}` : `失败：${mcpTesting[row.uid].error}`}
-																	</span>
-																)}
-															</div>
-														</div>
-													))}
-													<button type="button" onClick={() => setMcpRows((rows) => [...(rows ?? []), serverToRow({ name: `server-${(rows?.length ?? 0) + 1}` })])} className="rounded-lg border border-dashed border-slate-300 px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-50">+ 添加服务器</button>
-												</div>
-											</div>
-
 
 											<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
 												<div className="text-sm font-medium text-slate-800">助理小组件（嵌入业务系统）</div>
