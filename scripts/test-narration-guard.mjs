@@ -201,18 +201,45 @@ test("zero-tool task turn: guard continues exactly once and delivers the NEW rep
 	assert.equal(history.listMessages("conv-narrate-once").filter((m) => m.role === "assistant").at(-1)?.content, result.reply, "history persists the delivered reply");
 });
 
-test("still zero tools after the one continuation: honest notice appended, no second attempt", async (t) => {
+test("still zero tools, sentence-form narration: delivered WITH the notice (fail-open, user ruling 2026-11-10)", async (t) => {
 	let runs = 0;
-	const { engine, config } = makeEngine(t, { streamFn: async () => {
+	const { engine, config, history } = makeEngine(t, { streamFn: async () => {
 		runs += 1;
 		return textReply(runs === 1 ? NARRATION : "我需要先了解当前环境，然后再继续。");
 	} });
 	supplierConfig(config);
 	const agent = engine.getOrCreateSession("conv-narrate-twice");
 	const result = await engine.send(agent, TASK);
-	assert.ok(result.reply.startsWith("我需要先了解当前环境"), "the continuation text is delivered");
-	assert.ok(result.reply.endsWith(NARRATION_GUARD_NOTICE), "the no-action notice must be appended");
+	// A complete sentence is NOT structurally certain narration — it might carry
+	// a real blocker. Delivery quality first: the text is delivered verbatim with
+	// the honest notice appended, and it stays in history.
+	assert.ok(result.reply.startsWith("我需要先了解当前环境"), "the model text is delivered, not swallowed");
+	assert.ok(result.reply.endsWith(NARRATION_GUARD_NOTICE), "the no-action notice rides along");
+	assert.equal(result.narrationSuppressed, false);
+	assert.equal(result.narrationNoted, true, "zero action is flagged so settlements stay honest");
 	assert.equal(runs, 2, "the guard runs exactly once even when the continuation narrates again");
+	assert.equal(history.listMessages("conv-narrate-twice").filter((m) => m.role === "assistant").length, 1, "delivered text persists");
+});
+
+test("still zero tools, DANGLING narration: suppressed — only the notice, no history row", async (t) => {
+	let runs = 0;
+	const { engine, config, history } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		return textReply(runs === 1 ? NARRATION : "让我先确认一下当前环境和可用工具：");
+	} });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-narrate-dangling");
+	const result = await engine.send(agent, TASK);
+	// Ends mid-sentence on a colon: structurally it can never be a result, so
+	// suppressing it hides nothing real.
+	assert.equal(result.reply, NARRATION_GUARD_NOTICE, "only the honest system notice remains");
+	assert.equal(result.narrationSuppressed, true);
+	assert.equal(runs, 2, "exactly one continuation — never a loop");
+	assert.deepEqual(
+		history.listMessages("conv-narrate-dangling").filter((m) => m.role === "assistant"),
+		[],
+		"suppressed dangling narration leaves no assistant row",
+	);
 });
 
 test("a turn that already used tools never triggers the guard", async (t) => {
@@ -390,4 +417,109 @@ test("review 94189d6f P3: the guard's continuation keeps the turn's RBAC identit
 	assert.equal(engine.turnActor.size, 0, "turnActor cleaned after the guard");
 	assert.equal(engine.turnActorsSaved.size, 0, "snapshot map cleaned after the guard");
 	assert.equal(engine.turnMemorySaved.size, 0, "memory snapshot cleaned after the guard");
+});
+
+// ── Field 2026-11-10 13:00 (Nova, serial 0422026111000000654) ──────────────
+// The exact stall shape: a 39-char 「帮我查一下…」 instruction with NO verb in
+// TASK_VERBS, so looksLikeTask/looksLikeImperative were both false and the old
+// input-gated guard let a zero-tool narration ship as the final answer. The
+// output-side detector must catch it regardless of the input wording.
+const FIELD_20261110_MESSAGE = "帮我查一下这笔流水：0422026111000000654 的支付渠道下单日志";
+const FIELD_20261110_NARRATION = "好的，我来查这笔流水的支付渠道下单日志。先确认一下当前环境和可用工具：";
+
+test("field 2026-11-10: the old input gate misses this message, but the output guard suppresses its narration", async (t) => {
+	// Prove the seam exists on the INPUT side: this exact message passes both
+	// old shape detectors, which is why the narration used to sail through.
+	assert.equal(looksLikeTask(FIELD_20261110_MESSAGE), false, "39 chars, no listed task verb — the old gate's blind spot");
+	assert.equal(looksLikeImperative(FIELD_20261110_MESSAGE), false);
+
+	let runs = 0;
+	const { engine, config } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		// Continuation narrates again as a COMPLETE sentence: fail-open delivers
+		// it with the honest notice instead of gambling the delivery.
+		return textReply(runs === 1 ? FIELD_20261110_NARRATION : "我需要先确认环境，然后再继续。");
+	} });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-field-20261110");
+	const result = await engine.send(agent, FIELD_20261110_MESSAGE);
+
+	assert.equal(runs, 2, "the output-side guard still forces exactly one continuation");
+	assert.equal(result.narrationSuppressed, false, "sentence-form narration is delivered, not swallowed");
+	assert.equal(result.narrationNoted, true);
+	assert.ok(result.reply.startsWith("我需要先确认环境"), "the continuation text reaches the user");
+	assert.ok(result.reply.endsWith(NARRATION_GUARD_NOTICE), "with the honest no-action notice");
+});
+
+test("field 2026-11-10 dangling variant: a colon-ended continuation is suppressed", async (t) => {
+	let runs = 0;
+	const { engine, config, history } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		return textReply(runs === 1 ? FIELD_20261110_NARRATION : "好的，让我先确认一下当前环境和可用工具：");
+	} });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-field-20261110-dangle");
+	const result = await engine.send(agent, FIELD_20261110_MESSAGE);
+	assert.equal(runs, 2);
+	assert.equal(result.narrationSuppressed, true, "structurally certain dangling narration is suppressed");
+	assert.equal(result.reply, NARRATION_GUARD_NOTICE);
+	assert.deepEqual(history.listMessages("conv-field-20261110-dangle").filter((m) => m.role === "assistant"), []);
+});
+
+test("field 2026-11-10: if the continuation actually uses a tool, the real result is delivered", async (t) => {
+	let runs = 0;
+	let noteTool;
+	const { engine, config } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		if (runs === 2) noteTool?.(); // continuation earns tool evidence
+		return textReply(runs === 1 ? FIELD_20261110_NARRATION : "查到了：该流水渠道下单返回成功，无异常。");
+	} });
+	noteTool = () => engine.recordToolTelemetry("conv-field-20261110-ok", { name: "shell", durationMs: 5, ok: true });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-field-20261110-ok");
+	const result = await engine.send(agent, FIELD_20261110_MESSAGE);
+	assert.equal(runs, 2, "one continuation");
+	assert.equal(result.narrationSuppressed, false, "a tool-using continuation is not suppressed");
+	assert.equal(result.reply, "查到了：该流水渠道下单返回成功，无异常。", "the substantive result is delivered verbatim");
+});
+
+test("a continuation that returns a substantive zero-tool blocker is delivered, not suppressed", async (t) => {
+	// The first turn narrates; the forced continuation comes back with a REAL
+	// blocker question (zero tools, but not process narration). It must be
+	// delivered verbatim — suppressing it would hide the human's required action.
+	const BLOCKER = "驱动卡在 goto 上了。请回复\"确认终止\"，我重启后换 wait_until=commit 重连。";
+	let runs = 0;
+	const { engine, config } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		return textReply(runs === 1 ? NARRATION : BLOCKER);
+	} });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-blocker");
+	const result = await engine.send(agent, TASK);
+	assert.equal(runs, 2, "one forced continuation still runs");
+	assert.equal(result.narrationSuppressed, false, "a substantive blocker is not narration");
+	assert.equal(result.reply, BLOCKER, "the blocker question reaches the user verbatim");
+});
+
+test("telemetry records the zero-action outcome, never ok (review adaf0751 P2-D)", async (t) => {
+	const caps = [];
+	// Dangling → narration_suppressed
+	{
+		let runs = 0;
+		const { engine, config } = makeEngine(t, { streamFn: async () => { runs += 1; return textReply(runs === 1 ? NARRATION : "让我先确认一下当前环境和可用工具："); } });
+		engine.setTelemetryStore({ recordTurn: (i) => caps.push(i), recordTool: () => {} });
+		supplierConfig(config);
+		const result = await engine.send(engine.getOrCreateSession("conv-tel-sup"), FIELD_MESSAGE);
+		assert.equal(result.narrationSuppressed, true);
+	}
+	// Sentence-form → narration_noted
+	{
+		let runs = 0;
+		const { engine, config } = makeEngine(t, { streamFn: async () => { runs += 1; return textReply(runs === 1 ? NARRATION : "我需要先了解当前环境，然后再继续。"); } });
+		engine.setTelemetryStore({ recordTurn: (i) => caps.push(i), recordTool: () => {} });
+		supplierConfig(config);
+		const result = await engine.send(engine.getOrCreateSession("conv-tel-not"), FIELD_MESSAGE);
+		assert.equal(result.narrationNoted, true);
+	}
+	assert.deepEqual(caps.map((c) => c.status), ["narration_suppressed", "narration_noted"], "zero-action turns must land as their own statuses, never ok");
 });

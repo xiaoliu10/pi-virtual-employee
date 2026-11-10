@@ -20,9 +20,9 @@
  * structurally separate.
  */
 import { WorkerTaskStore, type WorkerTaskRow } from "./worker-tasks.js";
-import { looksLikeTask } from "../engine/task-planner.js";
+import { looksLikeTask, NARRATION_GUARD_NOTICE } from "../engine/task-planner.js";
 import { isBareContextToken } from "../im/triage.js";
-import { SYNTHETIC_FALLBACK_FRAGMENTS_RE } from "../db/history-store.js";
+import { stripNotice, SYNTHETIC_FALLBACK_FRAGMENTS_RE } from "../db/history-store.js";
 
 /** Injected durable-execution primitives (same shape WorkService uses — the
  * shared KERNEL below both infrastructures; nothing task-flavored crosses). */
@@ -31,7 +31,7 @@ export interface WorkerEngineDeps<Session> {
 	open(conversationId: string): Promise<Session> | Session;
 	/** One durable round: returns when the turn settles. reply = the final
 	 * assistant text (code-extracted result — no marker parsing anywhere). */
-	send(session: Session, message: string, senderId: string, sourceConversation: string): Promise<{ reply?: string; error?: string; deterministic?: boolean }>;
+	send(session: Session, message: string, senderId: string, sourceConversation: string): Promise<{ reply?: string; error?: string; deterministic?: boolean; narrationSuppressed?: boolean; narrationNoted?: boolean }>;
 	/** Deliver to the source conversation (idempotent upstream). */
 	push(conversationId: string, text: string): Promise<unknown> | unknown;
 	/** Cancel a live durable round (foreground-escape). Injected because the
@@ -133,13 +133,22 @@ export function buildSourceContextExcerpt(rows: Array<{ role: string; content: u
 		const row = rows[i];
 		const raw = flattenMessageContent(row?.content).trim();
 		if (!raw) continue;
-		if (SYNTHETIC_FALLBACK_FRAGMENTS_RE.test(raw.replace(/\s+/g, ""))) continue;
+		// Review adaf0751 P1-B: a MERGED row (real answer + appended synthetic
+		// notice) must keep its ANSWER in the source-context excerpt — dropping
+		// the whole row erased delivered results from a fresh worker's context.
+		// Strip the notice paragraph first; skip only when nothing remains.
+		let text0 = raw;
+		if (SYNTHETIC_FALLBACK_FRAGMENTS_RE.test(raw.replace(/\s+/g, ""))) {
+			const kept = stripNotice(raw, SYNTHETIC_FALLBACK_FRAGMENTS_RE);
+			if (!kept) continue;
+			text0 = kept;
+		}
 		// Forged block boundary → drop the row (see RESERVED_BLOCK_MARKERS).
-		if (RESERVED_BLOCK_MARKERS.some((m) => raw.includes(m))) continue;
+		if (RESERVED_BLOCK_MARKERS.some((m) => text0.includes(m))) continue;
 		const label = row.role === "assistant" ? "助手:" : row.role === "user" ? "用户:" : `${row.role}:`;
-		const text = raw.length > SOURCE_CONTEXT_MAX_PER_MESSAGE
-			? `${raw.slice(0, SOURCE_CONTEXT_MAX_PER_MESSAGE)}…`
-			: raw;
+		const text = text0.length > SOURCE_CONTEXT_MAX_PER_MESSAGE
+			? `${text0.slice(0, SOURCE_CONTEXT_MAX_PER_MESSAGE)}…`
+			: text0;
 		const line = `${label} ${text}`;
 		if (picked.length >= SOURCE_CONTEXT_MAX_MESSAGES || used + line.length > SOURCE_CONTEXT_MAX_CHARS) {
 			omitted = i + 1;
@@ -468,6 +477,20 @@ export class WorkerService<Session> {
 	private async runTurn(task: WorkerTaskRow, session: Session, message: string, senderId: string, opts: { record: boolean }): Promise<void> {
 		try {
 			const r = await this.opts.send(session, message, senderId, task.source_conversation);
+			// Narration contracts (review adaf0751 P1-A): the kernel flags zero-
+			// action turns explicitly. SUPPRESSED = dangling narration replaced by
+			// the system notice; NOTED = sentence-form narration delivered WITH the
+			// notice (fail-open). Neither executed anything, so neither may settle
+			// as a successful result nor be archived as a task outcome — both
+			// settle into the error column; only the pushed text differs.
+			if (r.narrationSuppressed) {
+				await this.deliver(task, (r.reply ?? "").trim() || NARRATION_GUARD_NOTICE, { ...opts, failed: true });
+				return;
+			}
+			if (r.narrationNoted) {
+				await this.deliver(task, (r.reply ?? "").trim() || NARRATION_GUARD_NOTICE, { ...opts, failed: true, archive: false });
+				return;
+			}
 			const text = (r.reply ?? "").trim();
 			if (!text && r.error) {
 				// Only fall back to the raw error when there is NO reply: send()
@@ -501,14 +524,21 @@ export class WorkerService<Session> {
 	}
 
 	/** Source-conversation delivery; also the terminal transition for the
-	 * dispatch round (record=true). One push per turn. */
-	private async deliver(task: WorkerTaskRow, text: string, opts: { record: boolean }): Promise<void> {
+	 * dispatch round (record=true). One push per turn. `failed` settles into the
+	 * error column regardless of the ⚠️ prefix (review adaf0751 P1-A: the
+	 * fail-open merged text starts with model speech, so prefix sniffing alone
+	 * recorded zero-action turns as successful results); `archive:false` skips
+	 * the knowledge-base outcome entry for turns that executed nothing. */
+	private async deliver(task: WorkerTaskRow, text: string, opts: { record: boolean; failed?: boolean; archive?: boolean }): Promise<void> {
 		if (opts.record) {
-			this.store.settle(task.id, text.startsWith("⚠️") ? { error: text } : { text }, this.clock.now());
-			try {
-				this.opts.onSettled?.({ id: task.id, instruction: task.instruction, sourceConversation: task.source_conversation, createdBy: task.created_by }, text);
-			} catch (err) {
-				this.opts.onError?.(err);
+			const asError = opts.failed === true || text.startsWith("⚠️");
+			this.store.settle(task.id, asError ? { error: text } : { text }, this.clock.now());
+			if (opts.archive !== false) {
+				try {
+					this.opts.onSettled?.({ id: task.id, instruction: task.instruction, sourceConversation: task.source_conversation, createdBy: task.created_by }, text);
+				} catch (err) {
+					this.opts.onError?.(err);
+				}
 			}
 		}
 		try {

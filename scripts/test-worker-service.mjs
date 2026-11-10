@@ -26,7 +26,8 @@ process.on("exit", () => { try { rmSync(dir, { recursive: true, force: true }); 
 
 await build({
 	stdin: {
-		contents: `export { WorkerTaskStore } from "./src/router/worker-tasks.ts";\nexport { WorkerService, buildSourceContextExcerpt, SOURCE_CONTEXT_MAX_MESSAGES, SOURCE_CONTEXT_MAX_CHARS, SOURCE_CONTEXT_MAX_PER_MESSAGE } from "./src/router/worker-service.ts";`,
+		contents: `export { WorkerTaskStore } from "./src/router/worker-tasks.ts";\nexport { WorkerService, buildSourceContextExcerpt, SOURCE_CONTEXT_MAX_MESSAGES, SOURCE_CONTEXT_MAX_CHARS, SOURCE_CONTEXT_MAX_PER_MESSAGE } from "./src/router/worker-service.ts";
+export { NARRATION_GUARD_NOTICE } from "./src/engine/task-planner.ts";`,
 		resolveDir: root,
 		loader: "ts",
 	},
@@ -36,7 +37,7 @@ await build({
 	format: "esm",
 	packages: "external",
 });
-const { WorkerTaskStore, WorkerService, buildSourceContextExcerpt, SOURCE_CONTEXT_MAX_MESSAGES, SOURCE_CONTEXT_MAX_CHARS, SOURCE_CONTEXT_MAX_PER_MESSAGE } =
+const { WorkerTaskStore, WorkerService, buildSourceContextExcerpt, SOURCE_CONTEXT_MAX_MESSAGES, SOURCE_CONTEXT_MAX_CHARS, SOURCE_CONTEXT_MAX_PER_MESSAGE, NARRATION_GUARD_NOTICE } =
 	await import(pathToFileURL(join(dir, "ws.mjs")).href);
 
 function harness(overrides = {}) {
@@ -45,7 +46,7 @@ function harness(overrides = {}) {
 	const store = new WorkerTaskStore(db);
 	const h = {
 		db, store,
-		sessions: [], sends: [], pushes: [], errors: [],
+		sessions: [], sends: [], pushes: [], errors: [], settled: [],
 		open: async (cid) => { h.sessions.push(cid); return { cid }; },
 		send: async (session, message) => {
 			h.sends.push({ session, message });
@@ -55,6 +56,7 @@ function harness(overrides = {}) {
 	};
 	const service = new WorkerService(store, {
 		open: h.open, send: h.send, push: h.push,
+		onSettled: (task, outcome) => h.settled.push({ task, outcome }),
 		maxConcurrent: 3, clock: { now: () => Date.now(), setTimeout: (fn) => { h.wake = fn; return fn; } },
 		onError: (e) => h.errors.push(e),
 		...overrides.service,
@@ -637,4 +639,91 @@ test("a LIVE worker still owns the dialogue unconditionally", async () => {
 		VALUES ('wlive', '长任务执行中', 'dt:group:g1', 'ma1', 'running', 'worker:wlive', ?, ?)`).run(now, now);
 	const taskMsg = "0002026110800003400。帮我查一下这笔流水的支付渠道下单日志，先查 spay 再查 sls，然后汇总异常";
 	assert.equal(await service.inject("dt:group:g1", taskMsg, "ma1"), true, "even task-shaped text reaches a running worker (verification codes etc.)");
+});
+
+test("a narration-suppressed DISPATCH round pushes only the honest notice and never settles as success", async () => {
+	// Field 2026-11-10: a zero-tool narration is dropped by the kernel, which
+	// returns narrationSuppressed + the system notice. The worker must deliver
+	// that notice (so the human is told nothing executed) but must NOT record a
+	// successful result — the notice starts with ⚠️ so the row settles as error.
+	const { h, service } = harness({
+		reply: () => ({ reply: NARRATION_GUARD_NOTICE, narrationSuppressed: true }),
+	});
+	const w = service.spawn({ instruction: "查一下这笔流水的支付渠道下单日志", sourceConversation: "dt:group:g1", createdBy: "ma1" });
+	service.start();
+	await flush();
+	const row = h.store.get(w.id);
+	// Worker linear state machine: every terminal dispatch is 'done' — failures
+	// ride the error COLUMN rather than a third status (see the TERMINAL-state
+	// test). The load-bearing guarantee here is result=null (never a fake
+	// success) with the honest notice recorded as the error.
+	assert.equal(row.status, "done", "the dispatch still settles as a terminal row");
+	assert.equal(row.result, null, "suppressed narration is never recorded as a successful result");
+	assert.match(row.error ?? "", /已尝试继续执行/, "the honest notice is recorded in the error column");
+	const pushed = h.pushes.filter((p) => p.cid === "dt:group:g1");
+	assert.equal(pushed.length, 1, "exactly one delivery — the notice, no fake result");
+	assert.equal(pushed[0].text, NARRATION_GUARD_NOTICE);
+});
+
+test("a narration-suppressed FOLLOW-UP delivers the notice but never rewrites the settled row", async () => {
+	// Follow-up turns are conversation (record=false): the worker_tasks row is
+	// already settled. A suppressed follow-up still owes the human the honest
+	// notice, but must not touch the stored status/result of the dispatch round.
+	const { h, service } = harness({
+		reply: () => ({ reply: NARRATION_GUARD_NOTICE, narrationSuppressed: true }),
+	});
+	const past = Date.now() - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wdone', '巡检', 'dt:group:g1', 'ma1', 'done', '早先的真实结果', 'worker:wdone', ?, ?, ?)`).run(past, past, past);
+	// 「继续」 is not task-shaped (no task verb), so a DONE worker keeps the
+	// dialogue as an ordinary follow-up instead of falling through to a new spawn.
+	const injected = await service.inject("dt:group:g1", "继续", "ma1");
+	assert.equal(injected, true, "the follow-up is claimed by the settled worker's session");
+	await flush();
+	const row = h.store.get("wdone");
+	assert.equal(row.status, "done", "a follow-up never rewrites the settled state");
+	assert.equal(row.result, "早先的真实结果", "the original dispatch result is untouched");
+	const pushed = h.pushes.filter((p) => p.cid === "dt:group:g1");
+	assert.equal(pushed.length, 1, "the notice is still delivered to the source conversation");
+	assert.equal(pushed[0].text, NARRATION_GUARD_NOTICE);
+});
+
+test("a narration-NOTED dispatch round settles as failure and is never archived as a task outcome (review adaf0751 P1-A)", async () => {
+	const MERGED = "我需要先了解当前环境，然后再继续。\n\n" + NARRATION_GUARD_NOTICE;
+	const { h, service } = harness({
+		reply: () => ({ reply: MERGED, narrationNoted: true }),
+	});
+	const w = service.spawn({ instruction: "查一下这笔流水的支付渠道下单日志", sourceConversation: "dt:group:g1", createdBy: "ma1" });
+	service.start();
+	await flush();
+	const row = h.store.get(w.id);
+	assert.equal(row.result, null, "zero action must never land in the result column");
+	assert.equal(row.error, MERGED, "the delivered text is recorded in the error column");
+	const pushed = h.pushes.filter((p) => p.cid === "dt:group:g1");
+	assert.equal(pushed.length, 1, "the human still sees the honest merged text");
+	assert.equal(pushed[0].text, MERGED);
+	assert.equal(h.settled.length, 0, "nothing executed → no knowledge-base outcome entry");
+});
+
+test("a suppressed reply WITHOUT the warning prefix is still corrected by the explicit flag", async () => {
+	// Mutation-proof (review adaf0751 P2-D): settlement must key on the kernel
+	// flag, not on sniffing the ⚠️ prefix.
+	const { h, service } = harness({
+		reply: () => ({ reply: "plain narration without prefix", narrationSuppressed: true }),
+	});
+	const w = service.spawn({ instruction: "查日志", sourceConversation: "dt:group:g1", createdBy: "ma1" });
+	service.start();
+	await flush();
+	const row = h.store.get(w.id);
+	assert.equal(row.result, null, "flag-based settlement, not prefix sniffing");
+	assert.equal(row.error, "plain narration without prefix");
+});
+
+test("source-context excerpt keeps a merged row's real answer (review adaf0751 P1-B)", () => {
+	const excerpt = buildSourceContextExcerpt([
+		{ role: "user", content: "帮我查对账" },
+		{ role: "assistant", content: "查完了，3 笔异常。\n\n" + NARRATION_GUARD_NOTICE },
+	]);
+	assert.ok(excerpt.includes("查完了，3 笔异常"), "the delivered answer must reach a fresh worker's context");
+	assert.ok(!excerpt.includes("已尝试继续执行但模型没有实际动作"), "the notice paragraph must not");
 });

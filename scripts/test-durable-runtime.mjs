@@ -182,6 +182,24 @@ test('persisted fallback notices are not replayed into the durable transcript', 
  }finally{await runtime.close();}
 });
 
+test('a MERGED history row (real answer + notice) keeps its ANSWER on durable import (review adaf0751 P1-B)', async t => {
+	const history = makeHistory(t);
+	history.ensureConversation('conv-merged', '合并行会话');
+	history.appendMessage('conv-merged', 'user', '帮我查对账');
+	history.appendMessage('conv-merged', 'assistant', '对账完成：3 条异常，已导出。\n\n' + NARRATION_GUARD_NOTICE);
+	const faux = fauxProvider();
+	const sessions = new Map();
+	const session = id => { if (!sessions.has(id)) sessions.set(id, new Agent({ streamFn: faux.provider.streamSimple, sessionId: id, initialState: { model: faux.provider.getModels()[0], systemPrompt: 'test' } })); return sessions.get(id); };
+	faux.setResponses([fauxAssistantMessage('收到，继续下一步。')]);
+	let seenTx = '';
+	const runtime = await DurableRuntime.open({ userDataDir: join(dir, 'merged-import'), history, session, tools: () => [], stream: (id, opts, messages) => { seenTx = JSON.stringify(messages); return faux.provider.streamSimple(faux.provider.getModels()[0], { messages }, opts); }, withActor: async (id, ctx, text, run) => run(), onRecovered: async () => {} });
+	try {
+		await runtime.send(session('conv-merged'), '继续');
+		assert.ok(seenTx.includes('对账完成：3 条异常'), 'the delivered real answer must survive into the next turn context');
+		assert.ok(!seenTx.includes('已尝试继续执行但模型没有实际动作'), 'the notice paragraph must not be replayed');
+	} finally { await runtime.close(); }
+});
+
 test('sweepSyntheticFallbackReplies removes persisted notices idempotently', t => {
  const db=new DatabaseSync(':memory:');
  db.exec(`CREATE TABLE conversations (id TEXT PRIMARY KEY,title TEXT,created_at INTEGER,updated_at INTEGER,origin TEXT,model_supplier_id TEXT,model_model_id TEXT); CREATE TABLE messages (id TEXT PRIMARY KEY,conversation_id TEXT,role TEXT,content TEXT,created_at INTEGER);`);
@@ -281,7 +299,7 @@ function narrationSetup(t, subdir, responses, tools = () => [], hooks = {}) {
 	return { history, session, opened, calls: () => modelCalls };
 }
 
-test('narration guard: zero-tool task turn forces ONE nudge; still zero tools → new answer + honest notice', async t => {
+test('narration guard: zero-tool nudge; sentence-form continuation delivered WITH notice (fail-open, user ruling 2026-11-10)', async t => {
 	const { history, session, opened, calls } = narrationSetup(t, 'narrate-once', [
 		fauxAssistantMessage('我来尝试登录生产后台管理。先检查一下当前环境可用的工具。'),
 		fauxAssistantMessage('我需要先了解当前环境，然后再继续。'),
@@ -289,10 +307,35 @@ test('narration guard: zero-tool task turn forces ONE nudge; still zero tools �
 	const runtime = await opened;
 	try {
 		const result = await runtime.send(session('conv-narrate-once'), NARRATION_TASK);
-		assert.ok(result.reply.startsWith('我需要先了解当前环境'), 'the continuation answer replaces the first narration');
-		assert.ok(result.reply.endsWith(NARRATION_GUARD_NOTICE), 'a continuation with zero tool calls carries the honest notice — a success claim without tool evidence is exactly the field bug');
+		assert.ok(result.reply.startsWith('我需要先了解当前环境'), 'a complete sentence is delivered, not swallowed');
+		assert.ok(result.reply.endsWith(NARRATION_GUARD_NOTICE), 'the honest notice rides along');
+		assert.ok(!result.narrationSuppressed, 'the flag is true ONLY on suppression');
+		assert.equal(result.narrationNoted, true, 'zero action is flagged for honest settlements');
 		assert.equal(calls(), 2, 'exactly one nudge even when the continuation narrates again — never a loop');
-		assert.deepEqual(history.listMessages('conv-narrate-once').filter(m=>m.role==='assistant').map(m=>m.content), [result.reply], 'only the final delivered text is projected into history');
+		assert.deepEqual(
+			history.listMessages('conv-narrate-once').filter(m => m.role === 'assistant').map(m => m.content),
+			[result.reply],
+			'the delivered text is projected into history',
+		);
+	} finally { await runtime.close(); }
+});
+
+test('narration guard: DANGLING continuation (colon-ended) is suppressed — only the notice, no projection', async t => {
+	const { history, session, opened, calls } = narrationSetup(t, 'narrate-dangling', [
+		fauxAssistantMessage('我来尝试登录生产后台管理。先检查一下当前环境可用的工具。'),
+		fauxAssistantMessage('好的，让我先确认一下当前环境和可用工具：'),
+	]);
+	const runtime = await opened;
+	try {
+		const result = await runtime.send(session('conv-narrate-dangling'), NARRATION_TASK);
+		assert.equal(result.reply, NARRATION_GUARD_NOTICE, 'a mid-sentence lead-in can never be a result — suppress it');
+		assert.equal(result.narrationSuppressed, true);
+		assert.equal(calls(), 2, 'exactly one nudge — never a loop');
+		assert.deepEqual(
+			history.listMessages('conv-narrate-dangling').filter(m => m.role === 'assistant'),
+			[],
+			'suppressed dangling narration is never projected into history',
+		);
 	} finally { await runtime.close(); }
 });
 

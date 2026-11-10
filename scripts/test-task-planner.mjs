@@ -23,7 +23,7 @@ mkdirSync(outDir, { recursive: true });
 const bundle = join(outDir, "b.mjs");
 await build({
 	stdin: {
-		contents: `export { looksLikeTask, parsePlan, formatPlanMessage, PLAN_PROMPT_HEADER, parseDurationMinutes, shouldPushPlanToChat, formatPlanForTurn, formatDuration, PLAN_CHAT_THRESHOLD_MIN } from "./src/engine/task-planner.ts";
+		contents: `export { looksLikeTask, isProcessNarration, isDanglingNarration, parsePlan, formatPlanMessage, PLAN_PROMPT_HEADER, parseDurationMinutes, shouldPushPlanToChat, formatPlanForTurn, formatDuration, PLAN_CHAT_THRESHOLD_MIN } from "./src/engine/task-planner.ts";
 			export { countPlanSteps } from "./src/im/triage.ts";`,
 		resolveDir: root, loader: "ts",
 	},
@@ -236,4 +236,65 @@ test("formatDuration reads naturally", () => {
 	assert.equal(formatDuration(30), "30 分钟");
 	assert.equal(formatDuration(60), "1 小时");
 	assert.equal(formatDuration(95), "1 小时 35 分");
+});
+
+// ---------- isProcessNarration (field 2026-11-10, Nova 13:00 stall) ----------
+
+test("isProcessNarration catches the field stall shapes (intent + dangling lead-in, no result)", () => {
+	for (const text of [
+		"好的，我来查这笔流水的支付渠道下单日志。先确认一下当前环境和可用工具：",
+		"我来尝试登录生产后台管理。先检查一下当前环境可用的工具。",
+		"让我调用 SLS 查询技能来执行：",
+		"你说得对，登录已经成功了，我不该再卡在这。马上开始查日志。\n\n让我调用 SLS 查询技能来执行：",
+		"我需要先了解当前环境，然后再继续。",
+	]) {
+		assert.equal(m.isProcessNarration(text), true, `must be treated as narration: ${text.slice(0, 30)}`);
+	}
+});
+
+test("isProcessNarration leaves substantive answers, blockers and chat untouched", () => {
+	for (const text of [
+		"我现在重启驱动，恢复 X11 连接后继续查日志。",
+		"登录入口在设置页。",
+		"查询完成。\n\n# 结果\n\n| 流水号 | 渠道 |\n|---|---|\n| 0422 | 工行 |",
+		"驱动卡在 goto 命令上了。需要你确认终止当前驱动进程，请回复\"确认终止\"，我杀掉重启。",
+		"你好，有什么可以帮你？",
+		"登录成功，环境检查完成。",
+		"共查到 3 笔异常订单，明细如下：1）a 2）b 3）c",
+		// Regression 2026-11-10 false-positive probe: a short prerequisite sentence
+		// that names a CONCRETE technical object is a real action commitment, not
+		// generic throat-clearing — it must stay deliverable.
+		"我先看一下当前环境里 spay_profile 的实际状态。",
+		"让我检查 sls_monitor_full.py 的运行状态。",
+		"我先看一下 C:\\\\Users\\\\hspcadmin\\\\Desktop\\\\Nova 目录。",
+		"",
+	]) {
+		assert.equal(m.isProcessNarration(text), false, `must NOT be treated as narration: ${text.slice(0, 30)}`);
+	}
+});
+
+test("isProcessNarration is bounded — long replies are never suppressed on this heuristic", () => {
+	assert.equal(m.isProcessNarration("我来查一下。".repeat(20)), false);
+});
+
+test("isDanglingNarration: only structurally certain mid-sentence lead-ins may replace a delivery", () => {
+	// Dangling: ends on a colon / execution lead-in with no outcome — can never BE a result.
+	for (const text of [
+		"好的，我来查这笔流水的支付渠道下单日志。先确认一下当前环境和可用工具：",
+		"让我调用 SLS 查询技能来执行：",
+		"好的，让我先确认一下当前环境和可用工具：",
+	]) assert.equal(m.isDanglingNarration(text), true, `dangling: ${text.slice(0, 30)}`);
+	// NOT dangling: complete sentences, or a colon that INTRODUCES real data.
+	for (const text of [
+		"我需要先了解当前环境，然后再继续。",
+		"查到 3 笔异常，明细：1）a 2）b",
+		"登录成功，环境检查完成。",
+		"你好，有什么可以帮你？",
+		// Review adaf0751 P2-A: a colon-ended CLARIFICATION lead-in is a question
+		// the human must answer — suppressing it loses what the model wanted to ask.
+		"我需要先确认几个问题：",
+		"让我确认一下时间范围：",
+		"我先确认一下你的需求：",
+		"让我先问清楚：",
+	]) assert.equal(m.isDanglingNarration(text), false, `not dangling: ${text.slice(0, 30)}`);
 });

@@ -4,8 +4,8 @@ import { createModels, createProvider, createAssistantMessageEventStream, type M
 import { defineDoc, ProviderDoc, type Conversation, type ConversationId, type Cursor, type EntryRecord, type ToolRegistration } from "@earendil-works/pi-durable";
 import type { Agent, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
 import type { SendCtx, SendResult, TurnProcessEvent } from "../engine.js";
-import type { HistoryStore } from "../../db/history-store.js";
-import { looksLikeImperative, looksLikeTask, NARRATION_GUARD_NOTICE } from "../task-planner.js";
+import { stripNotice, SYNTHETIC_FALLBACK_FRAGMENTS_RE, type HistoryStore } from "../../db/history-store.js";
+import { isDanglingNarration, isProcessNarration, NARRATION_GUARD_NOTICE } from "../task-planner.js";
 import { openDurableHost, type DurableHost } from "./harness-host.js";
 import { toDurableTool } from "./ve-tools.js";
 
@@ -412,11 +412,20 @@ export class DurableRuntime {
 			Object.assign(route, { conversationId: id, requestId: `ve:${cid}`, staffId: ctx?.actor?.senderId ?? "", verifiedRole: ctx?.actor?.channel === "widget" ? ctx.actor.verifiedRole ?? "" : "", name: ctx?.actor?.senderName ?? "", channel: ctx?.actor?.channel ?? "", chatType: ctx?.actor?.chatType ?? "", text, memoryConversationId: (ctx?.actor as { memoryConversationId?: string } | undefined)?.memoryConversationId ?? "", memoryChannel: (ctx?.actor as { memoryChannel?: string } | undefined)?.memoryChannel ?? "" });
 			// Import only on a NEW execution; resumed executions use their complete
 			// stored tool transcript and never rehydrate lossy UI messages.
-			for (const row of this.opts.history.listMessages(id)) {
+			for (const rawRow of this.opts.history.listMessages(id)) {
 				// Delivery-time notices are not employee speech: importing them would
 				// teach the model to imitate the fallback (observed on the box). The
 				// user's own question stays, so the exchange keeps its context.
-				if (row.role === "assistant" && isSyntheticFallbackReply(row.content)) continue;
+				// Review adaf0751 P1-B: a MERGED row (real answer + appended notice)
+				// must keep its REAL answer — dropping the whole row erased delivered
+				// results from the next turn's context. Same strip-then-skip-if-empty
+				// semantics as sweepSyntheticFallbackReplies, one implementation.
+				let row = rawRow;
+				if (row.role === "assistant" && isSyntheticFallbackReply(row.content)) {
+					const kept = stripNotice(row.content, SYNTHETIC_FALLBACK_FRAGMENTS_RE);
+					if (!kept) continue;
+					row = { ...row, content: kept };
+				}
 				// The history table stores no usage; imported assistant messages must
 				// still satisfy the durable contract (see ZERO_USAGE above) so any
 				// usage aggregation over the transcript cannot trip on undefined.
@@ -451,19 +460,22 @@ export class DurableRuntime {
 			const submission = await conv.submit({ type: "input", content, requestId: `ve:${conv.id}` }, context);
 			const outcome = await submission.wait(context);
 			let result = await this.result(conv, outcome.status === "done" ? outcome.answer : undefined);
-			// NARRATION GUARD (field 2026-11-09): a task-shaped turn that made ZERO
-			// tool calls must not settle for process narration (「我来尝试登录…先检查
-			// 工具」 then silence — nothing dispatched, nothing executed; the user ruled
-			// such replies unwanted). Force ONE continue and deliver the new answer;
-			// if the continuation still takes no action, deliver it WITH the honest
-			// notice. Exactly once — never a loop (flood-loop lesson). Failure notices
-			// (result.error) are already honest outcomes and are left alone.
-			// Review 94189d6f P3: an aborted turn must not get the nudge — /stop or
-			// a watchdog soft-stop landed mid-turn means the user cancelled it; one
-			// extra billed LLM call is exactly the wasted spend the guard avoids.
+			// NARRATION GUARD (field 2026-11-10): a turn with ZERO tool evidence that
+			// ended on pure process narration (「好的，我来查…先确认一下当前环境和可用
+			// 工具：」 then stop — nothing executed) must not deliver the narration as
+			// the task's result. Gate on the OUTPUT shape, not the input: the old
+			// looksLikeTask/looksLikeImperative gate missed ordinary instructions
+			// (「帮我查一下这笔流水…」, 39 chars, no listed verb) and the narration
+			// sailed through. Force ONE nudge; if the model still takes no action,
+			// drop every narration text (no projection into history — fake progress
+			// must never be rehydrated or imitated) and return only the honest system
+			// notice with narrationSuppressed. Exactly one nudge — never a loop
+			// (flood-loop lesson). Failure notices (result.error) are honest outcomes
+			// and stay untouched. Review 94189d6f P3: an aborted turn never gets the
+			// nudge — /stop or a watchdog soft-stop landing mid-turn cancelled it.
 			const abortedMidTurn = this.turnAbortIds.has(id);
-			if (!result.error && !abortedMidTurn && (looksLikeTask(text) || looksLikeImperative(text)) && !(await this.hadToolAction(conv))) {
-				console.warn(`[durable] narration guard: zero-tool task turn → forced continue via input (conv=${id})`);
+			if (!ctx?.ephemeral && !result.error && !abortedMidTurn && !(await this.hadToolAction(conv)) && isProcessNarration(result.reply)) {
+				console.warn(`[durable] narration guard: zero-tool narration → forced continue via input (conv=${id})`);
 				const priorEntries = await this.entryIdSnapshot(conv);
 				try {
 					// ONE nudge input, one requestId, no retry: a bare continue would
@@ -478,12 +490,24 @@ export class DurableRuntime {
 					console.warn("[durable] narration guard continue failed:", err instanceof Error ? err.message : err);
 				}
 				// Only the CONTINUATION's entries count: the first round's (lack of)
-				// evidence must not leak into the second judgment.
-				if (!result.error && !(await this.hadToolAction(conv, priorEntries))) {
-					result = { ...result, reply: `${result.reply}\n\n${NARRATION_GUARD_NOTICE}` };
+				// evidence must not leak into the second judgment. User ruling
+				// 2026-11-10 (delivery quality first): only the structurally certain
+				// dangling shape is suppressed; any other zero-tool narration is
+				// delivered with the honest notice appended (narrationNoted) so
+				// settlements never record zero action as success. Review adaf0751
+				// P2-C: an abort landing during the continuation owns the delivery.
+				if (!result.error && !this.turnAbortIds.has(id) && !(await this.hadToolAction(conv, priorEntries))) {
+					if (isDanglingNarration(result.reply)) {
+						result = { ...result, reply: NARRATION_GUARD_NOTICE, narrationSuppressed: true };
+					} else if (isProcessNarration(result.reply)) {
+						result = { ...result, reply: `${result.reply}\n\n${NARRATION_GUARD_NOTICE}`, narrationNoted: true };
+					}
 				}
 			}
-			await this.project(conv, result);
+			// Suppressed narration leaves NO history projection: the channel gets
+			// only the system notice, and a later turn can never imitate the fake
+			// progress. projected stays 0 so the next real answer still projects.
+			if (!result.narrationSuppressed) await this.project(conv, result);
 			ctx?.onPersist?.(id);
 			return result;
 		} finally {

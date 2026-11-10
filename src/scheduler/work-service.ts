@@ -58,7 +58,7 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	store: Store;
 	isAdmin(senderId: string): boolean;
 	open(item: WorkItemRow, conversationId: string): Session;
-	send(session: Session, message: string, senderId: string, memoryConversationId?: string, memoryChannel?: string): Promise<{ reply?: string; error?: string; deterministic?: boolean }>;
+	send(session: Session, message: string, senderId: string, memoryConversationId?: string, memoryChannel?: string): Promise<{ reply?: string; error?: string; deterministic?: boolean; narrationSuppressed?: boolean; narrationNoted?: boolean }>;
 	release(conversationId: string): Promise<void>;
 	push(conversationId: string, text: string): Promise<unknown>;
 	/** Live kb.enabled AND kb.learn.enabled, checked at completion. */
@@ -502,7 +502,7 @@ export class WorkService<Session extends WorkSession> {
 				// A thrown exception is NEVER retried (it may be anything).
 				stallRetriedThisTurn = false;
 				let stallAttempt = 0;
-				let result: { reply?: string; error?: string; deterministic?: boolean };
+				let result: { reply?: string; error?: string; deterministic?: boolean; narrationSuppressed?: boolean; narrationNoted?: boolean };
 				// Progress beats for the whole window (all turns): started before the
 				// first send and stopped+drained in the finally, so a slow in-flight note
 				// can never land after the window's completion push (v0.2.162 P2-1).
@@ -564,6 +564,16 @@ export class WorkService<Session extends WorkSession> {
 					break;
 				}
 				if (active.stopReason || !this.running) { question = active.stopReason ?? "应用停止执行，请管理员明确恢复。"; break; }
+				// Zero-action narration turns (review adaf0751 P2-B): the reply
+				// carries no window markers, so parseWindowReply would grade it
+				// "continue" and the chain would burn its budget re-driving a turn
+				// that executed nothing (and the ⚠️ notice would land in
+				// work_items.progress as if it were progress). Pause honestly
+				// instead — same contract as an empty-reply stall.
+				if (result.narrationSuppressed || result.narrationNoted) {
+					question = "本轮只产出过程叙述、未调用任何工具（已拦截或附通知放行），任务没有实际进展。请核查任务环境与指令可执行性后明确恢复，或取消任务。";
+					break;
+				}
 				if (answer !== null) store.clearAnswer(item.id, answer);
 				if (!current.created_by?.trim() || !this.opts.isAdmin(current.created_by)) {
 					question = "确认管理员权限已撤销；请核查操作并恢复权限后明确恢复任务。"; break;
