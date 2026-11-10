@@ -117,7 +117,7 @@ export interface TriageDecision {
 	/** true → dispatch to a background work item. */
 	dispatch: boolean;
 	/** Machine-readable reason, always populated (for logs and tests). */
-	reason: "disabled" | "not-task" | "no-plan" | "too-few-steps" | "no-long-verb" | "question" | "dispatch" | "deep-task" | "task" | "chat";
+	reason: "disabled" | "not-task" | "no-plan" | "too-few-steps" | "no-long-verb" | "question" | "reference" | "dispatch" | "deep-task" | "task" | "chat";
 	/** Number of numbered steps found in the plan (0 when no plan). */
 	steps: number;
 }
@@ -142,6 +142,29 @@ export function countPlanSteps(plan: string | undefined): number {
 		if (n === max + 1) max = n;
 	}
 	return max;
+}
+
+/** A bare context token: a verification code / serial number / order id /
+ * UUID — alphanumeric (plus . _ -), no CJK, no spaces, ≤64 chars after
+ * stripping trailing punctuation. Such a message is never a self-contained
+ * task: it ANSWERS or REFERENCES something the conversation already
+ * established (「875055」, 「0002026110800003400」, 「ORDER-2026-11-10-0001」).
+ * Dispatching it spawns a worker born without the chat history — the
+ * 2026-11-08/11-10 field bug (worker guessed 「订单系统」 and asked the user
+ * what the number was). ONE implementation, shared with the worker-service
+ * inject gate (single-implementation rule).
+ *
+ * Deliberate trade-off (review 7ba60092 P3-1): English confirmation words
+ * (ok/done/continue/retry) also match and, for DONE workers, go to the
+ * foreground instead of continuing the worker's private session — acceptable:
+ * the foreground carries full chat history, and the CJK continuation words the
+ * contract promises (继续/结果呢/重新执行) are unaffected. LIVE workers receive
+ * everything unconditionally (verification-code handoff). */
+const BARE_CONTEXT_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._\-]{0,63}$/;
+const TRAILING_PUNCT_RE = /[。，、！？.!?,;；:~～…]+$/;
+export function isBareContextToken(text: string): boolean {
+	const t = (text ?? "").trim().replace(TRAILING_PUNCT_RE, "").trim();
+	return BARE_CONTEXT_TOKEN_RE.test(t);
 }
 
 /** Does the message ask a question (which must never go to the background)? */
@@ -191,6 +214,12 @@ export function triageMessage(input: TriageInput, enabled: boolean): TriageDecis
 	// Worker window plans for itself from the raw instruction.
 	if (isQuestion(text)) return { dispatch: false, reason: "question", steps };
 	if (isSmallTalk(text)) return { dispatch: false, reason: "chat", steps };
+	// Review 7ba60092 P1: a bare token (serial/code/id) is a REFERENCE, not a
+	// task. Without this gate the planless dispatch (looksLikeTask hardcoded
+	// true) spawns a fresh worker whose whole instruction is the token —
+	// reproducing the exact context-loss bug the inject gate exists for. The
+	// foreground turn holds the conversation history that resolves it.
+	if (isBareContextToken(text)) return { dispatch: false, reason: "reference", steps };
 	return { dispatch: true, reason: isDeepTask(text) ? "deep-task" : "task", steps };
 }
 

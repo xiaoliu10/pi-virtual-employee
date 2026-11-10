@@ -21,6 +21,7 @@
  */
 import { WorkerTaskStore, type WorkerTaskRow } from "./worker-tasks.js";
 import { looksLikeTask } from "../engine/task-planner.js";
+import { isBareContextToken } from "../im/triage.js";
 
 /** Injected durable-execution primitives (same shape WorkService uses — the
  * shared KERNEL below both infrastructures; nothing task-flavored crosses). */
@@ -247,6 +248,21 @@ export class WorkerService<Session> {
 		// contract stays intact.
 		const LIVE_STATUSES = new Set(["queued", "running"]);
 		if (!LIVE_STATUSES.has(recent.status) && looksLikeTask(message)) {
+			return false;
+		}
+		// A BARE context token (digits / codes / serials like 「875055」) is a
+		// REFERENCE into the source chat — a FINISHED worker never holds that
+		// context (it was born with its instruction only), so it guesses and asks
+		// the user what the chat already answered (field 2026-11-10, single chat:
+		// 「查了一下，875055 在订单系统里没匹配到…这是什么类型的编号？」— the type was
+		// established turns ago in the very conversation the message came from).
+		// Fall through to the foreground turn: it carries the full conversation
+		// history and can resolve the reference, and triageMessage has the SAME
+		// guard (shared isBareContextToken → reason=reference), so the planless
+		// dispatch cannot loop the token back into a freshly spawned context-less
+		// worker either (review 7ba60092 P1). LIVE workers are untouched — the
+		// verification-code flow (field 2026-11-07) is served above this gate.
+		if (!LIVE_STATUSES.has(recent.status) && isBareContextToken(message)) {
 			return false;
 		}
 		const session = await this.opts.open(recent.conversation_id);
