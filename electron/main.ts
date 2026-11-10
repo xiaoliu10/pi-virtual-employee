@@ -51,6 +51,7 @@ import {
 	nextStallStep,
 	STALL_QUIET_RETRIES,
 } from "../src/scheduler/autonomous.js";
+import { buildSkillReviewPrompt, isNoNewSkillReply } from "../src/engine/skills/skill-review.js";
 import { TelemetryStore } from "../src/db/telemetry-store.js";
 import { ProposalStore } from "../src/engine/proposals.js";
 import { PromptLab } from "../src/db/prompt-lab.js";
@@ -1070,6 +1071,35 @@ ${tailForProgress(decision.text)}`;
 			}
 		}
 
+		// Auto skill distillation (separate from the KB learn turn): the KB turn
+		// records WHAT was learned; this one turns it into something a future run
+		// can EXECUTE — a skill with the verified script under scripts/. Without
+		// it the next run rewrites the script from scratch (field 2026-11-03).
+		// Every outcome qualifies: a stalled/errored run's blocker is exactly
+		// what the next run must not repeat.
+		if (config.all().kb.enabled && config.all().kb.learn.enabled) {
+			try {
+				const available = (await engine.listSkills()).skills.map((s) => s.name);
+				const skillSend = await engine.send(agent, buildSkillReviewPrompt({
+					taskTitle: task.title,
+					outcome: outcome === "done" ? "ok" : "error",
+					availableSkills: available,
+				}), {
+					ephemeral: true,
+					...(task.created_by ? { actor: { senderId: task.created_by, channel: "scheduler" as const, chatType: "single" as const, ...(task.conversation_id ? { memoryConversationId: task.conversation_id } : {}), ...(task.created_channel ? { memoryChannel: task.created_channel } : {}) } } : {}),
+				});
+				if (skillSend.deterministic || skillSend.error) {
+					appendAppLog(`[sched] chain ${task.id} skill review failed (deterministic=${!!skillSend.deterministic}, error=${skillSend.error?.slice(0, 80) ?? "none"}); skipped`);
+				} else if (isNoNewSkillReply(skillSend.reply ?? "")) {
+					appendAppLog(`[sched] chain ${task.id} (${task.title}) skill review: nothing new`);
+				} else {
+					appendAppLog(`[sched] chain ${task.id} (${task.title}) skill review: distilled`);
+				}
+			} catch (err) {
+				appendAppLog(`[sched] chain ${task.id} skill review failed: ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`);
+			}
+		}
+
 		// Deliver the outcome to the target chat (markers stripped by the parser).
 		if (task.conversation_id) {
 			const resumeHint = `\n\n回复「继续 ${task.title}」重置预算继续；不回复则保持暂停。`;
@@ -1297,6 +1327,52 @@ ${tailForProgress(decision.text)}`;
 		if (durableHost) void durableHost.close().catch(() => {});
 	});
 
+	/**
+	 * Auto-skill-distillation turn at the end of a scheduled run.
+	 *
+	 * Field 2026-11-03: a task wrote a working script on one run and a later
+	 * manual run rewrote it from scratch — the procedure lived only in that
+	 * run's transcript, which no future session reads. This turns the tail of a
+	 * run into an EPHEMERAL review turn (never enters the transcript, never
+	 * pushed) that sediments the reusable procedure AND the script itself into
+	 * the skill library, so the next run reads the skill and just invokes it.
+	 *
+	 * Ported from NousResearch/hermes-agent background_review: reuse-first
+	 * preference order (patch the skill in play → extend an existing umbrella →
+	 * add a scripts/ support file → only then create), read-before-write, and an
+	 * explicit do-not-capture list. See src/engine/skills/skill-review.ts.
+	 *
+	 * Never throws, never blocks the completion report: a failed distillation
+	 * is logged and skipped.
+	 */
+	const runSkillDistillReview = async (
+		agent: Parameters<typeof engine.send>[0],
+		task: { id: string; title: string },
+		outcome: "ok" | "error",
+	): Promise<void> => {
+		if (!config.all().kb.enabled || !config.all().kb.learn.enabled) return;
+		try {
+			const available = (await engine.listSkills()).skills.map((s) => s.name);
+			const res = await engine.send(
+				agent,
+				buildSkillReviewPrompt({ taskTitle: task.title, outcome, availableSkills: available }),
+				{ ephemeral: true },
+			);
+			if (res.error || res.deterministic) {
+				console.warn(`[sched] skill review failed for ${task.id}: ${res.error?.slice(0, 100) ?? "deterministic"}`);
+				return;
+			}
+			const reply = res.reply ?? "";
+			if (isNoNewSkillReply(reply)) {
+				appendAppLog(`[sched] task ${task.id} (${task.title}) skill review: nothing new`);
+				return;
+			}
+			appendAppLog(`[sched] task ${task.id} (${task.title}) skill review: distilled (${reply.slice(0, 120).replace(/\s+/g, " ")})`);
+		} catch (err) {
+			console.warn(`[sched] skill review threw for ${task.id}: ${(err as Error).message}`);
+		}
+	};
+
 	scheduler.setRunner({
 		async runTask(task, ctx) {
 			if (task.autonomous) return runAutonomousTask(task);
@@ -1439,6 +1515,10 @@ ${tailForProgress(decision.text)}`;
 				}
 			}
 			appendAppLog(`[sched] task ${task.id} (${task.title}) ${error ? `error=${error.slice(0, 120).replace(/\s+/g, " ")}` : pushError ? `ok;push_error=${pushError}` : "ok"}`);
+			// Auto skill distillation BEFORE returning: the run's transcript is the
+			// only place this procedure exists, and no future session reads it.
+			// Runs after the report push so a slow review never delays it.
+			await runSkillDistillReview(agent, task, error ? "error" : "ok");
 			if (error) return { status: "error:" + error.slice(0, 200) };
 			return { status: pushError ? "ok;push_error:" + pushError.slice(0, 180) : "ok" };
 		},
