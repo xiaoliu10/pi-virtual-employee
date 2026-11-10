@@ -81,7 +81,7 @@ export const NARRATION_GUARD_NOTICE = "⚠️ 已尝试继续执行但模型没�
 /** The plan prompt: short, numbered, verifiable steps; nothing else. */
 export const PLAN_PROMPT_HEADER =
 	"请判断下面这条消息是否是一个需要多步骤执行的任务。如果是，输出以下四部分；如果只是简单问答或单步操作，只输出 NO_PLAN。\n" +
-	"第一行：耗时：<预计总耗时，写成 5分钟 / 20分钟 / 1小时 / 3小时 这类形式>\n" +
+	"第一行：耗时：<只有存在可靠依据（步骤数明确、涉及操作的耗时已知、消息给出明确规模）才写数字，如 5分钟 / 1小时；没有可靠依据必须写「不确定」，严禁编造数字凑行。只计机器执行时间；等待人工配合（验证码/确认/授权）的时长一律不计入，需要配合时在目标行注明>\n" +
 	"第二行：目标：<一句话说明要达成什么，人话，不要术语堆砌>\n" +
 	"第三行：流程：<用一句话说明怎么做的，2-4 个动词短语用 → 连接即可>\n" +
 	"然后 3-6 行编号步骤（每步一行，动词开头，可验证）—— 这是给执行器看的，会被自动隐藏。\n" +
@@ -108,6 +108,11 @@ export interface ParsedPlan {
 export function parseDurationMinutes(raw: string | undefined): number {
 	const t = (raw ?? "").trim();
 	if (!t) return 0;
+	// User ruling 2026-11-10 (review 1ce0eb90 P2-1): 「不确定」 must WIN over any
+	// co-occurring number — a hedged "不确定，最多30分钟" is NOT an estimate, and
+	// parsing the embedded 30 would re-arm the exact misleading ⏱ card this
+	// rigor pass exists to kill.
+	if (t.includes("不确定")) return 0;
 	if (/半\s*(个)?\s*小时/.test(t)) return 30;
 	const m = /(\d+(?:\.\d+)?)\s*(分钟|分|小时|个小时|h|hr|hrs|hour|hours|天|day|days)/i.exec(t);
 	if (!m) return 0;
