@@ -50,6 +50,13 @@ const DEFAULT_MAX_PUSHES = 20;
 /** Backoff caps at an hour: long enough to outlive a relay outage, short
  *  enough that a recovered relay is picked up without human action. */
 const BACKOFF_CAP_MS = 60 * 60_000;
+/** The first beat fires this early instead of a full interval in (field
+ *  2026-11-10, box Nova): 16 worker tasks ran 0.3–17min against a 10-min
+ *  interval and 15 finished before the FIRST tick could fire — a pure
+ *  setInterval makes the first progress note a full interval away, so every
+ *  short task (the majority) narrates nothing at all. The steady cadence
+ *  after the first beat stays the configured interval. */
+const FIRST_BEAT_MS = 2 * 60_000;
 
 export interface ProgressNotifier {
 	start: () => void;
@@ -80,6 +87,8 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 	const intervalMs = normalizeProgressIntervalMin(opts.intervalMin) * 60_000;
 
 	let timer: NodeJS.Timeout | undefined;
+	/** One-shot early beat (FIRST_BEAT_MS after start); cleared on stop. */
+	let firstBeatTimer: NodeJS.Timeout | undefined;
 	/** Set while a push HTTP round-trip is on the wire (drain waits for it). */
 	let pushInFlight = false;
 	/** Resolves when the current push settles (deferred — no polling). */
@@ -96,9 +105,19 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 			clearInterval(timer);
 			timer = undefined;
 		}
+		if (firstBeatTimer) {
+			clearTimeout(firstBeatTimer);
+			firstBeatTimer = undefined;
+		}
 	};
 
 	const start = () => {
+		// Re-entry guard (review 41758e23 P3-1, pre-existing): a second start()
+		// used to overwrite the timers and leak the old interval. No current
+		// caller double-starts (each run builds a fresh notifier), this is
+		// purely defensive — but a leaked interval firing no-op ticks until
+		// process end is exactly the silent slop this module exists to prevent.
+		if (timer || firstBeatTimer) return;
 		// No target (console-created task) or disabled: stay a no-op — never burn
 		// side LLM calls for a push that cannot happen. This MUST log: a notifier
 		// that silently installs no timer is indistinguishable from a feature that
@@ -118,13 +137,21 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 		}, intervalMs);
 		// Never hold the process open for a progress push (all VE timers unref).
 		timer.unref?.();
+		// Short tasks never reach the first interval tick (field 2026-11-10):
+		// fire one early beat so they narrate at least once. Same tick() path →
+		// every gate (liveness, suppress, preflight, backoff, cap) applies.
+		firstBeatTimer = setTimeout(() => {
+			firstBeatTimer = undefined;
+			void tick();
+		}, FIRST_BEAT_MS);
+		firstBeatTimer.unref?.();
 		// The happy path MUST be as visible as the guard branches above: a
 		// window that beats silently is indistinguishable from a notifier that
 		// never started (field 2026-11-06: an 85-minute window produced zero
 		// progress notes and ZERO log lines, and the silence itself blocked
 		// diagnosis for hours — the tick may or may not have fired, and nothing
 		// could tell which).
-		log("INFO", `progress notifier started: interval=${Math.round(intervalMs / 60_000)}min target=${opts.target}`);
+		log("INFO", `progress notifier started: interval=${Math.round(intervalMs / 60_000)}min target=${opts.target} first-beat=+${Math.round(FIRST_BEAT_MS / 60_000)}min`);
 	};
 
 	const tick = async (): Promise<void> => {
@@ -155,7 +182,13 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 			log("INFO", "progress tick skipped: no target conversation");
 			return;
 		}
-		if (Date.now() < backoffUntil) return;
+		if (Date.now() < backoffUntil) {
+			// Degraded backoff eats every beat in its window; without a trace line
+			// a silent backoff window is indistinguishable from a dead timer
+			// (v0.2.173 field rule: a gate that drops a beat must say so).
+			log("INFO", "progress tick skipped: degraded backoff window");
+			return;
+		}
 
 		inFlight = true;
 		try {
