@@ -162,7 +162,7 @@ function capabilityRules(c: RulesCtx): string {
 	);
 	if (c.learnEnabled)
 		lines.push(
-			"- 发现可复用的规则、操作经验时，主动调用 save_to_knowledge 沉淀成知识库条目（标题简明、内容写清适用条件），让后续能被 search_knowledge_base 检索复用。关于对方个人的偏好、纠错、环境情况（「我是…」「以后…」「记住…」），用 remember 写入记忆，之后每个会话自动携带。",
+			"- 发现可复用的规则、操作经验时，主动调用 save_to_knowledge 沉淀成知识库条目（标题简明、内容写清适用条件），让后续能被 search_knowledge_base 检索复用；可执行的操作步骤/SOP（登录流程、后台操作、对账处理）用 save_to_skill 固化成技能，供所有会话复用。关于对方个人的偏好、纠错、环境情况（「我是…」「以后…」「记住…」），用 remember 写入记忆，之后每个会话自动携带。注意：对方教你「怎么做某事」（后台管理、对账操作等）是共享知识，不是个人偏好——写 save_to_skill/save_to_knowledge，不要写进按人隔离的记忆。",
 		);
 	if (c.manageEnabled)
 		lines.push(
