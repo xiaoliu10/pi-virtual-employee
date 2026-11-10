@@ -19,7 +19,7 @@ import { sidePassMaxTokens } from "./side-pass-budget.js";
 import { runningBackgroundProcesses, stopBackgroundProcesses } from "./tools/shell.js";
 import type { Skill } from "./skills/types.js";
 import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "./pi-compaction.js";
-import { formatPlanForTurn, formatPlanMessage, isProcessNarration, looksLikeTask, NARRATION_GUARD_NOTICE, parsePlan, PLAN_PROMPT_HEADER, shouldPushPlanToChat } from "./task-planner.js";
+import { formatPlanForTurn, formatPlanMessage, isDanglingNarration, isProcessNarration, looksLikeTask, NARRATION_GUARD_NOTICE, parsePlan, PLAN_PROMPT_HEADER, shouldPushPlanToChat } from "./task-planner.js";
 import { createModels, normalizeContext, ModelsError } from "@earendil-works/pi-ai";
 import { SIDE_PASS_DEFAULT_LEVEL, applyThinkingDeclaration } from "../shared/thinking.js";
 
@@ -3200,12 +3200,17 @@ export class EmployeeEngine implements EmployeeRuntime {
 			}
 			if (continuedReply.trim()) reply = continuedReply;
 			if ((this.turnToolCalls.get(conversationId) ?? 0) === 0) {
-				// Still no action. A substantive zero-tool reply (a real blocker,
-				// a question for the human) is legitimate and delivered; only
-				// repeated narration is suppressed.
-				if (isProcessNarration(reply)) {
+				// Still no action. User ruling 2026-11-10: narration is optional,
+				// the RESULT is what matters — the heuristic may force a retry but
+				// must never gamble a delivery. Only the structurally certain
+				// dangling shape (ends mid-sentence on 「…：」/「来执行」, so it can
+				// never BE a result) is suppressed; anything else is delivered with
+				// the honest notice appended, so a real blocker or answer survives.
+				if (isDanglingNarration(reply)) {
 					narrationSuppressed = true;
 					reply = NARRATION_GUARD_NOTICE;
+				} else if (isProcessNarration(reply)) {
+					reply = `${reply}\n\n${NARRATION_GUARD_NOTICE}`;
 				}
 			}
 		}

@@ -5,7 +5,7 @@ import { defineDoc, ProviderDoc, type Conversation, type ConversationId, type Cu
 import type { Agent, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
 import type { SendCtx, SendResult, TurnProcessEvent } from "../engine.js";
 import type { HistoryStore } from "../../db/history-store.js";
-import { isProcessNarration, NARRATION_GUARD_NOTICE } from "../task-planner.js";
+import { isDanglingNarration, isProcessNarration, NARRATION_GUARD_NOTICE } from "../task-planner.js";
 import { openDurableHost, type DurableHost } from "./harness-host.js";
 import { toDurableTool } from "./ve-tools.js";
 
@@ -481,11 +481,16 @@ export class DurableRuntime {
 					console.warn("[durable] narration guard continue failed:", err instanceof Error ? err.message : err);
 				}
 				// Only the CONTINUATION's entries count: the first round's (lack of)
-				// evidence must not leak into the second judgment. A substantive
-				// zero-tool reply (real blocker, question for the human) stays
-				// deliverable; only repeated narration is suppressed.
-				if (!result.error && !(await this.hadToolAction(conv, priorEntries)) && isProcessNarration(result.reply)) {
-					result = { ...result, reply: NARRATION_GUARD_NOTICE, narrationSuppressed: true };
+				// evidence must not leak into the second judgment. User ruling
+				// 2026-11-10 (delivery quality first): only the structurally certain
+				// dangling shape is suppressed; any other zero-tool reply is
+				// delivered with the honest notice appended.
+				if (!result.error && !(await this.hadToolAction(conv, priorEntries))) {
+					if (isDanglingNarration(result.reply)) {
+						result = { ...result, reply: NARRATION_GUARD_NOTICE, narrationSuppressed: true };
+					} else if (isProcessNarration(result.reply)) {
+						result = { ...result, reply: `${result.reply}\n\n${NARRATION_GUARD_NOTICE}` };
+					}
 				}
 			}
 			// Suppressed narration leaves NO history projection: the channel gets

@@ -23,7 +23,7 @@ mkdirSync(outDir, { recursive: true });
 const bundle = join(outDir, "b.mjs");
 await build({
 	stdin: {
-		contents: `export { looksLikeTask, isProcessNarration, parsePlan, formatPlanMessage, PLAN_PROMPT_HEADER, parseDurationMinutes, shouldPushPlanToChat, formatPlanForTurn, formatDuration, PLAN_CHAT_THRESHOLD_MIN } from "./src/engine/task-planner.ts";
+		contents: `export { looksLikeTask, isProcessNarration, isDanglingNarration, parsePlan, formatPlanMessage, PLAN_PROMPT_HEADER, parseDurationMinutes, shouldPushPlanToChat, formatPlanForTurn, formatDuration, PLAN_CHAT_THRESHOLD_MIN } from "./src/engine/task-planner.ts";
 			export { countPlanSteps } from "./src/im/triage.ts";`,
 		resolveDir: root, loader: "ts",
 	},
@@ -275,4 +275,20 @@ test("isProcessNarration leaves substantive answers, blockers and chat untouched
 
 test("isProcessNarration is bounded — long replies are never suppressed on this heuristic", () => {
 	assert.equal(m.isProcessNarration("我来查一下。".repeat(20)), false);
+});
+
+test("isDanglingNarration: only structurally certain mid-sentence lead-ins may replace a delivery", () => {
+	// Dangling: ends on a colon / execution lead-in with no outcome — can never BE a result.
+	for (const text of [
+		"好的，我来查这笔流水的支付渠道下单日志。先确认一下当前环境和可用工具：",
+		"让我调用 SLS 查询技能来执行：",
+		"好的，让我先确认一下当前环境和可用工具：",
+	]) assert.equal(m.isDanglingNarration(text), true, `dangling: ${text.slice(0, 30)}`);
+	// NOT dangling: complete sentences, or a colon that INTRODUCES real data.
+	for (const text of [
+		"我需要先了解当前环境，然后再继续。",
+		"查到 3 笔异常，明细：1）a 2）b",
+		"登录成功，环境检查完成。",
+		"你好，有什么可以帮你？",
+	]) assert.equal(m.isDanglingNarration(text), false, `not dangling: ${text.slice(0, 30)}`);
 });

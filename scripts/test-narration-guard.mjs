@@ -201,7 +201,7 @@ test("zero-tool task turn: guard continues exactly once and delivers the NEW rep
 	assert.equal(history.listMessages("conv-narrate-once").filter((m) => m.role === "assistant").at(-1)?.content, result.reply, "history persists the delivered reply");
 });
 
-test("still zero tools after the one continuation: narration suppressed — only the honest notice, no history row", async (t) => {
+test("still zero tools, sentence-form narration: delivered WITH the notice (fail-open, user ruling 2026-11-10)", async (t) => {
 	let runs = 0;
 	const { engine, config, history } = makeEngine(t, { streamFn: async () => {
 		runs += 1;
@@ -210,16 +210,34 @@ test("still zero tools after the one continuation: narration suppressed — only
 	supplierConfig(config);
 	const agent = engine.getOrCreateSession("conv-narrate-twice");
 	const result = await engine.send(agent, TASK);
-	// The continuation narrated again with zero tool evidence: BOTH narration
-	// texts are dropped (not pushed, not persisted) — only the honest system
-	// notice comes back, flagged so callers never treat it as the task result.
-	assert.equal(result.reply, NARRATION_GUARD_NOTICE, "the narration is suppressed; only the honest system notice remains");
-	assert.equal(result.narrationSuppressed, true);
+	// A complete sentence is NOT structurally certain narration — it might carry
+	// a real blocker. Delivery quality first: the text is delivered verbatim with
+	// the honest notice appended, and it stays in history.
+	assert.ok(result.reply.startsWith("我需要先了解当前环境"), "the model text is delivered, not swallowed");
+	assert.ok(result.reply.endsWith(NARRATION_GUARD_NOTICE), "the no-action notice rides along");
+	assert.equal(result.narrationSuppressed, false);
 	assert.equal(runs, 2, "the guard runs exactly once even when the continuation narrates again");
+	assert.equal(history.listMessages("conv-narrate-twice").filter((m) => m.role === "assistant").length, 1, "delivered text persists");
+});
+
+test("still zero tools, DANGLING narration: suppressed — only the notice, no history row", async (t) => {
+	let runs = 0;
+	const { engine, config, history } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		return textReply(runs === 1 ? NARRATION : "让我先确认一下当前环境和可用工具：");
+	} });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-narrate-dangling");
+	const result = await engine.send(agent, TASK);
+	// Ends mid-sentence on a colon: structurally it can never be a result, so
+	// suppressing it hides nothing real.
+	assert.equal(result.reply, NARRATION_GUARD_NOTICE, "only the honest system notice remains");
+	assert.equal(result.narrationSuppressed, true);
+	assert.equal(runs, 2, "exactly one continuation — never a loop");
 	assert.deepEqual(
-		history.listMessages("conv-narrate-twice").filter((m) => m.role === "assistant"),
+		history.listMessages("conv-narrate-dangling").filter((m) => m.role === "assistant"),
 		[],
-		"suppressed narration leaves no assistant row — fake progress can never be rehydrated or imitated",
+		"suppressed dangling narration leaves no assistant row",
 	);
 });
 
@@ -415,9 +433,10 @@ test("field 2026-11-10: the old input gate misses this message, but the output g
 	assert.equal(looksLikeImperative(FIELD_20261110_MESSAGE), false);
 
 	let runs = 0;
-	const { engine, config, history } = makeEngine(t, { streamFn: async () => {
+	const { engine, config } = makeEngine(t, { streamFn: async () => {
 		runs += 1;
-		// Both the first turn and the forced continuation produce only narration.
+		// Continuation narrates again as a COMPLETE sentence: fail-open delivers
+		// it with the honest notice instead of gambling the delivery.
 		return textReply(runs === 1 ? FIELD_20261110_NARRATION : "我需要先确认环境，然后再继续。");
 	} });
 	supplierConfig(config);
@@ -425,14 +444,24 @@ test("field 2026-11-10: the old input gate misses this message, but the output g
 	const result = await engine.send(agent, FIELD_20261110_MESSAGE);
 
 	assert.equal(runs, 2, "the output-side guard still forces exactly one continuation");
-	assert.equal(result.narrationSuppressed, true, "the turn is flagged as suppressed");
-	assert.equal(result.reply, NARRATION_GUARD_NOTICE, "only the honest system notice returns — no narration text");
-	assert.ok(!result.reply.includes("先确认一下当前环境"), "the fake-progress narration is not delivered");
-	assert.deepEqual(
-		history.listMessages("conv-field-20261110").filter((m) => m.role === "assistant"),
-		[],
-		"the narration leaves no history row — it cannot be rehydrated or imitated later",
-	);
+	assert.equal(result.narrationSuppressed, false, "sentence-form narration is delivered, not swallowed");
+	assert.ok(result.reply.startsWith("我需要先确认环境"), "the continuation text reaches the user");
+	assert.ok(result.reply.endsWith(NARRATION_GUARD_NOTICE), "with the honest no-action notice");
+});
+
+test("field 2026-11-10 dangling variant: a colon-ended continuation is suppressed", async (t) => {
+	let runs = 0;
+	const { engine, config, history } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		return textReply(runs === 1 ? FIELD_20261110_NARRATION : "好的，让我先确认一下当前环境和可用工具：");
+	} });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-field-20261110-dangle");
+	const result = await engine.send(agent, FIELD_20261110_MESSAGE);
+	assert.equal(runs, 2);
+	assert.equal(result.narrationSuppressed, true, "structurally certain dangling narration is suppressed");
+	assert.equal(result.reply, NARRATION_GUARD_NOTICE);
+	assert.deepEqual(history.listMessages("conv-field-20261110-dangle").filter((m) => m.role === "assistant"), []);
 });
 
 test("field 2026-11-10: if the continuation actually uses a tool, the real result is delivered", async (t) => {

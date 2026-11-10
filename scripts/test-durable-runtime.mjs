@@ -281,7 +281,7 @@ function narrationSetup(t, subdir, responses, tools = () => [], hooks = {}) {
 	return { history, session, opened, calls: () => modelCalls };
 }
 
-test('narration guard: zero-tool task turn forces ONE nudge; still zero tools → narration suppressed, only the honest notice, no history projection', async t => {
+test('narration guard: zero-tool nudge; sentence-form continuation delivered WITH notice (fail-open, user ruling 2026-11-10)', async t => {
 	const { history, session, opened, calls } = narrationSetup(t, 'narrate-once', [
 		fauxAssistantMessage('我来尝试登录生产后台管理。先检查一下当前环境可用的工具。'),
 		fauxAssistantMessage('我需要先了解当前环境，然后再继续。'),
@@ -289,13 +289,33 @@ test('narration guard: zero-tool task turn forces ONE nudge; still zero tools �
 	const runtime = await opened;
 	try {
 		const result = await runtime.send(session('conv-narrate-once'), NARRATION_TASK);
-		assert.equal(result.reply, NARRATION_GUARD_NOTICE, 'repeated zero-tool narration is dropped; only the honest system notice returns');
-		assert.equal(result.narrationSuppressed, true);
+		assert.ok(result.reply.startsWith('我需要先了解当前环境'), 'a complete sentence is delivered, not swallowed');
+		assert.ok(result.reply.endsWith(NARRATION_GUARD_NOTICE), 'the honest notice rides along');
+		assert.ok(!result.narrationSuppressed, 'the flag is true ONLY on suppression');
 		assert.equal(calls(), 2, 'exactly one nudge even when the continuation narrates again — never a loop');
 		assert.deepEqual(
-			history.listMessages('conv-narrate-once').filter(m => m.role === 'assistant'),
+			history.listMessages('conv-narrate-once').filter(m => m.role === 'assistant').map(m => m.content),
+			[result.reply],
+			'the delivered text is projected into history',
+		);
+	} finally { await runtime.close(); }
+});
+
+test('narration guard: DANGLING continuation (colon-ended) is suppressed — only the notice, no projection', async t => {
+	const { history, session, opened, calls } = narrationSetup(t, 'narrate-dangling', [
+		fauxAssistantMessage('我来尝试登录生产后台管理。先检查一下当前环境可用的工具。'),
+		fauxAssistantMessage('好的，让我先确认一下当前环境和可用工具：'),
+	]);
+	const runtime = await opened;
+	try {
+		const result = await runtime.send(session('conv-narrate-dangling'), NARRATION_TASK);
+		assert.equal(result.reply, NARRATION_GUARD_NOTICE, 'a mid-sentence lead-in can never be a result — suppress it');
+		assert.equal(result.narrationSuppressed, true);
+		assert.equal(calls(), 2, 'exactly one nudge — never a loop');
+		assert.deepEqual(
+			history.listMessages('conv-narrate-dangling').filter(m => m.role === 'assistant'),
 			[],
-			'suppressed narration is never projected into history — it cannot be imitated later',
+			'suppressed dangling narration is never projected into history',
 		);
 	} finally { await runtime.close(); }
 });

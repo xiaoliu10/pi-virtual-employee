@@ -124,6 +124,27 @@ export function isProcessNarration(raw: string): boolean {
 		&& !NARRATION_CONCRETE_TARGET_RE.test(text);
 }
 
+/**
+ * The STRUCTURALLY CERTAIN subset of process narration (user ruling
+ * 2026-11-10: 「旁白是可有可无的，结果是更关键的——不能因为可有可无的东西去影响
+ * 最终交付的质量」). A reply that ENDS on a dangling lead-in (「…：」 / 「让我…
+ * 来执行」) is mid-sentence by construction: it announces work and stops before
+ * any outcome exists, so it can never BE a result — suppressing it hides
+ * nothing. Anything else (a complete sentence, a question, a blocker) stays
+ * deliverable even when it smells like narration: the heuristic may trigger a
+ * continuation, but only this narrow shape may ever replace a delivery.
+ */
+const NARRATION_DANGLING_MAX_LEN = 200;
+export function isDanglingNarration(raw: string): boolean {
+	const text = (raw ?? "").trim();
+	if (!text || text.length > NARRATION_DANGLING_MAX_LEN) return false;
+	if (!NARRATION_DANGLING_RE.test(text)) return false;
+	// A real result quoted before the lead-in (「查到 3 笔：」) is substance — the
+	// colon then INTRODUCES data, not dangles. Require the narration shape.
+	if (NARRATION_SUBSTANCE_RE.test(text)) return false;
+	return NARRATION_INTENT_RE.test(text) || NARRATION_PREREQUISITE_RE.test(text);
+}
+
 /** The plan prompt: short, numbered, verifiable steps; nothing else. */
 export const PLAN_PROMPT_HEADER =
 	"请判断下面这条消息是否是一个需要多步骤执行的任务。如果是，输出以下四部分；如果只是简单问答或单步操作，只输出 NO_PLAN。\n" +
