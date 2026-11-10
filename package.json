@@ -43,12 +43,14 @@
     "prepare:native:win": "node scripts/prepare-win-native.mjs",
     "prepare:native:mac": "node scripts/prepare-mac-native.mjs",
     "prepare:native:linux": "node scripts/prepare-linux-native.mjs",
-    "package:win": "npm run typecheck && npm run build && npm run prepare:native:win && electron-builder --win nsis --x64",
-    "package:mac": "npm run typecheck && npm run build && npm run prepare:native:mac && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg --arm64",
-    "package:linux": "npm run typecheck && npm run build && npm run prepare:native:linux && electron-builder --linux AppImage --x64",
+    "package:win": "npm run check:build-env && npm run typecheck && npm run build && npm run prepare:native:win && electron-builder --win nsis --x64 && npm run verify:asar",
+    "package:mac": "npm run check:build-env && npm run typecheck && npm run build && npm run prepare:native:mac && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg --arm64 && npm run verify:asar",
+    "package:linux": "npm run check:build-env && npm run typecheck && npm run build && npm run prepare:native:linux && electron-builder --linux AppImage --x64 && npm run verify:asar",
     "release": "node scripts/publish.mjs",
     "release:dry": "node scripts/publish.mjs --dry-run",
-    "postinstall": "electron-rebuild -f -w better-sqlite3"
+    "postinstall": "electron-rebuild -f -w better-sqlite3",
+    "check:build-env": "node scripts/check-build-env.mjs",
+    "verify:asar": "node scripts/verify-asar.mjs"
   },
   "dependencies": {
     "@earendil-works/chord": "1.5.0",
@@ -74,6 +76,7 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^1.2.0",
+    "@electron/asar": "^3.4.1",
     "@electron/rebuild": "^4.2.0",
     "@types/ali-oss": "^6.23.3",
     "@types/better-sqlite3": "^7.6.12",
