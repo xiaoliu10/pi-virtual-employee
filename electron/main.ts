@@ -9,7 +9,7 @@
 import os from "node:os";
 import { app, BrowserWindow, clipboard, dialog, ipcMain, screen, shell } from "electron";
 import { mkdir, readFile, writeFile, copyFile, readdir, rm } from "node:fs/promises";
-import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import util from "node:util";
 import { runInstallTeardown } from "./install-cleanup.js";
@@ -93,6 +93,7 @@ const isDev = !!process.env.VITE_DEV_SERVER_URL;
  */
 const PROFILE_NAME_RE = /^[A-Za-z0-9_-]+$/;
 import { acquireProfileLock as coreAcquireProfileLock, LOCK_FILE } from "./profile-lock-core.js";
+import { DataRootUnavailableError, profileUserDataDir, resolveDataRoot, workspaceRoot } from "./data-root.js";
 
 /** Project the Electron updater state to the platform-agnostic tool status. */
 function toUpdateToolStatus(state: UpdateState): UpdateToolStatus {
@@ -138,9 +139,31 @@ function acquireProfileLock(userDataDir: string): void {
 }
 
 const activeProfile = resolveProfile(process.argv, process.env);
-if (activeProfile !== "default") {
-	app.setPath("userData", path.join(app.getPath("appData"), "pi-virtual-employee", "profiles", activeProfile));
+// Data root: env PI_DATA_ROOT > pinned marker > legacy-data protection >
+// fresh-install E:->D:->C: probe. A pinned root that is unavailable is a hard
+// error (never silently re-target — that looks exactly like data loss).
+let dataRoot: string;
+try {
+	dataRoot = resolveDataRoot({ appData: app.getPath("appData"), env: process.env });
+} catch (err) {
+	if (err instanceof DataRootUnavailableError) {
+		// This runs at module load, BEFORE app.whenReady — a whenReady().then()
+		// dialog is dead code because the top-level throw aborts app init before
+		// the ready phase (review 3bd05d8a P2-1, reproduced on Electron 37).
+		// showErrorBox is documented safe to call before ready; show it
+		// synchronously, then quit so the process never opens a DB on an empty
+		// fallback root. Starting anyway would orphan the real data.
+		console.error(`[main] ${err.message}`);
+		try {
+			dialog.showErrorBox("数据目录不可用", err.message);
+		} catch {
+			/* headless / no display: the console error above is the last resort */
+		}
+		app.quit();
+	}
+	throw err;
 }
+app.setPath("userData", profileUserDataDir(dataRoot, activeProfile));
 // app.setPath doesn't create the dir; ensure it exists before writing the lock.
 mkdirSync(app.getPath("userData"), { recursive: true });
 // App logs live with the profile data (not the packaged app-name dir Electron
@@ -388,7 +411,7 @@ function sharedTopLevelSegment(rels: string[]): string | null {
 
 /** Directory for a named (non-default) profile. */
 function profileDir(name: string): string {
-	return path.join(app.getPath("appData"), "pi-virtual-employee", "profiles", name);
+	return profileUserDataDir(dataRoot, name);
 }
 
 /**
@@ -489,7 +512,7 @@ async function main(): Promise<void> {
 	// — the same root the workspace would live under. Putting the workspace there
 	// made the sensitive-dir deny-list refuse every write (review round 2, P0-2).
 	// It therefore lives in a SEPARATE root that never overlaps any profile.
-	const scriptWorkspace = path.join(app.getPath("appData"), "pi-virtual-employee-workspace", activeProfile, "scripts");
+	const scriptWorkspace = path.join(workspaceRoot(dataRoot), activeProfile, "scripts");
 	// Create it up front: the guard resolves symlinks through the deepest EXISTING
 	// ancestor, so a not-yet-created workspace would fail the first write — the
 	// exact "can never author its first script" failure this feature exists to
