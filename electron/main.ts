@@ -21,7 +21,7 @@ import { formatRecoveredNote, planRecoveredDelivery, resolveTaskSourceTarget } f
 import { createWorkProgressNotifier, createRunProgressNotifier, resolveWorkProgressTarget } from "../src/scheduler/progress-wiring.js";
 import { createProgressNotifier } from "../src/scheduler/progress-notify.js";
 import { WorkerTaskStore } from "../src/router/worker-tasks.js";
-import { WorkerService } from "../src/router/worker-service.js";
+import { WorkerService, buildSourceContextExcerpt } from "../src/router/worker-service.js";
 import { openDatabase, closeDatabase } from "../src/db/sqlite.js";
 import { ConfigStore, normalizeModelConfig, type ExternalProviderConfig, type Supplier } from "../src/db/config-store.js";
 import { HistoryStore } from "../src/db/history-store.js";
@@ -1632,6 +1632,25 @@ ${tailForProgress(decision.text)}`;
 				return parts.join("\n");
 			} catch (err) {
 				console.warn("[worker] task context lookup failed (retry continues without it):", err instanceof Error ? err.message : err);
+				return null;
+			}
+		},
+		// Source-conversation context (user ruling 2026-11-10): a freshly
+		// dispatched worker must not be born blind — 「875055」/「这笔流水」 are
+		// resolvable only against the chat that produced them. Bounded excerpt
+		// from the SAME conversation (soft isolation: a group worker sees the
+		// group stream every member already sees), read at execute time.
+		sourceContext: (sourceConversation) => {
+			try {
+				// BOUNDED read (review 0bcb32c4 P2-2): the excerpt only ever looks
+				// at the last ~24 rendered messages, so pulling a long-lived group
+				// chat's whole history on every dispatch (and every retry) was a
+				// needless full materialisation. 200 rows comfortably saturates the
+				// window even after synthetic/forged rows are filtered out.
+				const rows = history.listMessagesTail(sourceConversation, 200);
+				return buildSourceContextExcerpt(rows);
+			} catch (err) {
+				console.warn("[worker] source context lookup failed (worker starts with instruction only):", err instanceof Error ? err.message : err);
 				return null;
 			}
 		},

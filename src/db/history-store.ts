@@ -66,6 +66,14 @@ export interface MiningCursor {
 	rowid: number;
 }
 
+/** Distinctive fragments of DELIVERY-TIME fallback notices (durable engine).
+ * They are not employee speech: replaying them into a transcript taught the
+ * model to imitate them (box 2026-10-29), so the sweep removes them AND the
+ * worker source-context excerpt filters them out. ONE constant, three
+ * consumers — never a second copy (durable/runtime.ts keeps its own copy until
+ * the component is retired; see PR-5). */
+export const SYNTHETIC_FALLBACK_FRAGMENTS_RE = /执行已暂停|模型没有返回任何内容|请检查恢复状态|已尝试继续执行但模型没有实际动作/;
+
 export class HistoryStore {
 	constructor(private readonly db: DB) {
 		// Runtime state, not user configuration. Safe for existing profiles too.
@@ -315,11 +323,13 @@ export class HistoryStore {
 	sweepSyntheticFallbackReplies(): number {
 		const rows = this.db.prepare("SELECT id, content FROM messages WHERE role = 'assistant'").all() as { id: string; content: string }[];
 		const normalized = (text: string) => (text ?? "").replace(/\s+/g, "").trim();
-		// Same distinctive-fragment rule as the durable import: a reworded notice must
-		// not silently stop being swept. Review 94189d6f P2: a row that MERGES a real
-		// reply with the notice must lose only the notice segment — deleting the whole
-		// row erased genuine answers from history/UI.
-		const noticeRe = /执行已暂停|模型没有返回任何内容|请检查恢复状态|已尝试继续执行但模型没有实际动作/;
+		// Same distinctive-fragment rule as the durable import (SHARED constant —
+		// the worker source-context excerpt uses it too, so a notice can never be
+		// fed back to a worker as if the employee had said it): a reworded notice
+		// must not silently stop being swept. Review 94189d6f P2: a row that
+		// MERGES a real reply with the notice must lose only the notice segment —
+		// deleting the whole row erased genuine answers from history/UI.
+		const noticeRe = SYNTHETIC_FALLBACK_FRAGMENTS_RE;
 		let changed = 0;
 		const strip = this.db.prepare("UPDATE messages SET content = ? WHERE id = ?");
 		const del = this.db.prepare("DELETE FROM messages WHERE id = ?");
