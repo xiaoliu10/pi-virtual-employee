@@ -22,7 +22,7 @@
 export const TASK_VERBS = [
 		"登录", "抓取", "爬", "下载", "整理", "汇总", "生成", "监控", "巡检", "对账", "采集",
 		"导出", "推送", "部署", "排查", "分析", "批量", "自动化", "跟踪", "核对", "注册", "配置",
-		"打开", "访问", "上传", "同步", "重启",
+		"打开", "访问", "上传", "同步", "重启", "查",
 		"write", "build", "deploy", "scrape", "crawl", "download", "generate", "monitor", "automate", "analyze",
 	];
 
@@ -62,10 +62,19 @@ export function looksLikeTask(message: string): boolean {
 	if (hits === 0) return false;
 	// Multi-step evidence: numbered list, several sentences, or sequencing words.
 	const multiStep = /\n|。|；|;|然后|接着|之后|再|并且|同时|以及|最后|第一步|第[一二三]|\d+[.、）)]|，.*(然后|接着|之后|并且|同时)/.test(text);
+	// A long digit serial (order/流水 number ≥10 digits) is task CARGO — a
+	// concrete lookup target, exactly the "a path, a condition, a target"
+	// detail the length gate stands in for (field 2026-11-10 21:24:
+	// 「帮我查一下这笔流水：0422026111000000654 的支付渠道下单日志」 is 39 chars with
+	// no sequencing words and 查 not even in the verb list — looksLikeTask=false
+	// routed it as conversational follow-up into a stale worker's ~200k-token
+	// transcript instead of spawning a fresh worker; it burned 61 minutes
+	// against the context wall and died).
+	const hasSerial = /\d{10,}/.test(text);
 	// A bare task verb alone ("登录") is a single-step command: require either
 	// multi-step evidence or a message long enough to carry detail (a path, a
 	// condition, a target).
-	return multiStep || text.length >= 40;
+	return multiStep || hasSerial || text.length >= 40;
 }
 
 /**

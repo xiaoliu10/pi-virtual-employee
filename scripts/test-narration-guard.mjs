@@ -427,11 +427,14 @@ test("review 94189d6f P3: the guard's continuation keeps the turn's RBAC identit
 const FIELD_20261110_MESSAGE = "帮我查一下这笔流水：0422026111000000654 的支付渠道下单日志";
 const FIELD_20261110_NARRATION = "好的，我来查这笔流水的支付渠道下单日志。先确认一下当前环境和可用工具：";
 
-test("field 2026-11-10: the old input gate misses this message, but the output guard suppresses its narration", async (t) => {
-	// Prove the seam exists on the INPUT side: this exact message passes both
-	// old shape detectors, which is why the narration used to sail through.
-	assert.equal(looksLikeTask(FIELD_20261110_MESSAGE), false, "39 chars, no listed task verb — the old gate's blind spot");
-	assert.equal(looksLikeImperative(FIELD_20261110_MESSAGE), false);
+test("field 2026-11-10: the input gate now catches this message; the output guard remains as defense in depth", async (t) => {
+	// The SAME evening's fix (task-planner): 查 joined TASK_VERBS and a ≥10-digit
+	// serial counts as task cargo, so the input gate now routes this exact
+	// message as a task (fresh worker instead of a stale worker's snowball
+	// transcript). The output-side guard below is kept as defense in depth for
+	// whatever shape the input heuristics will inevitably miss next.
+	assert.equal(looksLikeTask(FIELD_20261110_MESSAGE), true, "查 + a 19-digit serial: the input gate now routes it as a task");
+	assert.equal(looksLikeImperative(FIELD_20261110_MESSAGE), true, "帮我 lead + 查 verb");
 
 	let runs = 0;
 	const { engine, config } = makeEngine(t, { streamFn: async () => {

@@ -128,7 +128,7 @@ await build({
 							}
 							createLoopConfig() { return {}; }
 						}
-						export const DEFAULT_COMPACTION_SETTINGS = {};
+						export const DEFAULT_COMPACTION_SETTINGS = { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 };
 						export const convertToLlm = (x) => x;
 						export const estimateContextTokens = () => ({ tokens: 0 });
 						export const estimateTokensSafe = () => 0;
@@ -927,6 +927,44 @@ test("F2: repeated length-truncated empty runs surface context-overflow guidance
 	assert.match(result.reply, /超出了模型能一次处理的长度上限/, "must use the context-overflow deterministic template");
 	assert.match(result.reply, /\/new/, "must point at the /new remedy");
 	assert.doesNotMatch(result.reply, /模型服务连续多次未返回内容/, "must not misreport a length stall as a service outage");
+});
+
+// PRE-TURN BUDGET GATE (field 2026-11-10 night): a follow-up injected into a
+// day-long browser-automation worker started its turn on a ~200k-token
+// transcript and burned 61 minutes against the 204800 wall. Context management
+// is a structural guarantee: the turn must shrink BEFORE the first request.
+test("pre-turn budget gate shrinks an over-budget transcript before the first request", async (t) => {
+	const { engine, config } = makeEngine(t, { streamFn: async () => ({
+		async *[Symbol.asyncIterator]() {},
+		result: async () => ({ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" }),
+	}) });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-pregate");
+	// window 64000 → budget 47616; the fixture must exceed it.
+	agent.state.model = { ...agent.state.model, contextWindow: 64000, maxTokens: undefined };
+	const block = "对账明细、页面 DOM 与日志输出内容。".repeat(14);
+	for (let i = 0; i < 150; i++) {
+		agent.state.messages.push({ role: "user", content: `第 ${i} 步 ${block}` });
+		agent.state.messages.push({ role: "assistant", content: [{ type: "text", text: `结果 ${i} ${block}` }] });
+	}
+	const overBudget = estimateTokensSafe(agent.state.messages);
+	assert.ok(overBudget > 47616, `fixture must really exceed the budget (got ${overBudget})`);
+	// Spy on the recovery: the gate must call it ONCE, BEFORE the first request,
+	// with the over-budget transcript in view.
+	const recoverCalls = [];
+	const origRecover = engine.recoverFromContextOverflow.bind(engine);
+	engine.recoverFromContextOverflow = async (a) => {
+		recoverCalls.push(estimateTokensSafe(a.state.messages));
+		return origRecover(a);
+	};
+	const result = await engine.send(agent, "继续核对");
+	assert.equal(result.deterministic, false, "the turn completes normally after the shrink");
+	assert.equal(recoverCalls.length, 1, `the gate fired exactly once, pre-turn (got ${recoverCalls.length}: ${recoverCalls.map(n=>Math.round(n)).join(",")})`);
+	assert.ok(recoverCalls[0] > 47616, "the gate saw the over-budget transcript");
+	assert.ok(estimateTokensSafe(agent.state.messages) < overBudget, "the transcript actually shrank");
+	// And the turn itself executed: the stub replaces messages on prompt, so
+	// prove the turn ran by the non-deterministic reply.
+	assert.match(result.reply, /done/);
 });
 
 // Chat progress pump feed (field 2026-11-10): busyConversations() used to ask

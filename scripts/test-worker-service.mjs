@@ -146,7 +146,7 @@ test("「重新执行」 with NO interrupted worker falls through to the ordinar
 	const past = Date.now() - 60 * 60_000;
 	// A DONE worker exists — follow-up on it is conversation (settled semantics).
 	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, conversation_id, created_at, started_at, finished_at)
-		VALUES ('wdone', '统计任务', 'dt:group:g1', 'ma1', 'done', '完成', 'worker:wdone', ?, ?, ?)`).run(past, past, past);
+		VALUES ('wdone', '统计任务', 'dt:group:g1', 'ma1', 'done', '完成', 'worker:wdone', ?, ?, ?)`).run(past, past, Date.now() - 60_000); // settled 1min ago: inside the continuation window
 	const injected = await service.inject("dt:group:g1", "重新执行", "ma1");
 	assert.equal(injected, true, "still routed as follow-up");
 	assert.equal(h.db.prepare("SELECT COUNT(*) c FROM worker_tasks").get().c, 1, "no new spawn");
@@ -158,8 +158,8 @@ test("「重新执行」 with NO interrupted worker falls through to the ordinar
 test("a non-retry message never triggers the respawn (exact-match guard)", async () => {
 	const { h, service } = harness();
 	const past = Date.now() - 60 * 60_000;
-	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, error, conversation_id, created_at, started_at)
-		VALUES ('wdead', '巡检', 'dt:group:g1', 'ma1', 'error', '应用在执行中退出，该轮未跑完', 'worker:wdead', ?, ?)`).run(past, past);
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, error, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wdead', '巡检', 'dt:group:g1', 'ma1', 'error', '应用在执行中退出，该轮未跑完', 'worker:wdead', ?, ?, ?)`).run(past, past, Date.now() - 60_000); // inside the continuation window
 	// 「不要重新执行」 is a DIFFERENT sentence — exact-match keeps it out.
 	const injected = await service.inject("dt:group:g1", "不要重新执行", "ma1");
 	assert.equal(injected, true, "still a follow-up on the dead session's conversation");
@@ -476,8 +476,8 @@ test("a FINISHED worker no longer swallows a NEW task request — triage decides
 	// NEW request falls through to triage (spawn/inline decides).
 	const { h, service } = harness();
 	const past = Date.now() - 60 * 60_000;
-	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
-		VALUES ('wdone', '平阳数币今日交易金额监控', 'dt:group:g1', 'ma1', 'done', 'worker:wdone', ?, ?)`).run(past, past);
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wdone', '平阳数币今日交易金额监控', 'dt:group:g1', 'ma1', 'done', 'worker:wdone', ?, ?, ?)`).run(past, past, Date.now() - 60_000); // inside the continuation window
 	const taskMsg = "0002026110800003400。帮我查一下这笔流水的支付渠道下单日志，先查 spay 再查 sls，然后汇总异常";
 	assert.equal(await service.inject("dt:group:g1", taskMsg, "ma1"), false, "task-shaped request into a done worker → falls through");
 	// Conversational follow-up on the SAME finished worker still injects (contract).
@@ -497,8 +497,8 @@ test("a FINISHED worker does not swallow a BARE context token — the foreground
 	// worker for the token either.
 	const { h, service } = harness();
 	const past = Date.now() - 60 * 60_000;
-	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
-		VALUES ('wbare', '发送短信后锁住页面，登录成功才能关', 'dt:single:m1', 'u1', 'done', 'worker:wbare', ?, ?)`).run(past, past);
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wbare', '发送短信后锁住页面，登录成功才能关', 'dt:single:m1', 'u1', 'done', 'worker:wbare', ?, ?, ?)`).run(past, past, Date.now() - 60_000); // inside the continuation window
 	assert.equal(await service.inject("dt:single:m1", "875055", "u1"), false, "bare digits fall through to the foreground (which has the chat context)");
 	assert.equal(await service.inject("dt:single:m1", "A875055", "u1"), false, "prefixed codes too");
 	assert.equal(await service.inject("dt:single:m1", "0002026110800003400", "u1"), false, "19-digit serials too");
@@ -510,11 +510,33 @@ test("a FINISHED worker does not swallow a BARE context token — the foreground
 	assert.equal(await service.inject("dt:single:m1", "继续", "u1"), true, "「继续」 still continues");
 });
 
+// Field 2026-11-10 21:24 (the context-wall incident): a fresh lookup task routed
+// as "conversational follow-up" into a DONE worker from FOUR HOURS earlier
+// injected a day-long accumulated transcript (~200k tokens) — the turn burned 61
+// minutes against qwen's 204800 wall. Default reversed: a finished worker is
+// history; ONLY a short continuation window keeps the dialogue.
+test("the continuation contract EXPIRES: a worker settled outside the window is history", async () => {
+	const { h, service } = harness();
+	const old = Date.now() - 31 * 60_000; // just past the 30-min continuation window
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wold', '每日对账异常巡检', 'dt:old', 'ma1', 'done', 'worker:wold', ?, ?, ?)`).run(old, old, old);
+	// Everything falls through — conversational or not, the foreground (full push
+	// history) or a fresh worker handles it.
+	assert.equal(await service.inject("dt:old", "结果呢", "ma1"), false, "「结果呢」 past the window → foreground answers from pushed results");
+	assert.equal(await service.inject("dt:old", "继续", "ma1"), false, "「继续」 past the window → falls through");
+	assert.equal(await service.inject("dt:old", "帮我查一下 0422026111000000654 的下单日志", "ma1"), false, "never lands in the stale worker — triage routes it fresh (spawn or bounded foreground turn)");
+	// Boundary: inside the window the contract lives.
+	const recent = Date.now() - 5 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wnew', '每日对账异常巡检', 'dt:new', 'ma1', 'done', 'worker:wnew', ?, ?, ?)`).run(recent, recent, recent);
+	assert.equal(await service.inject("dt:new", "结果呢", "ma1"), true, "「结果呢」 minutes later keeps the continuation");
+});
+
 test("a CANCELLED worker gets the same bare-token guard (review P3-4)", async () => {
 	const { h, service } = harness();
 	const past = Date.now() - 60 * 60_000;
-	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at)
-		VALUES ('wcan', '发送短信后锁住页面，登录成功才能关', 'dt:single:m3', 'u1', 'cancelled', 'worker:wcan', ?, ?)`).run(past, past);
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wcan', '发送短信后锁住页面，登录成功才能关', 'dt:single:m3', 'u1', 'cancelled', 'worker:wcan', ?, ?, ?)`).run(past, past, Date.now() - 60_000); // inside the continuation window
 	assert.equal(await service.inject("dt:single:m3", "ORDER-2026-11-10-0001", "u1"), false, "cancelled worker must not swallow a bare order id");
 	assert.equal(await service.inject("dt:single:m3", "结果呢", "u1"), true, "continuation still reaches the cancelled worker");
 });
@@ -674,7 +696,7 @@ test("a narration-suppressed FOLLOW-UP delivers the notice but never rewrites th
 	});
 	const past = Date.now() - 60 * 60_000;
 	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, conversation_id, created_at, started_at, finished_at)
-		VALUES ('wdone', '巡检', 'dt:group:g1', 'ma1', 'done', '早先的真实结果', 'worker:wdone', ?, ?, ?)`).run(past, past, past);
+		VALUES ('wdone', '巡检', 'dt:group:g1', 'ma1', 'done', '早先的真实结果', 'worker:wdone', ?, ?, ?)`).run(past, past, Date.now() - 60_000); // inside the continuation window
 	// 「继续」 is not task-shaped (no task verb), so a DONE worker keeps the
 	// dialogue as an ordinary follow-up instead of falling through to a new spawn.
 	const injected = await service.inject("dt:group:g1", "继续", "ma1");

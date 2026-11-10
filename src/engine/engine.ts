@@ -2794,7 +2794,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 	/** Tokens held back for the summary + the model's own answer. */
 	private compactionReserve(): number {
-		return Math.max(DEFAULT_COMPACTION_SETTINGS.reserveTokens, 16_384);
+		// `|| 16_384` guards a stubbed/partially-built settings object:
+		// Math.max(undefined, 16_384) is NaN, and a NaN budget silently disables
+		// every budget gate (>= NaN is always false — field 2026-11-10, found by
+		// the pre-turn gate test when the test stub shipped an empty settings
+		// object).
+		return Math.max(DEFAULT_COMPACTION_SETTINGS.reserveTokens || 16_384, 16_384);
 	}
 
 	private getCachedSkills(): Skill[] {
@@ -2996,6 +3001,31 @@ export class EmployeeEngine implements EmployeeRuntime {
 				if (bundle) agent.state.messages = bundle.messages;
 			} catch (err) {
 				console.warn("[engine] work bundle assembly failed:", err instanceof Error ? err.message : err);
+			}
+		}
+
+		// PRE-TURN BUDGET GATE — context management is a STRUCTURAL guarantee, not
+		// a failure response. Field 2026-11-10 night: a follow-up injected into a
+		// day-long browser-automation worker (wmwah83bd2fi) started its turn on a
+		// ~200k-token transcript, burned 61 minutes in compact/truncate/retry, and
+		// died on the 204800 wall anyway (morning: the same snowball killed
+		// wmwa17jwdcs28). A turn must never START over budget: shrink FIRST
+		// (compaction → fit check → outright truncation, with honest failure), so
+		// the first request runs on a transcript that fits. The mid-turn
+		// finishTurn gate is the second line; promptWithRetry's overflow recovery
+		// the third. Cheap when under budget: one estimate pass.
+		{
+			const window = agent.state.model.contextWindow || FALLBACK_CONTEXT_WINDOW;
+			const budget = usableContextWindow(window, agent.state.model.maxTokens) - this.compactionReserve();
+			const beforeGate = estimateTokensSafe(agent.state.messages);
+			if (beforeGate >= budget) {
+				console.warn(`[engine] pre-turn budget gate: transcript ~${beforeGate} >= ${budget} — shrinking before the first request`);
+				try {
+					await this.recoverFromContextOverflow(agent);
+				} catch (err) {
+					// Never block the turn here: the in-turn gates below remain.
+					console.warn("[engine] pre-turn shrink failed (in-turn gates remain):", err instanceof Error ? err.message : err);
+				}
 			}
 		}
 
