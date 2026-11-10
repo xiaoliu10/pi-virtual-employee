@@ -263,6 +263,15 @@ export function transientRetryBackoffMs(retry: number): number {
  * turn into the honest empty→summary→deterministic chain. */
 export const LENGTH_EMPTY_GIVE_UP = 3;
 
+/** Synthetic cause recorded when a turn gives up after repeated
+ * length-truncated EMPTY runs. There is no thrown error to classify, but
+ * deterministicFailure() routes on isContextOverflowError(), so the string must
+ * carry a signature that regex recognizes ("context length"). Without it the
+ * user got the generic "model service unavailable" line for what is really an
+ * over-full-transcript problem with a concrete /new remedy (field 2026-11-10). */
+const LENGTH_EMPTY_OVERFLOW_CAUSE =
+	"context length exceeded: repeated length-truncated empty runs on an over-full transcript";
+
 /** Degenerate-reply detector (field 2026-10-16) — narrow by design, covering
  * only the observed failure shape: real length but almost no CJK characters
  * and no word-like letter run ("我完成. ## 11:30。5. 16 0.0 …" — 3 CJK chars
@@ -761,6 +770,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * must consult this set or the ≈5-minute retry ladder is invisible to
 	 * install_now and the auto-updater (review M2). */
 	private readonly retryWaits = new Set<string>();
+	/** Conversations whose CURRENT turn ended on LENGTH_EMPTY_GIVE_UP consecutive
+	 * length-truncated empty runs. Makes the deterministic reply read as a
+	 * context-length problem (with /new guidance) instead of a service outage.
+	 * Reset at the start of each user turn and consumed by the deterministic-reply
+	 * block (a finally-time delete ran before that block and cleared the signal). */
+	private readonly lengthEmptyGiveUps = new Set<string>();
 	/** Tool calls made so far in the in-flight turn of each conversation. */
 	private readonly turnToolCalls = new Map<string, number>();
 	/** Cumulative tool iterations for this conversation since the last user
@@ -1530,7 +1545,6 @@ export class EmployeeEngine implements EmployeeRuntime {
 		}
 
 		const { supplier, modelId } = this.resolveForConversation(conversationId);
-		const cfg = this.config.all();
 		const systemPrompt = buildSystemPrompt(this.promptPartsFor(conversationId));
 		const model = this.resolveModel(supplier, modelId);
 		// P1 WorkSession: a work:<id> session's opening transcript comes from the
@@ -2925,6 +2939,11 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// flow: a role-refusal registers it as the pending request to replay.
 		// Cleared in the finally like the other per-turn state.
 		this.turnUserMessage.set(conversationId, message);
+		// Fresh length-give-up flag for THIS user turn: promptWithRetry sets it on a
+		// give-up, the deterministic-reply block below consumes it. It must survive
+		// the try/finally (a finally-time delete ran BEFORE the reply classification
+		// and silently cleared the signal), so reset at turn start instead.
+		this.lengthEmptyGiveUps.delete(conversationId);
 
 		// Person/conversation memory is turn-scoped (one group serves many
 		// senders, so it cannot live in the cached system prompt). Build the
@@ -3061,7 +3080,14 @@ export class EmployeeEngine implements EmployeeRuntime {
 		// re-login guidance mapped as a thrown ModelsError would (review H4).
 		if (!reply.trim()) {
 			deterministic = true;
-			const cause = hardError || (errorMessage ? loginGuidanceOf(errorMessage) ?? errorMessage : undefined);
+			// A give-up after repeated length-truncated empty runs has no thrown
+			// error, but it IS a context-length failure — classify it so the user
+			// gets /new guidance, not the misleading "model service unavailable" line.
+			const lengthGiveUp = this.lengthEmptyGiveUps.has(conversationId);
+			const cause =
+				hardError ||
+				(errorMessage ? loginGuidanceOf(errorMessage) ?? errorMessage : undefined) ||
+				(lengthGiveUp ? LENGTH_EMPTY_OVERFLOW_CAUSE : undefined);
 			reply = this.deterministicFailure(cause);
 			console.warn(`[engine] no reply produced for ${conversationId}; emitted deterministic failure (${cause || "no error reported"})`);
 		}
@@ -3837,6 +3863,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 				emptyStreak += 1;
 				if (emptyStreak >= LENGTH_EMPTY_GIVE_UP) {
 					console.warn(`[engine] ${emptyStreak} consecutive length-truncated empty runs — ending the turn instead of retrying into the same wall`);
+					this.lengthEmptyGiveUps.add(conversationId);
 					return retries;
 				}
 				console.warn("[engine] length-truncated empty run — compacting before retry (output budget consumed on an over-full transcript)");
@@ -3941,12 +3968,27 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * be freed, so the caller can fail honestly instead of retrying forever.
 	 */
 	private async recoverFromContextOverflow(agent: Agent): Promise<boolean> {
+		const window = agent.state.model.contextWindow || FALLBACK_CONTEXT_WINDOW;
+		// Same fit line the mid-turn budget gate (finishTurn) measures against:
+		// usable window minus the compaction reserve. A recovery only counts if it
+		// lands UNDER this line.
+		const budget = usableContextWindow(window, agent.state.model.maxTokens) - this.compactionReserve();
 		try {
-			if ((await this.compactWithLife(agent, true)).compacted) return true;
+			const outcome = await this.compactWithLife(agent, true);
+			if (outcome.compacted) {
+				const after = estimateTokensSafe(agent.state.messages);
+				// Field 2026-11-10: a 200k-token worker transcript "compacted" three
+				// times yet measured ~199k→210k — the retained recent tail (DOM dumps,
+				// screenshots, logs) was itself over budget. The old `if (compacted)
+				// return true` treated that as recovery and skipped the hard truncate,
+				// so every retry re-hit the same 204800 wall. Verify the fit; only a
+				// genuinely smaller transcript returns here.
+				if (after < budget) return true;
+				console.warn(`[engine] compaction ran but transcript still over budget (~${after} >= ${budget}); forcing outright truncation`);
+			}
 		} catch (err) {
 			console.warn("[engine] overflow compaction failed:", err instanceof Error ? err.message : err);
 		}
-		const window = agent.state.model.contextWindow || FALLBACK_CONTEXT_WINDOW;
 		// Aim at half the USABLE window, not half of window − reserve: the goal
 		// must land BELOW the budget gate's line (usable − reserve), otherwise a
 		// successful drop still fails the re-check and the turn gets chopped anyway

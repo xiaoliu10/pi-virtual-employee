@@ -307,6 +307,45 @@ test("stripDanglingAssistant removes the un-resumable tail but keeps completed r
 	assert.equal(stripDanglingAssistant(msgs), 0);
 });
 
+// F3 (field 2026-11-10): a length-truncated THINKING-ONLY assistant message used to
+// survive stripDanglingAssistant, because messageText() counts the thinking block,
+// so the old `!text` check read it as non-empty. Each retry then piled another
+// up-to-maxTokens reasoning block onto the transcript until the provider hard-
+// rejected at 204800. Visible-text emptiness is what must decide (F3).
+test("stripDanglingAssistant drops a thinking-only length tail, keeps thinking+visible replies", () => {
+	const thinkingOnly = (reason) => ({
+		role: "assistant",
+		content: [{ type: "thinking", thinking: reason }],
+		stopReason: "length",
+		timestamp: Date.now(),
+	});
+
+	// Thinking-only length run → removed even though the reasoning string is long.
+	let msgs = [user("任务"), thinkingOnly("推理链。".repeat(500))];
+	assert.equal(stripDanglingAssistant(msgs), 1);
+	assert.equal(msgs.length, 1, "the unrecoverable thinking tail is popped");
+
+	// Thinking PLUS visible answer text → preserved (a real, resumable reply).
+	msgs = [
+		user("任务"),
+		{
+			role: "assistant",
+			content: [{ type: "thinking", thinking: "推理" }, { type: "text", text: "结论是 42。" }],
+			stopReason: "stop",
+			timestamp: Date.now(),
+		},
+	];
+	assert.equal(stripDanglingAssistant(msgs), 0);
+	assert.equal(msgs.length, 2);
+
+	// Repeated strips unwind a whole stack of thinking-only length runs.
+	msgs = [user("任务"), thinkingOnly("a"), thinkingOnly("b"), thinkingOnly("c")];
+	assert.equal(stripDanglingAssistant(msgs), 1, "only the single trailing message per call");
+	assert.equal(stripDanglingAssistant(msgs), 1);
+	assert.equal(stripDanglingAssistant(msgs), 1);
+	assert.equal(msgs.length, 1);
+});
+
 // Field incident 2026-09-18 (16:26 北京时间): the budget gate ran a compaction
 // that SUCCEEDED ("compacted 434 turns → summary") yet immediately ruled
 // "~188760 ≥ 188416 — could not free room" and killed the turn. Cause: the
