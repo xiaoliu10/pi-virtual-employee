@@ -1801,15 +1801,32 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 	/** True when a live turn is running on this conversation (steer-able). */
 	/**
-	 * Conversations with live work right now (see DurableRuntime.busyConversations).
+	 * Conversations with live work right now.
 	 *
 	 * Exposed for the IM progress pump: reporting must be driven by LIVE state, not
 	 * by the inbound message that started the work — that handler's timer dies
 	 * with the process and is never recreated after a restart, which silently
 	 * stopped progress notes for hours (field 2026-11-04).
+	 *
+	 * The busy feed must span BOTH kernels. Asking only the durable runtime
+	 * reported busy=0 forever under the single-kernel ruling (0.2.214+: durable
+	 * is not constructed on the default legacy kernel), so the chat pump never
+	 * fired — field 2026-11-06 note "chat pump has NEVER fired since v0.2.192",
+	 * re-confirmed 2026-11-10: a 13-minute inline chat task in dt:manager5792
+	 * ran tool calls the whole while while every pump tick logged busy=0. The
+	 * Agent SDK holds isStreaming true for the whole prompt() duration and
+	 * retryWaits covers deliberate backoff windows — the same liveness signals
+	 * isConversationStreaming already trusts — so derive from them too and
+	 * union with the durable runtime's own answer.
 	 */
 	busyConversations(): { conversationId: string }[] {
-		return this.durableRuntime?.busyConversations() ?? [];
+		const out = new Map<string, { conversationId: string }>();
+		for (const entry of this.durableRuntime?.busyConversations() ?? []) out.set(entry.conversationId, entry);
+		for (const id of this.sessions.keys()) {
+			if (out.has(id)) continue;
+			if (this.isConversationStreaming(id)) out.set(id, { conversationId: id });
+		}
+		return [...out.values()];
 	}
 
 	isConversationStreaming(conversationId: string): boolean {

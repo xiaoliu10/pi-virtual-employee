@@ -929,6 +929,32 @@ test("F2: repeated length-truncated empty runs surface context-overflow guidance
 	assert.doesNotMatch(result.reply, /模型服务连续多次未返回内容/, "must not misreport a length stall as a service outage");
 });
 
+// Chat progress pump feed (field 2026-11-10): busyConversations() used to ask
+// ONLY the retired durable runtime, so under the default legacy kernel it
+// returned [] forever and the pump logged busy=0 while a chat task ran for 13
+// minutes — the pump has never fired since v0.2.192 (field note 2026-11-06).
+// The feed must derive from the same live signals isConversationStreaming
+// trusts: SDK isStreaming during prompt() and the retryWaits backoff set.
+test("busyConversations sees legacy streaming and retry-wait sessions, clears when idle", async (t) => {
+	const { engine, config } = makeEngine(t, { streamFn: async () => ({
+		async *[Symbol.asyncIterator]() {},
+		result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }),
+	}) });
+	supplierConfig(config);
+	const a = engine.getOrCreateSession("conv-busy-streaming");
+	const b = engine.getOrCreateSession("conv-busy-backoff");
+	assert.deepEqual(engine.busyConversations(), [], "idle sessions are not busy");
+	// The SDK sets isStreaming for the whole prompt() duration (agent.js:351).
+	a.state.isStreaming = true;
+	// Mid-backoff turns are alive too (isConversationStreaming trusts retryWaits).
+	engine.retryWaits.add("conv-busy-backoff");
+	const busy = engine.busyConversations().map((x) => x.conversationId).sort();
+	assert.deepEqual(busy, ["conv-busy-backoff", "conv-busy-streaming"], "both liveness signals feed the pump");
+	a.state.isStreaming = false;
+	engine.retryWaits.delete("conv-busy-backoff");
+	assert.deepEqual(engine.busyConversations(), [], "the feed clears as soon as work ends");
+});
+
 // Hermes iteration_budget port (2026-11-06): maxToolSteps caps ONE turn; a model
 // that keeps finishing and restarting turns runs unbounded. The RESET contract is
 // what keeps the cap per-user-turn instead of per-process — a stale entry would
