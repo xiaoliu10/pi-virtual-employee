@@ -58,7 +58,7 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	store: Store;
 	isAdmin(senderId: string): boolean;
 	open(item: WorkItemRow, conversationId: string): Session;
-	send(session: Session, message: string, senderId: string, memoryConversationId?: string, memoryChannel?: string): Promise<{ reply?: string; error?: string; deterministic?: boolean }>;
+	send(session: Session, message: string, senderId: string, memoryConversationId?: string, memoryChannel?: string): Promise<{ reply?: string; error?: string; deterministic?: boolean; narrationSuppressed?: boolean }>;
 	release(conversationId: string): Promise<void>;
 	push(conversationId: string, text: string): Promise<unknown>;
 	/** Live kb.enabled AND kb.learn.enabled, checked at completion. */

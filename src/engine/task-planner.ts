@@ -78,6 +78,52 @@ export function looksLikeTask(message: string): boolean {
  */
 export const NARRATION_GUARD_NOTICE = "⚠️ 已尝试继续执行但模型没有实际动作；如需前台亲自执行请回复『前台执行』。";
 
+/**
+ * Process-narration detector (field 2026-11-10, Nova): an assistant turn that
+ * only ANNOUNCES what it is about to do — 「好的，我来查这笔流水…先确认一下
+ * 当前环境和可用工具：」 — and then stops with zero tool calls. The old guard
+ * gated on the INPUT shape (looksLikeTask/looksLikeImperative + TASK_VERBS),
+ * so an ordinary 「帮我查一下这笔流水…」 (39 chars, no listed verb) slipped past
+ * every gate and the narration was pushed as the task's final result while
+ * nothing executed. The reliable signal lives on the OUTPUT side: short text
+ * that declares intent/prerequisites and ends on a dangling lead-in.
+ *
+ * Deliberately NARROW — a false negative only keeps the old behavior, while a
+ * false positive would hide a possibly useful reply. Real answers carry
+ * substance (results, data, blockers, questions) and fail at least one gate:
+ * length, structure, or the absence of an intent phrase. Only invoked on turns
+ * with zero tool evidence, which is itself a strong precondition.
+ */
+const NARRATION_INTENT_RE = /(我来|让我|我这就|我现在|我先|我将|我需要先|我准备|马上|这就|接下来|先确认|先检查|先看一下|先看看|开始(?:查|处理|执行|登录|排查|分析|操作|查询))/;
+const NARRATION_DANGLING_RE = /[：:]\s*$|(来执行|来处理|来完成|来查询|来排查|来分析|来登录|来操作|来查|来看看|开始执行|开始处理|开始查询|开始排查)[。.！!]?\s*$/;
+const NARRATION_PREREQUISITE_RE = /(先|开始|准备).{0,12}(确认|检查|看一下|看看|了解|熟悉|环境|工具|状态)/;
+/** A CONCRETE technical object means the short prerequisite sentence is a real
+ *  action commitment, not generic throat-clearing: 「我先看一下 spay_profile 的
+ *  实际状态」 names an actual target, while 「先确认一下当前环境和可用工具」 names
+ *  nothing. Only consulted on the prerequisite branch — a dangling 「…：」 lead-in
+ *  is narration even when it mentions a system (field 2026-11-10). */
+const NARRATION_CONCRETE_TARGET_RE = /[a-z][a-z0-9]*_[a-z0-9_]+|[A-Z]{2,}[0-9]*|[\w-]+\.(?:py|js|mjs|cjs|ts|json|log|exe|cmd|bat|txt|csv|xlsx)\b|[A-Za-z]:[\\/]/;
+/** Substance markers: a reply that reports an outcome, data, or a concrete
+ *  blocker is NOT pure narration even when short. */
+const NARRATION_SUBSTANCE_RE = /(成功|完成|失败|报错|错误|异常|原因|结果如下|查到|找到|未匹配|没有找到|共\s*\d+|\d+\s*笔|\d+\s*条|请回复|确认终止|验证码)/;
+const NARRATION_MAX_LEN = 80;
+
+export function isProcessNarration(raw: string): boolean {
+	const text = (raw ?? "").trim();
+	if (!text || text.length > NARRATION_MAX_LEN) return false;
+	// Structured multi-line content (tables, lists, headings) is a substance answer.
+	if (/\n/.test(text) && /(^\s*[|*\-•]|^\s*\d+[.、)）]|#|\|.*\|)/m.test(text)) return false;
+	if (!NARRATION_INTENT_RE.test(text)) return false;
+	// A dangling lead-in (「…：」 / 「让我…来执行」) is the strongest field signal —
+	// every captured field narration ends exactly this way.
+	if (NARRATION_DANGLING_RE.test(text)) return true;
+	// Short intent + prerequisite wording, with no delivered outcome AND no
+	// concrete technical object (a named script/profile/system is real work).
+	return NARRATION_PREREQUISITE_RE.test(text)
+		&& !NARRATION_SUBSTANCE_RE.test(text)
+		&& !NARRATION_CONCRETE_TARGET_RE.test(text);
+}
+
 /** The plan prompt: short, numbered, verifiable steps; nothing else. */
 export const PLAN_PROMPT_HEADER =
 	"请判断下面这条消息是否是一个需要多步骤执行的任务。如果是，输出以下四部分；如果只是简单问答或单步操作，只输出 NO_PLAN。\n" +

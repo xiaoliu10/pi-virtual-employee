@@ -281,7 +281,7 @@ function narrationSetup(t, subdir, responses, tools = () => [], hooks = {}) {
 	return { history, session, opened, calls: () => modelCalls };
 }
 
-test('narration guard: zero-tool task turn forces ONE nudge; still zero tools → new answer + honest notice', async t => {
+test('narration guard: zero-tool task turn forces ONE nudge; still zero tools → narration suppressed, only the honest notice, no history projection', async t => {
 	const { history, session, opened, calls } = narrationSetup(t, 'narrate-once', [
 		fauxAssistantMessage('我来尝试登录生产后台管理。先检查一下当前环境可用的工具。'),
 		fauxAssistantMessage('我需要先了解当前环境，然后再继续。'),
@@ -289,10 +289,14 @@ test('narration guard: zero-tool task turn forces ONE nudge; still zero tools �
 	const runtime = await opened;
 	try {
 		const result = await runtime.send(session('conv-narrate-once'), NARRATION_TASK);
-		assert.ok(result.reply.startsWith('我需要先了解当前环境'), 'the continuation answer replaces the first narration');
-		assert.ok(result.reply.endsWith(NARRATION_GUARD_NOTICE), 'a continuation with zero tool calls carries the honest notice — a success claim without tool evidence is exactly the field bug');
+		assert.equal(result.reply, NARRATION_GUARD_NOTICE, 'repeated zero-tool narration is dropped; only the honest system notice returns');
+		assert.equal(result.narrationSuppressed, true);
 		assert.equal(calls(), 2, 'exactly one nudge even when the continuation narrates again — never a loop');
-		assert.deepEqual(history.listMessages('conv-narrate-once').filter(m=>m.role==='assistant').map(m=>m.content), [result.reply], 'only the final delivered text is projected into history');
+		assert.deepEqual(
+			history.listMessages('conv-narrate-once').filter(m => m.role === 'assistant'),
+			[],
+			'suppressed narration is never projected into history — it cannot be imitated later',
+		);
 	} finally { await runtime.close(); }
 });
 

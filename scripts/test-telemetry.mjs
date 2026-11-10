@@ -105,6 +105,22 @@ test("counters reflect what actually happened in a turn", (t) => {
 	assert.equal(scoped.scopedToConversation, true);
 });
 
+test("a narration_suppressed turn is counted as a failure in byStatus, not an ok turn", (t) => {
+	const { telemetry } = stores(t);
+	telemetry.recordTurn(turn("n1", { status: "narration_suppressed", replyLen: 0 }));
+	telemetry.recordTurn(turn("n2")); // a healthy turn
+	const snap = telemetry.summary({ hours: 24 });
+	assert.equal(snap.turns, 2);
+	assert.equal(snap.byStatus.narration_suppressed, 1);
+	assert.equal(snap.byStatus.ok, 1);
+	// Any non-ok status counts toward the failed day cell (same rule as the
+	// empty/degenerate/deterministic statuses), so suppressed fake progress
+	// shows up in failure trends rather than masquerading as a clean run.
+	assert.equal(snap.perDay.length, 1);
+	assert.equal(snap.perDay[0].failed, 1);
+	assert.equal(snap.perDay[0].turns, 2);
+});
+
 test("tool failures and RBAC refusals are separated in the ranking", (t) => {
 	const { telemetry } = stores(t);
 	telemetry.recordTurn(turn("t1"));

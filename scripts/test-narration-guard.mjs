@@ -201,18 +201,26 @@ test("zero-tool task turn: guard continues exactly once and delivers the NEW rep
 	assert.equal(history.listMessages("conv-narrate-once").filter((m) => m.role === "assistant").at(-1)?.content, result.reply, "history persists the delivered reply");
 });
 
-test("still zero tools after the one continuation: honest notice appended, no second attempt", async (t) => {
+test("still zero tools after the one continuation: narration suppressed — only the honest notice, no history row", async (t) => {
 	let runs = 0;
-	const { engine, config } = makeEngine(t, { streamFn: async () => {
+	const { engine, config, history } = makeEngine(t, { streamFn: async () => {
 		runs += 1;
 		return textReply(runs === 1 ? NARRATION : "我需要先了解当前环境，然后再继续。");
 	} });
 	supplierConfig(config);
 	const agent = engine.getOrCreateSession("conv-narrate-twice");
 	const result = await engine.send(agent, TASK);
-	assert.ok(result.reply.startsWith("我需要先了解当前环境"), "the continuation text is delivered");
-	assert.ok(result.reply.endsWith(NARRATION_GUARD_NOTICE), "the no-action notice must be appended");
+	// The continuation narrated again with zero tool evidence: BOTH narration
+	// texts are dropped (not pushed, not persisted) — only the honest system
+	// notice comes back, flagged so callers never treat it as the task result.
+	assert.equal(result.reply, NARRATION_GUARD_NOTICE, "the narration is suppressed; only the honest system notice remains");
+	assert.equal(result.narrationSuppressed, true);
 	assert.equal(runs, 2, "the guard runs exactly once even when the continuation narrates again");
+	assert.deepEqual(
+		history.listMessages("conv-narrate-twice").filter((m) => m.role === "assistant"),
+		[],
+		"suppressed narration leaves no assistant row — fake progress can never be rehydrated or imitated",
+	);
 });
 
 test("a turn that already used tools never triggers the guard", async (t) => {
@@ -390,4 +398,74 @@ test("review 94189d6f P3: the guard's continuation keeps the turn's RBAC identit
 	assert.equal(engine.turnActor.size, 0, "turnActor cleaned after the guard");
 	assert.equal(engine.turnActorsSaved.size, 0, "snapshot map cleaned after the guard");
 	assert.equal(engine.turnMemorySaved.size, 0, "memory snapshot cleaned after the guard");
+});
+
+// ── Field 2026-11-10 13:00 (Nova, serial 0422026111000000654) ──────────────
+// The exact stall shape: a 39-char 「帮我查一下…」 instruction with NO verb in
+// TASK_VERBS, so looksLikeTask/looksLikeImperative were both false and the old
+// input-gated guard let a zero-tool narration ship as the final answer. The
+// output-side detector must catch it regardless of the input wording.
+const FIELD_20261110_MESSAGE = "帮我查一下这笔流水：0422026111000000654 的支付渠道下单日志";
+const FIELD_20261110_NARRATION = "好的，我来查这笔流水的支付渠道下单日志。先确认一下当前环境和可用工具：";
+
+test("field 2026-11-10: the old input gate misses this message, but the output guard suppresses its narration", async (t) => {
+	// Prove the seam exists on the INPUT side: this exact message passes both
+	// old shape detectors, which is why the narration used to sail through.
+	assert.equal(looksLikeTask(FIELD_20261110_MESSAGE), false, "39 chars, no listed task verb — the old gate's blind spot");
+	assert.equal(looksLikeImperative(FIELD_20261110_MESSAGE), false);
+
+	let runs = 0;
+	const { engine, config, history } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		// Both the first turn and the forced continuation produce only narration.
+		return textReply(runs === 1 ? FIELD_20261110_NARRATION : "我需要先确认环境，然后再继续。");
+	} });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-field-20261110");
+	const result = await engine.send(agent, FIELD_20261110_MESSAGE);
+
+	assert.equal(runs, 2, "the output-side guard still forces exactly one continuation");
+	assert.equal(result.narrationSuppressed, true, "the turn is flagged as suppressed");
+	assert.equal(result.reply, NARRATION_GUARD_NOTICE, "only the honest system notice returns — no narration text");
+	assert.ok(!result.reply.includes("先确认一下当前环境"), "the fake-progress narration is not delivered");
+	assert.deepEqual(
+		history.listMessages("conv-field-20261110").filter((m) => m.role === "assistant"),
+		[],
+		"the narration leaves no history row — it cannot be rehydrated or imitated later",
+	);
+});
+
+test("field 2026-11-10: if the continuation actually uses a tool, the real result is delivered", async (t) => {
+	let runs = 0;
+	let noteTool;
+	const { engine, config } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		if (runs === 2) noteTool?.(); // continuation earns tool evidence
+		return textReply(runs === 1 ? FIELD_20261110_NARRATION : "查到了：该流水渠道下单返回成功，无异常。");
+	} });
+	noteTool = () => engine.recordToolTelemetry("conv-field-20261110-ok", { name: "shell", durationMs: 5, ok: true });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-field-20261110-ok");
+	const result = await engine.send(agent, FIELD_20261110_MESSAGE);
+	assert.equal(runs, 2, "one continuation");
+	assert.equal(result.narrationSuppressed, false, "a tool-using continuation is not suppressed");
+	assert.equal(result.reply, "查到了：该流水渠道下单返回成功，无异常。", "the substantive result is delivered verbatim");
+});
+
+test("a continuation that returns a substantive zero-tool blocker is delivered, not suppressed", async (t) => {
+	// The first turn narrates; the forced continuation comes back with a REAL
+	// blocker question (zero tools, but not process narration). It must be
+	// delivered verbatim — suppressing it would hide the human's required action.
+	const BLOCKER = "驱动卡在 goto 上了。请回复\"确认终止\"，我重启后换 wait_until=commit 重连。";
+	let runs = 0;
+	const { engine, config } = makeEngine(t, { streamFn: async () => {
+		runs += 1;
+		return textReply(runs === 1 ? NARRATION : BLOCKER);
+	} });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("conv-blocker");
+	const result = await engine.send(agent, TASK);
+	assert.equal(runs, 2, "one forced continuation still runs");
+	assert.equal(result.narrationSuppressed, false, "a substantive blocker is not narration");
+	assert.equal(result.reply, BLOCKER, "the blocker question reaches the user verbatim");
 });

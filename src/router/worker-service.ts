@@ -20,7 +20,7 @@
  * structurally separate.
  */
 import { WorkerTaskStore, type WorkerTaskRow } from "./worker-tasks.js";
-import { looksLikeTask } from "../engine/task-planner.js";
+import { looksLikeTask, NARRATION_GUARD_NOTICE } from "../engine/task-planner.js";
 import { isBareContextToken } from "../im/triage.js";
 import { SYNTHETIC_FALLBACK_FRAGMENTS_RE } from "../db/history-store.js";
 
@@ -31,7 +31,7 @@ export interface WorkerEngineDeps<Session> {
 	open(conversationId: string): Promise<Session> | Session;
 	/** One durable round: returns when the turn settles. reply = the final
 	 * assistant text (code-extracted result — no marker parsing anywhere). */
-	send(session: Session, message: string, senderId: string, sourceConversation: string): Promise<{ reply?: string; error?: string; deterministic?: boolean }>;
+	send(session: Session, message: string, senderId: string, sourceConversation: string): Promise<{ reply?: string; error?: string; deterministic?: boolean; narrationSuppressed?: boolean }>;
 	/** Deliver to the source conversation (idempotent upstream). */
 	push(conversationId: string, text: string): Promise<unknown> | unknown;
 	/** Cancel a live durable round (foreground-escape). Injected because the
@@ -468,6 +468,16 @@ export class WorkerService<Session> {
 	private async runTurn(task: WorkerTaskRow, session: Session, message: string, senderId: string, opts: { record: boolean }): Promise<void> {
 		try {
 			const r = await this.opts.send(session, message, senderId, task.source_conversation);
+			// Narration suppression: the kernel dropped a zero-tool process
+			// narration and returned ONLY the honest system notice. It is not the
+			// task's result — deliver the notice so the human is told nothing
+			// executed, but never treat it as success. A dispatch round's ⚠️ text
+			// settles as an error via deliver(); a follow-up round delivers the
+			// notice without touching the already-settled worker_tasks row.
+			if (r.narrationSuppressed) {
+				await this.deliver(task, (r.reply ?? "").trim() || NARRATION_GUARD_NOTICE, opts);
+				return;
+			}
 			const text = (r.reply ?? "").trim();
 			if (!text && r.error) {
 				// Only fall back to the raw error when there is NO reply: send()
