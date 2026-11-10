@@ -1599,7 +1599,13 @@ ${tailForProgress(decision.text)}`;
 			title: task.title,
 			target: task.target,
 			intervalMin: config.all().general.taskProgressMin,
-			summarize: () => engine.progressBriefDetailed(session, task.target),
+			// The side pass must be tracked against the WORKER conversation (task
+			// is executed in its own conversation) — field 2026-11-10: passing the
+			// TARGET (source chat) here attributed watchdog side-call liveness to
+			// the source chat and resolved the thinking level from the source
+			// chat's model override instead of the worker session's (PR #141's
+			// 409-on-thinking-token root cause class).
+			summarize: () => engine.progressBriefDetailed(session, task.conversationId),
 			push: async (cid, text) => { await im.pushToConversation(cid, text); },
 			isRunning: () => true,
 			log: (level, msg) => console.log(`[worker:progress] ${level} ${msg}`),

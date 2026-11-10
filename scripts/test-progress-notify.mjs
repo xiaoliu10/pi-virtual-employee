@@ -430,3 +430,68 @@ test("guard branches still log (no-target / disabled interval)", async () => {
 	h2.notifier.start();
 	assert.ok(logs.some((l) => l.includes("interval disabled")), "disabled-interval guard keeps its log");
 });
+
+test("first beat fires at FIRST_BEAT (2min), not a full interval in", async (t) => {
+	// Field 2026-11-10 (box Nova): 16 worker tasks ran 0.3–17min against a
+	// 10-min interval and 15 finished BEFORE the first tick — a pure setInterval
+	// makes the first note a full interval away, so short tasks narrate nothing.
+	mock.timers.reset();
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	try {
+		const logs = [];
+		const h = make({ log: (level, msg) => logs.push(`${level} ${msg}`) });
+		h.notifier.start();
+		assert.ok(logs.some((l) => l.includes("first-beat=+2min")),
+			"started log must announce the early first beat");
+		await advance(2 * 60_000);   // FIRST_BEAT_MS exactly
+		assert.equal(h.calls.summarize, 1, "the first beat fires at +2min");
+		assert.equal(h.calls.push, 1, "a 2-minute task gets one progress note");
+		await advance(INTERVAL);     // steady cadence tick at +7min
+		assert.equal(h.calls.summarize, 2, "steady cadence is unchanged after the first beat");
+		assert.equal(h.calls.push, 2);
+		h.notifier.stop();
+	} finally {
+		mock.timers.reset();
+	}
+});
+
+test("a task shorter than FIRST_BEAT still stays silent (gates, not timers)", async (t) => {
+	// The early beat is a timer change only: a task that finishes in <2min is
+	// still correctly narrated by its completion report, not by a mid-flight note.
+	mock.timers.reset();
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	try {
+		const h = make({ isRunning: () => false });
+		h.notifier.start();
+		await advance(2 * 60_000);
+		assert.equal(h.calls.summarize, 0, "liveness gate still applies to the first beat");
+		assert.equal(h.calls.push, 0);
+		h.notifier.stop();
+	} finally {
+		mock.timers.reset();
+	}
+});
+
+test("degraded backoff window logs its skip (no silent beats)", async (t) => {
+	// v0.2.173 rule: a gate that drops a beat must say so. The backoff return
+	// was the last silent gate — the 60-min degraded window looked dead.
+	mock.timers.reset();
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	try {
+		const logs = [];
+		const h = make({
+			log: (level, msg) => logs.push(`${level} ${msg}`),
+			summarize: async () => ({ text: "⏳ 任务仍在进行中。已完成：登录。剩余：导出。正在：查询。卡点：无", degraded: true }),
+		});
+		h.notifier.start();
+		await advance(INTERVAL * 1.2);   // beat #1: degraded push + streak=1
+		assert.equal(h.calls.push, 1);
+		// streak=2 enters backoff (2×interval). Next tick must log the skip.
+		await advance(INTERVAL * 2);
+		assert.ok(logs.some((l) => l.includes("progress tick skipped: degraded backoff window")),
+			"backoff skips must leave a trace line");
+		h.notifier.stop();
+	} finally {
+		mock.timers.reset();
+	}
+});
