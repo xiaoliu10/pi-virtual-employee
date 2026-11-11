@@ -184,6 +184,11 @@ export class IMAdapterManager {
 	}
 
 	async stopAll(): Promise<void> {
+		// Keep-alive deferral timers live up to window+1s (minutes, not seconds
+		// like the old 5s sweep) — they must not outlive the IM stack and fire
+		// kills/pushes into a stopped manager (review P3-1).
+		for (const t of this.inventoryTimers.values()) clearTimeout(t);
+		this.inventoryTimers.clear();
 		for (const adapter of this.active.values()) {
 			try {
 				await adapter.stop();
@@ -421,7 +426,7 @@ export class IMAdapterManager {
 
 
 
-	private scheduleBackgroundInventory(conversationId: string): void {
+	private scheduleBackgroundInventory(conversationId: string, delayMs = 5_000): void {
 		const prev = this.inventoryTimers.get(conversationId);
 		if (prev) clearTimeout(prev);
 		const t = setTimeout(() => {
@@ -429,13 +434,25 @@ export class IMAdapterManager {
 			void this.pushBackgroundInventory(conversationId).catch(
 				(err) => console.warn("[im] background inventory failed:", (err as Error).message),
 			);
-		}, 5_000);
+		}, delayMs);
 		this.inventoryTimers.set(conversationId, t);
 	}
 
 	private async pushBackgroundInventory(conversationId: string): Promise<void> {
 		const inventory = this.engine.inventoryBackgroundProcesses(conversationId);
 		if (!inventory.length) return;
+		// Keep-alive deferral (user ruling 2026-11-11, spay code-handoff
+		// incident): inside the worker's keep-alive window the conversation is
+		// still waiting on its human — the polling scripts it backgrounded must
+		// stay alive to receive the answer (killing them here is what dead-ended
+		// the spay login flow 13 seconds after the turn settled). Defer the sweep
+		// to window expiry instead; the window is TTL-bounded, so the 2026-11-08
+		// 「默认清理」 guarantee below still holds, just later.
+		const keepAliveMs = this.engine.workerBridge?.keepAliveRemainingMs?.(conversationId) ?? 0;
+		if (keepAliveMs > 0) {
+			this.scheduleBackgroundInventory(conversationId, keepAliveMs + 1_000);
+			return;
+		}
 		// 用户裁定 2026-11-08：收尾不回复盘点——默认把收尾工作做完。回合结束
 		// 仍在前台跑的后台脚本自动终止（审计 cascade_kill，与 abort 路径一致）；
 		// 清理干净就静默——内部工具名（进程轮询/终止指令）绝不暴露给用户。
@@ -876,7 +893,7 @@ export class IMAdapterManager {
 		conversationId: string,
 		cmd: ParsedCommand,
 		actor?: InboundActor,
-		userText?: string,
+		_userText?: string,
 	): string | Promise<string> {
 		if (cmd.name === "new" || cmd.name === "stop" || cmd.name === "steer") {
 			// Intercepted in makeIO (they must bypass the queue). Reaching here would

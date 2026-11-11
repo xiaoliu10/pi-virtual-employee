@@ -274,3 +274,20 @@ crash-recovery.md 选 pi-durable 的论据是「工具调用不落库，崩溃�
 6. ~~群聊多发送者 × RouterSession 身份~~ **已收敛**（2026-11-09）：actor 是 Trigger 的 metadata（dsh 语义采纳），分叉规则见 §5.3，分区铁律见 §6.5，记忆打通契约见 §7。
 7. **群聊轻模型与只读权限细则（待拍板）**：直接回答降轻模型建议做成 per-conversation 配置（重要群配主模型）；群内非创建人只读进度的角色下限推荐 viewer 即可。
 8. **双 profile 记忆互通边界（待拍板）**：personOwner 无 robotCode 维度，同 staffId 两个 profile 间记忆互通——与「双 agent 独立」裁定的关系需 P2 前定（加维度 = 隔离，维持现状 = 打通）。
+
+## 13. 保活窗口（2026-11-11 裁定，spay 验证码事故）
+
+**事故**：worker 问用户要短信验证码后回合收尾，码 2 秒后到达——worker 已非 LIVE，裸 token 门把码弹到前台；前台无工具却编造「已写入 spay_code.txt」（toolCalls=0，文件从未存在）；13 秒后 settle sweep 杀掉轮询脚本。三环相扣，流程死透。
+
+**裁定**：worker 应有保活机制（比如 2 小时），会话粘连优先——上下文丢失体验很差。
+
+**实现**（`general.workerKeepAliveMin`，默认 120，0=关）：
+
+- **热**（worker 最后活动在窗口内）：非任务消息（裸码/问句/闲聊）无条件进 worker；裸 token 注入时附带有界来源摘录（根治 11-10「875055 猜测」）；task-shaped 仍派发（新 worker 自带 sourceContext，上下文不丢）
+- **LIVE**：不变，无条件全收
+- **冷**（超窗）：现有门全部保留（task→派发、裸 token→前台、对话性→粘连）
+- **settle sweep 联动**：热窗口内后台脚本不杀，窗口到期统一清（TTL 有界，11-08「默认清理」保证不变，只是清理时点后移）
+
+滑窗锚点 = `max(row.finished_at, 最近一次热注入时间)`——持续对话的 worker 保持热。判断的影响面由此坍缩：**只有冷会话才做形状判断**，热窗口内没有可丢的上下文，也就没有判错的代价。
+
+**术语对照**：本域代码中的 `inline` = foreground turn（执行位置，相对 dispatch 到 worker），≠ 上下文工程文献的 inline/spill（信息驻留窗口内/外留引用）。本文 Spill 纪律处用的是后者的语义——两处同名不同义，讨论时注意区分。

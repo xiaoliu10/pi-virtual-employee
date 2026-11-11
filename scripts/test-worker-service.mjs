@@ -477,37 +477,97 @@ test("a FINISHED worker no longer swallows a NEW task request — triage decides
 	const { h, service } = harness();
 	const past = Date.now() - 60 * 60_000;
 	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
-		VALUES ('wdone', '平阳数币今日交易金额监控', 'dt:group:g1', 'ma1', 'done', 'worker:wdone', ?, ?, ?)`).run(past, past, Date.now() - 60_000); // inside the continuation window
+		VALUES ('wdone', '平阳数币今日交易金额监控', 'dt:group:g1', 'ma1', 'done', 'worker:wdone', ?, ?, ?)`).run(past, past, Date.now() - 60_000); // finished 1min ago — INSIDE the keep-alive window, and the task gate holds even hot
 	const taskMsg = "0002026110800003400。帮我查一下这笔流水的支付渠道下单日志，先查 spay 再查 sls，然后汇总异常";
-	assert.equal(await service.inject("dt:group:g1", taskMsg, "ma1"), false, "task-shaped request into a done worker → falls through");
+	assert.equal(await service.inject("dt:group:g1", taskMsg, "ma1"), false, "task-shaped request into a done worker → falls through (hot window does not change this)");
 	// Conversational follow-up on the SAME finished worker still injects (contract).
 	assert.equal(await service.inject("dt:group:g1", "结果呢", "ma1"), true, "non-task follow-up keeps the continuation contract");
 	assert.equal(await service.inject("dt:group:g1", "继续", "ma1"), true, "「继续」 still continues");
 });
 
-test("a FINISHED worker does not swallow a BARE context token — the foreground history resolves it (field 2026-11-10)", async () => {
-	// Field 2026-11-10, single chat: the user sent 「875055」 (a number the chat
-	// had contextualized turns ago). The most recent worker was DONE; the bare
-	// token was injected into it, and that session — born with its instruction
-	// only, no chat history — guessed 订单系统, found nothing, and asked
-	// 「这是什么类型的编号？」: the employee forgot a conversation it was part of.
-	// Review 7ba60092 P1: "falls through to the foreground" is provable END-TO-END —
-	// triageMessage carries the same shared guard (reason=reference, pinned in
-	// test-triage.mjs), so the planless dispatch cannot re-spawn a context-less
-	// worker for the token either.
-	const { h, service } = harness();
+test("keep-alive window: a bare code seconds after the turn settles reaches the worker (spay field 2026-11-11)", async () => {
+	// Field 2026-11-11 10:26: the worker asked for an SMS code and its turn
+	// settled; the code arrived 2s later, the bare-token gate bounced it to the
+	// foreground, which answered with a FABRICATED 「已写入 spay_code.txt」
+	// (toolCalls=0 — the file never existed) while the settle sweep killed the
+	// polling script: the flow died on a promise nothing could keep. User
+	// ruling: 「worker 应该有一个保活机制，比如2小时，会话还是需要粘连的不然
+	// 上下文丢失体验很差」. Within the window the code now reaches the worker,
+	// WITH the bounded source excerpt attached — field 2026-11-10 proved a
+	// settled session guesses on tokens it was never born holding.
+	const { h, service } = harness({ service: { sourceContext: () => "【来源会话近期上下文（测试块）】" } });
 	const past = Date.now() - 60 * 60_000;
 	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
-		VALUES ('wbare', '发送短信后锁住页面，登录成功才能关', 'dt:single:m1', 'u1', 'done', 'worker:wbare', ?, ?, ?)`).run(past, past, Date.now() - 60_000); // inside the continuation window
+		VALUES ('wbare', '发送短信后锁住页面，登录成功才能关', 'dt:single:m1', 'u1', 'done', 'worker:wbare', ?, ?, ?)`).run(past, past, Date.now() - 60_000); // finished 1 minute ago — deep inside the window
+	assert.equal(await service.inject("dt:single:m1", "786199", "u1"), true, "a bare code within the keep-alive window reaches the worker that asked for it");
+	await flush();
+	assert.match(h.sends.at(-1).message, /786199/, "the code itself is delivered");
+	assert.ok(h.sends.at(-1).message.includes("【来源会话近期上下文（测试块）】"), "the excerpt travels with the token (no guessing)");
+	// Whitespace/punctuation tolerance of the shared guard is unchanged.
+	assert.equal(await service.inject("dt:single:m1", " 875055 ", "u1"), true, "surrounding whitespace does not defeat the window");
+	await flush();
+	assert.equal(await service.inject("dt:single:m1", "875055。", "u1"), true, "trailing CJK punctuation does not defeat the window (review P2-1)");
+});
+
+test("beyond the keep-alive window the bare-token gate returns — the foreground history resolves it (field 2026-11-10)", async () => {
+	// Cold regime (window expired): a bare token is a REFERENCE into the source
+	// chat — injecting it into a long-settled worker reproduces field 2026-11-10
+	// (guessed 订单系统, asked 「这是什么类型的编号？」). The foreground carries
+	// the history; triageMessage has the SAME shared guard (reason=reference,
+	// pinned in test-triage.mjs), so the planless dispatch cannot re-spawn a
+	// context-less worker for the token either (review 7ba60092 P1).
+	const { h, service } = harness();
+	const old = Date.now() - 3 * 60 * 60_000; // window (default 120min) expired
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wcold', '发送短信后锁住页面，登录成功才能关', 'dt:single:m1', 'u1', 'done', 'worker:wcold', ?, ?, ?)`).run(old, old, old);
 	assert.equal(await service.inject("dt:single:m1", "875055", "u1"), false, "bare digits fall through to the foreground (which has the chat context)");
 	assert.equal(await service.inject("dt:single:m1", "A875055", "u1"), false, "prefixed codes too");
 	assert.equal(await service.inject("dt:single:m1", "0002026110800003400", "u1"), false, "19-digit serials too");
-	assert.equal(await service.inject("dt:single:m1", " 875055 ", "u1"), false, "surrounding whitespace does not matter");
-	assert.equal(await service.inject("dt:single:m1", "875055。", "u1"), false, "trailing CJK punctuation does not defeat the guard (review P2-1)");
 	assert.equal(await service.inject("dt:single:m1", "ORDER-2026-11-10-0001", "u1"), false, "order-id shape too");
 	// The continuation contract for worker-relative follow-ups is untouched.
 	assert.equal(await service.inject("dt:single:m1", "结果呢", "u1"), true, "「结果呢」 still continues the finished worker");
 	assert.equal(await service.inject("dt:single:m1", "继续", "u1"), true, "「继续」 still continues");
+});
+
+test("keep-alive window slides with the dialogue, and 0 disables it", async () => {
+	let nowMs = 1_000_000_000_000;
+	const { h, service } = harness({ service: {
+		keepAliveMinutes: 120,
+		clock: { now: () => nowMs, setTimeout: (fn) => { h.wake = fn; return fn; } },
+	} });
+	const past = nowMs - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wslide', '每日对账异常巡检', 'dt:slide', 'u1', 'done', 'worker:wslide', ?, ?, ?)`).run(past, past, past); // finished 60min ago — 60min of window left
+	assert.equal(await service.inject("dt:slide", "786199", "u1"), true, "hot: bare code injects");
+	nowMs += 100 * 60_000; // 100min after the injection → anchor slid, still inside
+	assert.equal(await service.inject("dt:slide", "786200", "u1"), true, "the window slides: a dialogue that keeps touching the worker keeps it hot");
+	nowMs += 130 * 60_000; // 130min since the LAST activity → expired
+	assert.equal(await service.inject("dt:slide", "786201", "u1"), false, "cold: 130min of silence closes the window");
+
+	// 0 disables: cold gates apply no matter how fresh the worker is.
+	const zero = harness({ service: { keepAliveMinutes: 0 } });
+	zero.h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wzero', 'x', 'dt:zero', 'u1', 'done', 'worker:wzero', ?, ?, ?)`).run(Date.now() - 1_000, Date.now() - 1_000, Date.now() - 1_000);
+	assert.equal(await zero.service.inject("dt:zero", "875055", "u1"), false, "keepAliveMinutes: 0 → bare tokens always fall through");
+});
+
+test("keepAliveRemainingMs drives the settle-sweep deferral", async () => {
+	const now = Date.now();
+	const mk = (serviceOpts, rowFinishedAt, status = "done") => {
+		const { h, service } = harness({ service: serviceOpts });
+		h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
+			VALUES ('w', 'x', 'dt:r', 'u1', ?, 'worker:w', ?, ?, ?)`).run(status, rowFinishedAt - 60_000, rowFinishedAt - 60_000, rowFinishedAt);
+		return service;
+	};
+	assert.equal(mk({ keepAliveMinutes: 0 }, now - 60_000).keepAliveRemainingMs("dt:r"), 0, "disabled → 0");
+	assert.equal(mk({}, now - 3 * 60 * 60_000).keepAliveRemainingMs("dt:r"), 0, "expired → 0");
+	assert.equal(mk({}, now - 60_000, "cancelled").keepAliveRemainingMs("dt:r"), 0, "cancelled → cold even fresh (review P2-3)");
+	assert.equal(mk({}, now - 60_000, "error").keepAliveRemainingMs("dt:r"), 0, "error → cold even fresh (review P2-3)");
+	const hot = mk({}, now - 60_000).keepAliveRemainingMs("dt:r");
+	assert.ok(hot > 118 * 60_000 && hot <= 120 * 60_000, "hot done worker → ~full window remains");
+	const live = mk({}, now, "running").keepAliveRemainingMs("dt:r");
+	assert.equal(live, 120 * 60_000, "a LIVE worker owns the dialogue for the full window");
+	assert.equal(harness().service.keepAliveRemainingMs("dt:none"), 0, "no worker → 0");
 });
 
 // User ruling 2026-11-10: 「IM 渠道一个对话粘连 worker 这个设计也是合理的」.
@@ -528,12 +588,13 @@ test("stickiness survives age: a worker settled hours ago still owns the dialogu
 	assert.equal(await service.inject("dt:old", "帮我查一下 0422026111000000654 的下单日志", "ma1"), false, "a fresh task never lands in the stale worker");
 });
 
-test("a CANCELLED worker gets the same bare-token guard (review P3-4)", async () => {
+test("a CANCELLED worker gets the same bare-token guard cold (review P3-4)", async () => {
 	const { h, service } = harness();
-	const past = Date.now() - 60 * 60_000;
+	const past = Date.now() - 3 * 60 * 60_000; // beyond the keep-alive window (default 120min)
 	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
-		VALUES ('wcan', '发送短信后锁住页面，登录成功才能关', 'dt:single:m3', 'u1', 'cancelled', 'worker:wcan', ?, ?, ?)`).run(past, past, Date.now() - 60_000); // inside the continuation window
-	assert.equal(await service.inject("dt:single:m3", "ORDER-2026-11-10-0001", "u1"), false, "cancelled worker must not swallow a bare order id");
+		VALUES ('wcan', '发送短信后锁住页面，登录成功才能关', 'dt:single:m3', 'u1', 'cancelled', 'worker:wcan', ?, ?, ?)`).run(past, past, past);
+	assert.equal(await service.inject("dt:single:m3", "ORDER-2026-11-10-0001", "u1"), false, "cancelled worker must not swallow a bare order id (cold)");
+	assert.equal(await service.inject("dt:single:m3", "875055", "u1"), false, "bare digits fall through cold too");
 	assert.equal(await service.inject("dt:single:m3", "结果呢", "u1"), true, "continuation still reaches the cancelled worker");
 });
 
@@ -657,6 +718,26 @@ test("a LIVE worker still owns the dialogue unconditionally", async () => {
 		VALUES ('wlive', '长任务执行中', 'dt:group:g1', 'ma1', 'running', 'worker:wlive', ?, ?)`).run(now, now);
 	const taskMsg = "0002026110800003400。帮我查一下这笔流水的支付渠道下单日志，先查 spay 再查 sls，然后汇总异常";
 	assert.equal(await service.inject("dt:group:g1", taskMsg, "ma1"), true, "even task-shaped text reaches a running worker (verification codes etc.)");
+	assert.equal(await service.inject("dt:group:g1", "辛苦了", "ma1"), true, "conversational reaches a LIVE worker too (matrix cell pin, review P3-3)");
+});
+
+test("cancelled and interrupted workers stay COLD-GATED inside the window (review P2-3)", async () => {
+	// The keep-alive window is a DONE worker's aftermath-ownership. cancelled =
+	// the user pulled the work back via 「前台执行」 — if the foreground rerun
+	// then asks for a code, the code must reach the FOREGROUND that asked, not
+	// the cancelled session. error = interrupted — the in-memory session is
+	// gone with the restart and the contract is 「重新执行」. Conversational
+	// stickiness (结果呢) is unchanged for both.
+	const { h, service } = harness();
+	const past = Date.now() - 60 * 60_000; // fresh — deep inside a would-be window
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wcanc', 'x', 'dt:cold1', 'u1', 'cancelled', 'worker:wcanc', ?, ?, ?)`).run(past, past, past);
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, error, conversation_id, created_at, started_at, finished_at)
+		VALUES ('werr', 'x', 'dt:cold2', 'u1', 'error', '应用在执行中退出，该轮未跑完（可回复「重新执行」重跑）', 'worker:werr', ?, ?, ?)`).run(past, past, past);
+	assert.equal(await service.inject("dt:cold1", "875055", "u1"), false, "cancelled-hot: bare tokens still fall through to the foreground");
+	assert.equal(await service.inject("dt:cold2", "786199", "u1"), false, "error-hot: bare tokens still fall through (empty session cannot honour them)");
+	assert.equal(await service.inject("dt:cold1", "结果呢", "u1"), true, "cancelled: conversational stickiness unchanged");
+	assert.equal(await service.inject("dt:cold2", "重新执行", "u1"), true, "error: the deterministic re-run contract is untouched");
 });
 
 test("a narration-suppressed DISPATCH round pushes only the honest notice and never settles as success", async () => {
@@ -763,14 +844,41 @@ test("a bare code ANSWERS a finished worker's input request — routed into the 
 	assert.ok(pushed.length >= 1, "the worker's follow-up reply is delivered back to the source chat");
 });
 
-test("a bare token with NO pending ask still goes to the foreground (unchanged)", async () => {
+test("a bare token with NO pending ask goes to the foreground once the window closes (unchanged cold)", async () => {
+	// Composed with PR #199's keep-alive window: a fresh ordinary reference (no
+	// pending ask) rides the hot window into the worker; this pin protects the
+	// COLD regime — past the window, an ordinary bare token still resolves in
+	// the foreground (field 2026-11-10 contract).
+	const { h, service } = harness();
+	const past = Date.now() - 3 * 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wdone2', '统计任务', 'dt:group:g1', 'ma1', 'done', '导出完成：最近7天共 37 笔，已生成报表。', 'worker:wdone2', ?, ?, ?)`).run(past, past, past);
+	const injected = await service.inject("dt:group:g1", "847159", "ma1");
+	assert.equal(injected, false, "an ordinary cold reference still resolves in the foreground");
+	assert.equal(h.sends.length, 0, "nothing routed into the settled session");
+});
+
+test("composition: an ask captures its answer even BEYOND the keep-alive window (PR #198 value over #199)", async () => {
+	// The window is time-bounded; the ask is state-bounded. A user answering a
+	// day-old question must still reach the asking session — the foreground
+	// never saw the question (push-only deliveries) and cannot resolve it.
+	const { h, service } = harness();
+	const old = Date.now() - 26 * 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, conversation_id, created_at, started_at, finished_at)
+		VALUES ('waskold', 'spay 登录对账', 'dt:group:g1', 'ma1', 'done', '如果是 spay 生产环境的短信验证码，发给我（6位数字），我立刻用它完成登录继续跑。', 'worker:waskold', ?, ?, ?)`).run(old, old, old);
+	assert.equal(await service.inject("dt:group:g1", "847159", "ma1"), true, "cold + pending ask → the answer still reaches the asking session");
+	assert.deepEqual(h.sessions, ["worker:waskold"]);
+});
+
+test("composition: an ERROR-STATUS run never captures via ask shape (P2-3: interrupted stays foreground)", async () => {
+	// #198 reads result ?? error; a true interrupted row carries the terminal
+	// notice in the error column — but even an ask-shaped column must not
+	// capture: the in-memory session is gone and the contract is 「重新执行」.
 	const { h, service } = harness();
 	const past = Date.now() - 60 * 60_000;
-	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, conversation_id, created_at, started_at, finished_at)
-		VALUES ('wdone2', '统计任务', 'dt:group:g1', 'ma1', 'done', '导出完成：最近7天共 37 笔，已生成报表。', 'worker:wdone2', ?, ?, ?)`).run(past, past, Date.now() - 60_000);
-	const injected = await service.inject("dt:group:g1", "847159", "ma1");
-	assert.equal(injected, false, "an ordinary reference still resolves in the foreground");
-	assert.equal(h.sends.length, 0, "nothing routed into the settled session");
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, error, conversation_id, created_at, started_at, finished_at)
+		VALUES ('werrask', '查订单', 'dt:cold3', 'u1', 'error', '请提供订单号，我立刻用它继续查询。', 'worker:werrask', ?, ?, ?)`).run(past, past, past);
+	assert.equal(await service.inject("dt:cold3", "0002026110800003400", "u1"), false, "error-status rows stay cold-gated regardless of ask shape");
 });
 
 test("an ask settled into the ERROR column (narration-noted zero-action turn) also captures the answer (review 20886054 P2-2)", async () => {

@@ -747,6 +747,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 		spawn(spec: { instruction: string; sourceConversation: string; createdBy: string; maxMinutes?: number }): unknown;
 		inject(sourceConversation: string, message: string, senderId: string): Promise<boolean>;
 		cancelForEscape(sourceConversation: string, senderId: string, note: string): string | undefined;
+		/** Remaining keep-alive window in ms (0 = cold/disabled) — the IM settle
+		 * sweep defers background-process cleanup while this is positive. */
+		keepAliveRemainingMs?(conversationId: string): number;
 	};
 
 	/** Shared by automatic + manual mining; cursors live durably in HistoryStore. */
