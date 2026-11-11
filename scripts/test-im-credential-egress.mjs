@@ -1086,6 +1086,27 @@ test("R13: preserved-region glue scan applies all secret rules; userinfo fails c
 	);
 });
 
+test("R14: separator-free CJK glue after a redacted credential fails closed even without a trailing URL", () => {
+	// The nested-tail cleanup must arm on the marker alone: 「。密码First_123456」
+	// has no separator label and no trailing URL, so every downstream pattern
+	// misses it while main truncates the whole run (review round-13 F1).
+	const head = "巡检完成。详见https://gitee.com/o/r/raw/master/f.xlsx?access_token=";
+	for (const sep of ["。", "，", ","]) {
+		const out = gateOutboundText(`${head}abcdef*ghijkl${sep}密码First_123456`, "restricted");
+		assert.ok(!out.includes("First_123456"), `glue after ${sep} cannot ship without a trailing URL`);
+		assert.equal(gateOutboundText(out, "restricted"), out, "stable on recheck");
+	}
+	const realistic = gateOutboundText(`${head}abcdef*ghijkl。密码First_123456如有问题联系我。`, "restricted");
+	assert.ok(!realistic.includes("First_123456"), "realistic full message cannot ship the glue secret");
+	assert.equal(gateOutboundText(realistic, "restricted"), realistic, "stable on recheck");
+	// Pure CJK prose without a trailing URL still delivers verbatim.
+	assert.equal(
+		gateOutboundText("https://gitee.com/o/r/raw/master/a.xlsx?access_token=***，请查收。", "restricted"),
+		"https://gitee.com/o/r/raw/master/a.xlsx?access_token=***，请查收。",
+		"pure CJK prose survives the marker-only arm",
+	);
+});
+
 test("R6: arbitrary URL markers cannot exempt plaintext residue", () => {
 	for (const query of ["foo=***", "access_token=***", "access_token=sekret"]) {
 		for (const prefix of ["", "密码：First_123456 "]) {
