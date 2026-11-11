@@ -724,3 +724,66 @@ test("the backstop never upgrades an ordinary masked delivery to withhold", () =
 	const json = gateOutboundText('tracing "token":"gk_' + "x".repeat(40) + '"', "restricted");
 	assert.notEqual(json, CREDENTIAL_WITHHELD_NOTICE, "masked JSON artifacts do not re-trip the backstop");
 });
+
+// ─── fourth-round review 664d7dcb: gap-colon parity + splice artifacts ─────
+
+test("R4-P1: main's full gap-colon detection coverage is preserved (no narrowing)", () => {
+	// The round-3 `(?!\/\/)` gap-colon narrowing leaked these (main withholds;
+	// 731 corpus cases). Detection must keep main's coverage; masked-output URL
+	// artifacts are neutralized in the backstop probe instead.
+	const h1 = gateOutboundText("password hint://Abc_123456", "restricted");
+	assert.ok(!h1.includes("Abc_123456"), "gap+colon+//value is caught");
+	const h2 = gateOutboundText("密码 提示://Abc_123456", "restricted");
+	assert.ok(!h2.includes("Abc_123456"), "CJK gap+colon+//value is caught");
+	// Compound: an independently masked credential must not mask the fact that
+	// the gap-colon one is also handled.
+	const cp = gateOutboundText("token:Tok_999888 password hint://Abc_123456", "restricted");
+	assert.ok(!cp.includes("Abc_123456") && !cp.includes("Tok_999888"), "both secrets handled in one message");
+	// Zero-gap parity (pre-existing) stays.
+	assert.notEqual(gateOutboundText("password://abc123def", "restricted"), "password://abc123def", "zero-gap // value still caught");
+});
+
+test("R4-P3: marker clearing preserves word boundaries — no synthesized labels", () => {
+	// Deleting `***` spliced `pass`+`word:` into `password:` and withheld benign
+	// messages; markers are now replaced with same-length spaces.
+	assert.equal(gateOutboundText("pass***word:report2026.xlsx", "restricted"), "pass***word:report2026.xlsx", "delivered unchanged, same as main");
+	assert.equal(gateOutboundText("api***key:report2026.xlsx", "restricted"), "api***key:report2026.xlsx", "delivered unchanged, same as main");
+});
+
+test("R4: a non-presigned URL never becomes a credential exemption", () => {
+	for (const input of [
+		"密码：Abc_123456https://example.com/r.md?access_token=gk_abcdef123456",
+		"password***https://example.com/Abc_123456",
+		"密码：***https://example.com/Abc_123456",
+	]) {
+		const out = gateOutboundText(input, "restricted");
+		assert.ok(!out.includes("Abc_123456") && !out.includes("gk_abcdef123456"), "the URL cannot shelter a labeled value");
+	}
+});
+
+test("R4: masked grant deliveries are not upgraded to withhold by the backstop", () => {
+	const link = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.xlsx?OSSAccessKeyId=abcd1234&Expires=1799999999&Signature=Sig%2BValue%3D";
+	// Clearing a mask must not attach the preceding label to the report URL
+	// or to its Expires query parameter.
+	const out = gateOutboundText(`密码：Abc_123456巡检报告链接${link}`, "restricted");
+	assert.notEqual(out, CREDENTIAL_WITHHELD_NOTICE, "masked delivery stays masked");
+	assert.ok(out.includes("Signature=Sig%2BValue%3D") && out.includes("Expires=1799999999"), "the full grant survives");
+	assert.ok(!out.includes("Abc_123456"), "the secret is masked");
+	assert.equal(gateOutboundText(out, "restricted"), out, "the delivered masked grant is stable on recheck");
+});
+
+test("M1b/M6 pins are artifact-level: masked delivery, not fail-closed withhold", () => {
+	// Strengthened per round-4: the reviewer showed both pins passed under
+	// mutants by withholding instead of masking. Assert the DELIVERY ARTIFACT.
+	const m1b = gateOutboundText("https://b.aliyuncs.com/r?OSSAccessKeyId=k&Signature=sig&credential=Abc_123456，另外的值是Zz9!qqqq1x", "restricted");
+	assert.ok(m1b.includes("credential=***"), "the non-grant param is redacted (dies if the list entry is removed)");
+	assert.notEqual(m1b, CREDENTIAL_WITHHELD_NOTICE, "redaction path, not the withhold fallback");
+	const m6 = gateOutboundText("password:Abc_123456私钥 是 SuperSecret99!", "restricted");
+	assert.notEqual(m6, CREDENTIAL_WITHHELD_NOTICE, "iterative masking handles it in-line (dies under single-pass)");
+	assert.ok(m6.includes("****") && !m6.includes("SuperSecret99") && !m6.includes("Abc_123456"), "both secrets masked in the delivered text");
+});
+
+test("AWS SigV4 grants survive verbatim with date and expiry parameters", () => {
+	const aws = "https://b.s3.amazonaws.com/r.pdf?X-Amz-Credential=AKIA123%2F20261111%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20261111T000000Z&X-Amz-Expires=3600&X-Amz-Signature=deadbeef00";
+	assert.equal(gateOutboundText(`报告：${aws}`, "restricted"), `报告：${aws}`, "the whole SigV4 grant ships untouched");
+});

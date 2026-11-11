@@ -97,15 +97,12 @@ const LABEL_VALUE_PATTERNS: RegExp[] = [];
 for (const label of [...SECRET_LABELS_ZH, ...SECRET_LABELS_EN]) {
 	// Separator form: 密码：xxx / 密码是 xxx / 密码还是 xxx / password: xxx / **密码**：`xxx`
 	// 0x60 = backtick, kept as an escape so the character class stays readable.
-	// Separator form, two branches (review round-3 backstop false-positive):
-	// a bare `[:：=]` right after the label keeps full main parity (values
-	// starting with `//` included), but a colon reached through a NON-EMPTY
-	// gap must not be the scheme colon of a glued `https://` — otherwise the
-	// fail-closed backstop re-reads 「密码：****https://bucket…」 as
-	// label+gap「https」+sep「:」+value「//bucket…」 and withholds benign
-	// report pushes. Zero-gap CJK separators stay a third alternative.
+	// Detection keeps main's FULL separator coverage (review round-4: narrowing
+	// the gap colon leaked `password hint://Abc_123456` — 731 corpus cases).
+	// Masked-output URL artifacts are separated at mask boundaries downstream,
+	// keeping the raw-input detector unchanged.
 	LABEL_VALUE_PATTERNS.push(new RegExp(
-		String.raw`(?<![A-Za-z0-9_])(?:${label})(?:[:：=]|[^\n]{1,12}?(?:[:：=](?!\/\/)|是|为|还是|改成|改为|变成|重置成|重设为|修改成)|是|为|还是|改成|改为|变成|重置成|重设为|修改成)\s*[*_\x60"'“”「『(（]*${TAMPERED_VALUE}`,
+		String.raw`(?<![A-Za-z0-9_])(?:${label})[^\n]{0,12}?(?:[:：=]|是|为|还是|改成|改为|变成|重置成|重设为|修改成)\s*[*_\x60"'“”「『(（]*${TAMPERED_VALUE}`,
 		"iu",
 	));
 	// Verb-first form: 正在用密码 xxx 登录 / 拿 token xxx 调接口 / 输入口令 xxx.
@@ -428,6 +425,10 @@ function credentialMaskSpans(text: string): MaskSpan[] {
 	if (!text) return [];
 	const grantParamSpans = presignedParamSpans(text);
 	const wholeUrlSpans = presignedUrlSpans(text);
+	// End a masked label before a verified report grant without treating an
+	// arbitrary URL as exempt. Other markers stay visible so later passes can
+	// still expose swallowed labels. Probe replacements preserve offsets.
+	const labelProbe = reportMaskProbe(text, false);
 	const spans: MaskSpan[] = [];
 	for (const pattern of SHAPE_PATTERNS) {
 		const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
@@ -457,7 +458,7 @@ function credentialMaskSpans(text: string): MaskSpan[] {
 	const labelValues = new Set<string>();
 	for (const pattern of LABEL_VALUE_PATTERNS) {
 		const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
-		for (const m of text.matchAll(global)) {
+		for (const m of labelProbe.matchAll(global)) {
 			const value = m[1] ?? "";
 			if (!value || !looksLikeSecretValue(value)) continue;
 			const start = m.index + m[0].length - value.length;
@@ -531,22 +532,24 @@ function applyCredentialMasks(text: string, spans: MaskSpan[]): string {
  * iterative masking in gateOutboundText + the overlong ceiling check, never
  * from this function.
  */
-/** Full main-equivalent detection over text, with grant params AND mask markers
- * (`***`/`****` fillers) pre-cleared so masked artifacts never re-trip. Spans
- * are sorted and merged because containsConcreteCredentialIn splices them out
- * with a forward cursor. */
+/** Recheck remaining credentials without joining words across mask markers. */
+function reportMaskProbe(text: string, clearOtherMarkers: boolean): string {
+	const reportStarts = new Set(presignedUrlSpans(text).map(([start]) => start));
+	return text.replace(/\*{3,}/g, (marker, offset: number) => {
+		if (reportStarts.has(offset + marker.length)) return "\n".repeat(marker.length);
+		return clearOtherMarkers ? " ".repeat(marker.length) : marker;
+	});
+}
+
 function finalCredentialCheck(text: string): boolean {
 	if (!text) return false;
-	const cleared: Array<[number, number]> = [...presignedParamSpans(text)];
-	for (const m of text.matchAll(/\*{3,}/g)) cleared.push([m.index, m.index + m[0].length]);
-	cleared.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-	const merged: Array<[number, number]> = [];
-	for (const span of cleared) {
-		const prev = merged[merged.length - 1];
-		if (prev && span[0] <= prev[1]) prev[1] = Math.max(prev[1], span[1]);
-		else merged.push([span[0], span[1]]);
-	}
-	return containsConcreteCredentialIn(text, merged);
+	// Do not delete markers: that would synthesize password from pass***word.
+	// Spaces preserve word boundaries; a newline before a verified report
+	// grant also prevents a label from reinterpreting its scheme separator.
+	// Compute grant spans on the original text: markers can occur inside an
+	// already-redacted query, and their probe whitespace must not truncate it.
+	const probed = reportMaskProbe(text, true);
+	return containsConcreteCredentialIn(probed, presignedParamSpans(text));
 }
 
 function shapeTripsOutside(text: string, protectedSpans: Array<[number, number]>): boolean {
