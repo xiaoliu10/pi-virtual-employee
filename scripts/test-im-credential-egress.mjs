@@ -757,6 +757,34 @@ test("long user mask markers cannot exhaust the remaining detector gap", () => {
 	}
 });
 
+test("mask whitespace preserves report delivery and catches compound newline residue", () => {
+	const grant = "https://b.aliyuncs.com/r?OSSAccessKeyId=Grant123&Signature=SigValue9&Expires=1799999999";
+	for (const markerLength of [3, 8, 16, 512]) {
+		for (const whitespace of ["", " ", "\t", "\n", "\r\n", "\u00a0", "\u2028"]) {
+			for (const label of ["密码：", "token=", "api_key:"]) {
+				const prefix = label + "*".repeat(markerLength) + whitespace;
+				const report = prefix + grant;
+				assert.equal(gateOutboundText(report, "restricted"), report, "verified report survives mask whitespace");
+				const compound = "密码：First_123456 " + prefix + "https://example.com/Abc_123456";
+				const out = gateOutboundText(compound, "restricted");
+				assert.ok(!out.includes("First_123456") && !out.includes("Abc_123456"), "both values handled across whitespace");
+				assert.equal(gateOutboundText(out, "restricted"), out, "stable compound result");
+			}
+		}
+	}
+});
+
+test("a report boundary does not hide a following pasted access-token assignment", () => {
+	const grant = "https://b.aliyuncs.com/r?OSSAccessKeyId=Grant123&Signature=SigValue9&Expires=1799999999";
+	for (const separator of [",", ";", "，", "。", "；"]) {
+		for (const secret of ["Abc_123456", "Z".repeat(205) + "9"]) {
+			const out = gateOutboundText("密码：First_123456 " + grant + separator + "access_token=" + secret, "restricted");
+			assert.ok(!out.includes(secret) && !out.includes("First_123456"), "both credentials removed");
+			assert.equal(gateOutboundText(out, "restricted"), out, "stable delivery");
+		}
+	}
+});
+
 test("R4-P3: marker clearing preserves word boundaries — no synthesized labels", () => {
 	// Deleting `***` spliced `pass`+`word:` into `password:` and withheld benign
 	// messages; markers are now replaced with same-length spaces.

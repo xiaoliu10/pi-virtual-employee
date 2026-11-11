@@ -281,6 +281,10 @@ const SHAPE_PATTERNS: RegExp[] = [
 	// never drift). Star-excluding value class prevents mask/redaction fillers
 	// from re-tripping the shape in later iterative passes.
 	new RegExp(`[?&]${URL_TOKEN_PARAM_SOURCE_BODY}=${URL_TOKEN_PARAM_VALUE}`, "i"),
+	// A pasted access-token assignment after prose punctuation is no longer a
+	// query parameter, but still carries the same credential. Exclude mask
+	// fillers so an already-redacted URL does not capture the following grant.
+	/(?<![A-Za-z0-9_])access[-_]?token\s*[:=]\s*[^*\s&"']{6,}/i,
 	// env / ini style assignment of a secret-looking key. The value class
 	// tempers on a URL scheme (review P1-1b): without it a no-space
 	// 「PASSWORD=secret巡检报告https://…」 capture swallows the report URL.
@@ -428,7 +432,7 @@ function credentialMaskSpans(text: string): MaskSpan[] {
 	// End a masked label before a verified report grant without treating an
 	// arbitrary URL as exempt. Other markers stay visible so later passes can
 	// still expose swallowed labels. Probe replacements preserve offsets.
-	const labelProbe = reportMaskProbe(text, false);
+	const labelProbe = reportMaskProbe(text);
 	const spans: MaskSpan[] = [];
 	for (const pattern of SHAPE_PATTERNS) {
 		const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
@@ -533,11 +537,15 @@ function applyCredentialMasks(text: string, spans: MaskSpan[]): string {
  * from this function.
  */
 /** Recheck remaining credentials without joining words across mask markers. */
-function reportMaskProbe(text: string, clearOtherMarkers: boolean): string {
+function reportMaskProbe(text: string): string {
 	const reportStarts = new Set(presignedUrlSpans(text).map(([start]) => start));
 	return text.replace(/\*{3,}/g, (marker, offset: number) => {
-		if (reportStarts.has(offset + marker.length)) return "\n".repeat(marker.length);
-		return clearOtherMarkers ? " ".repeat(marker.length) : marker;
+		// Whitespace belongs to the mask/report boundary too. Without this,
+		// normalization exposes the grant scheme colon to the prior label.
+		const after = offset + marker.length;
+		const gap = /^\s*/u.exec(text.slice(after))?.[0].length ?? 0;
+		if (reportStarts.has(after + gap)) return "\n".repeat(marker.length);
+		return marker;
 	});
 }
 
@@ -545,7 +553,7 @@ function finalCredentialCheck(text: string): boolean {
 	if (!text) return false;
 	// Compute protected offsets before normalizing markers. Use a newline for
 	// each cleared grant assignment so unrelated text cannot join across it.
-	const probed = reportMaskProbe(text, false);
+	const probed = reportMaskProbe(text);
 	const parts: string[] = [];
 	let cursor = 0;
 	for (const [start, end] of presignedParamSpans(text)) {
@@ -555,8 +563,11 @@ function finalCredentialCheck(text: string): boolean {
 	parts.push(probed.slice(cursor));
 	// Two spaces preserve split words (including api***key: the label allows
 	// ONE optional space) without letting marker length exhaust the bounded
-	// gap before a remaining credential. This probe needs no original offsets.
-	return containsConcreteCredentialIn(parts.join("").replace(/\*{3,}/g, "  "), []);
+	// gap before a remaining credential. Whitespace after an untrusted marker
+	// is part of that boundary too: a newline must not shelter a URL value when
+	// another credential in the message was already masked. Verified report
+	// markers were replaced above and retain their hard boundary.
+	return containsConcreteCredentialIn(parts.join("").replace(/\*{3,}\s*/g, "  "), []);
 }
 
 function shapeTripsOutside(text: string, protectedSpans: Array<[number, number]>): boolean {
