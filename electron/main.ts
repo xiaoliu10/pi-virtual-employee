@@ -1708,6 +1708,11 @@ ${tailForProgress(decision.text)}`;
 	const workerTaskStore = new WorkerTaskStore(db);
 	workerTaskStoreHolder.store = workerTaskStore;
 	const workerService = new WorkerService(workerTaskStore, {
+		// Keep-alive window (user ruling 2026-11-11, spay code-handoff incident):
+		// a config getter so a settings-page change applies without a restart.
+		keepAliveMinutes: () => {
+			try { return config.all().general.workerKeepAliveMin; } catch { return undefined; }
+		},
 		// Context-management P2: land each finished worker as a searchable
 		// knowledge entry (manual source → search_knowledge_base hit), so a
 		// later "上次那个对账" resolves through retrieval, not guesswork. The
@@ -1813,6 +1818,7 @@ ${tailForProgress(decision.text)}`;
 		spawn: (spec) => workerService.spawn(spec),
 		inject: (cid, message, senderId) => workerService.inject(cid, message, senderId),
 		cancelForEscape: (cid, senderId, note) => workerService.cancelForEscape(cid, senderId, note),
+		keepAliveRemainingMs: (cid) => workerService.keepAliveRemainingMs(cid),
 	};
 	// Recovery + dispatch only after IM initialization and bridge installation.
 	workService.start();

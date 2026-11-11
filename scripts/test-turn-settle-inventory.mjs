@@ -28,6 +28,19 @@ test("wiring: the sweep TERMINATES strays via the engine, then verifies", () => 
 		"and verifies what survived");
 });
 
+test("wiring: the sweep DEFERS while the keep-alive window is open (user ruling 2026-11-11, spay incident)", () => {
+	// Field 2026-11-11 10:26: the sweep killed the login polling script 13s
+	// after the turn settled — while the conversation was still waiting on the
+	// user's SMS code. Inside the worker's keep-alive window the sweep must
+	// re-arm at window expiry instead of killing (TTL-bounded cleanup, so the
+	// 11-08 「默认清理」 guarantee holds, just later).
+	assert.match(managerSrc, /keepAliveRemainingMs\?\.\(conversationId\)/,
+		"the sweep asks the bridge for the remaining window");
+	assert.match(managerSrc, /scheduleBackgroundInventory\(conversationId, keepAliveMs \+ 1_000\)/,
+		"deferral re-arms the sweep at window expiry");
+	assert.match(managerSrc, /keepAliveMs > 0/, "positive remaining window = defer");
+});
+
 test("wiring: internal tool names never reach the user (field 23:44 wording banned)", () => {
 	assert.doesNotMatch(managerSrc, /manage_process poll/, "poll guidance must be gone");
 	assert.doesNotMatch(managerSrc, /需要立即终止用 manage_process kill/, "kill guidance must be gone");
