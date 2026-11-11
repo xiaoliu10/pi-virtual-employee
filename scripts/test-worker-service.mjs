@@ -510,26 +510,22 @@ test("a FINISHED worker does not swallow a BARE context token — the foreground
 	assert.equal(await service.inject("dt:single:m1", "继续", "u1"), true, "「继续」 still continues");
 });
 
-// Field 2026-11-10 21:24 (the context-wall incident): a fresh lookup task routed
-// as "conversational follow-up" into a DONE worker from FOUR HOURS earlier
-// injected a day-long accumulated transcript (~200k tokens) — the turn burned 61
-// minutes against qwen's 204800 wall. Default reversed: a finished worker is
-// history; ONLY a short continuation window keeps the dialogue.
-test("the continuation contract EXPIRES: a worker settled outside the window is history", async () => {
+// User ruling 2026-11-10: 「IM 渠道一个对话粘连 worker 这个设计也是合理的」.
+// A 30-minute continuation window shipped in 0.2.220 and was REVERTED: stickiness
+// is the endorsed design, and once compaction is correct (thinking omitted from
+// the summarizer request + the model output limit for summaries) the snowball
+// cannot form. What stays guarded is a NEW TASK / bare reference landing in the
+// accumulated transcript — the engine pre-turn budget gate bounds the rest.
+test("stickiness survives age: a worker settled hours ago still owns the dialogue, but not a new task", async () => {
 	const { h, service } = harness();
-	const old = Date.now() - 31 * 60_000; // just past the 30-min continuation window
+	const old = Date.now() - 4 * 60 * 60_000; // the field incident: a 4-hour-old done worker
 	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
 		VALUES ('wold', '每日对账异常巡检', 'dt:old', 'ma1', 'done', 'worker:wold', ?, ?, ?)`).run(old, old, old);
-	// Everything falls through — conversational or not, the foreground (full push
-	// history) or a fresh worker handles it.
-	assert.equal(await service.inject("dt:old", "结果呢", "ma1"), false, "「结果呢」 past the window → foreground answers from pushed results");
-	assert.equal(await service.inject("dt:old", "继续", "ma1"), false, "「继续」 past the window → falls through");
-	assert.equal(await service.inject("dt:old", "帮我查一下 0422026111000000654 的下单日志", "ma1"), false, "never lands in the stale worker — triage routes it fresh (spawn or bounded foreground turn)");
-	// Boundary: inside the window the contract lives.
-	const recent = Date.now() - 5 * 60_000;
-	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
-		VALUES ('wnew', '每日对账异常巡检', 'dt:new', 'ma1', 'done', 'worker:wnew', ?, ?, ?)`).run(recent, recent, recent);
-	assert.equal(await service.inject("dt:new", "结果呢", "ma1"), true, "「结果呢」 minutes later keeps the continuation");
+	assert.equal(await service.inject("dt:old", "结果呢", "ma1"), true, "「结果呢」 hours later still reaches the worker that did the work");
+	assert.equal(await service.inject("dt:old", "继续", "ma1"), true, "「继续」 keeps the dialogue sticky");
+	// A NEW task must not land in the accumulated transcript (field 2026-11-08 23:44
+	// + 2026-11-10 21:24): triage routes it fresh instead.
+	assert.equal(await service.inject("dt:old", "帮我查一下 0422026111000000654 的下单日志", "ma1"), false, "a fresh task never lands in the stale worker");
 });
 
 test("a CANCELLED worker gets the same bare-token guard (review P3-4)", async () => {

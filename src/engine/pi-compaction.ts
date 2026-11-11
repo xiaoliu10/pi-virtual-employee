@@ -19,6 +19,20 @@
  *
  * If upstream extracts a lightweight compaction package later, replace this
  * file with that dependency.
+ *
+ * BACKPORTS (2026-11-10, field context-wall incident): two fixes from upstream
+ * 1.2.0/1.5.0 are applied here while the rest of the snapshot stays at 1.1.0 —
+ * pi-desktop rides pi-coding-agent 1.5.0's AgentSession and inherits them for
+ * free, VE drives these primitives itself so they must be ported explicitly:
+ *   • serializeConversation omits thinking (upstream: "including it can make the
+ *     summarization request larger than the context it summarizes");
+ *   • summaries use the model's output limit, not min(0.8*reserveTokens, …)
+ *     (upstream #9512 — the 13107-token cap starved reasoning models).
+ * Pinned by scripts/test-pi-compaction.mjs (mutation-verified: restoring both
+ * old behaviors fails 4 of the 8 tests — thinking alone 3, the output cap alone 1).
+ * NOT backported: upstream's assistant-role cut points — VE's contract pins the
+ * kept tail to a user-turn boundary (IM conversation semantics + taskAnchorOf),
+ * and the incident's compaction did run via the forced single-turn path.
  */
 import { contentText, uuidv7 } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
@@ -304,6 +318,19 @@ function truncateForSummary(text: string, maxChars: number): string {
  *
  * Tool results are truncated to keep the summarization request within
  * reasonable token budgets. Full content is not needed for summarization.
+ *
+ * Thinking is OMITTED (backported from upstream 1.2.0/1.5.0; the vendored 1.1.0
+ * snapshot still serialized it). Upstream's rationale is the exact diagnosis of
+ * the 2026-11-10 field incident: "Providers return summaries of the real
+ * reasoning, and replayed thinking is often not part of the model's live
+ * context: for example, a block that does not match its request is dropped.
+ * Including it can make the summarization request LARGER THAN THE CONTEXT IT
+ * SUMMARIZES." A 280-turn browser-automation worker fed its full qwen thinking
+ * chains into the summarizer: each compaction took ~80s and the reasoning model
+ * burned its output budget re-thinking, so the transcript measured
+ * 198936 → 199722 → 210321 tokens across three "successful" compactions and the
+ * turn died on the provider's 204800 wall. Visible text, tool calls and tool
+ * results record what happened; thinking does not.
  */
 export function serializeConversation(messages: Message[]): string {
 	const parts: string[] = [];
@@ -312,21 +339,15 @@ export function serializeConversation(messages: Message[]): string {
 			const content = contentText(msg.content, "");
 			if (content) parts.push(`[User]: ${content}`);
 		} else if (msg.role === "assistant") {
-			const thinkingParts: string[] = [];
 			const toolCalls: string[] = [];
 			for (const block of msg.content) {
-				if (block.type === "thinking") {
-					thinkingParts.push((block as { thinking: string }).thinking);
-				} else if (block.type === "toolCall") {
+				if (block.type === "toolCall") {
 					const call = block as { name: string; arguments: Record<string, unknown> };
 					const argsStr = Object.entries(call.arguments)
 						.map(([k, v]) => `${k}=${JSON.stringify(v)}`)
 						.join(", ");
 					toolCalls.push(`${call.name}(${argsStr})`);
 				}
-			}
-			if (thinkingParts.length > 0) {
-				parts.push(`[Assistant thinking]: ${thinkingParts.join("\n")}`);
 			}
 			if (msg.content.some((block) => block.type === "text")) {
 				parts.push(`[Assistant]: ${contentText(msg.content)}`);
@@ -515,7 +536,15 @@ export async function generateSummaryWithUsage(
 	_callbacks: unknown,
 	sessionId: string | undefined,
 ): Promise<{ text: string; usage: Usage }> {
-	const maxTokens = Math.min(Math.floor(0.8 * reserveTokens), model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY);
+	// Summaries use the MODEL'S OUTPUT LIMIT, not a fraction of the compaction
+	// reserve (backport of upstream #9512, landed by 1.5.0). The vendored 1.1.0
+	// snapshot capped this at min(0.8 * reserveTokens, model.maxTokens) = 13107
+	// tokens for the shipped 16384 reserve — on a reasoning model the thinking
+	// alone consumes that cap, so the summary came back stopReason="length" and
+	// getSummarizationFailure threw, i.e. compaction could never succeed on
+	// exactly the transcripts that needed it most. reserveTokens stays in the
+	// signature for existing callers; upstream keeps it unused for the same reason.
+	void reserveTokens;
 	// Use update prompt if we have a previous summary, otherwise initial prompt
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
 	if (customInstructions) {
@@ -531,7 +560,7 @@ export async function generateSummaryWithUsage(
 		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
 	}
 	promptText += basePrompt;
-	const completionOptions: SimpleStreamOptions = { maxTokens, signal, apiKey, headers, env, sessionId };
+	const completionOptions: SimpleStreamOptions = { signal, apiKey, headers, env, sessionId };
 	if (model.reasoning && thinkingLevel && thinkingLevel !== "off") {
 		completionOptions.reasoning = thinkingLevel;
 	}
