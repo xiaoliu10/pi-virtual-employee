@@ -587,3 +587,53 @@ test("P3: streamed accumulation converges to one suffix, no secret in any gated 
 	assert.ok(!wire.includes("yyyy@Y13z"), "the credential never appears in any frame");
 	assert.ok((final.match(/已脱敏/g) ?? []).length <= 1, "the final bubble carries at most one suffix note");
 });
+
+// ─── re-review 92a0f83b: RL-1/RL-2 blockers + P1-C hardening pins ──────────
+
+test("RL-1: CJK prose glued AFTER a presigned query is masked, grant intact (query-aware URL span)", () => {
+	const link = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.xlsx?OSSAccessKeyId=abcd1234&Signature=Sig%2BValue%3D&Expires=1799999999";
+	// The regression introduced by the first P1-1 fix: the whole-URL protection
+	// span counted CJK as URL chars, swallowed 「，密码：…」 and subtraction then
+	// erased the password mask entirely (plaintext, no suffix, fallback never
+	// consulted because total===0).
+	const out = gateOutboundText(`${link}，密码：Abc_123456`, "restricted");
+	assert.ok(!out.includes("Abc_123456"), "the glued password is masked");
+	assert.ok(out.includes("OSSAccessKeyId=abcd1234") && out.includes("Signature=Sig%2BValue%3D"), "the grant survives");
+	assert.ok(out.includes("脱敏"), "masked delivery carries the suffix note");
+	// Combined fuzz case: two links + glued bare-ish password.
+	const out2 = gateOutboundText(`${link} 和 ${link} 密码：83920174看这个`, "restricted");
+	assert.ok(!out2.includes("83920174"), "the second glued value is masked too");
+});
+
+test("RL-1 mirror: a CJK object-key path keeps the grant protected (query-aware, not ASCII-only)", () => {
+	// The ASCII-only first attempt broke this: the span stopped at 「日报」 before
+	// the query, isPresignedObjectUrl saw no params, and Signature was redacted.
+	const link = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r/日报.xlsx?OSSAccessKeyId=abcd&Signature=Sig%2BValue%3D&Expires=9999999999";
+	const out = gateOutboundText(`巡检完成，报表：${link}\n（登录密码：Sup3rSecret! 如需自取请告知）`, "restricted");
+	assert.ok(out.includes("OSSAccessKeyId=abcd") && out.includes("Signature=Sig%2BValue%3D"), "the CJK-path grant survives untouched");
+	assert.ok(!out.includes("Sup3rSecret!"), "the separate labeled password is still masked");
+});
+
+test("RL-2: a PEM private key is masked as ONE block — the body never ships", () => {
+	const pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----";
+	const out = gateOutboundText(`运维排查用这个私钥：\n${pem}`, "restricted");
+	assert.ok(!out.includes("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"), "the base64 body is masked, not just the banner");
+	assert.ok(!out.includes("END PRIVATE KEY"), "the whole block is one mask region");
+	// Truncated PEM (no END banner): mask runs to end of text.
+	const trunc = gateOutboundText("-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7fake7key7material", "restricted");
+	assert.ok(!trunc.includes("MIIEowIBAAKCAQEA"), "a truncated key body is masked too");
+});
+
+test("P1-C: a masked label value's bare occurrence elsewhere is cross-masked", () => {
+	const out = gateOutboundText("Abc_123456 密码是 Abc_123456", "restricted");
+	assert.ok(!out.includes("Abc_123456"), "neither the labeled nor the bare copy reaches the group");
+	assert.equal((out.match(/\*{4}/g) ?? []).length >= 2, true, "both occurrences are masked");
+});
+
+test("M7: the label-boundary lookbehind keeps an English label substring from cutting a value", () => {
+	// Direct pin for (?<![A-Za-z0-9_]) in LABEL_BOUNDARY: "secret" must not
+	// match inside "SuperSecret99!" and truncate the tempered capture below 6.
+	const out = gateOutboundText("系统密码是 SuperSecret99! 请妥善保管。", "restricted");
+	assert.ok(!out.includes("SuperSecret99"), "the whole value is masked");
+	assert.ok(out.includes("****"), "a mask span was produced (not a silent no-match)");
+});

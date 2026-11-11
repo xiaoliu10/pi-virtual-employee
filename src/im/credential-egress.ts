@@ -203,7 +203,16 @@ function isPresignedObjectUrl(url: string): boolean {
 }
 
 /** URL spans: everything up to whitespace or an angle/quote delimiter. */
-const OBJECT_URL_SPAN_PATTERN = /https?:\/\/[^\s<>"']+/g;
+/** A report URL span, query-aware: `scheme://` + path (CJK allowed, so a
+ * `/r/日报.xlsx` object key stays intact) + `?` + an ASCII query that STOPS at
+ * the first non-ASCII char. Review RL-1: the old `[^\s<>"]+` counted CJK as URL
+ * chars, so a whole-URL protection span swallowed 「，密码：Abc_123456」 glued
+ * after the query and subtraction then erased the password's mask span. A
+ * presigned query is percent-encoded ASCII, so bounding the query (but not the
+ * path) at 0x7F keeps the grant intact AND lets glued CJK prose be masked. The
+ * `\?` is required — every presigned grant has a query, and a span without one
+ * is never a grant, so nothing to protect is lost. */
+const OBJECT_URL_SPAN_PATTERN = /https?:\/\/[^\s<>"']*\?[^\s<>"'\u0080-\uffff]+/g;
 /** CJK/bracket punctuation that glues onto a URL in prose but is not part of it. */
 const URL_TRAILING_NOISE = /[)\]}>，。；！？、）】」』”’…]+$/;
 
@@ -256,7 +265,10 @@ const SHAPE_PATTERNS: RegExp[] = [
 	/\bgh[pousr]_[A-Za-z0-9]{20,}\b/,                               // GitHub tokens
 	/\bxox[abpsr]-[A-Za-z0-9-]{10,}\b/,                             // Slack tokens
 	/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/, // JWT
-	/-----BEGIN [A-Z ]*PRIVATE KEY-----/,                            // PEM private key
+	/-----BEGIN [A-Z ]*PRIVATE KEY-----/,                            // PEM private key banner
+	// Review RL-2: the banner shape alone masked only `-----BEGIN…-----`, shipping
+	// the base64 key body in full. The whole BEGIN…END (or to EOF when truncated)
+	// block is masked as one region below via PEM_BLOCK_PATTERN.
 	/\bBearer\s+[A-Za-z0-9._~+/-=]{12,}/,                           // Authorization header (= covers in-token base64 padding, review P1-4)
 	// URL credentials: scheme://user:password@host
 	/\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/@]{3,}@/i,
@@ -400,6 +412,11 @@ function hasOverlongLabelValue(text: string): boolean {
  * credential param (access_token) on a presigned URL must still be masked;
  * LABEL-value matches subtract around WHOLE presigned URLs — a labeled value
  * glued into a report link must never tear the link apart. */
+/** A whole PEM private-key block, BEGIN banner → END banner (or to end of text
+ * when the END banner is truncated). Review RL-2: masking only the banner left
+ * the base64 key body on the wire while the suffix claimed 「已脱敏」. */
+const PEM_BLOCK_PATTERN = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g;
+
 function credentialMaskSpans(text: string): MaskSpan[] {
 	if (!text) return [];
 	const grantParamSpans = presignedParamSpans(text);
@@ -416,6 +433,13 @@ function credentialMaskSpans(text: string): MaskSpan[] {
 			spans.push({ start, end, keepPrefix: Math.min(shapeKeepPrefix(m[0]), end - start) });
 		}
 	}
+	// RL-2: mask the ENTIRE PEM private-key block, not just its banner.
+	for (const m of text.matchAll(PEM_BLOCK_PATTERN)) {
+		const start = m.index, end = start + m[0].length;
+		spans.push({ start, end, keepPrefix: Math.min(3, end - start) });
+	}
+	// Collect masked label values for the P1-C cross-scan below.
+	const labelValues = new Set<string>();
 	for (const pattern of LABEL_VALUE_PATTERNS) {
 		const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
 		for (const m of text.matchAll(global)) {
@@ -424,9 +448,27 @@ function credentialMaskSpans(text: string): MaskSpan[] {
 			const start = m.index + m[0].length - value.length;
 			if (overlapsProtected(start, start + value.length, wholeUrlSpans)) {
 				spans.push(...subtractProtected(start, start + value.length, 0, wholeUrlSpans));
-				continue;
+			} else {
+				spans.push({ start, end: start + value.length, keepPrefix: 0 });
 			}
-			spans.push({ start, end: start + value.length, keepPrefix: 0 });
+			if (value.length >= 6) labelValues.add(value);
+		}
+	}
+	// P1-C hardening: a secret that was masked after a label may ALSO appear bare
+	// elsewhere in the same message (`Abc_123456 密码是 Abc_123456`). The bare copy
+	// has no shape and no label, so neither gate catches it standalone; main only
+	// protected it incidentally via whole-message withhold. Cross-scan every masked
+	// label value and mask its literal occurrences too (never tearing a grant).
+	for (const val of labelValues) {
+		let idx = text.indexOf(val);
+		while (idx !== -1) {
+			const start = idx, end = idx + val.length;
+			if (overlapsProtected(start, end, wholeUrlSpans)) {
+				spans.push(...subtractProtected(start, end, 0, wholeUrlSpans));
+			} else {
+				spans.push({ start, end, keepPrefix: 0 });
+			}
+			idx = text.indexOf(val, idx + val.length);
 		}
 	}
 	spans.sort((a, b) => a.start - b.start || a.end - b.end);
