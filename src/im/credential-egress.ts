@@ -77,26 +77,45 @@ function looksLikeSecretValue(raw: string): boolean {
 	return false;
 }
 
+/** All label alternatives as one regex branch — used to make value captures
+ * STOP at the next label word (review P1-2: a greedy \S run swallowed the
+ * second 「password:」 so its value escaped masking). */
+const ALL_LABELS_ALT = [...SECRET_LABELS_ZH, ...SECRET_LABELS_EN].join("|");
+/** Boundary guard: capture stops at the START of a later label word, not on a
+ * substring inside the value (review P1-2 fix iteration): English labels like
+ * 「secret」 must not cut 「SuperSecret99!」 in half — the (?<![A-Za-z0-9_])
+ * lookbehind requires a word boundary before the label, so a label embedded in
+ * a longer token does not count. A URL scheme stops capture too (review P1-1b)
+ * so a glued report link survives whole-URL subtraction. */
+const LABEL_BOUNDARY = String.raw`(?<![A-Za-z0-9_])(?:${ALL_LABELS_ALT})|https?://`;
+/** Tempered value group: 6-200 non-space chars, stopping at a later label-word
+ * boundary or a URL scheme. */
+const TAMPERED_VALUE = String.raw`((?:(?!${LABEL_BOUNDARY})\S){6,200})`;
+
 /** Build the "label + concrete value" patterns once. */
 const LABEL_VALUE_PATTERNS: RegExp[] = [];
 for (const label of [...SECRET_LABELS_ZH, ...SECRET_LABELS_EN]) {
 	// Separator form: 密码：xxx / 密码是 xxx / 密码还是 xxx / password: xxx / **密码**：`xxx`
 	// 0x60 = backtick, kept as an escape so the character class stays readable.
 	LABEL_VALUE_PATTERNS.push(new RegExp(
-		String.raw`(?<![A-Za-z0-9_])(?:${label})[^\n]{0,12}?(?:[:：=]|是|为|还是|改成|改为|变成|重置成|重设为|修改成)\s*[*_\x60"'“”「『(（]*(\S{6,200})`,
+		String.raw`(?<![A-Za-z0-9_])(?:${label})[^\n]{0,12}?(?:[:：=]|是|为|还是|改成|改为|变成|重置成|重设为|修改成)\s*[*_\x60"'“”「『(（]*${TAMPERED_VALUE}`,
 		"iu",
 	));
 	// Verb-first form: 正在用密码 xxx 登录 / 拿 token xxx 调接口 / 输入口令 xxx.
 	// No colon or 是 here — the verb + label is the separator.
 	LABEL_VALUE_PATTERNS.push(new RegExp(
-		String.raw`(?<![A-Za-z0-9_])(?:用|拿|以|输入|填入|填|试试|尝试|带上|附上)\s*(?:${label})\s*[:：=]?\s*[*_\x60"'“”「『(（]*(\S{6,200})`,
+		String.raw`(?<![A-Za-z0-9_])(?:用|拿|以|输入|填入|填|试试|尝试|带上|附上)\s*(?:${label})\s*[:：=]?\s*[*_\x60"'“”「『(（]*${TAMPERED_VALUE}`,
 		"iu",
 	));
 }
 
-/** Credential-bearing URL query-param name list (shared source, see below). */
+/** Credential-bearing URL query-param name list (shared source, see below).
+ * Value class EXCLUDES the star marker (*): redaction/mask fillers (***, ****,
+ * and their concatenations like  *******) must never re-trip the shape in a
+ * later masking pass (review: iterative-mask self-excitation). */
 const URL_TOKEN_PARAM_SOURCE_BODY =
 	"(?:password|passwd|pwd|secret|token|api_?key|apikey|access_?token|access_?key|OSSAccessKeyId|Signature|X-Amz-Signature|X-Amz-Credential)";
+const URL_TOKEN_PARAM_VALUE = "[^\\s&\"'*]{6,}";
 
 /**
  * Presigned object-storage URLs (report links the system itself generates via
@@ -189,21 +208,14 @@ const OBJECT_URL_SPAN_PATTERN = /https?:\/\/[^\s<>"']+/g;
 const URL_TRAILING_NOISE = /[)\]}>，。；！？、）】」』”’…]+$/;
 
 /**
- * The param names whose values are the presigned grant itself — exactly the
- * OSS/AWS entries of URL_TOKEN_PARAM_SOURCE_BODY. Everything else in the same
- * URL (access_token, password, token, ...) stays subject to redaction: a fake
- * "&OSSAccessKeyId=x&Signature=y" marker must never rescue a credential URL
- * (review P1 — the exemption is per-param, never per-URL).
+ * Char spans of the grant-carrying param ASSIGNMENTS inside presigned URLs
+ * (name + = + value) — DETECTION-level protection: these params are an access
+ * grant, not a credential leak, so shape/label detection skips them. Non-grant
+ * credential params on the same URL (access_token, password, …) are NOT
+ * protected and still get masked (per-param, never per-URL).
  */
 const PRESIGNED_PARAM_PATTERN = /([?&](?:OSSAccessKeyId|Signature|X-Amz-Signature|X-Amz-Credential)=)([^\s&"']*)/gi;
 
-/**
- * Char spans of the grant-carrying param ASSIGNMENTS (name + = + value) inside
- * presigned URLs. The name must be masked along with the value: param names
- * like X-Amz-Credential contain detector label words ("credential"), and a
- * value-only mask would leave "credential=<next params>" — a label+value shape
- * assembled from the leftovers — for the detector to trip on.
- */
 function presignedParamSpans(text: string): Array<[number, number]> {
 	const spans: Array<[number, number]> = [];
 	if (!text) return spans;
@@ -219,6 +231,25 @@ function presignedParamSpans(text: string): Array<[number, number]> {
 	return spans;
 }
 
+/**
+ * Char spans of presigned OBJECT URLs as WHOLE URLs — SUBTRACTION-level
+ * protection (review P1-1b): when a no-space CJK message glues a labeled value
+ * straight into the report URL, the label mask span is carved AROUND the link
+ * so the grant link survives intact instead of being torn apart. Detection
+ * still uses the param-level spans above; this list only feeds subtractProtected.
+ */
+function presignedUrlSpans(text: string): Array<[number, number]> {
+	const spans: Array<[number, number]> = [];
+	if (!text) return spans;
+	for (const match of text.matchAll(OBJECT_URL_SPAN_PATTERN)) {
+		const url = match[0].replace(URL_TRAILING_NOISE, "");
+		if (!url || !isPresignedObjectUrl(url)) continue;
+		const start = match.index;
+		spans.push([start, start + url.length]);
+	}
+	return spans;
+}
+
 /** Known credential shapes that need no label. */
 const SHAPE_PATTERNS: RegExp[] = [
 	/\bsk-[A-Za-z0-9_-]{16,}\b/,                                     // OpenAI-style keys
@@ -226,14 +257,18 @@ const SHAPE_PATTERNS: RegExp[] = [
 	/\bxox[abpsr]-[A-Za-z0-9-]{10,}\b/,                             // Slack tokens
 	/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/, // JWT
 	/-----BEGIN [A-Z ]*PRIVATE KEY-----/,                            // PEM private key
-	/\bBearer\s+[A-Za-z0-9._~+/-]{12,}=*/,                           // Authorization header
+	/\bBearer\s+[A-Za-z0-9._~+/-=]{12,}/,                           // Authorization header (= covers in-token base64 padding, review P1-4)
 	// URL credentials: scheme://user:password@host
 	/\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/@]{3,}@/i,
 	// Sensitive query params carrying a value (see redactUrlCredentialParams —
-	// matched by SHAPE_PATTERNS via a shared source so the two never drift).
-	new RegExp(`[?&]${URL_TOKEN_PARAM_SOURCE_BODY}=[^\\s&"']{6,}`, "i"),
-	// env / ini style assignment of a secret-looking key
-	/\b(?:PASSWORD|PASSWD|PWD|SECRET|TOKEN|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CLIENT_?SECRET)\s*=\s*["']?[^\s"']{6,}/,
+	// matched via SHAPE_PATTERNS with a shared source so detection and redaction
+	// never drift). Star-excluding value class prevents mask/redaction fillers
+	// from re-tripping the shape in later iterative passes.
+	new RegExp(`[?&]${URL_TOKEN_PARAM_SOURCE_BODY}=${URL_TOKEN_PARAM_VALUE}`, "i"),
+	// env / ini style assignment of a secret-looking key. The value class
+	// tempers on a URL scheme (review P1-1b): without it a no-space
+	// 「PASSWORD=secret巡检报告https://…」 capture swallows the report URL.
+	/\b(?:PASSWORD|PASSWD|PWD|SECRET|TOKEN|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CLIENT_?SECRET)\s*=\s*["']?(?:(?!https?:\/\/)[^\s"']){6,}/,
 	// JSON credential field with a concrete value
 	/"(?:password|passwd|pwd|secret|token|api_?key|apikey|access_?key|client_?secret|secret_?key)"\s*:\s*"[^"]{6,}"/i,
 ];
@@ -291,12 +326,21 @@ function containsConcreteCredentialIn(text: string, protectedSpans: Array<[numbe
  */
 interface MaskSpan { start: number; end: number; keepPrefix: number; }
 
-/** Keep-prefix rule for a whole-match SHAPE span: keep through the first
- * assignment sigil so the kind stays identifiable ("password=****"), else the
- * first 3 characters (token families sk- / ghp_ / eyJ / xox). */
+/** Keep-prefix rule for a whole-match SHAPE span.
+ *
+ * Review P1-4 (2026-11-11): the old "keep through any first =/:" rule leaked
+ * whole secrets — a base64 padding `=` sits INSIDE the token
+ * (`Bearer YWJjZGVmZ2hpamw=` → the entire 16-char token survived). A sigil is
+ * honored ONLY when the head is a recognizable assignment label (env/JSON/URL
+ * param), never inside a bare token; otherwise just the 3-char family head
+ * (sk-/ghp_/eyJ/xox/Bea) stays. */
 function shapeKeepPrefix(matched: string): number {
 	const sigil = /[=:]/.exec(matched);
-	if (sigil && sigil.index <= 24) return sigil.index + 1;
+	if (sigil && sigil.index <= 24) {
+		const head = matched.slice(0, sigil.index);
+		// env-style (PASSWORD), JSON-ish ("password"), URL param (?token).
+		if (/^[?&]?"?[A-Za-z_][A-Za-z0-9_.-]*"?$/.test(head)) return sigil.index + 1;
+	}
 	return Math.min(3, matched.length);
 }
 
@@ -304,16 +348,71 @@ function overlapsProtected(start: number, end: number, spans: Array<[number, num
 	return spans.some(([ps, pe]) => start < pe && end > ps);
 }
 
-/** Value-mask spans over `text`; candidates overlapping a presigned grant span
- * are skipped (the grant is delivered intact by design — 0.2.175). */
-function credentialMaskSpans(text: string, protectedSpans: Array<[number, number]>): MaskSpan[] {
+/** Split a candidate mask span AROUND protected (presigned grant) ranges:
+ * review P1-1 — dropping a candidate that merely INTERSECTS a grant span threw
+ * away the whole mask, so a no-space CJK message gluing the password straight
+ * into the report URL shipped the password in plaintext. We keep every
+ * non-protected sub-range; the grant itself stays intact (0.2.175). */
+function subtractProtected(start: number, end: number, keepPrefix: number, protectedSpans: Array<[number, number]>): MaskSpan[] {
+	const fragments: Array<[number, number]> = [];
+	let cursor = start;
+	for (const [ps, pe] of [...protectedSpans].sort((a, b) => a[0] - b[0])) {
+		if (pe <= cursor) continue;
+		if (ps >= end) break;
+		if (ps > cursor) fragments.push([cursor, Math.min(ps, end)]);
+		cursor = Math.max(cursor, pe);
+		if (cursor >= end) break;
+	}
+	if (cursor < end) fragments.push([cursor, end]);
+	return fragments
+		.filter(([s, e]) => e > s)
+		.map(([s, e], i) => ({
+			start: s,
+			end: e,
+			// keepPrefix is relative to the original span start — only the
+			// first fragment can contain the readable head.
+			keepPrefix: i === 0 ? Math.max(0, Math.min(keepPrefix, e - s)) : 0,
+		}));
+}
+
+/** Label-value capture at the detector's ceiling: the value pattern caps at
+ * 200 chars, so a 220-char secret yields a 200-char capture with the tail
+ * still glued (no whitespace boundary) — no mask span can ever cover that
+ * tail, and main would have withheld the message. A full 200-char capture
+ * followed by a non-space character therefore keeps the fail-closed contract
+ * (review P1-3). */
+function hasOverlongLabelValue(text: string): boolean {
+	for (const pattern of LABEL_VALUE_PATTERNS) {
+		const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
+		for (const m of text.matchAll(global)) {
+			const value = m[1] ?? "";
+			if (value.length >= 200) {
+				const after = text[m.index + m[0].length];
+				if (after && !/\s/.test(after)) return true;
+			}
+		}
+	}
+	return false;
+}
+
+/** Value-mask spans over `text`. Two protection levels (review P1-1):
+ * SHAPE matches subtract around GRANT PARAM spans only — a non-grant
+ * credential param (access_token) on a presigned URL must still be masked;
+ * LABEL-value matches subtract around WHOLE presigned URLs — a labeled value
+ * glued into a report link must never tear the link apart. */
+function credentialMaskSpans(text: string): MaskSpan[] {
 	if (!text) return [];
+	const grantParamSpans = presignedParamSpans(text);
+	const wholeUrlSpans = presignedUrlSpans(text);
 	const spans: MaskSpan[] = [];
 	for (const pattern of SHAPE_PATTERNS) {
 		const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
 		for (const m of text.matchAll(global)) {
 			const start = m.index, end = start + m[0].length;
-			if (overlapsProtected(start, end, protectedSpans)) continue;
+			if (overlapsProtected(start, end, grantParamSpans)) {
+				spans.push(...subtractProtected(start, end, Math.min(shapeKeepPrefix(m[0]), end - start), grantParamSpans));
+				continue;
+			}
 			spans.push({ start, end, keepPrefix: Math.min(shapeKeepPrefix(m[0]), end - start) });
 		}
 	}
@@ -323,7 +422,10 @@ function credentialMaskSpans(text: string, protectedSpans: Array<[number, number
 			const value = m[1] ?? "";
 			if (!value || !looksLikeSecretValue(value)) continue;
 			const start = m.index + m[0].length - value.length;
-			if (overlapsProtected(start, start + value.length, protectedSpans)) continue;
+			if (overlapsProtected(start, start + value.length, wholeUrlSpans)) {
+				spans.push(...subtractProtected(start, start + value.length, 0, wholeUrlSpans));
+				continue;
+			}
 			spans.push({ start, end: start + value.length, keepPrefix: 0 });
 		}
 	}
@@ -355,23 +457,28 @@ function applyCredentialMasks(text: string, spans: MaskSpan[]): string {
 }
 
 /**
- * Fail-closed residue check for the MASKED output: SHAPE patterns only
- * (sk-/JWT/password=/URL-params — high-precision), and only OUTSIDE the spans
- * we already masked (and presigned grants). The label-value heuristics are
- * deliberately NOT re-run here: on masked output they re-match at alternate
- * alignments (lazy skip past 「密码是****」 → capture the next 「https:」 colon →
- * the following URL becomes a phantom "value") — the same false positive the
- * original gate produced on any 「密码是：https://help.example.com」 prose. The
- * first pass already gave every label-value the detector accepts a mask span,
- * so re-running labels here can only re-find phantoms, never real residue.
+ * Fail-closed residue check on the FINAL masked text. Review P2-2: spans were
+ * computed on `redacted` but verified against `masked`, whose length differs
+ * (redaction uses `***`, masks use `****`) — stale coordinates then let a
+ * `?access_token=*******` re-match. Coordinates are therefore recomputed on
+ * the text actually being sent.
+ *
+ * Coverage, stated explicitly (review P2 header note): SHAPE patterns only —
+ * label-detectable residue is structurally invisible here because label
+ * heuristics re-match at phantom alignments on masked output (the
+ * 「密码是****」 → next `https:` colon case). Label coverage comes from
+ * iterative masking in gateOutboundText + the overlong ceiling check, never
+ * from this function.
  */
-function shapeTripsOutside(text: string, maskedSpans: MaskSpan[], protectedSpans: Array<[number, number]>): boolean {
+function shapeTripsOutside(text: string, protectedSpans: Array<[number, number]>): boolean {
 	if (!text) return false;
+	const maskMarkerSpans: Array<[number, number]> = [];
+	for (const m of text.matchAll(/\*{3,}/g)) maskMarkerSpans.push([m.index, m.index + m[0].length]);
 	for (const pattern of SHAPE_PATTERNS) {
 		const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
 		for (const m of text.matchAll(global)) {
 			const start = m.index, end = start + m[0].length;
-			if (overlapsProtected(start, end, maskedSpans.map((s) => [s.start, s.end]))) continue;
+			if (overlapsProtected(start, end, maskMarkerSpans)) continue;
 			if (overlapsProtected(start, end, protectedSpans)) continue;
 			return true;
 		}
@@ -385,28 +492,42 @@ function shapeTripsOutside(text: string, maskedSpans: MaskSpan[], protectedSpans
  * restricted audiences get the masked delivery: every credential span is
  * masked in place (label/prefix readable, value → ****) and a short suffix
  * note states how many spots were masked. Fail-closed withholding remains the
- * fallback when a HIGH-PRECISION shape hit survives outside the masked spans —
- * the mask is the happy path, never a weakening of the gate.
+ * fallback: (1) a label value beyond the detector's 200-char ceiling (review
+ * P1-3 — no mask span can ever cover it); (2) after iterative masking a
+ * high-precision shape hit still survives outside masked/protected spans on
+ * the FINAL text (coordinate-sound, review P2-2). The mask is the happy path,
+ * never a weakening: anything main withholds for safety stays either masked
+ * to nothing or withheld.
  */
 export function gateOutboundText(text: string, audience: CredentialAudience): string {
 	if (audience === "admin-single") return text;
 	const redacted = redactUrlCredentialParams(text);
-	const protectedSpans = presignedParamSpans(redacted);
-	const spans = credentialMaskSpans(redacted, protectedSpans);
-	if (!spans.length) return redacted !== text ? redacted : text;
-	const masked = applyCredentialMasks(redacted, spans);
-	if (shapeTripsOutside(masked, spans, presignedParamSpans(masked))) {
-		// Un-maskable residue: keep the original fail-closed contract.
+	// P1-3: an over-long labeled value cannot produce a mask span at all.
+	if (hasOverlongLabelValue(redacted)) return CREDENTIAL_WITHHELD_NOTICE;
+	let working = redacted;
+	let total = 0;
+	// Iterative masking (review P1-2): a greedy value capture can swallow a
+	// later credential label so it never starts its own match; re-running on the
+	// masked output exposes the next label. Bounded so a pathological text can
+	// never loop forever.
+	for (let pass = 0; pass < 8; pass++) {
+		const spans = credentialMaskSpans(working);
+		if (!spans.length) break;
+		working = applyCredentialMasks(working, spans);
+		total += spans.length;
+	}
+	if (total === 0) return redacted !== text ? redacted : text;
+	if (shapeTripsOutside(working, presignedParamSpans(working))) {
 		return CREDENTIAL_WITHHELD_NOTICE;
 	}
-	return `${masked}${CREDENTIAL_MASKED_SUFFIX.replace("{count}", String(spans.length))}`;
+	return `${working}${CREDENTIAL_MASKED_SUFFIX.replace("{count}", String(total))}`;
 }
 /**
  * Global matcher for credential-bearing URL query params. Shared source with
  * SHAPE_PATTERNS so detection and in-place redaction never drift.
  */
 const URL_TOKEN_PARAM_GLOBAL = new RegExp(
-	`([?&]${URL_TOKEN_PARAM_SOURCE_BODY}=)([^\\s&"\']{6,})`,
+	`([?&]${URL_TOKEN_PARAM_SOURCE_BODY}=)([^\\s&"\'*]{6,})`,
 	"gi",
 );
 

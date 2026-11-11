@@ -499,3 +499,91 @@ test("the cloud defaults keep working regardless of configuration", () => {
 	const oss = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.html?OSSAccessKeyId=LTAIZHYtKQegFGXe&Expires=1795654871&Signature=N9him7VHYYIEdIftaIY5iHWf2iU%3D";
 	assert.equal(gateOutboundText(oss, "restricted"), oss, "aliyuncs.com needs no configuration");
 });
+
+// ─── review ac4d70c5: fuzz-found P1 plaintext-leak regression pins ─────────
+// Every case below was WITHHELD on main but shipped plaintext on the first
+// redact-first draft (800-case fuzz + ~40 hand-built adversarial probes).
+const GRANT = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.xlsx?OSSAccessKeyId=abcd1234&Signature=Sig%2BValue%3D&Expires=9999999999";
+
+test("P1-1: a no-space CJK value glued into a presigned URL is masked, grant intact", () => {
+	const cjk = `密码：Abc_123456巡检报告链接${GRANT}`;
+	const out = gateOutboundText(cjk, "restricted");
+	assert.ok(!out.includes("Abc_123456"), "the password never reaches the group");
+	assert.ok(out.includes("OSSAccessKeyId=abcd1234") && out.includes("Signature=Sig%2BValue%3D"), "the report grant survives untouched");
+	const env = `PASSWORD=hunter2securevalue巡检报告${GRANT}`;
+	const out2 = gateOutboundText(env, "restricted");
+	assert.ok(!out2.includes("hunter2securevalue"), "the env value never reaches the group");
+	assert.ok(out2.includes("OSSAccessKeyId=abcd1234"), "the report grant survives the env-style glue too");
+});
+
+test("P1-2: a greedy capture cannot hide a second credential label", () => {
+	const t = "下一步继续。password: Hunter2Passw0rd下一步继续。password: Hunter2Passw0rd。";
+	const out = gateOutboundText(t, "restricted");
+	assert.ok(!out.includes("Hunter2Passw0rd"), "both values are masked, neither escapes via greedy capture");
+	assert.equal((out.match(/\*{4}/g) ?? []).length >= 2, true, "two mask spans are produced");
+});
+
+test("P1-3: a value beyond the 200-char detector ceiling is withheld, never partially leaked", () => {
+	const long = "密码：" + "A1".repeat(110); // 220 chars — no mask span can ever cover the tail
+	const out = gateOutboundText(long, "restricted");
+	assert.equal(out, CREDENTIAL_WITHHELD_NOTICE, "the fail-closed contract holds for un-maskable values");
+	assert.ok(!out.includes("A1A1A1A1A1"), "no plaintext tail survives");
+});
+
+test("P1-4: base64 padding inside a token never leaks via keep-prefix", () => {
+	const padded = "Bearer YWJjZGVmZ2hpamw=";
+	const out1 = gateOutboundText(padded, "restricted");
+	assert.ok(!out1.includes("YWJjZGVmZ2hpamw"), "the whole padded token is masked");
+	assert.ok(out1.startsWith("Bea****"), "only the 3-char family head stays");
+	const mid = gateOutboundText("Bearer abcdefghijkl=mnopqrstuv", "restricted");
+	assert.ok(!mid.includes("mnopqrstuv"), "the fragment after an in-token = is masked too");
+});
+
+test("P2: high-precision shapes take the masked path; the P2-2 stale-coordinate case no longer withholds", () => {
+	// High-precision shapes are masked in place (happy path), never plaintext.
+	const t = 'tracing header "token":"gk_' + "x".repeat(40) + '"';
+	const out = gateOutboundText(t, "restricted");
+	assert.ok(!out.includes("gk_" + "x".repeat(40)), "the token never reaches the group");
+	assert.ok(out.includes("****"), "the shape value is masked");
+	// Review P2-2 minimal repro: redaction (***) + mask (****) once concatenated
+	// into ?access_token=******* and re-tripped the URL-param shape under STALE
+	// coordinates, so the whole message was spuriously withheld. Iterative
+	// masking recomputes spans on the actual final text — the result is a clean
+	// masked delivery, not the withhold notice.
+	const glued = 'https://r.example.net/d?access_token=gk_abcdef123456"password":"JsonSecret12345"巡检完成，';
+	const out2 = gateOutboundText(glued, "restricted");
+	assert.notEqual(out2, CREDENTIAL_WITHHELD_NOTICE, "no spurious withhold from stale coordinates");
+	assert.ok(!out2.includes("gk_abcdef123456") && !out2.includes("JsonSecret12345"), "both secrets are masked");
+	// shapeTripsOutside remains as defense-in-depth for an internal span bug;
+	// under correct masking every shape hit already has a span, so the happy
+	// path carries the suffix note rather than the withhold notice.
+	const happy = gateOutboundText("密码是 Abc_123456 谢谢", "restricted");
+	assert.ok(happy.includes("脱敏"), "ordinary hits take the masked-delivery path, not withholding");
+});
+
+test("P3: masked output is idempotent and carries exactly one suffix note", () => {
+	const once = gateOutboundText("密码是 Abc_123456 谢谢", "restricted");
+	assert.equal(gateOutboundText(once, "restricted"), once, "re-gating masked text changes nothing");
+	assert.equal((once.match(/已脱敏/g) ?? []).length, 1, "exactly one suffix note");
+});
+
+test("P3: streamed accumulation converges to one suffix, no secret in any gated frame", () => {
+	// Replicates makeGatedChannel's accumulation discipline (widget-service):
+	// per-push gating over the growing text, final flush gates the whole text.
+	const chunks = ["好的，", "账号/密码：", "xxxx/", "yyyy@Y13z"];
+	let full = "", sent = "";
+	const frames = [];
+	for (const delta of chunks) {
+		full += delta;
+		const safe = gateOutboundText(full, "restricted");
+		if (safe === sent) continue;
+		if (safe.startsWith(sent)) frames.push(["delta", safe.slice(sent.length)]);
+		else frames.push(["replace", safe]);
+		sent = safe;
+	}
+	const final = gateOutboundText(full, "restricted");
+	if (final !== sent) frames.push(["flush", final]);
+	const wire = JSON.stringify(frames);
+	assert.ok(!wire.includes("yyyy@Y13z"), "the credential never appears in any frame");
+	assert.ok((final.match(/已脱敏/g) ?? []).length <= 1, "the final bubble carries at most one suffix note");
+});
