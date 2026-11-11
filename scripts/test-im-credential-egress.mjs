@@ -954,6 +954,42 @@ test("R9: credential URLs redact concrete sibling params, nested tails and paths
 	}
 });
 
+test("R10: signed structural params on verified presigned grants are never generic-redacted", () => {
+	// Changing X-Amz-Algorithm / response-content-disposition / x-oss-process
+	// invalidates the signature without removing any credential: they must be
+	// delivered byte-verbatim (main parity).
+	const cases = [
+		"巡检完成。详见https://bucket.oss-cn-hangzhou.aliyuncs.com/r.xlsx?OSSAccessKeyId=KeyAbc123&Expires=1799999999&Signature=aBc%2BdEf%3D123456&response-content-disposition=attachment%3B%20filename%3D%22daily-report.xlsx%22",
+		"巡检完成。详见https://bucket.oss-cn-hangzhou.aliyuncs.com/r.png?OSSAccessKeyId=KeyAbc123&Expires=1799999999&Signature=aBc%2BdEf%3D123456&x-oss-process=style/preview1024",
+		"https://b.s3.us-east-1.amazonaws.com/d.xlsx?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE&X-Amz-Date=20261111T000000Z&X-Amz-Signature=deadbeef00",
+	];
+	for (const text of cases) {
+		assert.equal(gateOutboundText(text, "restricted"), text, "verified grant structural params survive verbatim");
+	}
+});
+
+test("R10: safe nested report links survive a preceding redacted credential", () => {
+	// The nested-tail cleanup must not delete ordinary CJK-glued report links
+	// that merely follow an already-redacted credential (main truncated these;
+	// we preserve them). Concrete nested secrets are still removed.
+	const safe = [
+		"报告一https://gitee.com/o/r/raw/master/a.xlsx?access_token=***，报告二https://gitee.com/o/r/raw/master/b.xlsx?access_token=***",
+		"报告一https://gitee.com/o/r/raw/master/a.xlsx?access_token=***，明细https://docs.example.com/日报.md",
+		"https://gitee.com/o/r/raw/master/a.xlsx?access_token=***，请查收。",
+	];
+	for (const text of safe) {
+		assert.equal(gateOutboundText(text, "restricted"), text, "safe nested links and prose survive verbatim");
+	}
+	for (const text of [
+		"巡检完成。详见https://gitee.com/o/r/raw/master/f.xlsx?access_token=***，详见https://example.com/Abc_123456",
+		"巡检完成。详见https://gitee.com/o/r/raw/master/f.xlsx?access_token=**x，详见https://example.com/Abc_123456",
+	]) {
+		const out = gateOutboundText(text, "restricted");
+		assert.ok(!out.includes("Abc_123456"), "concrete nested tails stay blocked");
+		assert.equal(gateOutboundText(out, "restricted"), out, "the result remains stable on recheck");
+	}
+});
+
 test("R6: arbitrary URL markers cannot exempt plaintext residue", () => {
 	for (const query of ["foo=***", "access_token=***", "access_token=sekret"]) {
 		for (const prefix of ["", "密码：First_123456 "]) {

@@ -271,6 +271,29 @@ function isConcreteUrlPathSegment(part: string): boolean {
 	return looksLikeSecretValue(decoded.replace(REPORT_FILE_EXTENSION, ""));
 }
 
+/** A nested URL following an already-redacted credential may be ordinary prose
+ * (another report/document link), not necessarily a secret tail. Preserve it
+ * only when its path and query contain no concrete unredacted value. */
+function isSafeNestedCredentialTailUrl(raw: string): boolean {
+	const url = raw.replace(URL_TRAILING_NOISE, "");
+	if (isPresignedObjectUrl(url)) return true;
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return false;
+	}
+	const path = parsed.pathname;
+	const giteeRaw = hostMatches(parsed.hostname.toLowerCase(), "gitee.com") && /^\/[^/]+\/[^/]+\/raw\//.test(path);
+	const candidatePath = giteeRaw ? path.slice(path.indexOf("/raw/") + 5) : path;
+	if (candidatePath.split("/").some((part) => isConcreteUrlPathSegment(part))) return false;
+	for (const [, value] of parsed.searchParams) {
+		if (!value || /^\*+$/.test(value)) continue;
+		if (value.length > 200 || looksLikeSecretValue(value)) return false;
+	}
+	return true;
+}
+
 /**
  * Char spans of the grant-carrying param ASSIGNMENTS inside presigned URLs
  * (name + = + value) — DETECTION-level protection: these params are an access
@@ -767,6 +790,7 @@ const REDACTED_URL_NESTED_TAIL_GLOBAL = new RegExp(
 	`([?&]${URL_TOKEN_PARAM_SOURCE_BODY}=)(?=[^\\s&"']*\\*)(?=[^\\s&"']*https?:\\/\\/)[^\\s&"']*`,
 	"gi",
 );
+const NESTED_URL_SPAN_PATTERN = /https?:\/\/[^\s<>"']*/g;
 
 /**
  * Redact just the credential param values inside URLs (e.g. a Gitee
@@ -795,6 +819,11 @@ function redactUrlCredentialParams(text: string): string {
 	const siblingsRedacted = redacted.replace(URL_REDACTION_SPAN_PATTERN, (matched: string, offset: number) => {
 		const url = matched.replace(URL_TRAILING_NOISE, "");
 		if (!URL_CREDENTIAL_NAME_PATTERN.test(url)) return matched;
+		// The first pass already redacts every credential-NAMED non-grant param.
+		// Do not generic-redact signed structural params on a verified grant
+		// (X-Amz-Algorithm, response-content-disposition, x-oss-process): changing
+		// them invalidates the signature without removing a credential.
+		if (isPresignedObjectUrl(url)) return matched;
 		const stripped = url.replace(URL_ANY_PARAM_GLOBAL, (assignment: string, prefix: string, value: string, localOffset: number) => {
 			const absolute = offset + localOffset;
 			if (grantSpans.some(([start, end]) => absolute < end && absolute + assignment.length > start)) return assignment;
@@ -836,8 +865,21 @@ function redactUrlCredentialParams(text: string): string {
 		return result + matched.slice(url.length);
 	});
 	const cleanupGrantSpans = presignedParamSpans(siblingsRedacted);
-	return siblingsRedacted.replace(REDACTED_URL_NESTED_TAIL_GLOBAL, (match: string, prefix: string, offset: number) =>
-		cleanupGrantSpans.some(([start, end]) => offset < end && offset + match.length > start) ? match : `${prefix}***`);
+	return siblingsRedacted.replace(REDACTED_URL_NESTED_TAIL_GLOBAL, (match: string, prefix: string, offset: number) => {
+		if (cleanupGrantSpans.some(([start, end]) => offset < end && offset + match.length > start)) return match;
+		const nestedAt = match.search(/https?:\/\//);
+		const tail = nestedAt >= 0 ? match.slice(nestedAt) : "";
+		if (!tail || [...tail.matchAll(NESTED_URL_SPAN_PATTERN)].some((m) => !isSafeNestedCredentialTailUrl(m[0]))) {
+			return `${prefix}***`;
+		}
+		// Safe nested report/document links and their CJK prose survive. Only the
+		// credential-shaped prefix is normalized; no legitimate trailing URL is
+		// deleted merely because it follows a redaction marker.
+		const before = match.slice(prefix.length, nestedAt);
+		const proseAt = before.search(/[\u0080-\uffff]/);
+		const prose = proseAt >= 0 ? before.slice(proseAt) : "";
+		return `${prefix}***${prose}${tail}`;
+	});
 }
 
 /**
