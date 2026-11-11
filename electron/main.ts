@@ -1709,7 +1709,8 @@ ${tailForProgress(decision.text)}`;
 	workerTaskStoreHolder.store = workerTaskStore;
 	const workerService = new WorkerService(workerTaskStore, {
 		// Keep-alive window (user ruling 2026-11-11, spay code-handoff incident):
-		// a config getter so a settings-page change applies without a restart.
+		// a live config getter so config changes apply without a restart
+		// (config-file/API — no settings-UI control for this flag yet).
 		keepAliveMinutes: () => {
 			try { return config.all().general.workerKeepAliveMin; } catch { return undefined; }
 		},

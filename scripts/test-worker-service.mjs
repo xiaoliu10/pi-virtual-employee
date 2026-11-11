@@ -561,6 +561,8 @@ test("keepAliveRemainingMs drives the settle-sweep deferral", async () => {
 	};
 	assert.equal(mk({ keepAliveMinutes: 0 }, now - 60_000).keepAliveRemainingMs("dt:r"), 0, "disabled → 0");
 	assert.equal(mk({}, now - 3 * 60 * 60_000).keepAliveRemainingMs("dt:r"), 0, "expired → 0");
+	assert.equal(mk({}, now - 60_000, "cancelled").keepAliveRemainingMs("dt:r"), 0, "cancelled → cold even fresh (review P2-3)");
+	assert.equal(mk({}, now - 60_000, "error").keepAliveRemainingMs("dt:r"), 0, "error → cold even fresh (review P2-3)");
 	const hot = mk({}, now - 60_000).keepAliveRemainingMs("dt:r");
 	assert.ok(hot > 118 * 60_000 && hot <= 120 * 60_000, "hot done worker → ~full window remains");
 	const live = mk({}, now, "running").keepAliveRemainingMs("dt:r");
@@ -716,6 +718,26 @@ test("a LIVE worker still owns the dialogue unconditionally", async () => {
 		VALUES ('wlive', '长任务执行中', 'dt:group:g1', 'ma1', 'running', 'worker:wlive', ?, ?)`).run(now, now);
 	const taskMsg = "0002026110800003400。帮我查一下这笔流水的支付渠道下单日志，先查 spay 再查 sls，然后汇总异常";
 	assert.equal(await service.inject("dt:group:g1", taskMsg, "ma1"), true, "even task-shaped text reaches a running worker (verification codes etc.)");
+	assert.equal(await service.inject("dt:group:g1", "辛苦了", "ma1"), true, "conversational reaches a LIVE worker too (matrix cell pin, review P3-3)");
+});
+
+test("cancelled and interrupted workers stay COLD-GATED inside the window (review P2-3)", async () => {
+	// The keep-alive window is a DONE worker's aftermath-ownership. cancelled =
+	// the user pulled the work back via 「前台执行」 — if the foreground rerun
+	// then asks for a code, the code must reach the FOREGROUND that asked, not
+	// the cancelled session. error = interrupted — the in-memory session is
+	// gone with the restart and the contract is 「重新执行」. Conversational
+	// stickiness (结果呢) is unchanged for both.
+	const { h, service } = harness();
+	const past = Date.now() - 60 * 60_000; // fresh — deep inside a would-be window
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wcanc', 'x', 'dt:cold1', 'u1', 'cancelled', 'worker:wcanc', ?, ?, ?)`).run(past, past, past);
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, error, conversation_id, created_at, started_at, finished_at)
+		VALUES ('werr', 'x', 'dt:cold2', 'u1', 'error', '应用在执行中退出，该轮未跑完（可回复「重新执行」重跑）', 'worker:werr', ?, ?, ?)`).run(past, past, past);
+	assert.equal(await service.inject("dt:cold1", "875055", "u1"), false, "cancelled-hot: bare tokens still fall through to the foreground");
+	assert.equal(await service.inject("dt:cold2", "786199", "u1"), false, "error-hot: bare tokens still fall through (empty session cannot honour them)");
+	assert.equal(await service.inject("dt:cold1", "结果呢", "u1"), true, "cancelled: conversational stickiness unchanged");
+	assert.equal(await service.inject("dt:cold2", "重新执行", "u1"), true, "error: the deterministic re-run contract is untouched");
 });
 
 test("a narration-suppressed DISPATCH round pushes only the honest notice and never settles as success", async () => {

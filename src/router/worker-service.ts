@@ -348,8 +348,23 @@ export class WorkerService<Session> {
 		const recent = this.store.recentForConversation(conversationId);
 		if (!recent?.conversation_id) return 0;
 		if (LIVE_WORKER_STATUSES.has(recent.status)) return keepMs;
-		const last = Math.max(recent.finished_at ?? recent.started_at ?? recent.created_at ?? 0, this.injectActivity.get(conversationId) ?? 0);
-		return Math.max(0, last + keepMs - this.clock.now());
+		// The window is a DONE worker's aftermath-ownership only (review P2-3):
+		// error = interrupted — the in-memory session is gone and the contract is
+		// 「重新执行」; cancelled = the user pulled the work back via 「前台执行」,
+		// so the foreground owns the dialogue (and its payloads) again. Both stay
+		// cold-gated even when their timestamps are fresh — a bare code after an
+		// escape must reach the session that asked for it.
+		if (recent.status !== "done") return 0;
+		return Math.max(0, this.lastActivityAt(recent, conversationId) + keepMs - this.clock.now());
+	}
+
+	/** Shared sliding anchor for the keep-alive window (review P2-2 — ONE
+	 * definition for both consumers: routing heat and sweep deferral). The
+	 * row's completion time with a started/created fallback so a schema-NULL
+	 * finished_at can never fork the two paths, maxed with the last hot
+	 * injection. */
+	private lastActivityAt(recent: WorkerTaskRow, conversationId: string): number {
+		return Math.max(recent.finished_at ?? recent.started_at ?? recent.created_at ?? 0, this.injectActivity.get(conversationId) ?? 0);
 	}
 
 	async inject(sourceConversation: string, message: string, senderId: string): Promise<boolean> {
@@ -399,12 +414,15 @@ export class WorkerService<Session> {
 		// The transcript itself is bounded by the engine's pre-turn budget gate +
 		// compaction, NOT by refusing the dialogue.
 		const isLive = LIVE_WORKER_STATUSES.has(recent.status);
-		let hot = isLive;
-		if (!hot) {
+		// Keep-alive is a DONE worker's aftermath-ownership (review P2-3): error
+		// (interrupted; empty session; contract = 「重新执行」) and cancelled
+		// (user pulled the work back) stay cold-gated even when fresh.
+		let hot = false;
+		if (isLive) hot = true;
+		else if (recent.status === "done") {
 			const keepMs = this.keepAliveWindowMs();
 			if (keepMs > 0) {
-				const last = Math.max(recent.finished_at ?? 0, this.injectActivity.get(sourceConversation) ?? 0);
-				hot = this.clock.now() - last < keepMs;
+				hot = this.clock.now() - this.lastActivityAt(recent, sourceConversation) < keepMs;
 			}
 		}
 		// Task-shaped requests to a FINISHED worker fall through regardless of

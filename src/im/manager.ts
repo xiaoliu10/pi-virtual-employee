@@ -184,6 +184,11 @@ export class IMAdapterManager {
 	}
 
 	async stopAll(): Promise<void> {
+		// Keep-alive deferral timers live up to window+1s (minutes, not seconds
+		// like the old 5s sweep) — they must not outlive the IM stack and fire
+		// kills/pushes into a stopped manager (review P3-1).
+		for (const t of this.inventoryTimers.values()) clearTimeout(t);
+		this.inventoryTimers.clear();
 		for (const adapter of this.active.values()) {
 			try {
 				await adapter.stop();
@@ -888,7 +893,7 @@ export class IMAdapterManager {
 		conversationId: string,
 		cmd: ParsedCommand,
 		actor?: InboundActor,
-		userText?: string,
+		_userText?: string,
 	): string | Promise<string> {
 		if (cmd.name === "new" || cmd.name === "stop" || cmd.name === "steer") {
 			// Intercepted in makeIO (they must bypass the queue). Reaching here would
