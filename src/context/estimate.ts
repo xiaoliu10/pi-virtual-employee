@@ -76,7 +76,23 @@ export function estimateMessageTokens(message: AgentMessage): number {
 	// same block is never counted twice and image-heavy transcripts compact
 	// before they hit the provider's hard limit.
 	const piWithoutImages = Math.max(0, estimateTokens(message) - images * PI_IMAGE_BASELINE_TOKENS);
-	return Math.max(estimateTextTokens(messageText(message)), piWithoutImages)
+	// pi-session projection system messages carry the prompt in `sections`
+	// (Record<string, string|undefined>) — pi counts them at chars÷4, a ~4×
+	// under-count for CJK (review e7db0afd P2-A, probe: 10_012 CJK chars →
+	// 2_521 tokens). Fold each section through the CJK-aware estimator: the
+	// sections ARE the real employee prompt on that path, and under-counting
+	// it starves the budget gates exactly like the image blind-spot did.
+	// SAFETY: pi's projection system messages carry the prompt in a `sections`
+	// record that the public AgentMessage union does not declare; read it as
+	// unknown and validate before use (same pattern as countImageParts below).
+	const sections = (message as unknown as { sections?: Record<string, string | undefined> }).sections;
+	let sectionsEstimate = 0;
+	if (sections) {
+		for (const v of Object.values(sections)) {
+			if (v) sectionsEstimate += estimateTextTokens(v);
+		}
+	}
+	return Math.max(estimateTextTokens(messageText(message)) + sectionsEstimate, piWithoutImages)
 		+ images * VISION_TOKENS_PER_IMAGE;
 }
 

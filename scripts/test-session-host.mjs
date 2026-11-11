@@ -155,4 +155,10 @@ test("the PROVIDER-visible system prompt is the agent's real prompt, never the l
 	const wire = seen.join("\n");
 	assert.ok(wire.includes("EMPLOYEE-REAL-PROMPT-MARKER"), "the provider must see the agent's REAL system prompt");
 	assert.ok(!wire.includes("VE session host"), "the loader stub must never reach the provider (field: worker printed shell fences as chat)");
+	// P2-B (review e7db0afd): a second turn must not re-send or duplicate the
+	// prompt patch — the marker stays exactly once in the per-request wire.
+	await host.session.prompt("第二轮", { expandPromptTemplates: false });
+	const last = seen[seen.length - 1];
+	const count = (last.match(/EMPLOYEE-REAL-PROMPT-MARKER/g) || []).length;
+	assert.equal(count, 1, `prompt must appear exactly once per request (got ${count} on turn 2)`);
 });
