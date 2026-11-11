@@ -56,10 +56,10 @@
     "verify:asar:linux": "node scripts/verify-asar.mjs release/linux-unpacked/resources/app.asar"
   },
   "dependencies": {
-    "@earendil-works/chord": "1.5.0",
-    "@earendil-works/pi-agent-core": "^1.2.0",
-    "@earendil-works/pi-ai": "^1.2.0",
-    "@earendil-works/pi-durable": "1.5.0",
+    "@earendil-works/chord": "1.5.2",
+    "@earendil-works/pi-agent-core": "^1.5.2",
+    "@earendil-works/pi-ai": "^1.5.2",
+    "@earendil-works/pi-durable": "1.5.2",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@types/adm-zip": "^0.5.8",
     "adm-zip": "^0.6.0",
@@ -78,7 +78,7 @@
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^1.2.0",
+    "@earendil-works/pi-coding-agent": "^1.5.2",
     "@electron/asar": "^3.4.1",
     "@electron/rebuild": "^4.2.0",
     "@types/ali-oss": "^6.23.3",
