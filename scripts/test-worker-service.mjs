@@ -772,3 +772,13 @@ test("a bare token with NO pending ask still goes to the foreground (unchanged)"
 	assert.equal(injected, false, "an ordinary reference still resolves in the foreground");
 	assert.equal(h.sends.length, 0, "nothing routed into the settled session");
 });
+
+test("an ask settled into the ERROR column (narration-noted zero-action turn) also captures the answer (review 20886054 P2-2)", async () => {
+	const { h, service } = harness();
+	const past = Date.now() - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, error, conversation_id, created_at, started_at, finished_at)
+		VALUES ('werr', '查订单', 'dt:group:g1', 'ma1', 'done', '⚠️ 本轮只产出过程叙述、未调用任何工具……我需要你提供订单号才能继续。', 'worker:werr', ?, ?, ?)`).run(past, past, Date.now() - 60_000);
+	const injected = await service.inject("dt:group:g1", "0002026110800003400", "ma1");
+	assert.equal(injected, true, "the answer reaches the asking session even from the error column");
+	assert.deepEqual(h.sessions, ["worker:werr"]);
+});

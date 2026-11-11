@@ -167,22 +167,35 @@ export function isBareContextToken(text: string): boolean {
 	return BARE_CONTEXT_TOKEN_RE.test(t);
 }
 
-/** True when a settled worker reply ENDS by asking the user to send something
- * (a verification code / password / id / a choice) — the natural pause of an
- * interactive run. Deliberately NARROW: only explicit user-directed asks
- * match, so ordinary completion reports never capture later bare tokens —
- * uncertain shapes fail open toward the foreground (the pre-fix behaviour).
+/** True when a settled worker reply's LAST sentence asks the user to send
+ * something (a verification code / password / id) — the natural pause of an
+ * interactive run. Deliberately NARROW, in BOTH dimensions:
+ *
+ * · Tail-anchored: only the last ~160 chars are examined. Review 20886054 P1-1
+ *   probe-proved that full-text matching catches mid-report quotations and
+ *   past-tense narration (「登录页一直提示请输入验证码，重试三次后放弃」「系统告诉我
+ *   该订单已退款」) and would silently re-open the 2026-11-08 bare-token
+ *   incident via an incidental substring; the ask that captures an answer is
+ *   by definition the LAST thing the worker said.
+ * · Curated branches only: the loosest shapes (告诉我/需要你/\d位数字) are gone
+ *   for the same reason. Quoted UI prompts are excluded via lookbehind. Every
+ *   uncertain shape fails open toward the foreground (the pre-fix behaviour).
+ *   Known misses (accepted): English asks, 「请回复 1 或 2」选择题, asks inside
+ *   error/cancel columns of non-terminal runs.
  *
  * Field 2026-11-10: a spay-login worker ended its turn with 「……发给我（6位
  * 数字），我立刻用它完成登录继续跑。」; the user's bare 「847159」 hit the
  * bare-token gate and fell to a foreground that had NEVER seen the question
  * (worker deliveries are push-only since 0.2.208, they never enter the chat
  * history), so the model answered 「这串数字我这边没有对应的上下文」. */
-const INPUT_REQUEST_RE = /(发给我|发我|告诉我|回复我|回我一下|请提供|请输入|请填写|请把.{0,24}发|把.{0,24}发给|需要你|等你.{0,8}(发|提供|回复)|收到.{0,16}(后|再).{0,12}(我|继续)|\d\s*位(数字|验证码))/;
+const INPUT_REQUEST_RE = /(发给我|发我一下|(?<!提示|要求|让)请输入|请填写|请提供|需要你(提供|回复|发送|发我|确认|补充|上传)|回复我|回我一下|把.{0,24}发给我|收到.{0,12}(后|再)(我)?(立刻|马上|就|再)?(继续|执行|完成|用它))/;
 export function looksLikeInputRequest(text: string): boolean {
 	const t = (text ?? "").trim();
-	if (!t || t.length > 2000) return false;
-	return INPUT_REQUEST_RE.test(t);
+	if (!t) return false;
+	// Tail window only (review 20886054 P1-1/P2-1): bounds cost on any length
+	// and matches the semantics — the ask is the last thing that was said.
+	const tail = t.length > 160 ? t.slice(-160) : t;
+	return INPUT_REQUEST_RE.test(tail);
 }
 
 /** Does the message ask a question (which must never go to the background)? */

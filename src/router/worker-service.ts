@@ -371,16 +371,22 @@ export class WorkerService<Session> {
 		// verification-code flow (field 2026-11-07) is served above this gate.
 		//
 		// EXCEPTION — the ask-then-settled handoff (field 2026-11-10, spay group):
-		// when the finished worker's RESULT is itself an input request, the bare
+		// when the finished worker's settled output is an input request, the bare
 		// token IS the answer to that ask. The foreground cannot resolve it: the
 		// question was the WORKER's last delivery, and worker deliveries are
 		// push-only (0.2.208) — they never entered the chat history the front
 		// turn rehydrates, so the front model saw a naked 「847159」 and asked
 		// what it means. Route it into the asking worker's session instead — the
-		// same session the LIVE handoff serves, one turn later. Only the exact
-		// ask shape (looksLikeInputRequest) captures the answer; every other bare
-		// token keeps the foreground resolution path.
-		if (!LIVE_STATUSES.has(recent.status) && isBareContextToken(message) && !looksLikeInputRequest(recent.result ?? "")) {
+		// same session the LIVE handoff serves, one turn later. The error column
+		// is included too: narration-noted turns settle there and may end with
+		// the model's own ask (review 20886054 P2-2); ⚠️ system notices and
+		// interrupt markers never match the ask shape. Only the exact ask shape
+		// (looksLikeInputRequest) captures the answer; every other bare token
+		// keeps the foreground resolution path. Known residues (accepted,
+		// review 20886054): asks in cancelled/errored runs whose result/error was
+		// overwritten by the terminal notice, and sessions dead across a restart
+		// (in-memory transcript) — both fall through to the foreground.
+		if (!LIVE_STATUSES.has(recent.status) && isBareContextToken(message) && !looksLikeInputRequest(recent.result ?? recent.error ?? "")) {
 			return false;
 		}
 		const session = await this.opts.open(recent.conversation_id);

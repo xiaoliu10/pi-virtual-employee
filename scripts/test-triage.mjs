@@ -360,18 +360,32 @@ test("isBareContextToken: cap boundary + CJK exclusion", () => {
 	}
 });
 
-test("looksLikeInputRequest: explicit user-directed asks match (the spay field shape)", () => {
-	// The exact field message (2026-11-10, spay group).
+test("looksLikeInputRequest: explicit tail asks match (the spay field shape + variants)", () => {
+	// The exact field message (2026-11-10, spay group) — ask sits in the tail.
 	const field = "是的，如果是 spay 系统登录流程走到的验证码环节，那确实是我（或后台任务）触发登录时系统发到你手机的。你刚收到的是哪条？如果是 spay 生产环境的短信验证码，发给我（6位数字），我立刻用它完成登录继续跑。";
-	assert.equal(looksLikeInputRequest(field), true, "发给我（6位数字） must match");
-	assert.equal(looksLikeInputRequest("请把手机收到的 6 位验证码发给我，我继续登录。"), true);
-	assert.equal(looksLikeInputRequest("需要你提供一下工号，我再继续查。"), true);
+	assert.equal(looksLikeInputRequest(field), true, "发给我（6位数字） in the tail must match");
+	assert.equal(looksLikeInputRequest("详情页打不开，请提供订单号，我继续查。"), true);
 	assert.equal(looksLikeInputRequest("收到验证码后我再继续。"), true);
+	assert.equal(looksLikeInputRequest("核对无误，请把回执发给我即可结束。"), true);
 });
 
-test("looksLikeInputRequest: completion reports and past-tense narration never match", () => {
-	assert.equal(looksLikeInputRequest("导出完成：最近7天共 37 笔，已生成报表。"), false);
-	assert.equal(looksLikeInputRequest("已在登录页输入账号，等待下一步。"), false, "已输入 is past tense, not an ask");
-	assert.equal(looksLikeInputRequest("任务失败：目标站点 502 超时。"), false);
-	assert.equal(looksLikeInputRequest(""), false);
+test("looksLikeInputRequest: real completion/error reports NEVER match (review 20886054 P1-1 probes)", () => {
+	// Every line below is a normal report shape that full-text matching used to
+	// catch via an incidental substring — the silent re-entry of the 2026-11-08
+	// bare-token incident.
+	assert.equal(looksLikeInputRequest("任务失败：登录页一直提示请输入验证码，重试三次后放弃。"), false, "quoted UI prompt (提示请输入)");
+	assert.equal(looksLikeInputRequest("查完了：系统告诉我该订单已于昨日退款。"), false, "转述来源（告诉我）");
+	assert.equal(looksLikeInputRequest("导出完成：共 37 笔，其中 6 位数字的旧单号已全部标注。"), false, "\d位数字 in a report");
+	assert.equal(looksLikeInputRequest("已修复。之后如再遇到需要你授权的操作，我会先问你。"), false, "需要你 in a completion note");
+	assert.equal(looksLikeInputRequest("收到数据后我立刻做了三重比对，无差异。"), false, "past-tense 收到…后我…");
+	assert.equal(looksLikeInputRequest("报表已生成，请把文件转发给财务组即可。"), false, "outbound 转发给…, not an input ask");
+});
+
+test("looksLikeInputRequest: tail-anchored — ask survives in long reports, mid-text asks do not capture", () => {
+	// P2-1: a long report (>2000 chars) whose LAST sentence asks must still match.
+	const pad = "报表明细：" + "甲乙丙丁戊己庚辛壬癸".repeat(250) + "。";
+	assert.ok(pad.length > 2000);
+	assert.equal(looksLikeInputRequest(pad + "下一步需要登录复核，请把手机收到的验证码发给我。"), true, "tail ask in a long report");
+	// A mid-report ask followed by a long completion tail does NOT capture.
+	assert.equal(looksLikeInputRequest("中途请提供工号核验。" + pad + "全部完成，报表已生成。"), false, "stale mid-report ask");
 });
