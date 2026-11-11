@@ -97,8 +97,15 @@ const LABEL_VALUE_PATTERNS: RegExp[] = [];
 for (const label of [...SECRET_LABELS_ZH, ...SECRET_LABELS_EN]) {
 	// Separator form: 密码：xxx / 密码是 xxx / 密码还是 xxx / password: xxx / **密码**：`xxx`
 	// 0x60 = backtick, kept as an escape so the character class stays readable.
+	// Separator form, two branches (review round-3 backstop false-positive):
+	// a bare `[:：=]` right after the label keeps full main parity (values
+	// starting with `//` included), but a colon reached through a NON-EMPTY
+	// gap must not be the scheme colon of a glued `https://` — otherwise the
+	// fail-closed backstop re-reads 「密码：****https://bucket…」 as
+	// label+gap「https」+sep「:」+value「//bucket…」 and withholds benign
+	// report pushes. Zero-gap CJK separators stay a third alternative.
 	LABEL_VALUE_PATTERNS.push(new RegExp(
-		String.raw`(?<![A-Za-z0-9_])(?:${label})[^\n]{0,12}?(?:[:：=]|是|为|还是|改成|改为|变成|重置成|重设为|修改成)\s*[*_\x60"'“”「『(（]*${TAMPERED_VALUE}`,
+		String.raw`(?<![A-Za-z0-9_])(?:${label})(?:[:：=]|[^\n]{1,12}?(?:[:：=](?!\/\/)|是|为|还是|改成|改为|变成|重置成|重设为|修改成)|是|为|还是|改成|改为|变成|重置成|重设为|修改成)\s*[*_\x60"'“”「『(（]*${TAMPERED_VALUE}`,
 		"iu",
 	));
 	// Verb-first form: 正在用密码 xxx 登录 / 拿 token xxx 调接口 / 输入口令 xxx.
@@ -114,7 +121,7 @@ for (const label of [...SECRET_LABELS_ZH, ...SECRET_LABELS_EN]) {
  * and their concatenations like  *******) must never re-trip the shape in a
  * later masking pass (review: iterative-mask self-excitation). */
 const URL_TOKEN_PARAM_SOURCE_BODY =
-	"(?:password|passwd|pwd|secret|token|api_?key|apikey|access_?token|access_?key|OSSAccessKeyId|Signature|X-Amz-Signature|X-Amz-Credential)";
+	"(?:password|passwd|pwd|secret|client[-_]?secret|credential|passphrase|private[-_]?key|auth[-_]?token|token|api[-_]?key|apikey|access[-_]?token|access[-_]?key|OSSAccessKeyId|Signature|X-Amz-Signature|X-Amz-Credential)";
 const URL_TOKEN_PARAM_VALUE = "[^\\s&\"'*]{6,}";
 
 /**
@@ -212,7 +219,7 @@ function isPresignedObjectUrl(url: string): boolean {
  * path) at 0x7F keeps the grant intact AND lets glued CJK prose be masked. The
  * `\?` is required — every presigned grant has a query, and a span without one
  * is never a grant, so nothing to protect is lost. */
-const OBJECT_URL_SPAN_PATTERN = /https?:\/\/[^\s<>"']*\?[^\s<>"'\u0080-\uffff]+/g;
+const OBJECT_URL_SPAN_PATTERN = /https?:\/\/[^\s<>"'?]*\?[^\s<>"',;\u0080-\uffff]+/g;
 /** CJK/bracket punctuation that glues onto a URL in prose but is not part of it. */
 const URL_TRAILING_NOISE = /[)\]}>，。；！？、）】」』”’…]+$/;
 
@@ -427,6 +434,14 @@ function credentialMaskSpans(text: string): MaskSpan[] {
 		for (const m of text.matchAll(global)) {
 			const start = m.index, end = start + m[0].length;
 			if (overlapsProtected(start, end, grantParamSpans)) {
+				// Review N4: a match that STARTS inside a grant param (the grant's
+				// own `Signature=…` whose CJK value class swallowed trailing prose
+				// like 「。请查收」) is grant + incidental tail — exempt it whole.
+				// Emitting the tail as a fragment produced false masks on benign
+				// report pushes. A match starting OUTSIDE protection (e.g. a
+				// non-grant `credential=` param glued to a labeled secret) still
+				// subtracts, keeping the M1b defense.
+				if (grantParamSpans.some(([ps, pe]) => start >= ps && start < pe)) continue;
 				spans.push(...subtractProtected(start, end, Math.min(shapeKeepPrefix(m[0]), end - start), grantParamSpans));
 				continue;
 			}
@@ -471,9 +486,13 @@ function credentialMaskSpans(text: string): MaskSpan[] {
 			idx = text.indexOf(val, idx + val.length);
 		}
 	}
-	spans.sort((a, b) => a.start - b.start || a.end - b.end);
+	// Review N4(ii): a span whose keepPrefix covers its whole length masks
+	// nothing yet would still append `****` and bump the count — drop no-ops so
+	// the iterative gate loop structurally converges.
+	const effective = spans.filter((s) => s.keepPrefix < s.end - s.start);
+	effective.sort((a, b) => a.start - b.start || a.end - b.end);
 	const merged: MaskSpan[] = [];
-	for (const span of spans) {
+	for (const span of effective) {
 		const prev = merged[merged.length - 1];
 		if (prev && span.start <= prev.end) {
 			prev.end = Math.max(prev.end, span.end);
@@ -512,6 +531,24 @@ function applyCredentialMasks(text: string, spans: MaskSpan[]): string {
  * iterative masking in gateOutboundText + the overlong ceiling check, never
  * from this function.
  */
+/** Full main-equivalent detection over text, with grant params AND mask markers
+ * (`***`/`****` fillers) pre-cleared so masked artifacts never re-trip. Spans
+ * are sorted and merged because containsConcreteCredentialIn splices them out
+ * with a forward cursor. */
+function finalCredentialCheck(text: string): boolean {
+	if (!text) return false;
+	const cleared: Array<[number, number]> = [...presignedParamSpans(text)];
+	for (const m of text.matchAll(/\*{3,}/g)) cleared.push([m.index, m.index + m[0].length]);
+	cleared.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+	const merged: Array<[number, number]> = [];
+	for (const span of cleared) {
+		const prev = merged[merged.length - 1];
+		if (prev && span[0] <= prev[1]) prev[1] = Math.max(prev[1], span[1]);
+		else merged.push([span[0], span[1]]);
+	}
+	return containsConcreteCredentialIn(text, merged);
+}
+
 function shapeTripsOutside(text: string, protectedSpans: Array<[number, number]>): boolean {
 	if (!text) return false;
 	const maskMarkerSpans: Array<[number, number]> = [];
@@ -558,8 +595,24 @@ export function gateOutboundText(text: string, audience: CredentialAudience): st
 		working = applyCredentialMasks(working, spans);
 		total += spans.length;
 	}
-	if (total === 0) return redacted !== text ? redacted : text;
+	if (total === 0) {
+		// Review N1/N2/N3 amplifier: protection subtraction can erase every mask
+		// span while a concrete credential still sits in the text — the early
+		// return used to ship it plaintext with no suffix and the fail-closed
+		// fallback was never consulted. Degrade any protection-induced blind
+		// spot to main's own verdict (withhold) instead of plaintext.
+		return finalCredentialCheck(redacted) ? CREDENTIAL_WITHHELD_NOTICE : (redacted !== text ? redacted : text);
+	}
 	if (shapeTripsOutside(working, presignedParamSpans(working))) {
+		return CREDENTIAL_WITHHELD_NOTICE;
+	}
+	// Review round-3 structural backstop: whole-URL protection can hide a
+	// non-grant credential param (e.g. `&secret_key=…` inside a presigned URL)
+	// from masking while ANOTHER masked span keeps total > 0 — the total===0
+	// guard never fires and the secret ships. Re-run main's own full detection
+	// (shapes + label heuristics) over the FINAL text, with grant params and
+	// mask markers pre-cleared, so any survivor degrades to withhold.
+	if (finalCredentialCheck(working)) {
 		return CREDENTIAL_WITHHELD_NOTICE;
 	}
 	return `${working}${CREDENTIAL_MASKED_SUFFIX.replace("{count}", String(total))}`;

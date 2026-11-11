@@ -637,3 +637,90 @@ test("M7: the label-boundary lookbehind keeps an English label substring from cu
 	assert.ok(!out.includes("SuperSecret99"), "the whole value is masked");
 	assert.ok(out.includes("****"), "a mask span was produced (not a silent no-match)");
 });
+
+// ─── third-round review 4b16f1b1: N1-N4 + unique-defense pins ──────────────
+const GL3 = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.xlsx?OSSAccessKeyId=abcd1234&Expires=1799999999&Signature=Sig%2BValue%3D";
+
+test("N4: the canonical Chinese report push (grant + glued CJK tail) ships verbatim, no false mask, idempotent", () => {
+	// d616b5c regression: the Signature SHAPE match swallowed 「。请查收」 past the
+	// protected param span; the fragment got a no-op keepPrefix==len span that
+	// still appended stars, burning all 8 passes → false 「已脱敏 8 处」 + destroyed
+	// prose + no fixed point. Fixed by start-inside-grant whole exemption +
+	// no-op span drop.
+	const msg = `报表：${GL3}。请查收`;
+	assert.equal(gateOutboundText(msg, "restricted"), msg, "a benign push is delivered verbatim");
+	const longTail = `报表：${GL3}。请查收，另附本次巡检的详细报告如下`;
+	const out = gateOutboundText(longTail, "restricted");
+	assert.ok(out.includes("的详细报告如下") && !out.includes("****"), "the prose tail survives");
+	assert.equal(gateOutboundText(out, "restricted"), out, "the gate is a fixed point on this shape");
+});
+
+test("N1: CJK glue between two links on one line never ships plaintext", () => {
+	const out = gateOutboundText(`${GL3}，密码：Abc_123456，${GL3.replace("r.xlsx", "r2.xlsx")}`, "restricted");
+	assert.ok(!out.includes("Abc_123456"), "the glued password is masked or the message is withheld");
+	// The ?-bait variant: a later ASCII ? in the same whitespace-free run must
+	// not extend the URL span across the secret.
+	const out2 = gateOutboundText(`${GL3}，密码：Abc_123456?a=b`, "restricted");
+	assert.ok(!out2.includes("Abc_123456"), "the ?-bait does not rescue the secret");
+});
+
+test("N2: ASCII comma glue after a grant never ships plaintext", () => {
+	const out = gateOutboundText(`${GL3},password:Abc_123456`, "restricted");
+	assert.ok(!out.includes("Abc_123456"), "the comma-glued password is masked or withheld");
+});
+
+test("N3: credential params with label-word names are redacted even when missing from the original list", () => {
+	for (const name of ["client_secret", "credential", "passphrase", "private_key", "auth_token"]) {
+		const out = gateOutboundText(`${GL3}&${name}=Abc_123456`, "restricted");
+		assert.ok(!out.includes("Abc_123456"), `${name}= value never reaches the group`);
+	}
+	// The grant itself stays intact through N3 redaction.
+	const out = gateOutboundText(`${GL3}&client_secret=Abc_123456`, "restricted");
+	assert.ok(out.includes("OSSAccessKeyId=abcd1234") && out.includes("Signature=Sig%2BValue%3D"), "the grant survives");
+});
+
+test("M1b unique defense: a non-grant param glued to a labeled secret keeps both masked (subtractProtected whole-URL level)", () => {
+	// Reverting subtractProtected to drop-whole-candidate makes this leak
+	// Zz9!qqqq1x while the 38-test suite stays green — this is its only pin.
+	const out = gateOutboundText("https://b.aliyuncs.com/r?OSSAccessKeyId=k&Signature=sig&credential=Abc_123456，另外的值是Zz9!qqqq1x", "restricted");
+	assert.ok(!out.includes("Zz9!qqqq1x"), "the glued labeled secret is masked");
+	assert.ok(!out.includes("Abc_123456"), "the non-grant credential param is redacted");
+});
+
+test("M6 unique defense: the iterative loop re-matches labels exposed by masking (no-space case)", () => {
+	// With a space, one pass suffices; WITHOUT a space the first value capture
+	// hides the 「私钥」 label until masking frees it — a single-pass mutant
+	// ships SuperSecret99! in plaintext while the suite stays green.
+	const out = gateOutboundText("password:Abc_123456私钥 是 SuperSecret99!", "restricted");
+	assert.ok(!out.includes("SuperSecret99"), "the second secret is masked via re-match");
+	assert.ok(!out.includes("Abc_123456"), "the first secret is masked");
+});
+
+test("backstop: a secret hidden by whole-URL protection while another span keeps total>0 is withheld, never shipped", () => {
+	// Structural pin for the final full-detection check: `secret_key=` is not a
+	// URL-redaction name and sits INSIDE the protected presigned span, so mask
+	// subtraction drops it; the separate 密码 span keeps total>0, so the
+	// total===0 guard never fires. Only the final containsConcreteCredentialIn
+	// re-check over the finished text catches it (main-equivalent fail-closed).
+	const link = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.xlsx?OSSAccessKeyId=abcd1234&Expires=1799999999&Signature=Sig%2BValue%3D";
+	const out = gateOutboundText(`密码：First_123456 ${link}&secret_key=Abc_123456`, "restricted");
+	assert.ok(!out.includes("Abc_123456"), "the protected-position secret never ships");
+	assert.ok(!out.includes("First_123456"), "the other secret never ships either");
+});
+
+test("hyphenated credential param names are redacted like their underscore twins", () => {
+	const link = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.xlsx?OSSAccessKeyId=abcd1234&Expires=1799999999&Signature=Sig%2BValue%3D";
+	for (const name of ["private-key", "client-secret", "auth-token"]) {
+		const out = gateOutboundText(`${link}&${name}=Abc_123456 巡检`, "restricted");
+		assert.ok(!out.includes("Abc_123456"), `${name}= is redacted`);
+		assert.ok(out.includes("Signature=Sig%2BValue%3D"), "the grant survives the hyphen redaction");
+	}
+});
+
+test("the backstop never upgrades an ordinary masked delivery to withhold", () => {
+	const out = gateOutboundText("密码是 Abc_123456 谢谢", "restricted");
+	assert.notEqual(out, CREDENTIAL_WITHHELD_NOTICE, "masked delivery stays masked");
+	assert.ok(out.includes("****") && out.includes("脱敏"), "mask + suffix note");
+	const json = gateOutboundText('tracing "token":"gk_' + "x".repeat(40) + '"', "restricted");
+	assert.notEqual(json, CREDENTIAL_WITHHELD_NOTICE, "masked JSON artifacts do not re-trip the backstop");
+});
