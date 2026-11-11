@@ -343,35 +343,34 @@ export class WorkerService<Session> {
 		if (!recent?.conversation_id) return false;
 		// ONLY a LIVE worker owns the dialogue unconditionally (field 2026-11-07:
 		// the worker asked 「把验证码发给我」, the user's reply must reach IT).
+		// A FINISHED worker (done/error/cancelled) keeps the CONVERSATION sticky
+		// (user ruling 2026-11-10: 「IM 渠道一个对话粘连 worker 这个设计是合理的」):
+		// 「结果呢」「继续」 hours later still reach the session that did the work.
+		// What must NOT happen is a NEW TASK landing in that accumulated transcript
+		// — field 2026-11-08 23:44 (the boundary brief turned a fresh lookup away)
+		// and 2026-11-10 21:24 (a fresh lookup injected a day-long ~200k-token
+		// worker transcript and burned 61 minutes against the context wall). Two
+		// guards keep task-shaped and reference-shaped messages out; the transcript
+		// itself is bounded by the engine's pre-turn budget gate + compaction, NOT
+		// by refusing the dialogue. (A 30-minute continuation window shipped in
+		// 0.2.220 and was reverted here: it broke the endorsed stickiness, and once
+		// compaction is correct the snowball cannot form.)
 		const LIVE_STATUSES = new Set(["queued", "running"]);
-		if (!LIVE_STATUSES.has(recent.status)) {
-			// A FINISHED worker is HISTORY, and the default is a FRESH worker:
-			// EVERY message falls through to the Router (spawn with a bounded
-			// source excerpt, or the foreground turn with the full push history)
-			// EXCEPT the conversational-continuation contract, which survives only
-			// inside a short window right after the worker settled — 「结果呢」
-			// minutes later needs the worker's execution context; hours later it
-			// is a new ask the foreground can answer from the pushed results.
-			// Field 2026-11-10 21:24: a fresh lookup task routed as
-			// "conversational follow-up" into a done worker from 4 hours earlier
-			// injected a day-long accumulated transcript (~200k tokens) — the
-			// turn burned 61 minutes against the context wall and died. The
-			// WINDOW is the first line so a heuristic miss degrades to a bounded
-			// injection instead of an unbounded one; looksLikeTask is the second
-			// (field 2026-11-08 23:44 stays honored: task-shaped spawns fresh).
-			const DONE_CONTINUATION_WINDOW_MS = 30 * 60_000;
-			const settledAt = recent.finished_at ?? recent.started_at ?? recent.created_at ?? 0;
-			const inWindow = settledAt > 0 && this.clock.now() - settledAt <= DONE_CONTINUATION_WINDOW_MS;
-			if (!inWindow) return false;
-			// Inside the window: a TASK-shaped message still spawns fresh
-			// (execution, not conversation), and a BARE context token (digits /
-			// codes like 「875055」) is a reference the foreground resolves better
-			// than a worker born with its instruction only (field 2026-11-10
-			// single chat; triageMessage carries the same shared guard — review
-			// 7ba60092 P1 — so the planless dispatch cannot loop the token back
-			// into a freshly spawned context-less worker either).
-			if (looksLikeTask(message)) return false;
-			if (isBareContextToken(message)) return false;
+		if (!LIVE_STATUSES.has(recent.status) && looksLikeTask(message)) {
+			return false;
+		}
+		// A BARE context token (digits / codes / serials like 「875055」) is a
+		// REFERENCE into the source chat — a FINISHED worker never holds that
+		// context (it was born with its instruction only), so it guesses and asks
+		// the user what the chat already answered (field 2026-11-10, single chat).
+		// Fall through to the foreground turn: it carries the full conversation
+		// history and can resolve the reference, and triageMessage has the SAME
+		// guard (shared isBareContextToken → reason=reference), so the planless
+		// dispatch cannot loop the token back into a freshly spawned context-less
+		// worker either (review 7ba60092 P1). LIVE workers are untouched — the
+		// verification-code flow (field 2026-11-07) is served above this gate.
+		if (!LIVE_STATUSES.has(recent.status) && isBareContextToken(message)) {
+			return false;
 		}
 		const session = await this.opts.open(recent.conversation_id);
 		// Serialize on the session's turn chain: the kernel refuses concurrent
