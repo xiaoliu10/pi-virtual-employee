@@ -1046,6 +1046,46 @@ test("R12: mask-loop span subtraction stays pinned against layer-dropping mutant
 	assert.equal(gateOutboundText(out2, "restricted"), out2, "masked output is stable on recheck");
 });
 
+test("R13: preserved-region glue scan applies all secret rules; userinfo fails closed", () => {
+	const head = "巡检完成。详见https://gitee.com/o/r/raw/master/f.xlsx?access_token=";
+	// Blocker-1 shapes: numeric PIN, alpha-12, punctuation-split, sub-6 runs.
+	for (const tail of [
+		"***，巡检已完成12345678https://example.com/b.md",
+		"***，巡检已完成Abcdefghijklhttps://example.com/b.md",
+		"***，巡检已完成Abc.123456https://example.com/b.md",
+		"***，巡检已完成Ab_12https://example.com/b.md",
+		"***，巡检已完成Xy9$2https://example.com/b.md",
+	]) {
+		const out = gateOutboundText(head + tail, "restricted");
+		for (const secret of ["12345678", "Abcdefghijkl", "Abc.123456", "Ab_12", "Xy9$2"]) {
+			assert.ok(!out.includes(secret), `preserved prose cannot ship ${secret}`);
+		}
+		assert.equal(gateOutboundText(out, "restricted"), out, "stable on recheck");
+	}
+	// Blocker-2 shapes: userinfo (username/password) carriers, scheme + www.
+	for (const tail of [
+		"***，详见https://Abc_123456:x@example.com/report.md",
+		"***，详见https://Abc_123456@example.com/report.md",
+		"***，详见https://Abc_123456:xy@example.com:8443/report.md",
+		"***，详见www.Abc_123456:x@example.com/report.md",
+	]) {
+		const out = gateOutboundText(head + tail, "restricted");
+		assert.ok(!out.includes("Abc_123456"), "userinfo cannot carry a secret through a preserved tail");
+		assert.equal(gateOutboundText(out, "restricted"), out, "stable on recheck");
+	}
+	// Safe pins must survive the stricter scan.
+	assert.equal(
+		gateOutboundText("报告一https://gitee.com/o/r/raw/master/a.xlsx?access_token=***，报告二https://gitee.com/o/r/raw/master/b.xlsx?access_token=***", "restricted"),
+		"报告一https://gitee.com/o/r/raw/master/a.xlsx?access_token=***，报告二https://gitee.com/o/r/raw/master/b.xlsx?access_token=***",
+		"two redacted report links still deliver verbatim",
+	);
+	assert.equal(
+		gateOutboundText("巡检完成。详见https://gitee.com/o/r/raw/master/f.xlsx?access_token=***，详见www.example.com/report.md", "restricted"),
+		"巡检完成。详见https://gitee.com/o/r/raw/master/f.xlsx?access_token=***，详见www.example.com/report.md",
+		"clean scheme-less www link still delivers verbatim",
+	);
+});
+
 test("R6: arbitrary URL markers cannot exempt plaintext residue", () => {
 	for (const query of ["foo=***", "access_token=***", "access_token=sekret"]) {
 		for (const prefix of ["", "密码：First_123456 "]) {

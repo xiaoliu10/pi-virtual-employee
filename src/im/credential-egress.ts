@@ -271,17 +271,15 @@ function isConcreteUrlPathSegment(part: string): boolean {
 	return looksLikeSecretValue(decoded.replace(REPORT_FILE_EXTENSION, ""));
 }
 
-/** Fail-closed ASCII glue scan for text we would otherwise PRESERVE: a
- * letter+digit/symbol run (≥6, no whitespace) inside it ships verbatim, and
- * machine-style secrets glue into prose without any label or separator
- * (「密码First_123456」 between CJK chars, or 「Abc_123456」 run-together after
- * 「巡检已完成」). Pure digit dates and alpha leftovers stay unaffected. */
-function hasConcreteAsciiGlueRun(segment: string): boolean {
-	for (const match of segment.matchAll(/[A-Za-z0-9_$@%+=~^-]{6,}/g)) {
-		const run = match[0];
-		if (/[A-Za-z]/.test(run) && /[0-9_!@#$%^&*()+=~<>?/\\|{}[\]:;"'.,-]/.test(run)) return true;
-	}
-	return false;
+/** Fail-closed glue scan for text we would otherwise PRESERVE. The whole
+ * region goes through the same value heuristic as labeled credentials — all
+ * three secret rules (letter+digit/symbol ≥6, digit run ≥8, alpha run ≥12),
+ * not just the mixed-run shape. Whitespace/`&`/quotes cannot occur inside the
+ * region (the tail regex excludes them), so CJK glue like 「，巡检已完成12345678」
+ * or 「Abc.123456」 trips exactly like main's swallowed-run check; pure CJK
+ * prose (「，报告二」「，明细」) and the `***` marker alone stay unaffected. */
+function hasConcreteGlueInPreservedRegion(segment: string): boolean {
+	return looksLikeSecretValue(segment);
 }
 
 /** A nested URL following an already-redacted credential may be ordinary prose
@@ -303,6 +301,9 @@ function isSafeNestedCredentialTailUrl(raw: string): boolean {
 	} catch {
 		return false;
 	}
+	// Userinfo is part of the delivered text and a classic secret carrier
+	// (https://Abc_123456:x@host/…). Report links never need it — fail closed.
+	if (parsed.username || parsed.password) return false;
 	for (const label of parsed.hostname.split(".")) {
 		if (label.startsWith("xn--") || isConcreteUrlPathSegment(label)) return false;
 	}
@@ -906,7 +907,7 @@ function redactUrlCredentialParams(text: string): string {
 		// Fail closed: ASCII glue inside the prose we would keep (no separator
 		// label, invisible to residue capture) or any unsafe nested URL removes
 		// the whole tail. main truncates here anyway — removal is parity.
-		if (!tail || hasConcreteAsciiGlueRun(before) || [...tail.matchAll(NESTED_URL_SPAN_PATTERN)].some((m) => !isSafeNestedCredentialTailUrl(m[0]))) {
+		if (!tail || hasConcreteGlueInPreservedRegion(before) || [...tail.matchAll(NESTED_URL_SPAN_PATTERN)].some((m) => !isSafeNestedCredentialTailUrl(m[0]))) {
 			return `${prefix}***`;
 		}
 		// Safe nested report/document links and their CJK prose survive. Only the
