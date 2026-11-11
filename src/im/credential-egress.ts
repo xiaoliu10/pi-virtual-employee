@@ -256,6 +256,20 @@ function isPresignedObjectUrl(url: string): boolean {
 const OBJECT_URL_SPAN_PATTERN = /https?:\/\/[^\s<>"'?]*\?(?:(?!https?:\/\/)[^\s<>"',;\u0080-\uffff])+/g;
 /** CJK/bracket punctuation that glues onto a URL in prose but is not part of it. */
 const URL_TRAILING_NOISE = /[)\]}>，。；！？、）】」』”’…]+$/;
+const REPORT_FILE_EXTENSION = /\.(?:md|markdown|txt|pdf|xlsx|xls|csv|html?|json|log|png|jpe?g)$/i;
+
+/** A concrete value inside a credential-bearing URL path. Known document
+ * extensions are structural; encoded input is decoded before applying the same
+ * value heuristic used for labeled credentials. Invalid encoding fails closed. */
+function isConcreteUrlPathSegment(part: string): boolean {
+	let decoded = "";
+	try {
+		decoded = decodeURIComponent(part);
+	} catch {
+		return true;
+	}
+	return looksLikeSecretValue(decoded.replace(REPORT_FILE_EXTENSION, ""));
+}
 
 /**
  * Char spans of the grant-carrying param ASSIGNMENTS inside presigned URLs
@@ -604,42 +618,21 @@ function reportMaskProbe(text: string): string {
 
 function finalCredentialCheck(text: string): boolean {
 	if (!text) return false;
-	// Compute protected offsets before normalizing markers.
-	const probed = reportMaskProbe(text);
 	const cleared: Array<[number, number]> = [...presignedParamSpans(text)];
 	const verifiedUrls = presignedUrlSpans(text);
-	// A labeled URL value may contain a verified grant and then extend into a
-	// second URL (including a non-grant redirect parameter). Clearing the
-	// grant's skeleton must not erase the label association with that remaining
-	// URL, whether the capture starts in prose or inside the grant itself.
-	for (const pattern of RESIDUE_LABEL_VALUE_PATTERNS) {
-		const global = new RegExp(pattern.source, `${pattern.flags}g`);
-		for (const match of text.matchAll(global)) {
-			const value = match[1] ?? "";
-			const start = match.index + match[0].length - value.length;
-			const end = start + value.length;
-			if (!verifiedUrls.some(([vs, ve]) => start < ve && end > vs)) continue;
-			for (const url of value.matchAll(/https?:\/\//g)) {
-				const offset = start + url.index;
-				if (!verifiedUrls.some(([vs, ve]) => offset >= vs && offset < ve)) return true;
-			}
-		}
-	}
-	// Verified report URLs are system artifacts: splice the SKELETON
-	// (scheme://host/path) and each grant-param assignment out with hard
-	// newline boundaries, so neither can be re-read as a label value by the
-	// residue patterns. NON-grant query params (e.g. `&secret_key=…`) stay
-	// visible — catching those is the compound-leak purpose of this backstop.
+	// Verified report URLs are system artifacts: clear the SKELETON
+	// (scheme://host/path) and each grant-param assignment. NON-grant query
+	// params (e.g. `&secret_key=…`) stay visible — catching those is the
+	// compound-leak purpose of this backstop.
 	for (const [start, end] of verifiedUrls) {
 		const q = text.indexOf("?", start);
 		cleared.push([start, q !== -1 && q < end ? q : end]);
 	}
 	// Re-gating a redacted Gitee raw share link must not re-read its URL as a
-	// value for an unrelated preceding label. The exemption is deliberately
-	// narrow: a known raw-file route, and EVERY query parameter must be a
-	// credential assignment whose entire value is a redaction marker. Unknown
-	// markers, non-grant plaintext params, nested URLs and other hosts stay
-	// visible to the residue detector. Nothing in the delivered text changes.
+	// value for an unrelated preceding label. Only a known raw-file route with
+	// fully redacted credential params and no concrete secret in its branch/file
+	// path qualifies. Unknown markers, plaintext params, nested URLs and other
+	// hosts stay visible to the residue detector.
 	const redactedParam = new RegExp(`^${URL_TOKEN_PARAM_SOURCE_BODY}=\\*{3,}$`, "i");
 	for (const match of text.matchAll(OBJECT_URL_SPAN_PATTERN)) {
 		const url = match[0].replace(URL_TRAILING_NOISE, "");
@@ -651,28 +644,38 @@ function finalCredentialCheck(text: string): boolean {
 			continue;
 		}
 		if (!hostMatches(parsed.hostname.toLowerCase(), "gitee.com")) continue;
-		if (!/^\/[^/]+\/[^/]+\/raw\/[^/]+(?:\/[^/]+)*$/.test(parsed.pathname)) continue;
+		const route = /^\/[^/]+\/[^/]+\/raw\/[^/]+(?:\/[^/]+)*$/.exec(parsed.pathname);
+		if (!route) continue;
 		const params = parsed.search.slice(1).split("&");
 		if (!params.length || params.some((param) => !redactedParam.test(param))) continue;
-		cleared.push([match.index, match.index + url.length]);
+		let concretePathValue = false;
+		for (const part of parsed.pathname.slice(parsed.pathname.indexOf("/raw/") + 5).split("/")) {
+			if (isConcreteUrlPathSegment(part)) {
+				concretePathValue = true;
+				break;
+			}
+		}
+		if (!concretePathValue) cleared.push([match.index, match.index + url.length]);
 	}
-	// Clear wider spans first when offsets tie; nested parameter spans are
-	// already covered by the surrounding URL span.
+	// Replace cleared spans with SAME-LENGTH double-quote filler, never a newline
+	// or deletion. The probe therefore keeps offsets AND the original label →
+	// prose → following-URL association. Quote fillers are excluded by the
+	// credential shape value classes and stripped by looksLikeSecretValue, while
+	// any concrete material after a cleared link remains visible (review N4-N6).
 	cleared.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
 	const parts: string[] = [];
 	let cursor = 0;
 	for (const [start, end] of cleared) {
-		if (start < cursor) continue; // contained in an already-spliced wider span
-		parts.push(probed.slice(cursor, start), "\n");
+		if (start < cursor) continue;
+		parts.push(text.slice(cursor, start), "\"".repeat(end - start));
 		cursor = end;
 	}
-	parts.push(probed.slice(cursor));
+	parts.push(text.slice(cursor));
 	// Two spaces preserve split words (including api***key: the label allows
 	// ONE optional space) without letting marker length exhaust the bounded
 	// gap before a remaining credential. Whitespace after an untrusted marker
 	// is part of that boundary too: a newline must not shelter a URL value when
-	// another credential in the message was already masked. Verified report
-	// markers were replaced above and retain their hard boundary.
+	// another credential in the message was already masked.
 	return containsConcreteCredentialIn(parts.join("").replace(/\*{3,}\s*/g, "  "), [], RESIDUE_LABEL_VALUE_PATTERNS);
 }
 
@@ -752,6 +755,18 @@ const URL_TOKEN_PARAM_GLOBAL = new RegExp(
 	`([?&]${URL_TOKEN_PARAM_SOURCE_BODY}=)([^\\s&"\'*]{6,})`,
 	"gi",
 );
+const URL_CREDENTIAL_NAME_PATTERN = new RegExp(`[?&]${URL_TOKEN_PARAM_SOURCE_BODY}=`, "i");
+const URL_ANY_PARAM_GLOBAL = /([?&][^=&#\s]+=)([^&\s"']*)/g;
+// Redaction must see a nested URL tail too. The protection span deliberately
+// stops at the next scheme; using it here would leave that tail untouched.
+const URL_REDACTION_SPAN_PATTERN = /https?:\/\/[^\s<>"',;\u0080-\uffff]*/g;
+// An already-redacted credential value may still have a nested URL/prose tail.
+// Remove that tail only when another scheme is present; ordinary CJK prose
+// after a report link (e.g. 「，请查收。」) is preserved.
+const REDACTED_URL_NESTED_TAIL_GLOBAL = new RegExp(
+	`([?&]${URL_TOKEN_PARAM_SOURCE_BODY}=)(?=[^\\s&"']*\\*)(?=[^\\s&"']*https?:\\/\\/)[^\\s&"']*`,
+	"gi",
+);
 
 /**
  * Redact just the credential param values inside URLs (e.g. a Gitee
@@ -765,13 +780,64 @@ const URL_TOKEN_PARAM_GLOBAL = new RegExp(
  */
 function redactUrlCredentialParams(text: string): string {
 	const spans = presignedParamSpans(text);
-	if (!spans.length) return text.replace(URL_TOKEN_PARAM_GLOBAL, (_m, prefix: string) => `${prefix}***`);
 	// spans cover the whole assignment while the callback match is the same
 	// assignment — the overlap test below is an exact containment in practice.
 	const inPresigned = (offset: number, length: number) =>
 		spans.some(([valueStart, valueEnd]) => offset < valueEnd && offset + length > valueStart);
-	return text.replace(URL_TOKEN_PARAM_GLOBAL, (match, prefix: string, _value: string, offset: number) =>
+	const redacted = text.replace(URL_TOKEN_PARAM_GLOBAL, (match, prefix: string, _value: string, offset: number) =>
 		inPresigned(offset, match.length) ? match : `${prefix}***`);
+	// Once a URL carries a credential param, a concrete-looking SIBLING value
+	// is not safe either: it can be another secret or a nested URL tail glued to
+	// a redaction marker. Redact those values too, while leaving verified grant
+	// assignments intact. Ordinary values and URLs without credentials retain
+	// their existing behavior.
+	const grantSpans = presignedParamSpans(redacted);
+	const siblingsRedacted = redacted.replace(URL_REDACTION_SPAN_PATTERN, (matched: string, offset: number) => {
+		const url = matched.replace(URL_TRAILING_NOISE, "");
+		if (!URL_CREDENTIAL_NAME_PATTERN.test(url)) return matched;
+		const stripped = url.replace(URL_ANY_PARAM_GLOBAL, (assignment: string, prefix: string, value: string, localOffset: number) => {
+			const absolute = offset + localOffset;
+			if (grantSpans.some(([start, end]) => absolute < end && absolute + assignment.length > start)) return assignment;
+			if (!value || /^\*+$/.test(value)) return assignment;
+			return value.length > 200 || looksLikeSecretValue(value) ? `${prefix}***` : assignment;
+		});
+		// A credential URL's path can carry the same secret too. Redact concrete
+		// path segments, except on a verified grant whose object key is a system
+		// artifact. On Gitee raw links the owner/repo routing stays readable;
+		// only branch/file segments are candidates.
+		let result = stripped;
+		if (!isPresignedObjectUrl(url)) {
+			const schemeEnd = result.indexOf("://");
+			const pathStart = result.indexOf("/", schemeEnd + 3);
+			const queryStart = result.indexOf("?", pathStart);
+			if (schemeEnd > 0 && pathStart > 0 && queryStart > pathStart) {
+				const path = result.slice(pathStart, queryStart);
+				let candidatePath = path;
+				try {
+					if (hostMatches(new URL(result).hostname.toLowerCase(), "gitee.com") && /^\/[^/]+\/[^/]+\/raw\//.test(path)) {
+						candidatePath = path.slice(path.indexOf("/raw/") + 5);
+					}
+				} catch {
+					// An unparseable credential URL gets the conservative whole-path scan.
+				}
+				let changed = false;
+				const redactedPath = candidatePath.split("/").map((part) => {
+					if (!isConcreteUrlPathSegment(part)) return part;
+					changed = true;
+					const extension = REPORT_FILE_EXTENSION.exec(part)?.[0] ?? "";
+					return `***${extension}`;
+				}).join("/");
+				if (changed) {
+					const startInPath = candidatePath === path ? 0 : path.indexOf("/raw/") + 5;
+					result = result.slice(0, pathStart) + path.slice(0, startInPath) + redactedPath + result.slice(queryStart);
+				}
+			}
+		}
+		return result + matched.slice(url.length);
+	});
+	const cleanupGrantSpans = presignedParamSpans(siblingsRedacted);
+	return siblingsRedacted.replace(REDACTED_URL_NESTED_TAIL_GLOBAL, (match: string, prefix: string, offset: number) =>
+		cleanupGrantSpans.some(([start, end]) => offset < end && offset + match.length > start) ? match : `${prefix}***`);
 }
 
 /**

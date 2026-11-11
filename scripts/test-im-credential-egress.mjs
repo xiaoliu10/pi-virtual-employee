@@ -922,6 +922,38 @@ test("R8: prose before a verified grant cannot shelter a trailing non-grant URL"
 	assert.equal(gateOutboundText(`密码：已生成${grant}`, "restricted"), `密码：已生成${grant}`, "a clean labeled grant remains deliverable");
 });
 
+test("R9: cleared share-link spans cannot shelter nested or path credentials", () => {
+	const grant = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.xlsx?OSSAccessKeyId=abcd1234&Expires=1799999999&Signature=Sig%2BValue%3D";
+	const cases = [
+		// N4: neutralization must not sever the label from the following URL.
+		"密码：First_123456 巡检报告https://gitee.com/o/r/raw/f?access_token=***，详见https://example.com/Abc_123456",
+		// N5: the path is message content, not a trusted part of the redaction.
+		"密码：First_123456 详见 https://gitee.com/o/r/raw/main/Second_987654.txt?access_token=***",
+		"密码：First_123456 详见 https://gitee.com/o/r/raw/dev/src/deep/Second_987654.txt?access_token=***",
+		// N6: a masked value + space + verified grant must not hide the next path.
+		`密码：First_123456 已生成${grant}https://gitee.com/o/r/raw/main/Second_987654.txt?access_token=***`,
+	];
+	for (const text of cases) {
+		const out = gateOutboundText(text, "restricted");
+		assert.ok(!out.includes("First_123456") && !out.includes("Abc_123456") && !out.includes("Second_987654"), "cleared URL spans cannot hide residual credentials");
+		assert.equal(gateOutboundText(out, "restricted"), out, "the result remains stable on recheck");
+	}
+});
+
+test("R9: credential URLs redact concrete sibling params, nested tails and paths", () => {
+	const cases = [
+		"巡检完成。详见https://gitee.com/o/r/raw/master/f.xlsx?access_token=***https://example.com/Abc_123456",
+		"巡检完成。详见https://gitee.com/o/r/raw/master/f.xlsx?access_token=***&foo=Bar123456 密码：Third_789012",
+		"https://example.com/Second_987654.txt?access_token=*** 密码：Third_789012",
+	];
+	for (const text of cases) {
+		const out = gateOutboundText(text, "restricted");
+		for (const secret of ["Abc_123456", "Bar123456", "Second_987654", "Third_789012"]) {
+			assert.ok(!out.includes(secret), "no concrete sibling/path value survives credential URL redaction");
+		}
+	}
+});
+
 test("R6: arbitrary URL markers cannot exempt plaintext residue", () => {
 	for (const query of ["foo=***", "access_token=***", "access_token=sekret"]) {
 		for (const prefix of ["", "密码：First_123456 "]) {
