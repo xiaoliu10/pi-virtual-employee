@@ -826,3 +826,67 @@ test("source-context excerpt keeps a merged row's real answer (review adaf0751 P
 	assert.ok(excerpt.includes("查完了，3 笔异常"), "the delivered answer must reach a fresh worker's context");
 	assert.ok(!excerpt.includes("已尝试继续执行但模型没有实际动作"), "the notice paragraph must not");
 });
+
+test("a bare code ANSWERS a finished worker's input request — routed into the asking session (field 2026-11-10 spay)", async () => {
+	const { h, service } = harness();
+	const past = Date.now() - 60 * 60_000;
+	// The worker ended its turn ASKING for the SMS code (push-only delivery —
+	// the question never entered the group history the front turn rehydrates).
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wask', 'spay 登录对账', 'dt:group:g1', 'ma1', 'done', '是的，如果是 spay 系统登录流程走到的验证码环节……如果是 spay 生产环境的短信验证码，发给我（6位数字），我立刻用它完成登录继续跑。', 'worker:wask', ?, ?, ?)`).run(past, past, Date.now() - 60_000);
+	const injected = await service.inject("dt:group:g1", "847159", "ma1");
+	assert.equal(injected, true, "the answer must reach the worker that asked");
+	assert.deepEqual(h.sessions, ["worker:wask"], "routed into the ASKING session, not a fresh one");
+	assert.equal(h.sends.length, 1);
+	assert.equal(h.sends[0].message, "847159");
+	await flush();
+	const pushed = h.pushes.filter((p) => p.cid === "dt:group:g1");
+	assert.ok(pushed.length >= 1, "the worker's follow-up reply is delivered back to the source chat");
+});
+
+test("a bare token with NO pending ask goes to the foreground once the window closes (unchanged cold)", async () => {
+	// Composed with PR #199's keep-alive window: a fresh ordinary reference (no
+	// pending ask) rides the hot window into the worker; this pin protects the
+	// COLD regime — past the window, an ordinary bare token still resolves in
+	// the foreground (field 2026-11-10 contract).
+	const { h, service } = harness();
+	const past = Date.now() - 3 * 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wdone2', '统计任务', 'dt:group:g1', 'ma1', 'done', '导出完成：最近7天共 37 笔，已生成报表。', 'worker:wdone2', ?, ?, ?)`).run(past, past, past);
+	const injected = await service.inject("dt:group:g1", "847159", "ma1");
+	assert.equal(injected, false, "an ordinary cold reference still resolves in the foreground");
+	assert.equal(h.sends.length, 0, "nothing routed into the settled session");
+});
+
+test("composition: an ask captures its answer even BEYOND the keep-alive window (PR #198 value over #199)", async () => {
+	// The window is time-bounded; the ask is state-bounded. A user answering a
+	// day-old question must still reach the asking session — the foreground
+	// never saw the question (push-only deliveries) and cannot resolve it.
+	const { h, service } = harness();
+	const old = Date.now() - 26 * 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, conversation_id, created_at, started_at, finished_at)
+		VALUES ('waskold', 'spay 登录对账', 'dt:group:g1', 'ma1', 'done', '如果是 spay 生产环境的短信验证码，发给我（6位数字），我立刻用它完成登录继续跑。', 'worker:waskold', ?, ?, ?)`).run(old, old, old);
+	assert.equal(await service.inject("dt:group:g1", "847159", "ma1"), true, "cold + pending ask → the answer still reaches the asking session");
+	assert.deepEqual(h.sessions, ["worker:waskold"]);
+});
+
+test("composition: an ERROR-STATUS run never captures via ask shape (P2-3: interrupted stays foreground)", async () => {
+	// #198 reads result ?? error; a true interrupted row carries the terminal
+	// notice in the error column — but even an ask-shaped column must not
+	// capture: the in-memory session is gone and the contract is 「重新执行」.
+	const { h, service } = harness();
+	const past = Date.now() - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, error, conversation_id, created_at, started_at, finished_at)
+		VALUES ('werrask', '查订单', 'dt:cold3', 'u1', 'error', '请提供订单号，我立刻用它继续查询。', 'worker:werrask', ?, ?, ?)`).run(past, past, past);
+	assert.equal(await service.inject("dt:cold3", "0002026110800003400", "u1"), false, "error-status rows stay cold-gated regardless of ask shape");
+});
+
+test("an ask settled into the ERROR column (narration-noted zero-action turn) also captures the answer (review 20886054 P2-2)", async () => {
+	const { h, service } = harness();
+	const past = Date.now() - 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, error, conversation_id, created_at, started_at, finished_at)
+		VALUES ('werr', '查订单', 'dt:group:g1', 'ma1', 'done', '⚠️ 本轮只产出过程叙述、未调用任何工具……我需要你提供订单号才能继续。', 'worker:werr', ?, ?, ?)`).run(past, past, Date.now() - 60_000);
+	const injected = await service.inject("dt:group:g1", "0002026110800003400", "ma1");
+	assert.equal(injected, true, "the answer reaches the asking session even from the error column");
+	assert.deepEqual(h.sessions, ["worker:werr"]);
+});
