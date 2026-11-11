@@ -28,8 +28,8 @@
  *     summarization request larger than the context it summarizes");
  *   • summaries use the model's output limit, not min(0.8*reserveTokens, …)
  *     (upstream #9512 — the 13107-token cap starved reasoning models).
- * Pinned by scripts/test-pi-compaction.mjs (mutation-verified: restoring either
- * old behavior fails 4 of the 8 tests).
+ * Pinned by scripts/test-pi-compaction.mjs (mutation-verified: restoring both
+ * old behaviors fails 4 of the 8 tests — thinking alone 3, the output cap alone 1).
  * NOT backported: upstream's assistant-role cut points — VE's contract pins the
  * kept tail to a user-turn boundary (IM conversation semantics + taskAnchorOf),
  * and the incident's compaction did run via the forced single-turn path.

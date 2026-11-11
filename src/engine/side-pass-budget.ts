@@ -4,9 +4,14 @@
  * hard-coded 0.8×512=409 cap and every side pass died with "hit the token cap".
  * User ruling 2026-11-02: DON'T self-limit — follow the model's own max-output
  * resolution (per-model override → gateway model-info → 32k relay default).
- * pi-compaction (vendored, pi-compaction.ts:518) computes maxTokens = 0.8×reserve clamped to model.maxTokens, so
- * reserving ceil(maxOut/0.8) lands exactly on maxOut; a ceiling only caps
- * runaway generation, it must not silently shrink what the model may produce.
+ * Historically pi-compaction computed maxTokens = 0.8×reserve clamped to
+ * model.maxTokens, so reserving ceil(maxOut/0.8) landed exactly on maxOut. The
+ * 2026-11-10 backport of upstream #9512 removed that cap (summaries now use the
+ * model's own output limit), which makes the /0.8 inflation a harmless no-op:
+ * the reserve argument is unused and pi-ai resolves options.maxTokens ??
+ * model.maxTokens either way. Kept as-is so the exported contract and its tests
+ * stay stable; a ceiling only caps runaway generation, it must not silently
+ * shrink what the model may produce.
  * Exported for tests: every side pass MUST call this — a hard-coded number here
  * regresses to the incident (planTaskBrief did exactly that on 2026-11-04).
  */
