@@ -167,6 +167,24 @@ export function isBareContextToken(text: string): boolean {
 	return BARE_CONTEXT_TOKEN_RE.test(t);
 }
 
+/** True when a settled worker reply ENDS by asking the user to send something
+ * (a verification code / password / id / a choice) — the natural pause of an
+ * interactive run. Deliberately NARROW: only explicit user-directed asks
+ * match, so ordinary completion reports never capture later bare tokens —
+ * uncertain shapes fail open toward the foreground (the pre-fix behaviour).
+ *
+ * Field 2026-11-10: a spay-login worker ended its turn with 「……发给我（6位
+ * 数字），我立刻用它完成登录继续跑。」; the user's bare 「847159」 hit the
+ * bare-token gate and fell to a foreground that had NEVER seen the question
+ * (worker deliveries are push-only since 0.2.208, they never enter the chat
+ * history), so the model answered 「这串数字我这边没有对应的上下文」. */
+const INPUT_REQUEST_RE = /(发给我|发我|告诉我|回复我|回我一下|请提供|请输入|请填写|请把.{0,24}发|把.{0,24}发给|需要你|等你.{0,8}(发|提供|回复)|收到.{0,16}(后|再).{0,12}(我|继续)|\d\s*位(数字|验证码))/;
+export function looksLikeInputRequest(text: string): boolean {
+	const t = (text ?? "").trim();
+	if (!t || t.length > 2000) return false;
+	return INPUT_REQUEST_RE.test(t);
+}
+
 /** Does the message ask a question (which must never go to the background)? */
 export function isQuestion(text: string): boolean {
 	const t = (text ?? "").trim();

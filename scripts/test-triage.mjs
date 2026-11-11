@@ -25,7 +25,7 @@ await build({
 	stdin: { contents: `export * from "./src/im/triage.ts";`, resolveDir: root, loader: "ts" },
 	outfile: bundle, bundle: true, platform: "node", format: "esm", packages: "external", logLevel: "silent",
 });
-const { triageMessage, countPlanSteps, isQuestion, hasLongRunningVerb, isForegroundEscape, FOREGROUND_ESCAPE_HINT, isDeepTask, isBareContextToken } = await import(pathToFileURL(bundle).href);
+const { triageMessage, countPlanSteps, isQuestion, hasLongRunningVerb, isForegroundEscape, FOREGROUND_ESCAPE_HINT, isDeepTask, isBareContextToken, looksLikeInputRequest } = await import(pathToFileURL(bundle).href);
 
 const configBundle = join(outDir, "config.mjs");
 await build({
@@ -358,4 +358,20 @@ test("isBareContextToken: cap boundary + CJK exclusion", () => {
 	for (const t of ["重新执行", "继续", "结果呢", "查一下这笔流水 004966"]) {
 		assert.equal(isBareContextToken(t), false, `CJK text is not a bare token: ${t}`);
 	}
+});
+
+test("looksLikeInputRequest: explicit user-directed asks match (the spay field shape)", () => {
+	// The exact field message (2026-11-10, spay group).
+	const field = "是的，如果是 spay 系统登录流程走到的验证码环节，那确实是我（或后台任务）触发登录时系统发到你手机的。你刚收到的是哪条？如果是 spay 生产环境的短信验证码，发给我（6位数字），我立刻用它完成登录继续跑。";
+	assert.equal(looksLikeInputRequest(field), true, "发给我（6位数字） must match");
+	assert.equal(looksLikeInputRequest("请把手机收到的 6 位验证码发给我，我继续登录。"), true);
+	assert.equal(looksLikeInputRequest("需要你提供一下工号，我再继续查。"), true);
+	assert.equal(looksLikeInputRequest("收到验证码后我再继续。"), true);
+});
+
+test("looksLikeInputRequest: completion reports and past-tense narration never match", () => {
+	assert.equal(looksLikeInputRequest("导出完成：最近7天共 37 笔，已生成报表。"), false);
+	assert.equal(looksLikeInputRequest("已在登录页输入账号，等待下一步。"), false, "已输入 is past tense, not an ask");
+	assert.equal(looksLikeInputRequest("任务失败：目标站点 502 超时。"), false);
+	assert.equal(looksLikeInputRequest(""), false);
 });

@@ -21,7 +21,7 @@
  */
 import { WorkerTaskStore, type WorkerTaskRow } from "./worker-tasks.js";
 import { looksLikeTask, NARRATION_GUARD_NOTICE } from "../engine/task-planner.js";
-import { isBareContextToken } from "../im/triage.js";
+import { isBareContextToken, looksLikeInputRequest } from "../im/triage.js";
 import { stripNotice, SYNTHETIC_FALLBACK_FRAGMENTS_RE } from "../db/history-store.js";
 
 /** Injected durable-execution primitives (same shape WorkService uses — the
@@ -369,7 +369,18 @@ export class WorkerService<Session> {
 		// dispatch cannot loop the token back into a freshly spawned context-less
 		// worker either (review 7ba60092 P1). LIVE workers are untouched — the
 		// verification-code flow (field 2026-11-07) is served above this gate.
-		if (!LIVE_STATUSES.has(recent.status) && isBareContextToken(message)) {
+		//
+		// EXCEPTION — the ask-then-settled handoff (field 2026-11-10, spay group):
+		// when the finished worker's RESULT is itself an input request, the bare
+		// token IS the answer to that ask. The foreground cannot resolve it: the
+		// question was the WORKER's last delivery, and worker deliveries are
+		// push-only (0.2.208) — they never entered the chat history the front
+		// turn rehydrates, so the front model saw a naked 「847159」 and asked
+		// what it means. Route it into the asking worker's session instead — the
+		// same session the LIVE handoff serves, one turn later. Only the exact
+		// ask shape (looksLikeInputRequest) captures the answer; every other bare
+		// token keeps the foreground resolution path.
+		if (!LIVE_STATUSES.has(recent.status) && isBareContextToken(message) && !looksLikeInputRequest(recent.result ?? "")) {
 			return false;
 		}
 		const session = await this.opts.open(recent.conversation_id);
