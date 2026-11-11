@@ -98,7 +98,7 @@ import type { FileSystemService } from "../filesystem/filesystem-service.js";
 import type { ReportService } from "../reports/report-service.js";
 import type { DownloadService } from "../downloads/download-service.js";
 import { buildSystemPrompt, buildTools, guardTool, withTelemetry } from "./definition.js";
-import { LegacySettleGate } from "./legacy-settle-gate.js";
+import { LegacySettleGate, legacyGateEligible } from "./legacy-settle-gate.js";
 import type { UpdateOperations } from "./tools/update.js";
 import { hasActiveShellCommands } from "./tools/shell.js";
 import {effectiveAuthorizationRole, ROLE_RANK, checkPermission, isDeclaredAdmin, isLocalConversation} from "../security/permissions.js";
@@ -3291,15 +3291,30 @@ export class EmployeeEngine implements EmployeeRuntime {
 
 		// LEGACY SETTLE-GATE — the engine-layer equivalent of the pi-session
 		// ve-settle-gate extension (kernel = "legacy" has no extension runtime).
-		// The [[TASK_DONE]] marker is the ONLY gate: it is taught exclusively by
-		// the autonomous/work prompt paths (work.ts, autonomous.ts) — ordinary IM
-		// prompts never contain it, so a normal reply is a natural no-op, exactly
-		// like the extension and durable kernels (which gate on the marker alone,
-		// not on a conversation prefix). Skipped for ephemeral side passes,
-		// errored/deterministic turns and suppressed narration as defence-in-depth.
+		// The [[TASK_DONE]] marker is the only CONTENT gate: it is taught
+		// exclusively by the autonomous/work prompt paths (work.ts,
+		// autonomous.ts) — ordinary IM prompts never contain it, so a normal
+		// reply is a natural no-op, exactly like the other two kernels.
+		// legacyGateEligible adds the TURN-level skips: a turn that already
+		// carries a system decision (abort, tool-step cap, context budget,
+		// narration guard, undelivered steer) must never be re-driven — agent
+		// .prompt builds a FRESH AbortController, so gating an aborted turn
+		// would resurrect it, and gating a cap-hit turn would open a new tool
+		// loop after the safety cap fired (review 3ff3d67d P1-2/P2-1).
 		let settleVerifyRounds = 0;
 		let settleReleasedAtCap = false;
-		if (this.opts.kernel === "legacy" && !ctx?.ephemeral && !hardError && !deterministic && !narrationSuppressed) {
+		if (legacyGateEligible({
+			kernel: this.opts.kernel,
+			ephemeral: ctx?.ephemeral,
+			hardError,
+			deterministic,
+			capHit,
+			contextBudgetHit,
+			aborted: this.turnAborts.has(conversationId),
+			narrationSuppressed,
+			narrationNoted,
+			undeliveredSteer,
+		})) {
 			const gated = await this.legacySettleGate.run({
 				conversationId,
 				reply,
@@ -3655,11 +3670,12 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * real reads, unlike finalSummary which disables tools). Fail-open: the
 	 * caller treats a throw as "gate unavailable" and keeps the original reply. */
 	private async gateTurn(agent: Agent, conversationId: string, instruction: string): Promise<{ text: string; hadToolCalls: boolean }> {
-		let text = "";
+		const parts: string[] = [];
 		const before = this.turnToolCalls.get(conversationId) ?? 0;
 		const unsubscribe = agent.subscribe((event: AgentEvent) => {
 			if (event.type === "message_end" && (event.message as { role?: string }).role === "assistant") {
-				text += extractText(event.message);
+				const part = extractText(event.message);
+				if (part) parts.push(part);
 			}
 		});
 		try {
@@ -3668,7 +3684,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 			unsubscribe();
 		}
 		const after = this.turnToolCalls.get(conversationId) ?? before;
-		return { text: text.trim(), hadToolCalls: after > before };
+		// Newline-join, not concatenate: parseVerifyReply requires the verdict
+		// marker at LINE START, so an earlier assistant fragment must not glue
+		// onto the final marker line (review 3ff3d67d P3-3).
+		return { text: parts.join("\n").trim(), hadToolCalls: after > before };
 	}
 
 	/** Deterministic reply of last resort — always non-empty, in Chinese. */
