@@ -96,8 +96,8 @@ const ALL_LABELS_ALT = [...SECRET_LABELS_ZH, ...SECRET_LABELS_EN].join("|");
  *   A label + whitespace + secret URL (`密码：\nhttps://example.com/Abc_123456`,
  *   a wholly natural line break — review N1) must trip exactly like main, so
  *   URLs do NOT stop capture there. Masked-output artifacts cannot false-trip
- *   because generated masks persist a prose boundary before share links, and
- *   verified-report skeletons/grant params are cleared from the probe. */
+ *   because narrowly recognized redacted Gitee raw artifacts and verified
+ *   report skeletons/grant params are cleared only from the probe. */
 function buildLabelValuePatterns(urlBoundary: boolean): RegExp[] {
 	const boundary = urlBoundary
 		? String.raw`(?<![A-Za-z0-9_])(?:${ALL_LABELS_ALT})|https?://`
@@ -572,15 +572,6 @@ function applyCredentialMasks(text: string, spans: MaskSpan[]): string {
 		parts.push(text.slice(cursor, span.start));
 		parts.push(text.slice(span.start, span.start + span.keepPrefix));
 		parts.push("****");
-		// Keep a generated mask separate from prose introducing a redacted share
-		// link. Persist the boundary in the delivered text so re-gating needs no
-		// exemption for arbitrary URLs containing an untrusted `***` marker.
-		const tail = text.slice(span.end);
-		const nextUrl = /https?:\/\/\S+/.exec(tail);
-		if (nextUrl && /\*{3,}/.test(nextUrl[0]) && nextUrl.index > 0 &&
-			!/[\r\n]/.test(tail.slice(0, nextUrl.index)) && /\S/.test(tail.slice(0, nextUrl.index))) {
-			parts.push("；\n");
-		}
 		cursor = span.end;
 	}
 	parts.push(text.slice(cursor));
@@ -595,8 +586,8 @@ function applyCredentialMasks(text: string, spans: MaskSpan[]): string {
  * the text actually being sent.
  *
  * The final check includes shapes and label values. Verified grant material
- * is cleared from its probe; generated masks retain prose boundaries so a
- * label cannot attach itself to an unrelated report URL.
+ * and narrowly recognized redacted Gitee raw artifacts are cleared only from
+ * its probe; all other URL text and label associations stay inspectable.
  */
 /** Recheck remaining credentials without joining words across mask markers. */
 function reportMaskProbe(text: string): string {
@@ -617,15 +608,17 @@ function finalCredentialCheck(text: string): boolean {
 	const probed = reportMaskProbe(text);
 	const cleared: Array<[number, number]> = [...presignedParamSpans(text)];
 	const verifiedUrls = presignedUrlSpans(text);
-	// A labeled URL value may extend beyond a verified grant into a second
-	// URL (including a non-grant redirect parameter). Clearing the grant's
-	// skeleton must not erase the label association with that remaining URL.
+	// A labeled URL value may contain a verified grant and then extend into a
+	// second URL (including a non-grant redirect parameter). Clearing the
+	// grant's skeleton must not erase the label association with that remaining
+	// URL, whether the capture starts in prose or inside the grant itself.
 	for (const pattern of RESIDUE_LABEL_VALUE_PATTERNS) {
 		const global = new RegExp(pattern.source, `${pattern.flags}g`);
 		for (const match of text.matchAll(global)) {
 			const value = match[1] ?? "";
 			const start = match.index + match[0].length - value.length;
-			if (!verifiedUrls.some(([vs, ve]) => start >= vs && start < ve)) continue;
+			const end = start + value.length;
+			if (!verifiedUrls.some(([vs, ve]) => start < ve && end > vs)) continue;
 			for (const url of value.matchAll(/https?:\/\//g)) {
 				const offset = start + url.index;
 				if (!verifiedUrls.some(([vs, ve]) => offset >= vs && offset < ve)) return true;
@@ -640,6 +633,28 @@ function finalCredentialCheck(text: string): boolean {
 	for (const [start, end] of verifiedUrls) {
 		const q = text.indexOf("?", start);
 		cleared.push([start, q !== -1 && q < end ? q : end]);
+	}
+	// Re-gating a redacted Gitee raw share link must not re-read its URL as a
+	// value for an unrelated preceding label. The exemption is deliberately
+	// narrow: a known raw-file route, and EVERY query parameter must be a
+	// credential assignment whose entire value is a redaction marker. Unknown
+	// markers, non-grant plaintext params, nested URLs and other hosts stay
+	// visible to the residue detector. Nothing in the delivered text changes.
+	const redactedParam = new RegExp(`^${URL_TOKEN_PARAM_SOURCE_BODY}=\\*{3,}$`, "i");
+	for (const match of text.matchAll(OBJECT_URL_SPAN_PATTERN)) {
+		const url = match[0].replace(URL_TRAILING_NOISE, "");
+		if (verifiedUrls.some(([start]) => start === match.index)) continue;
+		let parsed: URL;
+		try {
+			parsed = new URL(url);
+		} catch {
+			continue;
+		}
+		if (!hostMatches(parsed.hostname.toLowerCase(), "gitee.com")) continue;
+		if (!/^\/[^/]+\/[^/]+\/raw\/[^/]+(?:\/[^/]+)*$/.test(parsed.pathname)) continue;
+		const params = parsed.search.slice(1).split("&");
+		if (!params.length || params.some((param) => !redactedParam.test(param))) continue;
+		cleared.push([match.index, match.index + url.length]);
 	}
 	// Clear wider spans first when offsets tie; nested parameter spans are
 	// already covered by the surrounding URL span.

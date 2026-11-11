@@ -897,6 +897,31 @@ test("R7: clearing a labeled grant preserves detection of a trailing non-grant U
 	assert.equal(gateOutboundText(`密码：${grant}`, "restricted"), `密码：${grant}`, "the verified grant alone still survives");
 });
 
+test("R8: mask delivery never inserts a boundary that hides a following URL secret", () => {
+	// Review N2: a generated `；\n` used to sever the label association before
+	// the residue check. None of these compounds may ship either secret.
+	const cases = [
+		"密码：First_123456 note2026https://example.com/Abc_123456?foo=***",
+		"密码：First_123456 note2026 https://example.com/Abc_123456?foo=***",
+		"密码：First_123456 巡检报告v2 https://example.com/Abc_123456?foo=***",
+		"密码：First_123456 详见 https://example.com/Abc_123456?access_token=***",
+		"密码：First_123456 详见 https://example.com/Abc_123456#frag***",
+		// No attacker marker: our own URL redaction produces the stars.
+		"密码：First_123456 note2026 https://example.com/Abc_123456?access_token=RealToken123456",
+	];
+	for (const text of cases) {
+		const out = gateOutboundText(text, "restricted");
+		assert.ok(!out.includes("First_123456") && !out.includes("Abc_123456") && !out.includes("RealToken123456"), "the inserted-boundary family is closed");
+	}
+});
+
+test("R8: prose before a verified grant cannot shelter a trailing non-grant URL", () => {
+	const grant = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.xlsx?OSSAccessKeyId=abcd1234&Expires=1799999999&Signature=Sig%2BValue%3D";
+	const out = gateOutboundText(`密码：已生成${grant}&next=https://example.com/Abc_123456`, "restricted");
+	assert.ok(!out.includes("Abc_123456"), "a prose-to-grant capture keeps the trailing URL checked");
+	assert.equal(gateOutboundText(`密码：已生成${grant}`, "restricted"), `密码：已生成${grant}`, "a clean labeled grant remains deliverable");
+});
+
 test("R6: arbitrary URL markers cannot exempt plaintext residue", () => {
 	for (const query of ["foo=***", "access_token=***", "access_token=sekret"]) {
 		for (const prefix of ["", "密码：First_123456 "]) {
