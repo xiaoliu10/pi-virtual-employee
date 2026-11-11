@@ -990,6 +990,62 @@ test("R10: safe nested report links survive a preceding redacted credential", ()
 	}
 });
 
+test("R11: ASCII glue inside preserved nested-tail prose fails closed", () => {
+	// Machine-style secrets glue to CJK prose with no label/separator, so the
+	// preserved region must be scanned for letter+digit/symbol runs. main and
+	// f1e9590 both remove these tails entirely.
+	const cases = [
+		"巡检完成。详见https://gitee.com/o/r/raw/master/f.xlsx?access_token=***https://a.md密码First_123456https://b.md",
+		"巡检完成。详见https://gitee.com/o/r/raw/master/f.xlsx?access_token=abcdef*ghijkl，巡检密码First_123456https://example.com/b.md",
+		"巡检完成。详见https://gitee.com/o/r/raw/master/f.xlsx?access_token=***，巡检已完成Abc_123456https://example.com/b.md",
+	];
+	for (const text of cases) {
+		const out = gateOutboundText(text, "restricted");
+		assert.ok(!out.includes("First_123456") && !out.includes("Abc_123456"), "ASCII glue inside preserved prose cannot ship a secret");
+		assert.equal(gateOutboundText(out, "restricted"), out, "the result remains stable on recheck");
+	}
+});
+
+test("R11: nested-tail URL fragments, hosts and scheme-less www tails fail closed", () => {
+	// Fragment (#…), hostname labels and scheme-less www. references are part
+	// of the delivered text — they get the same concrete-value heuristics as
+	// path and query. A legit scheme-less link still survives verbatim.
+	for (const text of [
+		"巡检完成。详见https://gitee.com/o/r/raw/master/f.xlsx?access_token=***，详见https://example.com/r.md#First_123456",
+		"巡检完成。详见https://gitee.com/o/r/raw/master/f.xlsx?access_token=***，详见www.example.com/Abc_123456.md",
+	]) {
+		const out = gateOutboundText(text, "restricted");
+		assert.ok(!out.includes("First_123456") && !out.includes("Abc_123456"), "fragments and www tails cannot carry a secret");
+		assert.equal(gateOutboundText(out, "restricted"), out, "the result remains stable on recheck");
+	}
+	assert.equal(
+		gateOutboundText("巡检完成。详见https://gitee.com/o/r/raw/master/f.xlsx?access_token=***，详见www.example.com/report.md", "restricted"),
+		"巡检完成。详见https://gitee.com/o/r/raw/master/f.xlsx?access_token=***，详见www.example.com/report.md",
+		"a clean scheme-less www link survives verbatim",
+	);
+});
+
+test("R12: mask-loop span subtraction stays pinned against layer-dropping mutants", () => {
+	// Pins the exact masked-delivery contract of the span-subtraction layer:
+	// grant params stay readable, the WHOLE labeled secret value is masked
+	// (no `sk-` style prefix survives), and param-style secrets between grants
+	// stay delivered rather than withheld. Mutants that drop subtractProtected
+	// / shape spans / label spans change these outputs and must fail here.
+	const grant = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.xlsx?OSSAccessKeyId=abcd1234&Expires=1799999999&Signature=Sig%2BValue%3D";
+	const grant2 = grant.replace("r.xlsx", "r2.xlsx");
+	const out1 = gateOutboundText(`${grant}&client_secret:sk-abcdefghijklmnopqrstuvwx，${grant2}`, "restricted");
+	assert.notEqual(out1, CREDENTIAL_WITHHELD_NOTICE, "masked delivery, not withhold");
+	assert.ok(out1.includes("client_secret:****"), "the full labeled value is masked in place");
+	assert.ok(!out1.includes("sk-abcdefghijklmnopqrstuvwx") && !out1.includes("sk-****"), "no secret prefix survives partial masking");
+	assert.ok(out1.includes("OSSAccessKeyId=abcd1234"), "grant params stay readable");
+	const out2 = gateOutboundText(`${grant}&access_token:Abc_123456，${grant2}`, "restricted");
+	assert.notEqual(out2, CREDENTIAL_WITHHELD_NOTICE, "masked delivery, not withhold");
+	assert.ok(!out2.includes("Abc_123456"), "the secret value never ships");
+	assert.ok(out2.includes("access_token:****"), "the value is masked in place");
+	assert.equal(gateOutboundText(out1, "restricted"), out1, "masked output is stable on recheck");
+	assert.equal(gateOutboundText(out2, "restricted"), out2, "masked output is stable on recheck");
+});
+
 test("R6: arbitrary URL markers cannot exempt plaintext residue", () => {
 	for (const query of ["foo=***", "access_token=***", "access_token=sekret"]) {
 		for (const prefix of ["", "密码：First_123456 "]) {

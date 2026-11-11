@@ -271,17 +271,40 @@ function isConcreteUrlPathSegment(part: string): boolean {
 	return looksLikeSecretValue(decoded.replace(REPORT_FILE_EXTENSION, ""));
 }
 
+/** Fail-closed ASCII glue scan for text we would otherwise PRESERVE: a
+ * letter+digit/symbol run (≥6, no whitespace) inside it ships verbatim, and
+ * machine-style secrets glue into prose without any label or separator
+ * (「密码First_123456」 between CJK chars, or 「Abc_123456」 run-together after
+ * 「巡检已完成」). Pure digit dates and alpha leftovers stay unaffected. */
+function hasConcreteAsciiGlueRun(segment: string): boolean {
+	for (const match of segment.matchAll(/[A-Za-z0-9_$@%+=~^-]{6,}/g)) {
+		const run = match[0];
+		if (/[A-Za-z]/.test(run) && /[0-9_!@#$%^&*()+=~<>?/\\|{}[\]:;"'.,-]/.test(run)) return true;
+	}
+	return false;
+}
+
 /** A nested URL following an already-redacted credential may be ordinary prose
  * (another report/document link), not necessarily a secret tail. Preserve it
- * only when its path and query contain no concrete unredacted value. */
+ * only when nothing concrete can hide in authority, path, query or fragment.
+ * Scheme-less `www.` tails get the same heuristics. The RAW authority must be
+ * pure ASCII (CJK inside it means the URL run swallowed prose/secret glue —
+ * the span matcher cannot parse that reliably); punycode labels are not
+ * decodable here. Anything unparseable fails closed — main truncates these
+ * tails anyway, so removal is parity and preservation is the improvement. */
 function isSafeNestedCredentialTailUrl(raw: string): boolean {
 	const url = raw.replace(URL_TRAILING_NOISE, "");
 	if (isPresignedObjectUrl(url)) return true;
+	const authority = url.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "").split(/[/?#]/)[0];
+	if (/[^\x20-\x7f]/.test(authority)) return false;
 	let parsed: URL;
 	try {
-		parsed = new URL(url);
+		parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `https://${url}`);
 	} catch {
 		return false;
+	}
+	for (const label of parsed.hostname.split(".")) {
+		if (label.startsWith("xn--") || isConcreteUrlPathSegment(label)) return false;
 	}
 	const path = parsed.pathname;
 	const giteeRaw = hostMatches(parsed.hostname.toLowerCase(), "gitee.com") && /^\/[^/]+\/[^/]+\/raw\//.test(path);
@@ -290,6 +313,15 @@ function isSafeNestedCredentialTailUrl(raw: string): boolean {
 	for (const [, value] of parsed.searchParams) {
 		if (!value || /^\*+$/.test(value)) continue;
 		if (value.length > 200 || looksLikeSecretValue(value)) return false;
+	}
+	if (parsed.hash && parsed.hash.length > 1) {
+		let decodedHash = "";
+		try {
+			decodedHash = decodeURIComponent(parsed.hash.slice(1));
+		} catch {
+			return false;
+		}
+		if (looksLikeSecretValue(decodedHash)) return false;
 	}
 	return true;
 }
@@ -783,14 +815,15 @@ const URL_ANY_PARAM_GLOBAL = /([?&][^=&#\s]+=)([^&\s"']*)/g;
 // Redaction must see a nested URL tail too. The protection span deliberately
 // stops at the next scheme; using it here would leave that tail untouched.
 const URL_REDACTION_SPAN_PATTERN = /https?:\/\/[^\s<>"',;\u0080-\uffff]*/g;
-// An already-redacted credential value may still have a nested URL/prose tail.
-// Remove that tail only when another scheme is present; ordinary CJK prose
-// after a report link (e.g. 「，请查收。」) is preserved.
+// An already-redacted credential value may still have a nested URL/prose tail
+// (scheme-bearing or scheme-less `www.`). Remove that tail only when another
+// URL reference is present; ordinary CJK prose after a report link
+// (e.g. 「，请查收。」) is preserved.
 const REDACTED_URL_NESTED_TAIL_GLOBAL = new RegExp(
-	`([?&]${URL_TOKEN_PARAM_SOURCE_BODY}=)(?=[^\\s&"']*\\*)(?=[^\\s&"']*https?:\\/\\/)[^\\s&"']*`,
+	`([?&]${URL_TOKEN_PARAM_SOURCE_BODY}=)(?=[^\\s&"']*\\*)(?=[^\\s&"']*(?:https?:\\/\\/|www\.))[^\\s&"']*`,
 	"gi",
 );
-const NESTED_URL_SPAN_PATTERN = /https?:\/\/[^\s<>"']*/g;
+const NESTED_URL_SPAN_PATTERN = /(?:https?:\/\/|www\.)[^\s<>"']*/g;
 
 /**
  * Redact just the credential param values inside URLs (e.g. a Gitee
@@ -867,15 +900,18 @@ function redactUrlCredentialParams(text: string): string {
 	const cleanupGrantSpans = presignedParamSpans(siblingsRedacted);
 	return siblingsRedacted.replace(REDACTED_URL_NESTED_TAIL_GLOBAL, (match: string, prefix: string, offset: number) => {
 		if (cleanupGrantSpans.some(([start, end]) => offset < end && offset + match.length > start)) return match;
-		const nestedAt = match.search(/https?:\/\//);
+		const nestedAt = match.search(/https?:\/\/|www\./);
 		const tail = nestedAt >= 0 ? match.slice(nestedAt) : "";
-		if (!tail || [...tail.matchAll(NESTED_URL_SPAN_PATTERN)].some((m) => !isSafeNestedCredentialTailUrl(m[0]))) {
+		const before = nestedAt > 0 ? match.slice(prefix.length, nestedAt) : "";
+		// Fail closed: ASCII glue inside the prose we would keep (no separator
+		// label, invisible to residue capture) or any unsafe nested URL removes
+		// the whole tail. main truncates here anyway — removal is parity.
+		if (!tail || hasConcreteAsciiGlueRun(before) || [...tail.matchAll(NESTED_URL_SPAN_PATTERN)].some((m) => !isSafeNestedCredentialTailUrl(m[0]))) {
 			return `${prefix}***`;
 		}
 		// Safe nested report/document links and their CJK prose survive. Only the
 		// credential-shaped prefix is normalized; no legitimate trailing URL is
 		// deleted merely because it follows a redaction marker.
-		const before = match.slice(prefix.length, nestedAt);
 		const proseAt = before.search(/[\u0080-\uffff]/);
 		const prose = proseAt >= 0 ? before.slice(proseAt) : "";
 		return `${prefix}***${prose}${tail}`;
