@@ -743,6 +743,20 @@ test("R4-P1: main's full gap-colon detection coverage is preserved (no narrowing
 	assert.notEqual(gateOutboundText("password://abc123def", "restricted"), "password://abc123def", "zero-gap // value still caught");
 });
 
+test("long user mask markers cannot exhaust the remaining detector gap", () => {
+	for (const length of [3, 6, 7, 8, 9, 10, 12, 16, 64, 512]) {
+		for (const label of ["密码：", "token=", "api_key:"]) {
+			const input = label + "*".repeat(length) + "https://example.com/Abc_123456";
+			for (const message of [input, "密码：First_123456 " + input]) {
+				const out = gateOutboundText(message, "restricted");
+				assert.ok(!out.includes("Abc_123456"), label + " marker length " + length);
+				assert.ok(!out.includes("First_123456"), "independent credential also handled");
+				assert.equal(gateOutboundText(out, "restricted"), out, "stable on recheck");
+			}
+		}
+	}
+});
+
 test("R4-P3: marker clearing preserves word boundaries — no synthesized labels", () => {
 	// Deleting `***` spliced `pass`+`word:` into `password:` and withheld benign
 	// messages; markers are now replaced with same-length spaces.

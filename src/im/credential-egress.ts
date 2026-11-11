@@ -543,13 +543,20 @@ function reportMaskProbe(text: string, clearOtherMarkers: boolean): string {
 
 function finalCredentialCheck(text: string): boolean {
 	if (!text) return false;
-	// Do not delete markers: that would synthesize password from pass***word.
-	// Spaces preserve word boundaries; a newline before a verified report
-	// grant also prevents a label from reinterpreting its scheme separator.
-	// Compute grant spans on the original text: markers can occur inside an
-	// already-redacted query, and their probe whitespace must not truncate it.
-	const probed = reportMaskProbe(text, true);
-	return containsConcreteCredentialIn(probed, presignedParamSpans(text));
+	// Compute protected offsets before normalizing markers. Use a newline for
+	// each cleared grant assignment so unrelated text cannot join across it.
+	const probed = reportMaskProbe(text, false);
+	const parts: string[] = [];
+	let cursor = 0;
+	for (const [start, end] of presignedParamSpans(text)) {
+		parts.push(probed.slice(cursor, start), "\n");
+		cursor = end;
+	}
+	parts.push(probed.slice(cursor));
+	// Two spaces preserve split words (including api***key: the label allows
+	// ONE optional space) without letting marker length exhaust the bounded
+	// gap before a remaining credential. This probe needs no original offsets.
+	return containsConcreteCredentialIn(parts.join("").replace(/\*{3,}/g, "  "), []);
 }
 
 function shapeTripsOutside(text: string, protectedSpans: Array<[number, number]>): boolean {
