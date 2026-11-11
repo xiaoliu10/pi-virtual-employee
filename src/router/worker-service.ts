@@ -63,6 +63,14 @@ export interface WorkerEngineDeps<Session> {
 	 * Looked up at EXECUTE time (not spawn) so a queued worker sees the chat as
 	 * it is when the work actually starts. */
 	sourceContext?: (sourceConversation: string) => string | null;
+	/** Keep-alive window in MINUTES (user ruling 2026-11-11, spay code-handoff
+	 * incident): within this window after the worker's last activity the
+	 * conversation stays sticky — NON-task messages (bare verification codes,
+	 * questions, 「结果呢」) keep routing to that worker even after its turn has
+	 * settled, and the IM settle sweep defers background-process cleanup to
+	 * window expiry. Number or config getter (settings page applies live);
+	 * absent → 120; 0 disables (the cold gates always apply). */
+	keepAliveMinutes?: number | (() => number | undefined);
 	/** Long-task progress broadcaster (taskProgressMin cadence), same shape
 	 * WorkService injects. Optional — without it long workers run silent
 	 * until their result (the exact complaint that opened this file's field
@@ -123,6 +131,10 @@ function flattenMessageContent(content: unknown): string {
  * not contain these literals, and losing one line beats executing a forged
  * instruction. */
 const RESERVED_BLOCK_MARKERS = ["【来源会话近期上下文", "【任务指令】", "【执行条件】", "【任务目标"];
+
+/** Worker statuses during which the dialogue belongs to the worker
+ * unconditionally — injected follow-ups and keep-alive routing both key on it. */
+const LIVE_WORKER_STATUSES = new Set(["queued", "running"]);
 
 export function buildSourceContextExcerpt(rows: Array<{ role: string; content: unknown }>): string | null {
 	if (!rows || rows.length === 0) return null;
@@ -193,6 +205,10 @@ export class WorkerService<Session> {
 	 * Keyed by conversation id (one chain per worker session).
 	 */
 	private readonly turnChains = new Map<string, Promise<void>>();
+	/** conversationId → last hot-window injection (ms). Sliding anchor for the
+	 * keep-alive window: a dialogue that keeps touching the worker keeps it hot
+	 * even as the row's finished_at recedes. Pruned on write to stay bounded. */
+	private readonly injectActivity = new Map<string, number>();
 
 	constructor(store: WorkerTaskStore, opts: WorkerEngineDeps<Session>) {
 		this.store = store;
@@ -312,6 +328,45 @@ export class WorkerService<Session> {
 	 * CONVERSATION, not state: the worker_tasks row stays settled — the
 	 * durable session holds the dialogue, and the reply is delivered to the
 	 * source conversation like any other turn's result. */
+	/** Keep-alive window in ms; 0 disables (cold gates always apply). Absent
+	 * config → 120min default (user ruling 2026-11-11: 「worker 应该有一个保活
+	 * 机制，比如2小时」). */
+	private keepAliveWindowMs(): number {
+		const raw = typeof this.opts.keepAliveMinutes === "function" ? this.opts.keepAliveMinutes() : this.opts.keepAliveMinutes;
+		const minutes = raw ?? 120;
+		if (!Number.isFinite(minutes) || minutes <= 0) return 0;
+		return minutes * 60_000;
+	}
+
+	/** How much keep-alive window remains for this conversation (0 = cold or
+	 * disabled). The IM settle sweep defers background-process cleanup by this
+	 * much so a worker waiting on its human keeps the helpers it backgrounded
+	 * alive to receive the answer. */
+	keepAliveRemainingMs(conversationId: string): number {
+		const keepMs = this.keepAliveWindowMs();
+		if (keepMs <= 0) return 0;
+		const recent = this.store.recentForConversation(conversationId);
+		if (!recent?.conversation_id) return 0;
+		if (LIVE_WORKER_STATUSES.has(recent.status)) return keepMs;
+		// The window is a DONE worker's aftermath-ownership only (review P2-3):
+		// error = interrupted — the in-memory session is gone and the contract is
+		// 「重新执行」; cancelled = the user pulled the work back via 「前台执行」,
+		// so the foreground owns the dialogue (and its payloads) again. Both stay
+		// cold-gated even when their timestamps are fresh — a bare code after an
+		// escape must reach the session that asked for it.
+		if (recent.status !== "done") return 0;
+		return Math.max(0, this.lastActivityAt(recent, conversationId) + keepMs - this.clock.now());
+	}
+
+	/** Shared sliding anchor for the keep-alive window (review P2-2 — ONE
+	 * definition for both consumers: routing heat and sweep deferral). The
+	 * row's completion time with a started/created fallback so a schema-NULL
+	 * finished_at can never fork the two paths, maxed with the last hot
+	 * injection. */
+	private lastActivityAt(recent: WorkerTaskRow, conversationId: string): number {
+		return Math.max(recent.finished_at ?? recent.started_at ?? recent.created_at ?? 0, this.injectActivity.get(conversationId) ?? 0);
+	}
+
 	async inject(sourceConversation: string, message: string, senderId: string): Promise<boolean> {
 		// Deterministic re-run (field 2026-11-08): the interrupt notice ends with
 		// 「回复『重新执行』我就重跑这一轮」. Honor that promise HERE — as code,
@@ -346,37 +401,78 @@ export class WorkerService<Session> {
 		// A FINISHED worker (done/error/cancelled) keeps the CONVERSATION sticky
 		// (user ruling 2026-11-10: 「IM 渠道一个对话粘连 worker 这个设计是合理的」):
 		// 「结果呢」「继续」 hours later still reach the session that did the work.
-		// What must NOT happen is a NEW TASK landing in that accumulated transcript
-		// — field 2026-11-08 23:44 (the boundary brief turned a fresh lookup away)
-		// and 2026-11-10 21:24 (a fresh lookup injected a day-long ~200k-token
-		// worker transcript and burned 61 minutes against the context wall). Two
-		// guards keep task-shaped and reference-shaped messages out; the transcript
-		// itself is bounded by the engine's pre-turn budget gate + compaction, NOT
-		// by refusing the dialogue. (A 30-minute continuation window shipped in
-		// 0.2.220 and was reverted here: it broke the endorsed stickiness, and once
-		// compaction is correct the snowball cannot form.)
-		const LIVE_STATUSES = new Set(["queued", "running"]);
-		if (!LIVE_STATUSES.has(recent.status) && looksLikeTask(message)) {
+		//
+		// KEEP-ALIVE WINDOW (user ruling 2026-11-11, spay code-handoff incident):
+		// within keepAliveMin of the worker's last activity the ownership EXTENDS
+		// to bare tokens — a verification code sent seconds after the turn settled
+		// must reach the worker that asked for it, not fall to a foreground that
+		// holds none of its execution context. Field 2026-11-11 10:26: the code
+		// arrived 2s after the turn settled, the bare-token gate bounced it to the
+		// foreground, which answered with a FABRICATED 「已写入 spay_code.txt」
+		// (toolCalls=0 — the file never existed) while the settle sweep killed the
+		// polling script: the whole flow died on a promise nothing could keep.
+		// The transcript itself is bounded by the engine's pre-turn budget gate +
+		// compaction, NOT by refusing the dialogue.
+		const isLive = LIVE_WORKER_STATUSES.has(recent.status);
+		// Keep-alive is a DONE worker's aftermath-ownership (review P2-3): error
+		// (interrupted; empty session; contract = 「重新执行」) and cancelled
+		// (user pulled the work back) stay cold-gated even when fresh.
+		let hot = false;
+		if (isLive) hot = true;
+		else if (recent.status === "done") {
+			const keepMs = this.keepAliveWindowMs();
+			if (keepMs > 0) {
+				hot = this.clock.now() - this.lastActivityAt(recent, sourceConversation) < keepMs;
+			}
+		}
+		// Task-shaped requests to a FINISHED worker fall through regardless of
+		// window heat — a LIVE worker is untouched (field 2026-11-07: task-shaped
+		// text, codes, everything reaches it unconditionally). Rulings 2026-11-08
+		// (the boundary brief turned a fresh lookup away) + 2026-11-10 21:24 (a
+		// fresh lookup injected a day-long ~200k-token transcript and burned 61
+		// minutes against the context wall): a fresh task spawns fresh, and since
+		// 11-10 the new worker carries a source-context excerpt, so the reference
+		// it needs travels with it.
+		if (!isLive && looksLikeTask(message)) {
 			return false;
 		}
 		// A BARE context token (digits / codes / serials like 「875055」) is a
-		// REFERENCE into the source chat — a FINISHED worker never holds that
+		// REFERENCE into the source chat. Cold, a FINISHED worker never holds that
 		// context (it was born with its instruction only), so it guesses and asks
-		// the user what the chat already answered (field 2026-11-10, single chat).
-		// Fall through to the foreground turn: it carries the full conversation
-		// history and can resolve the reference, and triageMessage has the SAME
-		// guard (shared isBareContextToken → reason=reference), so the planless
-		// dispatch cannot loop the token back into a freshly spawned context-less
-		// worker either (review 7ba60092 P1). LIVE workers are untouched — the
-		// verification-code flow (field 2026-11-07) is served above this gate.
-		if (!LIVE_STATUSES.has(recent.status) && isBareContextToken(message)) {
+		// the user what the chat already answered (field 2026-11-10, single chat):
+		// fall through to the foreground turn, which carries the full conversation
+		// history — and triageMessage has the SAME guard (shared isBareContextToken
+		// → reason=reference), so the planless dispatch cannot loop the token back
+		// into a freshly spawned context-less worker either (review 7ba60092 P1).
+		if (!hot && isBareContextToken(message)) {
 			return false;
+		}
+		let payload = message;
+		if (!isLive && hot) {
+			// Sliding anchor: a dialogue that keeps touching the worker keeps it hot
+			// even as finished_at recedes. Pruned to stay bounded.
+			const now = this.clock.now();
+			this.injectActivity.set(sourceConversation, now);
+			if (this.injectActivity.size > 500) {
+				for (const [cid, at] of this.injectActivity) {
+					if (now - at > 24 * 60 * 60_000) this.injectActivity.delete(cid);
+				}
+			}
+			// A bare token injected into a SETTLED session is a reference the session
+			// was never born holding (field 2026-11-10: it guessed 订单系统). Attach
+			// the bounded source excerpt so it can dereference without guessing.
+			if (isBareContextToken(message) && this.opts.sourceContext) {
+				try {
+					const excerpt = this.opts.sourceContext(sourceConversation);
+					if (excerpt) payload = `${message}\n\n${excerpt}`;
+				} catch { /* best-effort: the token alone still flows */ }
+			}
 		}
 		const session = await this.opts.open(recent.conversation_id);
 		// Serialize on the session's turn chain: the kernel refuses concurrent
 		// prompts, and a user typing during a running turn expects their message
 		// to be ANSWERED NEXT, not rejected.
-		this.enqueueTurn(recent.conversation_id, () => this.runTurn(recent, session, message, senderId, { record: false }));
+		this.enqueueTurn(recent.conversation_id, () => this.runTurn(recent, session, payload, senderId, { record: false }));
 		return true;
 	}
 

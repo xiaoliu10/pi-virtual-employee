@@ -345,6 +345,16 @@ export interface AppConfig {
 			enabled: boolean;
 		};
 		/**
+		 * Worker keep-alive window in MINUTES (user ruling 2026-11-11, spay
+		 * code-handoff incident): within this window after a worker's last
+		 * activity the conversation stays sticky — non-task messages (bare
+		 * verification codes, questions, follow-ups) keep routing to that worker,
+		 * and the IM settle sweep defers background-process cleanup to window
+		 * expiry so helpers polling for the awaited input stay alive. 0 disables
+		 * the window (the cold gates always apply). Default 120.
+		 */
+		workerKeepAliveMin?: number;
+		/**
 		 * Unattended auto-update mode. "full" (default for fresh installs and
 		 * configs predating this tri-state): check → download → idle → restart &
 		 * install without a human. "download_only": check + download, but STOP at
@@ -642,7 +652,7 @@ export const DEFAULTS: AppConfig = {
 	identity: { name: "客服小派", role: "虚拟客服", duty: "在线为客户提供专业、礼貌、高效的服务", serviceHours: "7×24h" },
 	im: { enabled: false, channels: [], ack: { enabled: true, text: "👍 收到，正在处理…" } },
 	general: { autostart: false, language: "zh-CN", requestTimeoutMin: 0, longTaskProgressMin: 15, taskProgressMin: 30, turnTimeoutMin: 20, maxToolSteps: 0,
-			progressWatchdog: { enabled: true, stallWindowMs: 300_000, windowSize: 32, softStopAfterWindows: 2, hungRequestCapMs: 600_000 }, taskPlanning: { enabled: true }, chatDispatch: { enabled: true }, autoUpdate: true, oneOffRetentionDays: 30, messageRetentionDays: 30, engineKernel: "legacy" as const, piRegistryUrl: "" },
+			progressWatchdog: { enabled: true, stallWindowMs: 300_000, windowSize: 32, softStopAfterWindows: 2, hungRequestCapMs: 600_000 }, taskPlanning: { enabled: true }, chatDispatch: { enabled: true }, workerKeepAliveMin: 120, autoUpdate: true, oneOffRetentionDays: 30, messageRetentionDays: 30, engineKernel: "legacy" as const, piRegistryUrl: "" },
 	browser: { enabled: false, headless: true, allowedDomains: [], downloadHost: "", useRealProfile: false },
 	computer: DEFAULT_COMPUTER_CONFIG,
 	scheduler: { enabled: true },
