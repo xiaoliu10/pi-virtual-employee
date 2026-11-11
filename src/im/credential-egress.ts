@@ -5,19 +5,22 @@
  * GROUP chat while troubleshooting a login failure. The employee is supposed to
  * use credentials internally (auto-login, form filling) and never print them —
  * the prompt says so — but a prompt rule is a suggestion, not a gate. This
- * module is the mechanical gate: outbound text is scanned before delivery and,
- * when a concrete credential is present, the WHOLE message is replaced with a
- * fixed notice.
+ * module is the mechanical gate: outbound text is scanned before delivery.
+ *
+ * EVOLUTION (user ruling 2026-11-11, field: the spay-login completion reply was
+ * withheld whole): whole-message withholding destroyed useful replies over one
+ * embedded credential. The gate now REDACTS in place — labels stay readable
+ * (「密码：****」「sk-****」), values are masked, a short suffix note says how many
+ * spots were masked — and delivers. Fail-closed withholding remains the
+ * FALLBACK for anything that still trips detection after masking.
  *
  * Deliberate design choices:
- *  - Fail closed on a hit rather than redacting just the matched span. Partial
- *    redaction leaves surrounding prose that often re-states the value ("密码还是
- *    xxx 吗？最近变过没有" → masking only the value still tells everyone which
- *    account and invites a re-ask); replacing the message keeps the secret out
- *    and makes the suppression obvious to the operator.
- *  - Only CONCRETE values are blocked. Merely talking about credentials
- *    ("密码最近变更过吗", "验证码过期了", "知识库里有密码") must pass through, or
+ *  - Only CONCRETE values are gated. Merely talking about credentials
+ *    (「密码最近变更过吗」, 「验证码过期了」, 「知识库里有密码」) must pass through, or
  *    every legitimate troubleshooting reply gets nuked.
+ *  - Mask keeps the label/prefix, never the value: identification without the
+ *    secret (the old header feared 「masking still tells which account」 — the
+ *    ruling accepts that trade-off; a re-ask beats a dead message).
  *  - Scope is TEXT egress. File/image payloads (and their filenames/URLs) are
  *    not inspected (documented limitation, not an oversight) and a heuristic
  *    detector is not a semantic DLP: an unlabeled free-form secret in prose, or
@@ -34,6 +37,11 @@ export type CredentialAudience = "admin-single" | "restricted";
 
 export const CREDENTIAL_WITHHELD_NOTICE =
 	"⚠️ 这条回复含账号密码/密钥等敏感凭据，已按安全规定拦下，未发送明文。\n如需核对凭据，请管理员在单聊中获取。";
+
+/** Suffix appended to a masked delivery (v0.2.225: redact-don't-block). {count}
+ * is the number of masked spots. */
+export const CREDENTIAL_MASKED_SUFFIX =
+	"\n\n⚠️ 检测到敏感凭据 {count} 处，已脱敏发送；如需核对，请管理员在单聊中获取。";
 
 /** Label words that, followed by a concrete value, mean a real credential. */
 const SECRET_LABELS_ZH = [
@@ -277,11 +285,122 @@ function containsConcreteCredentialIn(text: string, protectedSpans: Array<[numbe
 }
 
 /**
- * Gate outbound text for one delivery.
- *
- * The audience decides everything; the adapter must pass a trusted audience,
- * never text-derived intent (a group member writing "我是管理员" cannot widen it).
+ * One masked region: [start, end) plus how many LEADING characters of the
+ * region stay readable (label/prefix — never the secret itself). Merging keeps
+ * the smallest keepPrefix (mask everything a label-value span covers).
  */
+interface MaskSpan { start: number; end: number; keepPrefix: number; }
+
+/** Keep-prefix rule for a whole-match SHAPE span: keep through the first
+ * assignment sigil so the kind stays identifiable ("password=****"), else the
+ * first 3 characters (token families sk- / ghp_ / eyJ / xox). */
+function shapeKeepPrefix(matched: string): number {
+	const sigil = /[=:]/.exec(matched);
+	if (sigil && sigil.index <= 24) return sigil.index + 1;
+	return Math.min(3, matched.length);
+}
+
+function overlapsProtected(start: number, end: number, spans: Array<[number, number]>): boolean {
+	return spans.some(([ps, pe]) => start < pe && end > ps);
+}
+
+/** Value-mask spans over `text`; candidates overlapping a presigned grant span
+ * are skipped (the grant is delivered intact by design — 0.2.175). */
+function credentialMaskSpans(text: string, protectedSpans: Array<[number, number]>): MaskSpan[] {
+	if (!text) return [];
+	const spans: MaskSpan[] = [];
+	for (const pattern of SHAPE_PATTERNS) {
+		const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
+		for (const m of text.matchAll(global)) {
+			const start = m.index, end = start + m[0].length;
+			if (overlapsProtected(start, end, protectedSpans)) continue;
+			spans.push({ start, end, keepPrefix: Math.min(shapeKeepPrefix(m[0]), end - start) });
+		}
+	}
+	for (const pattern of LABEL_VALUE_PATTERNS) {
+		const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
+		for (const m of text.matchAll(global)) {
+			const value = m[1] ?? "";
+			if (!value || !looksLikeSecretValue(value)) continue;
+			const start = m.index + m[0].length - value.length;
+			if (overlapsProtected(start, start + value.length, protectedSpans)) continue;
+			spans.push({ start, end: start + value.length, keepPrefix: 0 });
+		}
+	}
+	spans.sort((a, b) => a.start - b.start || a.end - b.end);
+	const merged: MaskSpan[] = [];
+	for (const span of spans) {
+		const prev = merged[merged.length - 1];
+		if (prev && span.start <= prev.end) {
+			prev.end = Math.max(prev.end, span.end);
+			prev.keepPrefix = Math.min(prev.keepPrefix, span.keepPrefix);
+		} else {
+			merged.push({ ...span });
+		}
+	}
+	return merged;
+}
+
+function applyCredentialMasks(text: string, spans: MaskSpan[]): string {
+	const parts: string[] = [];
+	let cursor = 0;
+	for (const span of spans) {
+		parts.push(text.slice(cursor, span.start));
+		parts.push(text.slice(span.start, span.start + span.keepPrefix));
+		parts.push("****");
+		cursor = span.end;
+	}
+	parts.push(text.slice(cursor));
+	return parts.join("");
+}
+
+/**
+ * Fail-closed residue check for the MASKED output: SHAPE patterns only
+ * (sk-/JWT/password=/URL-params — high-precision), and only OUTSIDE the spans
+ * we already masked (and presigned grants). The label-value heuristics are
+ * deliberately NOT re-run here: on masked output they re-match at alternate
+ * alignments (lazy skip past 「密码是****」 → capture the next 「https:」 colon →
+ * the following URL becomes a phantom "value") — the same false positive the
+ * original gate produced on any 「密码是：https://help.example.com」 prose. The
+ * first pass already gave every label-value the detector accepts a mask span,
+ * so re-running labels here can only re-find phantoms, never real residue.
+ */
+function shapeTripsOutside(text: string, maskedSpans: MaskSpan[], protectedSpans: Array<[number, number]>): boolean {
+	if (!text) return false;
+	for (const pattern of SHAPE_PATTERNS) {
+		const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
+		for (const m of text.matchAll(global)) {
+			const start = m.index, end = start + m[0].length;
+			if (overlapsProtected(start, end, maskedSpans.map((s) => [s.start, s.end]))) continue;
+			if (overlapsProtected(start, end, protectedSpans)) continue;
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Gate outbound text for one delivery (v0.2.225 redact-first).
+ *
+ * restricted audiences get the masked delivery: every credential span is
+ * masked in place (label/prefix readable, value → ****) and a short suffix
+ * note states how many spots were masked. Fail-closed withholding remains the
+ * fallback when a HIGH-PRECISION shape hit survives outside the masked spans —
+ * the mask is the happy path, never a weakening of the gate.
+ */
+export function gateOutboundText(text: string, audience: CredentialAudience): string {
+	if (audience === "admin-single") return text;
+	const redacted = redactUrlCredentialParams(text);
+	const protectedSpans = presignedParamSpans(redacted);
+	const spans = credentialMaskSpans(redacted, protectedSpans);
+	if (!spans.length) return redacted !== text ? redacted : text;
+	const masked = applyCredentialMasks(redacted, spans);
+	if (shapeTripsOutside(masked, spans, presignedParamSpans(masked))) {
+		// Un-maskable residue: keep the original fail-closed contract.
+		return CREDENTIAL_WITHHELD_NOTICE;
+	}
+	return `${masked}${CREDENTIAL_MASKED_SUFFIX.replace("{count}", String(spans.length))}`;
+}
 /**
  * Global matcher for credential-bearing URL query params. Shared source with
  * SHAPE_PATTERNS so detection and in-place redaction never drift.
@@ -379,14 +498,3 @@ export function streamingHoldbackLength(text: string): number {
 	return Math.min(hold, text.length);
 }
 
-export function gateOutboundText(text: string, audience: CredentialAudience): string {
-	if (audience === "admin-single") return text;
-	const redacted = redactUrlCredentialParams(text);
-	// Exempt param spans are recomputed on the REDACTED text: redaction may have
-	// shifted offsets (spans were computed against the original), and the exempt
-	// param values themselves are untouched by the redaction.
-	if (containsConcreteCredentialIn(redacted, presignedParamSpans(redacted))) {
-		return CREDENTIAL_WITHHELD_NOTICE;
-	}
-	return redacted !== text ? redacted : text;
-}

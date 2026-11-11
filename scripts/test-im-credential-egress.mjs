@@ -122,11 +122,18 @@ test("talking ABOUT credentials without a value is never blocked", () => {
 	}
 });
 
-test("gate: groups are always withheld, even when the sender is an admin", () => {
+test("gate: groups get a MASKED delivery, not a whole-message withhold (user ruling 2026-11-11)", () => {
 	const text = `密码还是 ${SECRET} 吗？`;
 	// The audience is decided by the trusted route, so a group is "restricted"
 	// regardless of who asked — the admin CASE is covered by the adapter test.
-	assert.equal(gateOutboundText(text, "restricted"), CREDENTIAL_WITHHELD_NOTICE);
+	// v0.2.225: the value is masked in place (label readable), a short suffix
+	// note reports the redaction — the message survives.
+	const out = gateOutboundText(text, "restricted");
+	assert.ok(!out.includes(SECRET), "the secret value never reaches the wire");
+	assert.ok(out.includes("****"), "the value is masked");
+	assert.ok(out.includes("密码还是"), "the label stays readable");
+	assert.ok(out.includes("脱敏"), "a masked-delivery note is appended");
+	assert.ok(!out.includes("拦下"), "the withhold notice is NOT the delivery");
 });
 
 test("gate: restricted keeps ordinary text verbatim, and the notice is idempotent", () => {
@@ -281,15 +288,19 @@ test("mid-turn progress and proactive push are gated too", async () => {
 	}
 });
 
-test("a credential straddling a long push is caught BEFORE splitting (manager path)", async () => {
+test("a credential straddling a long push is masked BEFORE splitting (manager path)", async () => {
 	// The field message was one long troubleshooting reply; splitForPush cuts at
 	// ~1200 chars, so a value landing near a boundary must not survive as two
-	// individually-innocuous halves.
+	// individually-innocuous halves. v0.2.225: the whole message is scanned and
+	// MASKED before any split — the value cannot ride a boundary.
 	const { gateOutboundText: gate } = await import(pathToFileURL(bundle).href);
 	const filler = "巡检说明：".repeat(240); // long enough to force a split
 	const long = `${filler}\n密码还是 ${SECRET} 吗？`;
 	assert.ok(long.length > 1200, "the fixture really is long");
-	assert.equal(gate(long, "restricted"), CREDENTIAL_WITHHELD_NOTICE, "whole-message scan happens before any split");
+	const out = gate(long, "restricted");
+	assert.ok(!out.includes(SECRET), "whole-message mask happens before any split");
+	assert.ok(out.includes("****"), "the value is masked in the long body");
+	assert.ok(out.includes("脱敏"), "the masked-delivery note is appended");
 });
 
 test("a share-link token is redacted in place — the report text survives", async () => {
@@ -300,9 +311,34 @@ test("a share-link token is redacted in place — the report text survives", asy
 	assert.ok(delivered.includes("日报已生成"), "the rest of the message survives");
 	// Idempotent: re-gating the redacted text is a no-op.
 	assert.equal(gateOutboundText(delivered, "restricted"), delivered);
-	// But a real labeled credential nearby still withholds the whole message.
+	// A real labeled credential nearby is MASKED in place (v0.2.225) while the
+	// share-link redaction stays intact.
 	const mixed = `密码是 Abc_123456 ${link}`;
-	assert.equal(gateOutboundText(mixed, "restricted"), CREDENTIAL_WITHHELD_NOTICE);
+	const mixedOut = gateOutboundText(mixed, "restricted");
+	assert.ok(!mixedOut.includes("Abc_123456"), "the labeled value never reaches the group");
+	assert.ok(/密码是\s*\*{4}/.test(mixedOut), "the label stays, the value is masked");
+	assert.ok(mixedOut.includes("access_token=***"), "the share-link redaction still applies");
+	assert.ok(mixedOut.includes("脱敏"), "the masked note reports the redaction");
+});
+
+test("mask keeps token-family prefixes and counts multiple spots", () => {
+	const text = "配置用了 sk-abcdefghijklmnopqrstuvwx，回执 token=Zx9Kq2Lm8Pp4Qr7St 也换过。";
+	const out = gateOutboundText(text, "restricted");
+	assert.ok(!out.includes("sk-abcdefghijklmnopqrstuvwx"), "the key value is gone");
+	assert.ok(out.includes("sk-****"), "the token-family prefix stays identifiable");
+	assert.ok(!out.includes("Zx9Kq2Lm8Pp4Qr7St"), "the env value is gone");
+	assert.ok(out.includes("token=****"), "the env label stays readable");
+	assert.ok(out.includes("2 处"), "the suffix counts both masked spots");
+});
+
+test("presigned report links stay intact while a separate credential is masked", () => {
+	const link = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r/日报.xlsx?OSSAccessKeyId=abcd&Signature=Sig%2BValue%3D&Expires=9999999999";
+	const text = `巡检完成，报表：${link}\n（登录密码：Sup3rSecret! 如需自取请告知）`;
+	const out = gateOutboundText(text, "restricted");
+	assert.ok(out.includes("OSSAccessKeyId=abcd"), "the presigned grant survives untouched");
+	assert.ok(out.includes("Signature=Sig%2BValue%3D"), "the signature is a grant, not a leak");
+	assert.ok(!out.includes("Sup3rSecret!"), "the labeled password is masked");
+	assert.ok(out.includes("脱敏"), "the masked note is appended");
 });
 
 test("an OSS presigned report link survives group egress intact (field 2026-10-27)", () => {
@@ -321,12 +357,13 @@ test("an OSS presigned report link survives group egress intact (field 2026-10-2
 });
 
 test("a presigned link does not exempt a REAL credential elsewhere in the message", () => {
+	// v0.2.225: per-URL protection means the grant survives AND the labeled
+	// credential is masked — both in one delivery (never a whole withhold).
 	const link = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.html?OSSAccessKeyId=LTAIZHYtKQegFGXe&Expires=1795654871&Signature=N9him7VHYYIEdIftaIY5iHWf2iU%3D";
-	assert.equal(
-		gateOutboundText(`密码是 Abc_123456 查看报告：${link}`, "restricted"),
-		CREDENTIAL_WITHHELD_NOTICE,
-		"presigned protection is per-URL, never a whole-message exemption",
-	);
+	const out = gateOutboundText(`密码是 Abc_123456 查看报告：${link}`, "restricted");
+	assert.ok(!out.includes("Abc_123456"), "presigned protection is per-URL, never a whole-message exemption: the credential is still masked");
+	assert.ok(out.includes("Signature=N9him7VHYYIEdIftaIY5iHWf2iU%3D"), "the grant itself survives untouched");
+	assert.ok(out.includes("脱敏"), "the masked note is appended");
 });
 
 test("a fake presigned marker never rescues a credential URL (review P1 regression pins)", () => {
@@ -335,9 +372,14 @@ test("a fake presigned marker never rescues a credential URL (review P1 regressi
 	const dg = gateOutboundText(g, "restricted");
 	assert.ok(dg.includes("access_token=***"), "PAT redacted despite the fake presigned markers");
 	assert.ok(!dg.includes("gk_abcdef123456"));
-	// [B] intranet password url + dummy markers: whole message still withheld.
+	// [B] intranet password url + dummy markers: the password is masked (the
+	// fake markers are swallowed by the same mask span) — v0.2.225 delivers.
 	const b = "http://10.0.0.5:8080/d?password=hunter2secure&OSSAccessKeyId=x&Signature=abcdef123456";
-	assert.equal(gateOutboundText(b, "restricted"), CREDENTIAL_WITHHELD_NOTICE, "withhold is restored for non-storage hosts");
+	const db = gateOutboundText(b, "restricted");
+	assert.ok(!db.includes("hunter2secure"), "non-storage host: the password never survives");
+	assert.ok(db.includes("password="), "the label stays readable");
+	assert.ok(db.includes("****"), "the value is masked");
+	assert.ok(db.includes("脱敏"), "the masked note is appended");
 	// [C] REAL presigned url carrying an extra credential param: param-level split.
 	const real = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.html?access_token=gk_abcdef123456&OSSAccessKeyId=LTAIZHYtKQegFGXe&Expires=1795654871&Signature=N9him7VHYYIEdIftaIY5iHWf2iU%3D";
 	const dr = gateOutboundText(real, "restricted");
