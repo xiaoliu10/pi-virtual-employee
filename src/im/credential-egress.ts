@@ -85,33 +85,70 @@ const ALL_LABELS_ALT = [...SECRET_LABELS_ZH, ...SECRET_LABELS_EN].join("|");
  * substring inside the value (review P1-2 fix iteration): English labels like
  * 「secret」 must not cut 「SuperSecret99!」 in half — the (?<![A-Za-z0-9_])
  * lookbehind requires a word boundary before the label, so a label embedded in
- * a longer token does not count. A URL scheme stops capture too (review P1-1b)
- * so a glued report link survives whole-URL subtraction. */
-const LABEL_BOUNDARY = String.raw`(?<![A-Za-z0-9_])(?:${ALL_LABELS_ALT})|https?://`;
-/** Tempered value group: 6-200 non-space chars, stopping at a later label-word
- * boundary or a URL scheme. */
-const TAMPERED_VALUE = String.raw`((?:(?!${LABEL_BOUNDARY})\S){6,200})`;
-
-/** Build the "label + concrete value" patterns once. */
-const LABEL_VALUE_PATTERNS: RegExp[] = [];
-for (const label of [...SECRET_LABELS_ZH, ...SECRET_LABELS_EN]) {
-	// Separator form: 密码：xxx / 密码是 xxx / 密码还是 xxx / password: xxx / **密码**：`xxx`
-	// 0x60 = backtick, kept as an escape so the character class stays readable.
-	// Detection keeps main's FULL separator coverage (review round-4: narrowing
-	// the gap colon leaked `password hint://Abc_123456` — 731 corpus cases).
-	// Masked-output URL artifacts are separated at mask boundaries downstream,
-	// keeping the raw-input detector unchanged.
-	LABEL_VALUE_PATTERNS.push(new RegExp(
-		String.raw`(?<![A-Za-z0-9_])(?:${label})[^\n]{0,12}?(?:[:：=]|是|为|还是|改成|改为|变成|重置成|重设为|修改成)\s*[*_\x60"'“”「『(（]*${TAMPERED_VALUE}`,
-		"iu",
-	));
-	// Verb-first form: 正在用密码 xxx 登录 / 拿 token xxx 调接口 / 输入口令 xxx.
-	// No colon or 是 here — the verb + label is the separator.
-	LABEL_VALUE_PATTERNS.push(new RegExp(
-		String.raw`(?<![A-Za-z0-9_])(?:用|拿|以|输入|填入|填|试试|尝试|带上|附上)\s*(?:${label})\s*[:：=]?\s*[*_\x60"'“”「『(（]*${TAMPERED_VALUE}`,
-		"iu",
-	));
+ * a longer token does not count.
+ *
+ * TWO pattern sets share the builder (review round-6 N1, P0):
+ * - INPUT set (`urlBoundary: true`) — mask loop + public detection. Value
+ *   capture stops at `https?://`, the v0.2.225 delivery contract: a report or
+ *   share URL adjacent to a masked secret survives as a delivery artifact, and
+ *   verified grants are additionally protected by whole-URL subtraction.
+ * - RESIDUE set (`urlBoundary: false`) — ONLY for re-checking the final text.
+ *   A label + whitespace + secret URL (`密码：\nhttps://example.com/Abc_123456`,
+ *   a wholly natural line break — review N1) must trip exactly like main, so
+ *   URLs do NOT stop capture there. Masked-output artifacts cannot false-trip
+ *   because generated masks persist a prose boundary before share links, and
+ *   verified-report skeletons/grant params are cleared from the probe. */
+function buildLabelValuePatterns(urlBoundary: boolean): RegExp[] {
+	const boundary = urlBoundary
+		? String.raw`(?<![A-Za-z0-9_])(?:${ALL_LABELS_ALT})|https?://`
+		: String.raw`(?<![A-Za-z0-9_])(?:${ALL_LABELS_ALT})`;
+	const tempered = String.raw`((?:(?!${boundary})\S){6,200})`;
+	const patterns: RegExp[] = [];
+	for (const label of [...SECRET_LABELS_ZH, ...SECRET_LABELS_EN]) {
+		// Separator form: 密码：xxx / 密码是 xxx / 密码还是 xxx / password: xxx / **密码**：`xxx`
+		// 0x60 = backtick, kept as an escape so the character class stays readable.
+		// Detection keeps main's FULL separator coverage (review round-4: narrowing
+		// the gap colon leaked `password hint://Abc_123456` — 731 corpus cases).
+		patterns.push(new RegExp(
+			String.raw`(?<![A-Za-z0-9_])(?:${label})[^\n]{0,12}?(?:[:：=]|是|为|还是|改成|改为|变成|重置成|重设为|修改成)\s*[*_\x60'"“”「『(（]*${tempered}`,
+			"iu",
+		));
+		// Verb-first form: 正在用密码 xxx 登录 / 拿 token xxx 调接口 / 输入口令 xxx.
+		// No colon or 是 here — the verb + label is the separator.
+		patterns.push(new RegExp(
+			String.raw`(?<![A-Za-z0-9_])(?:用|拿|以|输入|填入|填|试试|尝试|带上|附上)\s*(?:${label})\s*[:：=]?\s*[*_\x60'"“”「『(（]*${tempered}`,
+			"iu",
+		));
+	}
+	return patterns;
 }
+
+/** Label+value patterns over INPUT text (mask loop + public detection). */
+const LABEL_VALUE_PATTERNS: RegExp[] = buildLabelValuePatterns(true);
+/** Label+value patterns for the RESIDUE re-check over final/probe text — a
+ * label + gap + URL value counts there (review N1). */
+const RESIDUE_LABEL_VALUE_PATTERNS: RegExp[] = buildLabelValuePatterns(false);
+
+/**
+ * Review round-6 N1 (P0): label + separator + (whitespace or mask markers) +
+ * an http(s) URL — the URL IS the value. Main withholds such a message
+ * wholesale; the branch masks the URL span instead (delivery preserved, secret
+ * gone). Only ZERO-GAP separators qualify: a match that reaches a URL through
+ * a prose gap (「…生成：https://…」 after unrelated words) is not a labeled
+ * value, so report/share links adjacent to other text survive untouched.
+ * Verified report grants are skipped in the mask loop (system artifacts per
+ * the 0.2.175 field ruling). */
+function buildLabelUrlValuePatterns(): RegExp[] {
+	const patterns: RegExp[] = [];
+	for (const label of [...SECRET_LABELS_ZH, ...SECRET_LABELS_EN]) {
+		patterns.push(new RegExp(
+			String.raw`(?<![A-Za-z0-9_])(?:${label})(?:[:：=]|是|为|还是|改成|改为|变成|重置成|重设为|修改成)\s*(?:\*{3,}\s*)?(https?:\/\/\S{6,200})`,
+			"iu",
+		));
+	}
+	return patterns;
+}
+const LABEL_URL_VALUE_PATTERNS: RegExp[] = buildLabelUrlValuePatterns();
 
 /** Credential-bearing URL query-param name list (shared source, see below).
  * Value class EXCLUDES the star marker (*): redaction/mask fillers (***, ****,
@@ -216,7 +253,7 @@ function isPresignedObjectUrl(url: string): boolean {
  * path) at 0x7F keeps the grant intact AND lets glued CJK prose be masked. The
  * `\?` is required — every presigned grant has a query, and a span without one
  * is never a grant, so nothing to protect is lost. */
-const OBJECT_URL_SPAN_PATTERN = /https?:\/\/[^\s<>"'?]*\?[^\s<>"',;\u0080-\uffff]+/g;
+const OBJECT_URL_SPAN_PATTERN = /https?:\/\/[^\s<>"'?]*\?(?:(?!https?:\/\/)[^\s<>"',;\u0080-\uffff])+/g;
 /** CJK/bracket punctuation that glues onto a URL in prose but is not part of it. */
 const URL_TRAILING_NOISE = /[)\]}>，。；！？、）】」』”’…]+$/;
 
@@ -227,7 +264,11 @@ const URL_TRAILING_NOISE = /[)\]}>，。；！？、）】」』”’…]+$/;
  * credential params on the same URL (access_token, password, …) are NOT
  * protected and still get masked (per-param, never per-URL).
  */
-const PRESIGNED_PARAM_PATTERN = /([?&](?:OSSAccessKeyId|Signature|X-Amz-Signature|X-Amz-Credential)=)([^\s&"']*)/gi;
+// Expires/Date params are part of the grant triple too: the backstop splices
+// grant assignments out of the probe text, and a leftover `&Expires=1799999999`
+// would otherwise serve as label-value material for a preceding 「密码：」 and
+// withhold a delivered report (review round-6 regression hunt).
+const PRESIGNED_PARAM_PATTERN = /([?&](?:OSSAccessKeyId|Signature|X-Amz-Signature|X-Amz-Credential|Expires|X-Amz-Expires|X-Amz-Date|X-Oss-Date)=)([^\s&"']*)/gi;
 
 function presignedParamSpans(text: string): Array<[number, number]> {
 	const spans: Array<[number, number]> = [];
@@ -282,9 +323,11 @@ const SHAPE_PATTERNS: RegExp[] = [
 	// from re-tripping the shape in later iterative passes.
 	new RegExp(`[?&]${URL_TOKEN_PARAM_SOURCE_BODY}=${URL_TOKEN_PARAM_VALUE}`, "i"),
 	// A pasted access-token assignment after prose punctuation is no longer a
-	// query parameter, but still carries the same credential. Exclude mask
-	// fillers so an already-redacted URL does not capture the following grant.
-	/(?<![A-Za-z0-9_])access[-_]?token\s*[:=]\s*[^*\s&"']{6,}/i,
+	// URL query param, but still carries the same credential. Horizontal-only
+	// gaps plus the scheme lookahead keep the match from crossing a line break
+	// or capturing a following (report) URL as the value (review round-6 P2);
+	// the star-excluded value class never re-trips on redacted `***`.
+	/(?<![A-Za-z0-9_])access[-_]?token[^\S\r\n]*[:=][^\S\r\n]*(?!https?:\/\/)[^*\s&"']{6,}/i,
 	// env / ini style assignment of a secret-looking key. The value class
 	// tempers on a URL scheme (review P1-1b): without it a no-space
 	// 「PASSWORD=secret巡检报告https://…」 capture swallows the report URL.
@@ -313,7 +356,7 @@ export function containsConcreteCredential(text: string): boolean {
  * Spans are masked with a hazard-free filler of the same length so offsets and
  * surrounding context stay intact.
  */
-function containsConcreteCredentialIn(text: string, protectedSpans: Array<[number, number]>): boolean {
+function containsConcreteCredentialIn(text: string, protectedSpans: Array<[number, number]>, labelPatterns: RegExp[] = LABEL_VALUE_PATTERNS): boolean {
 	if (!text) return false;
 	let masked = text;
 	if (protectedSpans.length) {
@@ -329,7 +372,7 @@ function containsConcreteCredentialIn(text: string, protectedSpans: Array<[numbe
 	for (const pattern of SHAPE_PATTERNS) {
 		if (pattern.test(masked)) return true;
 	}
-	for (const pattern of LABEL_VALUE_PATTERNS) {
+	for (const pattern of labelPatterns) {
 		const match = pattern.exec(masked);
 		if (!match) continue;
 		// A labelled mention only counts when the following token looks like a
@@ -474,6 +517,19 @@ function credentialMaskSpans(text: string): MaskSpan[] {
 			if (value.length >= 6) labelValues.add(value);
 		}
 	}
+	// Review round-6 N1: a URL directly after a label separator IS the value.
+	// Mask the URL span unless it is a verified report grant (wholeUrlSpans) —
+	// links delivered as artifacts must never be torn apart by a nearby label.
+	for (const pattern of LABEL_URL_VALUE_PATTERNS) {
+		const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
+		for (const m of labelProbe.matchAll(global)) {
+			const url = m[1] ?? "";
+			if (!url) continue;
+			const start = m.index + m[0].length - url.length;
+			if (overlapsProtected(start, start + url.length, wholeUrlSpans)) continue;
+			spans.push({ start, end: start + url.length, keepPrefix: 0 });
+		}
+	}
 	// P1-C hardening: a secret that was masked after a label may ALSO appear bare
 	// elsewhere in the same message (`Abc_123456 密码是 Abc_123456`). The bare copy
 	// has no shape and no label, so neither gate catches it standalone; main only
@@ -516,6 +572,15 @@ function applyCredentialMasks(text: string, spans: MaskSpan[]): string {
 		parts.push(text.slice(cursor, span.start));
 		parts.push(text.slice(span.start, span.start + span.keepPrefix));
 		parts.push("****");
+		// Keep a generated mask separate from prose introducing a redacted share
+		// link. Persist the boundary in the delivered text so re-gating needs no
+		// exemption for arbitrary URLs containing an untrusted `***` marker.
+		const tail = text.slice(span.end);
+		const nextUrl = /https?:\/\/\S+/.exec(tail);
+		if (nextUrl && /\*{3,}/.test(nextUrl[0]) && nextUrl.index > 0 &&
+			!/[\r\n]/.test(tail.slice(0, nextUrl.index)) && /\S/.test(tail.slice(0, nextUrl.index))) {
+			parts.push("；\n");
+		}
 		cursor = span.end;
 	}
 	parts.push(text.slice(cursor));
@@ -529,12 +594,9 @@ function applyCredentialMasks(text: string, spans: MaskSpan[]): string {
  * `?access_token=*******` re-match. Coordinates are therefore recomputed on
  * the text actually being sent.
  *
- * Coverage, stated explicitly (review P2 header note): SHAPE patterns only —
- * label-detectable residue is structurally invisible here because label
- * heuristics re-match at phantom alignments on masked output (the
- * 「密码是****」 → next `https:` colon case). Label coverage comes from
- * iterative masking in gateOutboundText + the overlong ceiling check, never
- * from this function.
+ * The final check includes shapes and label values. Verified grant material
+ * is cleared from its probe; generated masks retain prose boundaries so a
+ * label cannot attach itself to an unrelated report URL.
  */
 /** Recheck remaining credentials without joining words across mask markers. */
 function reportMaskProbe(text: string): string {
@@ -551,12 +613,25 @@ function reportMaskProbe(text: string): string {
 
 function finalCredentialCheck(text: string): boolean {
 	if (!text) return false;
-	// Compute protected offsets before normalizing markers. Use a newline for
-	// each cleared grant assignment so unrelated text cannot join across it.
+	// Compute protected offsets before normalizing markers.
 	const probed = reportMaskProbe(text);
+	const cleared: Array<[number, number]> = [...presignedParamSpans(text)];
+	// Verified report URLs are system artifacts: splice the SKELETON
+	// (scheme://host/path) and each grant-param assignment out with hard
+	// newline boundaries, so neither can be re-read as a label value by the
+	// residue patterns. NON-grant query params (e.g. `&secret_key=…`) stay
+	// visible — catching those is the compound-leak purpose of this backstop.
+	for (const [start, end] of presignedUrlSpans(text)) {
+		const q = text.indexOf("?", start);
+		cleared.push([start, q !== -1 && q < end ? q : end]);
+	}
+	// Clear wider spans first when offsets tie; nested parameter spans are
+	// already covered by the surrounding URL span.
+	cleared.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
 	const parts: string[] = [];
 	let cursor = 0;
-	for (const [start, end] of presignedParamSpans(text)) {
+	for (const [start, end] of cleared) {
+		if (start < cursor) continue; // contained in an already-spliced wider span
 		parts.push(probed.slice(cursor, start), "\n");
 		cursor = end;
 	}
@@ -567,7 +642,7 @@ function finalCredentialCheck(text: string): boolean {
 	// is part of that boundary too: a newline must not shelter a URL value when
 	// another credential in the message was already masked. Verified report
 	// markers were replaced above and retain their hard boundary.
-	return containsConcreteCredentialIn(parts.join("").replace(/\*{3,}\s*/g, "  "), []);
+	return containsConcreteCredentialIn(parts.join("").replace(/\*{3,}\s*/g, "  "), [], RESIDUE_LABEL_VALUE_PATTERNS);
 }
 
 function shapeTripsOutside(text: string, protectedSpans: Array<[number, number]>): boolean {

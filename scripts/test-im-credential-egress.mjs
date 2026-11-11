@@ -829,3 +829,91 @@ test("AWS SigV4 grants survive verbatim with date and expiry parameters", () => 
 	const aws = "https://b.s3.amazonaws.com/r.pdf?X-Amz-Credential=AKIA123%2F20261111%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20261111T000000Z&X-Amz-Expires=3600&X-Amz-Signature=deadbeef00";
 	assert.equal(gateOutboundText(`报告：${aws}`, "restricted"), `报告：${aws}`, "the whole SigV4 grant ships untouched");
 });
+
+test("R6-N1: label + whitespace + secret URL is MASKED in place, not delivered", () => {
+	// Round-6 N1 (P0): a natural line break after a label used to exempt the
+	// URL from capture entirely — the secret URL shipped while main withheld.
+	// The URL is now the masked value; the message still delivers.
+	const cases = [
+		["密码：\nhttps://example.com/Abc_123456", "Abc_123456"],
+		[`密码：${" ".repeat(13)}https://example.com/Abc_123456`, "Abc_123456"],
+		// Marker glue between label and URL must not exempt the URL value.
+		[`密码：${"*".repeat(7)}https://example.com/Abc_123456&password=Abc_123456`, "Abc_123456"],
+		// A secret-bearing non-presigned query param rides the same rule.
+		["password:\nhttps://gitee.com/x/repo/raw/master/f.xlsx?raw_with_token=GiteeTok_123456", "GiteeTok_123456"],
+	];
+	for (const [text, secret] of cases) {
+		const out = gateOutboundText(text, "restricted");
+		assert.ok(!out.includes(secret), `the URL value never reaches the group: ${text.slice(0, 30)}`);
+		assert.notEqual(out, CREDENTIAL_WITHHELD_NOTICE, "masked delivery, not the withhold fallback");
+		assert.ok(out.includes("脱敏"), "the masked note is appended");
+		assert.equal(gateOutboundText(out, "restricted"), out, "the masked delivery is stable on recheck");
+	}
+	// Compound: one label already masked + a second secret URL the mask loop
+	// must still catch (the old backstop-only path degraded this to withhold).
+	const compound = `密码：First_123456 密码：${"*".repeat(7)}\nhttps://example.com/Abc_123456`;
+	const out = gateOutboundText(compound, "restricted");
+	assert.ok(!out.includes("First_123456") && !out.includes("Abc_123456"), "both secrets are masked");
+	assert.notEqual(out, CREDENTIAL_WITHHELD_NOTICE, "compound still delivers masked");
+});
+
+test("R6: an over-long URL label value is still fully masked across iterations", () => {
+	// The label-URL rule captures at most 200 chars; the remainder is exposed on
+	// the next iteration as a plain label value and masked too. The whole URL
+	// must disappear without a withhold.
+	const long = `密码：\nhttps://example.com/${"x".repeat(210)}Abc_123456`;
+	const out = gateOutboundText(long, "restricted");
+	assert.notEqual(out, CREDENTIAL_WITHHELD_NOTICE, "iterative masking covers the unmaskable length");
+	assert.ok(!out.includes("Abc_123456") && !out.includes("https://"), "no fragment of the URL value survives");
+});
+
+test("R6: a URL value reached through a prose gap degrades to withhold (residue pin)", () => {
+	// Phantom alignment: the label's own value is a mask marker, and a prose
+	// colon within 12 chars points at a secret URL. Masking has no zero-gap
+	// separator here, so the residue re-check (no URL boundary) must withhold —
+	// main withholds the same message. Kills a mutant that restores the https
+	// boundary in the residue patterns (the URL would ship verbatim).
+	const phantom = `密码：**** 说明如下：https://example.com/Abc_123456`;
+	const out = gateOutboundText(phantom, "restricted");
+	assert.equal(out, CREDENTIAL_WITHHELD_NOTICE, "gap-reached URL value is withheld like main");
+});
+
+test("R6: mixed share-link compound delivery is idempotent", () => {
+	const mixed = "密码是 Abc_123456 日报已生成：https://gitee.com/xiaoliu10/repo/raw/main/report.md?access_token=gk_abcdef123456，请查收。";
+	const out = gateOutboundText(mixed, "restricted");
+	assert.notEqual(out, CREDENTIAL_WITHHELD_NOTICE, "the compound report still delivers");
+	assert.ok(out.includes("access_token=***"), "the share-link redaction survives");
+	assert.equal(gateOutboundText(out, "restricted"), out, "re-gating a delivered artifact is a no-op");
+});
+
+test("R6: arbitrary URL markers cannot exempt plaintext residue", () => {
+	for (const query of ["foo=***", "access_token=***", "access_token=sekret"]) {
+		for (const prefix of ["", "密码：First_123456 "]) {
+			const text = `${prefix}密码：**** 说明如下：https://example.com/Abc_123456?${query}`;
+			const out = gateOutboundText(text, "restricted");
+			assert.ok(!out.includes("Abc_123456") && !out.includes("First_123456"), "a URL marker grants no exemption");
+		}
+	}
+});
+
+test("R6: a non-grant secret param inside a processed verified url cannot ride the splice", () => {
+	// Two-param blind spot: a redacted param puts a marker INSIDE the verified
+	// grant url, which must not hide a second, non-grant secret param from the
+	// residue re-check (label value subtraction protects it from masking).
+	const GL = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.xlsx?OSSAccessKeyId=abcd1234&Expires=1799999999&Signature=Sig%2BValue%3D";
+	const out = gateOutboundText(`${GL}&token=sk-abcdefghijklmnopqrstuvwx&secret_key=Abc_123456`, "restricted");
+	assert.ok(!out.includes("Abc_123456"), "the non-grant secret never reaches the group");
+	assert.ok(!out.includes("sk-abcdefghijklmnopqrstuvwx"), "the token shape never reaches the group");
+});
+
+test("R6: a shape-masked non-grant param inside a verified url delivers masked, grant intact", () => {
+	// The client_secret:sk-… composite: the shape masks the secret inside the
+	// grant url; the message delivers with BOTH links intact (redact-first),
+	// and the residue check must not phantom-trip on the masked param label.
+	const GL = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.xlsx?OSSAccessKeyId=abcd1234&Expires=1799999999&Signature=Sig%2BValue%3D";
+	const out = gateOutboundText(`${GL}&client_secret:sk-abcdefghijklmnopqrstuvwx，${GL.replace("r.xlsx", "r2.xlsx")}`, "restricted");
+	assert.ok(!out.includes("sk-abcdefghijklmnopqrstuvwx"), "the secret is masked");
+	assert.ok(out.includes("Signature=Sig%2BValue%3D") && out.includes("r2.xlsx"), "both grant links survive");
+	assert.notEqual(out, CREDENTIAL_WITHHELD_NOTICE, "masked delivery, not withhold");
+	assert.equal(gateOutboundText(out, "restricted"), out, "stable on recheck");
+});
