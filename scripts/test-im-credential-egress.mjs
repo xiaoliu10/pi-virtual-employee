@@ -886,6 +886,17 @@ test("R6: mixed share-link compound delivery is idempotent", () => {
 	assert.equal(gateOutboundText(out, "restricted"), out, "re-gating a delivered artifact is a no-op");
 });
 
+test("R7: clearing a labeled grant preserves detection of a trailing non-grant URL", () => {
+	const grant = "https://bucket.oss-cn-hangzhou.aliyuncs.com/r.xlsx?OSSAccessKeyId=abcd1234&Expires=1799999999&Signature=Sig%2BValue%3D";
+	for (const label of ["密码：", "用密码 ", "password:", "api_key:"]) {
+		for (const quote of ["`", '"']) {
+			const out = gateOutboundText(`${label}${quote}${grant}&next=https://example.com/Abc_123456`, "restricted");
+			assert.ok(!out.includes("Abc_123456"), "grant clearing cannot erase the label association with a non-grant URL");
+		}
+	}
+	assert.equal(gateOutboundText(`密码：${grant}`, "restricted"), `密码：${grant}`, "the verified grant alone still survives");
+});
+
 test("R6: arbitrary URL markers cannot exempt plaintext residue", () => {
 	for (const query of ["foo=***", "access_token=***", "access_token=sekret"]) {
 		for (const prefix of ["", "密码：First_123456 "]) {

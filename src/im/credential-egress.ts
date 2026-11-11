@@ -616,12 +616,28 @@ function finalCredentialCheck(text: string): boolean {
 	// Compute protected offsets before normalizing markers.
 	const probed = reportMaskProbe(text);
 	const cleared: Array<[number, number]> = [...presignedParamSpans(text)];
+	const verifiedUrls = presignedUrlSpans(text);
+	// A labeled URL value may extend beyond a verified grant into a second
+	// URL (including a non-grant redirect parameter). Clearing the grant's
+	// skeleton must not erase the label association with that remaining URL.
+	for (const pattern of RESIDUE_LABEL_VALUE_PATTERNS) {
+		const global = new RegExp(pattern.source, `${pattern.flags}g`);
+		for (const match of text.matchAll(global)) {
+			const value = match[1] ?? "";
+			const start = match.index + match[0].length - value.length;
+			if (!verifiedUrls.some(([vs, ve]) => start >= vs && start < ve)) continue;
+			for (const url of value.matchAll(/https?:\/\//g)) {
+				const offset = start + url.index;
+				if (!verifiedUrls.some(([vs, ve]) => offset >= vs && offset < ve)) return true;
+			}
+		}
+	}
 	// Verified report URLs are system artifacts: splice the SKELETON
 	// (scheme://host/path) and each grant-param assignment out with hard
 	// newline boundaries, so neither can be re-read as a label value by the
 	// residue patterns. NON-grant query params (e.g. `&secret_key=…`) stay
 	// visible — catching those is the compound-leak purpose of this backstop.
-	for (const [start, end] of presignedUrlSpans(text)) {
+	for (const [start, end] of verifiedUrls) {
 		const q = text.indexOf("?", start);
 		cleared.push([start, q !== -1 && q < end ? q : end]);
 	}
