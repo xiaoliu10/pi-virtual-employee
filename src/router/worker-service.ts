@@ -22,6 +22,36 @@
 import { WorkerTaskStore, type WorkerTaskRow } from "./worker-tasks.js";
 import { looksLikeTask } from "../engine/task-planner.js";
 
+/**
+ * Readable one-line task title derived from a raw instruction.
+ *
+ * Field 2026-11-11 (box Nova): a pasted article/code block became the
+ * instruction, and every user-facing notice showed a mid-text 60-char slice
+ * (「⏳ **import ddddocr _ocr = ddddocr.DdddOcr(show_ad=False) def sol** 任务仍在进行中…」).
+ * A title must read like a task name, never a raw prompt prefix: strip fenced
+ * code and markdown markers, take the first meaningful line, collapse
+ * whitespace, and cut at a sentence boundary inside the cap when possible.
+ */
+export function workerTaskTitle(instruction: string, max = 40): string {
+	const text = (instruction ?? "").replace(/```[\s\S]*?(```|$)/g, "\n");
+	const first = text
+		.split("\n")
+		.map((line) => line.replace(/^\s*(?:[-*+]+\s+|#+\s*|>+\s*)+/, "").replace(/[*`_]/g, "").trim())
+		.find((line) => line.length > 0) ?? "";
+	const flat = (first || text).replace(/\s+/g, " ").trim();
+	if (!flat) return "未命名任务";
+	if (flat.length <= max) return flat;
+	const window = flat.slice(0, max);
+	// Prefer a clean clause cut (sentence/comma/space) inside the window over a
+	// mid-word slice; never accept a stub shorter than 40% of the window.
+	let cut = -1;
+	for (const ch of ["。", "！", "？", "；", ";", "，", ",", " "]) {
+		const at = window.lastIndexOf(ch);
+		if (at > cut) cut = at;
+	}
+	return (cut >= Math.floor(max * 0.4) ? window.slice(0, cut) : window).trim();
+}
+
 /** Injected durable-execution primitives (same shape WorkService uses — the
  * shared KERNEL below both infrastructures; nothing task-flavored crosses). */
 export interface WorkerEngineDeps<Session> {
@@ -148,7 +178,7 @@ export class WorkerService<Session> {
 		}
 		for (const o of orphans) {
 			console.log(`[worker] orphan reconciled: ${o.id} (${o.source_conversation}) — ${o.instruction.slice(0, 60)}`);
-			const title = o.instruction.slice(0, 60).replace(/\s+/g, " ").trim();
+			const title = workerTaskTitle(o.instruction);
 			const text = [
 				`⚠️ **任务被中断：${title}**`,
 				"",
@@ -221,7 +251,7 @@ export class WorkerService<Session> {
 			const retry = this.retryInterrupted(sourceConversation);
 			if (retry) {
 				const cid = retry.conversation_id ?? `worker:${retry.id}`;
-				const note = `✅ 已重新派发：${retry.instruction.replace(/\s+/g, " ").slice(0, 60)}。新一轮任务编号 ${cid}，完成后结果照常推回本会话。`;
+				const note = `✅ 已重新派发：${workerTaskTitle(retry.instruction)}。新一轮任务编号 ${cid}，完成后结果照常推回本会话。`;
 				// The spawn is already real — a failed confirmation must be
 				// OBSERVABLE (push-only means no history anchor left): surface it
 				// through onError instead of swallowing it.
@@ -324,7 +354,7 @@ export class WorkerService<Session> {
 		const session = await this.opts.open(task.conversation_id!);
 		this.sessions.set(task.id, session);
 		const notifier = this.opts.progress?.(
-			{ title: task.instruction.slice(0, 60), target: task.source_conversation, conversationId: task.conversation_id! },
+			{ title: workerTaskTitle(task.instruction), target: task.source_conversation, conversationId: task.conversation_id! },
 			session,
 		);
 		notifier?.start();
