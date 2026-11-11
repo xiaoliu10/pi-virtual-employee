@@ -98,6 +98,7 @@ import type { FileSystemService } from "../filesystem/filesystem-service.js";
 import type { ReportService } from "../reports/report-service.js";
 import type { DownloadService } from "../downloads/download-service.js";
 import { buildSystemPrompt, buildTools, guardTool, withTelemetry } from "./definition.js";
+import { LegacySettleGate } from "./legacy-settle-gate.js";
 import type { UpdateOperations } from "./tools/update.js";
 import { hasActiveShellCommands } from "./tools/shell.js";
 import {effectiveAuthorizationRole, ROLE_RANK, checkPermission, isDeclaredAdmin, isLocalConversation} from "../security/permissions.js";
@@ -791,6 +792,10 @@ export class EmployeeEngine implements EmployeeRuntime {
 	 * Reset at the start of each user turn and consumed by the deterministic-reply
 	 * block (a finally-time delete ran before that block and cleared the signal). */
 	private readonly lengthEmptyGiveUps = new Set<string>();
+	/** Legacy-kernel settle gate: evidence-round self-verification for
+	 * autonomous/work turns that declare [[TASK_DONE]] (the engine-layer
+	 * equivalent of the pi-session ve-settle-gate extension). */
+	private readonly legacySettleGate = new LegacySettleGate();
 	/** Tool calls made so far in the in-flight turn of each conversation. */
 	private readonly turnToolCalls = new Map<string, number>();
 	/** Cumulative tool iterations for this conversation since the last user
@@ -3283,6 +3288,31 @@ export class EmployeeEngine implements EmployeeRuntime {
 			reply += "\n\n⚠️ 有中途指令尚未送达模型，本轮已结束，请重新发送。";
 		}
 		reply = reply.trim();
+
+		// LEGACY SETTLE-GATE — the engine-layer equivalent of the pi-session
+		// ve-settle-gate extension (kernel = "legacy" has no extension runtime).
+		// The [[TASK_DONE]] marker is the ONLY gate: it is taught exclusively by
+		// the autonomous/work prompt paths (work.ts, autonomous.ts) — ordinary IM
+		// prompts never contain it, so a normal reply is a natural no-op, exactly
+		// like the extension and durable kernels (which gate on the marker alone,
+		// not on a conversation prefix). Skipped for ephemeral side passes,
+		// errored/deterministic turns and suppressed narration as defence-in-depth.
+		let settleVerifyRounds = 0;
+		let settleReleasedAtCap = false;
+		if (this.opts.kernel === "legacy" && !ctx?.ephemeral && !hardError && !deterministic && !narrationSuppressed) {
+			const gated = await this.legacySettleGate.run({
+				conversationId,
+				reply,
+				enabled: true,
+				drive: (instruction) => this.gateTurn(agent, conversationId, instruction),
+			});
+			reply = gated.reply.trim();
+			settleVerifyRounds = gated.verifyRounds;
+			settleReleasedAtCap = gated.releasedAtCap;
+			if (settleVerifyRounds > 0 || settleReleasedAtCap) {
+				console.warn(`[settle-gate] legacy ${conversationId}: verifyRounds=${settleVerifyRounds} releasedAtCap=${settleReleasedAtCap}`);
+			}
+		}
 		if (!ctx?.ephemeral) {
 			// Suppressed narration is not employee speech: leave no assistant row
 			// (the channel receives only the system notice above), so a later turn
@@ -3617,6 +3647,28 @@ export class EmployeeEngine implements EmployeeRuntime {
 			unsubscribe();
 		}
 		return text.trim();
+	}
+
+	/** Run ONE extra model turn for the legacy settle-gate (evidence verify or
+	 * repair). Returns the visible text and whether the turn made any tool calls.
+	 * Keeps the current tool set (a verify turn must be able to re-check with
+	 * real reads, unlike finalSummary which disables tools). Fail-open: the
+	 * caller treats a throw as "gate unavailable" and keeps the original reply. */
+	private async gateTurn(agent: Agent, conversationId: string, instruction: string): Promise<{ text: string; hadToolCalls: boolean }> {
+		let text = "";
+		const before = this.turnToolCalls.get(conversationId) ?? 0;
+		const unsubscribe = agent.subscribe((event: AgentEvent) => {
+			if (event.type === "message_end" && (event.message as { role?: string }).role === "assistant") {
+				text += extractText(event.message);
+			}
+		});
+		try {
+			await agent.prompt(instruction);
+		} finally {
+			unsubscribe();
+		}
+		const after = this.turnToolCalls.get(conversationId) ?? before;
+		return { text: text.trim(), hadToolCalls: after > before };
 	}
 
 	/** Deterministic reply of last resort — always non-empty, in Chinese. */
