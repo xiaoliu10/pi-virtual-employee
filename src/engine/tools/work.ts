@@ -58,6 +58,12 @@ type Rewrite = { field: "title" | "goal" | "conditions"; label: string; value: s
 
 /** Collect admin rewrites (title/goal/conditions) from tool params. Every
  * provided field is validated up front so callers can apply all-or-nothing. */
+import { sanitizeWorkItemTitle } from "../progress.js";
+
+function titleParam(p: { title?: string }): string {
+	return sanitizeWorkItemTitle(p.title ?? "", 80);
+}
+
 function collectRewrites(p: { title?: string; goal?: string; conditions?: string }): { fields: Rewrite[] } | { failure: string } {
 	const fields: Rewrite[] = [];
 	for (const { key, label, limit } of REWRITE_FIELDS) {
@@ -284,7 +290,7 @@ export function createWorkTools(deps: {
 						return failure(`本后台任务派生的未完结一次性任务已达上限（3 个）。请等现有任务完成，或把剩余工作写进任务结果交回管理员。`);
 					}
 					const created = workItems.create({
-						title: p.title.trim().slice(0, 80),
+						title: titleParam(p),
 						goal: p.goal.trim().slice(0, 2000),
 						originConversation: conversationId,
 						originNote: "后台任务派生（一次性）",
@@ -342,10 +348,10 @@ export function createWorkTools(deps: {
 				// one term: 自主任务 lives in manage_work_items.
 				if (!p.title?.trim() || !p.goal?.trim()) return failure("create 需要 title 与 goal：写清要持续跟进的目标。");
 				const created = workItems.create({
-					title: p.title.trim().slice(0, 80),
+					title: titleParam(p),
 					goal: p.goal.trim().slice(0, 2000),
 					originConversation: conversationId,
-					originNote: `管理员要求直接创建：${p.title.trim().slice(0, 120)}`,
+					originNote: `管理员要求直接创建：${sanitizeWorkItemTitle(p.title ?? "", 120)}`,
 					// Admin-ordered AUTONOMOUS work: same class as an approved mined
 					// proposal — self-schedules, pushes as 自主任务 (the reply says so).
 					origin: "mining",

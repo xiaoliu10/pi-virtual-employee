@@ -115,6 +115,37 @@ export function containsTemplateHeadingLine(text: string): boolean {
 }
 
 /**
+ * Sanitize a user-facing work-item TITLE (「⏳ **title**」 prefix in progress
+ * notes, task list renderings). Field 2026-11-11: the model passed the
+ * compaction template's Goal section ("## Goal\n- 继续排查流水…") as a work
+ * item's title, and the progress broadcaster echoed it verbatim:
+ * 「⏳ **## Goal\n- …** 任务仍在进行中」. Titles are single-line display labels:
+ * strip the template Goal heading (with or without the `##`), markdown
+ * markers, list bullets and quotes, collapse ALL whitespace to spaces (a
+ * title can never carry a newline), and clamp at a clause boundary. Empty
+ * result degrades to a neutral placeholder rather than an empty `**  **`.
+ * Mirrors the field-level contamination rule above (模板标题不是标题，是污染).
+ */
+export function sanitizeWorkItemTitle(raw: string, max = 40): string {
+	let text = (raw ?? "")
+		.replace(/^\s*#{1,6}\s*Goal\b[:：]?\s*/i, "")   // template heading, with or without following text
+		.replace(/^\s*#{1,6}\s*/, "")                    // any other markdown heading
+		.replace(/^\s*[-*+]\s+/, "")                     // list bullet
+		.replace(/^\s*>+\s*/, "")                        // blockquote
+		.replace(/[*`_]/g, "");                          // inline emphasis
+	const flat = text.replace(/\s+/g, " ").trim();
+	if (!flat) return "未命名任务";
+	if (flat.length <= max) return flat;
+	const window = flat.slice(0, max);
+	let cut = -1;
+	for (const ch of ["。", "！", "？", "；", ";", "，", ",", " "]) {
+		const at = window.lastIndexOf(ch);
+		if (at > cut) cut = at;
+	}
+	return (cut >= Math.floor(max * 0.4) ? window.slice(0, cut) : window).trim();
+}
+
+/**
  * Rewrite Chinese markdown headings of the four known labels ("## 已完成\n…")
  * into inline labels ("已完成：…") so a single extraction pass handles both
  * layouts. Only exact label headings are rewritten; arbitrary "##" headings
