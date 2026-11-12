@@ -607,6 +607,22 @@ test("steerConversation accepts the TASK OWNER mid-turn and persists senderName 
 	}
 });
 
+test("classifyWorkerFollowUp: NEW routes away, CONT/ambiguous/failure fail safe to continuation", async (t) => {
+	const { engine, config } = makeEngine(t, { streamFn: async () => ({ async *[Symbol.asyncIterator]() {}, result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }) }) });
+	supplierConfig(config);
+	const agent = engine.getOrCreateSession("worker:cls");
+	const prev = globalThis.__generateSummaryHook;
+	t.after(() => { globalThis.__generateSummaryHook = prev; });
+	globalThis.__generateSummaryHook = async () => ({ ok: true, value: "NEW" });
+	assert.equal(await engine.classifyWorkerFollowUp(agent, "查 SLS 日志", "帮我查平阳数币金额", "worker:cls"), "new-task");
+	globalThis.__generateSummaryHook = async () => ({ ok: true, value: "CONT" });
+	assert.equal(await engine.classifyWorkerFollowUp(agent, "查 SLS 日志", "改成前后各一天", "worker:cls"), "continuation");
+	globalThis.__generateSummaryHook = async () => ({ ok: true, value: "我不确定" });
+	assert.equal(await engine.classifyWorkerFollowUp(agent, "查 SLS 日志", "随便", "worker:cls"), "continuation", "ambiguous output fails safe");
+	globalThis.__generateSummaryHook = async () => { throw new Error("relay down"); };
+	assert.equal(await engine.classifyWorkerFollowUp(agent, "查 SLS 日志", "另一件事", "worker:cls"), "continuation", "a failed pass never spawns a duplicate worker");
+});
+
 test("worker steer checks current owner and source conversation and persists accepted input", async (t) => {
 	const gate = enteredGate();
 	const { engine, history } = makeEngine(t, { streamFn: async () => {
@@ -1000,7 +1016,7 @@ test("busyConversations sees legacy streaming and retry-wait sessions, clears wh
 	}) });
 	supplierConfig(config);
 	const a = engine.getOrCreateSession("conv-busy-streaming");
-	const b = engine.getOrCreateSession("conv-busy-backoff");
+	const _b = engine.getOrCreateSession("conv-busy-backoff");
 	assert.deepEqual(engine.busyConversations(), [], "idle sessions are not busy");
 	// The SDK sets isStreaming for the whole prompt() duration (agent.js:351).
 	a.state.isStreaming = true;

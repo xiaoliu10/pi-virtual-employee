@@ -178,6 +178,16 @@ export const PLAN_PROMPT_HEADER =
 	"然后 3-6 行编号步骤（每步一行，动词开头，可验证）—— 这是给执行器看的，会被自动隐藏。\n" +
 	"不要输出任何其他解释。消息如下：";
 
+
+/** Follow-up routing prompt (user ruling 2026-11-12): while a worker is live,
+ * decide whether an incoming task-shaped message supplements THAT task or is an
+ * independent new request. One word only — the caller fails safe to CONT. */
+export const FOLLOWUP_CLASSIFY_PROMPT =
+	"你在判断一条新消息与「正在执行中的任务」的关系。只输出一个词：CONT 或 NEW，不要任何解释。\n" +
+	"CONT = 这条消息是对正在执行任务的补充、纠正、追加条件、催促或回答它的提问（例如换账号/改时间范围/换查询条件/让它先收尾/给它验证码）。\n" +
+	"NEW = 这条消息是一件独立的新事情，与正在执行的任务目标无关，应当另起一个任务并行处理（例如正在查支付日志时又问另一件事的统计金额）。\n" +
+	"判据：看目标对象和意图是否仍指向同一个任务。只要是在修改/推进同一个任务，就是 CONT；只有明显换了另一件事才是 NEW。拿不准时输出 CONT。";
+
 /** A parsed plan: the model's estimate, the human summary, and the raw steps. */
 export interface ParsedPlan {
 	/** Estimated total duration in minutes (0 when the model gave nothing usable). */

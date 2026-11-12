@@ -440,6 +440,108 @@ test("rejected live steer is reported and never replayed under another actor", a
 	assert.match(h.pushes.at(-1).text, /追加指令未投递.*发起人/);
 });
 
+
+test("live worker: an unrelated NEW task is routed to triage, not absorbed (field 2026-11-12)", async () => {
+	const entered = deferred(), release = deferred();
+	const steers = [], classified = [];
+	let sends = 0, live = false;
+	const { h, service } = harness({ service: {
+		send: async () => {
+			if (++sends === 1) { live = true; entered.resolve(); await release.promise; live = false; }
+			return { reply: "ok" };
+		},
+		steer: (_cid, text) => { steers.push(text); return live ? { status: "accepted" } : { status: "idle" }; },
+		classifyFollowUp: async (_s, running, message) => { classified.push({ running, message }); return "new-task"; },
+	} });
+	const huge = service.spawn({ instruction: "排查 SLS 下单日志（数小时）", sourceConversation: "dt:single:u1", createdBy: "u1" });
+	service.start(); await entered.promise;
+	try {
+		const unrelated = "帮我查一下平阳今天的数币交易金额";
+		assert.equal(await service.inject("dt:single:u1", unrelated, "u1"), false, "a NEW task goes back to triage for a PARALLEL worker");
+		assert.equal(classified.length, 1, "the classifier saw the running instruction as context");
+		assert.match(classified[0].running, /SLS/);
+		assert.equal(steers.length, 0, "the running task is NOT disturbed");
+		assert.equal(h.store.get(huge.id).status, "running", "the huge task keeps running");
+		// triage's own path: a second worker really can run alongside it
+		const second = service.spawn({ instruction: unrelated, sourceConversation: "dt:single:u1", createdBy: "u1" });
+		h.wake?.(); // the harness clock does not auto-fire the claim tick
+		await flush();
+		assert.equal(h.store.get(second.id).status, "done", "the new task completed while the huge one is still in flight");
+		assert.equal(h.store.get(huge.id).status, "running");
+	} finally { release.resolve(); await flush(); service.stop(); }
+});
+
+test("live worker: a continuation is still steered into the running task", async () => {
+	const entered = deferred(), release = deferred();
+	const steers = [];
+	let sends = 0, live = false;
+	const { service } = harness({ service: {
+		send: async () => { if (++sends === 1) { live = true; entered.resolve(); await release.promise; live = false; } return { reply: "ok" }; },
+		steer: (_cid, text) => { steers.push(text); return live ? { status: "accepted" } : { status: "idle" }; },
+		classifyFollowUp: async () => "continuation",
+	} });
+	service.spawn({ instruction: "查 SLS 日志", sourceConversation: "dt:cont", createdBy: "u1" });
+	service.start(); await entered.promise;
+	try {
+		const correction = "帮我把查询时间改成下单日前后各一天";
+		assert.equal(await service.inject("dt:cont", correction, "u1"), true);
+		assert.deepEqual(steers, [correction]);
+	} finally { release.resolve(); await flush(); service.stop(); }
+});
+
+test("live worker: codes and cancel phrases never pay for a classification", async () => {
+	const entered = deferred(), release = deferred();
+	const steers = [];
+	let sends = 0, live = false, classifyCalls = 0;
+	const { service } = harness({ service: {
+		send: async () => { if (++sends === 1) { live = true; entered.resolve(); await release.promise; live = false; } return { reply: "ok" }; },
+		steer: (_cid, text) => { steers.push(text); return live ? { status: "accepted" } : { status: "idle" }; },
+		classifyFollowUp: async () => { classifyCalls++; return "new-task"; },
+	} });
+	service.spawn({ instruction: "登录堡垒机", sourceConversation: "dt:fast", createdBy: "u1" });
+	service.start(); await entered.promise;
+	try {
+		assert.equal(await service.inject("dt:fast", "875055", "u1"), true, "a verification code reaches the worker");
+		assert.equal(await service.inject("dt:fast", "取消", "u1"), true, "a cancel reaches the worker without waiting on a round-trip");
+		assert.equal(classifyCalls, 0, "no model call for codes / cancel phrases");
+		assert.equal(steers.length, 2);
+	} finally { release.resolve(); await flush(); service.stop(); }
+});
+
+test("live worker: a throwing classifier fails safe to continuation (no duplicate worker)", async () => {
+	const entered = deferred(), release = deferred();
+	const steers = [];
+	let sends = 0, live = false;
+	const { h, service } = harness({ service: {
+		send: async () => { if (++sends === 1) { live = true; entered.resolve(); await release.promise; live = false; } return { reply: "ok" }; },
+		steer: (_cid, text) => { steers.push(text); return live ? { status: "accepted" } : { status: "idle" }; },
+		classifyFollowUp: async () => { throw new Error("relay down"); },
+	} });
+	service.spawn({ instruction: "查日志", sourceConversation: "dt:throw", createdBy: "u1" });
+	service.start(); await entered.promise;
+	try {
+		assert.equal(await service.inject("dt:throw", "帮我查一下另一件事的统计", "u1"), true, "never dropped, never duplicated");
+		assert.equal(steers.length, 1);
+		assert.equal(h.db.prepare("SELECT COUNT(*) c FROM worker_tasks").get().c, 1, "no second worker spawned");
+	} finally { release.resolve(); await flush(); service.stop(); }
+});
+
+test("live worker without a classifier keeps the pre-fix steer behaviour", async () => {
+	const entered = deferred(), release = deferred();
+	const steers = [];
+	let sends = 0, live = false;
+	const { service } = harness({ service: {
+		send: async () => { if (++sends === 1) { live = true; entered.resolve(); await release.promise; live = false; } return { reply: "ok" }; },
+		steer: (_cid, text) => { steers.push(text); return live ? { status: "accepted" } : { status: "idle" }; },
+	} });
+	service.spawn({ instruction: "查日志", sourceConversation: "dt:nocls", createdBy: "u1" });
+	service.start(); await entered.promise;
+	try {
+		assert.equal(await service.inject("dt:nocls", "帮我查一下另一件事", "u1"), true);
+		assert.equal(steers.length, 1);
+	} finally { release.resolve(); await flush(); service.stop(); }
+});
+
 test("rejection notice delivery failure cannot replay the instruction inline", async () => {
 	const { h, service } = harness({ service: {
 		steer: () => ({ status: "rejected", reason: "owner mismatch" }),

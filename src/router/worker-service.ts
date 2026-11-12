@@ -22,6 +22,7 @@
 import { WorkerTaskStore, type WorkerTaskRow } from "./worker-tasks.js";
 import { looksLikeTask, NARRATION_GUARD_NOTICE } from "../engine/task-planner.js";
 import { isBareContextToken, looksLikeInputRequest } from "../im/triage.js";
+import { isCancelPhrase } from "../im/commands.js";
 import { stripNotice, SYNTHETIC_FALLBACK_FRAGMENTS_RE } from "../db/history-store.js";
 
 /**
@@ -66,6 +67,10 @@ export interface WorkerEngineDeps<Session> {
 	 * current permissions and turn ownership; idle means use a normal turn. */
 	steer?(conversationId: string, message: string, senderId: string, sourceConversation: string):
 		{ status: "accepted" | "idle" } | { status: "rejected"; reason: string };
+	/** Continuation of the running task, or an independent new request? Only
+	 * task-shaped non-bare-token messages reach this bounded side pass; absent
+	 * → every live follow-up is steered (pre-2026-11-12 behaviour). */
+	classifyFollowUp?(session: Session, runningInstruction: string, message: string, conversationId: string): Promise<"continuation" | "new-task">;
 	/** Deliver to the source conversation (idempotent upstream). */
 	push(conversationId: string, text: string): Promise<unknown> | unknown;
 	/** Cancel a live durable round (foreground-escape). Injected because the
@@ -522,6 +527,31 @@ export class WorkerService<Session> {
 			}
 		}
 		const session = await this.opts.open(recent.conversation_id);
+		// An independent NEW request must not be absorbed by the running task
+		// (user ruling 2026-11-12: 「不连贯的那体验是不是太差了」). Codes and
+		// non-task shapes are steered by code above/below without a model call;
+		// only genuinely task-shaped text pays for the classification. Returning
+		// false hands the message back to triage, which spawns a PARALLEL worker
+		// (maxConcurrent) and leaves the running one untouched.
+		// NOT gated on looksLikeTask: the real detector under-detects task-shaped
+		// text (the dispatch path hardcodes true for exactly this reason — 7457cdd),
+		// so gating here would silently miss most new requests. Codes and cancel
+		// phrases skip the call: a code is an answer, and 「取消」 must never wait
+		// on a classification round-trip.
+		if (isLive && !isBareContextToken(message) && !isCancelPhrase(message) && this.opts.classifyFollowUp) {
+			let verdict: "continuation" | "new-task" = "continuation";
+			try {
+				verdict = await this.opts.classifyFollowUp(session, recent.instruction, message, recent.conversation_id);
+			} catch (err) {
+				// Fail safe to continuation: a thrown classifier must neither drop the
+				// message nor spawn a duplicate worker onto the same target.
+				console.warn("[worker] follow-up classification threw (keeping continuation):", err instanceof Error ? err.message : err);
+			}
+			if (verdict === "new-task") {
+				console.log(`[worker] follow-up is a NEW task — leaving ${recent.id} running, routing to triage`);
+				return false;
+			}
+		}
 		// Row status is insufficient: a done worker can be running a follow-up.
 		// Ask the engine synchronously after open(), with no await between its
 		// liveness check and queue admission. Accepted input belongs to THIS turn
