@@ -431,23 +431,28 @@ test("guard branches still log (no-target / disabled interval)", async () => {
 	assert.ok(logs.some((l) => l.includes("interval disabled")), "disabled-interval guard keeps its log");
 });
 
-test("first beat fires at FIRST_BEAT (2min), not a full interval in", async (t) => {
-	// Field 2026-11-10 (box Nova): 16 worker tasks ran 0.3–17min against a
-	// 10-min interval and 15 finished BEFORE the first tick — a pure setInterval
-	// makes the first note a full interval away, so short tasks narrate nothing.
+test("no early first beat — the first note waits the FULL interval", async (t) => {
+	// User ruling 2026-11-11: the 2-minute first beat (v0.2.217) was noise —
+	// at T+2 a task has no evidenced progress (a 「暂未确认」 shell at best)
+	// and field feedback is that notes this early read as too frequent. The
+	// first note now waits the full configured interval; short tasks deliver
+	// their final result with no interim note.
 	mock.timers.reset();
 	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
 	try {
 		const logs = [];
 		const h = make({ log: (level, msg) => logs.push(`${level} ${msg}`) });
 		h.notifier.start();
-		assert.ok(logs.some((l) => l.includes("first-beat=+2min")),
-			"started log must announce the early first beat");
-		await advance(2 * 60_000);   // FIRST_BEAT_MS exactly
-		assert.equal(h.calls.summarize, 1, "the first beat fires at +2min");
-		assert.equal(h.calls.push, 1, "a 2-minute task gets one progress note");
-		await advance(INTERVAL);     // steady cadence tick at +7min
-		assert.equal(h.calls.summarize, 2, "steady cadence is unchanged after the first beat");
+		assert.ok(!logs.some((l) => l.includes("first-beat")),
+			"started log must NOT announce any early first beat");
+		await advance(2 * 60_000);   // the old FIRST_BEAT_MS point: must stay SILENT
+		assert.equal(h.calls.summarize, 0, "no beat at the old +2min mark");
+		assert.equal(h.calls.push, 0);
+		await advance(INTERVAL - 2 * 60_000); // reach the full interval
+		assert.equal(h.calls.summarize, 1, "the first beat is the full interval in");
+		assert.equal(h.calls.push, 1);
+		await advance(INTERVAL);     // steady cadence unchanged
+		assert.equal(h.calls.summarize, 2, "steady cadence is the configured interval");
 		assert.equal(h.calls.push, 2);
 		h.notifier.stop();
 	} finally {
@@ -455,16 +460,14 @@ test("first beat fires at FIRST_BEAT (2min), not a full interval in", async (t) 
 	}
 });
 
-test("a task shorter than FIRST_BEAT still stays silent (gates, not timers)", async (t) => {
-	// The early beat is a timer change only: a task that finishes in <2min is
-	// still correctly narrated by its completion report, not by a mid-flight note.
+test("liveness gate still applies to the first full-interval tick", async (t) => {
 	mock.timers.reset();
 	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
 	try {
 		const h = make({ isRunning: () => false });
 		h.notifier.start();
-		await advance(2 * 60_000);
-		assert.equal(h.calls.summarize, 0, "liveness gate still applies to the first beat");
+		await advance(INTERVAL);
+		assert.equal(h.calls.summarize, 0, "liveness gate still applies");
 		assert.equal(h.calls.push, 0);
 		h.notifier.stop();
 	} finally {
