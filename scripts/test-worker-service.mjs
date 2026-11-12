@@ -352,6 +352,138 @@ test("follow-up message continues the SAME session as CONVERSATION, state stays 
 	assert.ok(h.pushes.length >= 2, "the follow-up's reply is also delivered");
 });
 
+
+function deferred() {
+	let resolve;
+	const promise = new Promise((r) => { resolve = r; });
+	return { promise, resolve };
+}
+
+test("live worker consumes the date correction before its first turn settles (real Agent)", async () => {
+	const { Agent } = await import("@earendil-works/pi-agent-core");
+	const entered = deferred(), release = deferred();
+	const correction = "按订单日期前后各一天查询，不要再选择今天";
+	const seen = [];
+	let sends = 0, streams = 0;
+	const model = { id: "m", name: "M", api: "openai-completions", provider: "test", baseUrl: "https://example.com", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 8192 };
+	const agent = new Agent({
+		initialState: { model, tools: [{ name: "query", description: "query", parameters: { type: "object", properties: {} }, execute: async () => {
+			entered.resolve(); await release.promise;
+			return { content: [{ type: "text", text: "query returned" }] };
+		} }] },
+		streamFn: async (_model, context) => {
+			streams++;
+			seen.push(context.messages.map((m) => typeof m.content === "string" ? m.content : JSON.stringify(m.content)).join("\n"));
+			const first = streams === 1;
+			const message = { role: "assistant", api: model.api, provider: model.provider, model: model.id, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, timestamp: Date.now(), stopReason: first ? "toolUse" : "stop", content: first ? [{ type: "toolCall", id: "q1", name: "query", arguments: {} }] : [{ type: "text", text: "已调整时间范围" }] };
+			return { async *[Symbol.asyncIterator]() {}, result: async () => message };
+		},
+	});
+	const { h, service } = harness({ service: {
+		open: () => agent,
+		send: async (session, text) => { sends++; await session.prompt(text); return { reply: "已调整时间范围" }; },
+		steer: (_cid, text) => {
+			if (!agent.state.isStreaming) return { status: "idle" };
+			agent.steer({ role: "user", content: text, timestamp: Date.now() });
+			return { status: "accepted" };
+		},
+	} });
+	service.spawn({ instruction: "查询订单日志", sourceConversation: "dt:steer", createdBy: "owner" });
+	service.start();
+	try {
+		await entered.promise;
+		assert.equal(await service.inject("dt:steer", correction, "owner"), true);
+		assert.equal(sends, 1);
+		assert.equal(h.pushes.length, 0, "the original turn is still blocked in its tool");
+		release.resolve(); await agent.waitForIdle(); await flush();
+		assert.ok(seen[1].includes(correction), "the next model request sees the correction");
+		assert.equal(sends, 1, "accepted steer must not also run as a second prompt");
+		assert.equal(h.pushes.length, 1);
+	} finally { release.resolve(); service.stop(); }
+});
+
+test("live follow-up of a done row still owns task-shaped corrections", async () => {
+	const entered = deferred(), release = deferred();
+	const steers = [];
+	let sends = 0, live = false;
+	const { h, service } = harness({ service: {
+		send: async () => {
+			sends++;
+			if (sends === 2) { live = true; entered.resolve(); await release.promise; live = false; }
+			return { reply: "ok" };
+		},
+		steer: (cid, text) => {
+			if (!live) return { status: "idle" };
+			steers.push({ cid, text }); return { status: "accepted" };
+		},
+	} });
+	const row = service.spawn({ instruction: "查日志", sourceConversation: "dt:done-live", createdBy: "owner" });
+	service.start(); await flush();
+	assert.equal(h.store.get(row.id).status, "done");
+	await service.inject("dt:done-live", "结果呢", "owner"); await entered.promise;
+	try {
+		const correction = "帮我查询订单日期前后各一天的日志，然后汇总结果";
+		assert.equal(await service.inject("dt:done-live", correction, "owner"), true);
+		assert.equal(steers[0].text, correction);
+	} finally { release.resolve(); await flush(); service.stop(); }
+	assert.equal(sends, 2);
+});
+
+test("rejected live steer is reported and never replayed under another actor", async () => {
+	const { h, service } = harness({ service: { steer: () => ({ status: "rejected", reason: "只能由当前任务发起人追加" }) } });
+	service.spawn({ instruction: "查日志", sourceConversation: "dt:owner", createdBy: "owner" });
+	service.start(); await flush();
+	const before = h.sends.length;
+	assert.equal(await service.inject("dt:owner", "结果呢", "foreign"), true);
+	await flush();
+	assert.equal(h.sends.length, before);
+	assert.match(h.pushes.at(-1).text, /追加指令未投递.*发起人/);
+});
+
+test("rejection notice delivery failure cannot replay the instruction inline", async () => {
+	const { h, service } = harness({ service: {
+		steer: () => ({ status: "rejected", reason: "owner mismatch" }),
+		push: async () => { throw new Error("push unavailable"); },
+	} });
+	service.spawn({ instruction: "查日志", sourceConversation: "dt:reject-push", createdBy: "owner" });
+	service.start(); await flush();
+	const before = h.sends.length;
+	assert.equal(await service.inject("dt:reject-push", "结果呢", "foreign"), true);
+	await flush();
+	assert.equal(h.sends.length, before);
+	assert.match(h.errors.at(-1).message, /push unavailable/);
+	service.stop();
+});
+
+test("turn settling during open falls back to exactly one serial prompt", async () => {
+	const entered = deferred(), release = deferred(), opening = deferred(), openRelease = deferred();
+	let opens = 0, sends = 0, live = false;
+	const steers = [];
+	const { service } = harness({ service: {
+		open: async (cid) => {
+			if (++opens === 2) { opening.resolve(); await openRelease.promise; }
+			return { cid };
+		},
+		send: async () => {
+			if (++sends === 1) { live = true; entered.resolve(); await release.promise; live = false; }
+			return { reply: "ok" };
+		},
+		steer: (_cid, text) => { steers.push(text); assert.equal(live, false); return { status: "idle" }; },
+	} });
+	service.spawn({ instruction: "查日志", sourceConversation: "dt:idle-steer", createdBy: "owner" });
+	service.start(); await entered.promise;
+	try {
+		const injecting = service.inject("dt:idle-steer", "结果呢", "owner");
+		await opening.promise;
+		release.resolve(); await flush(); // original turn settles while open awaits
+		openRelease.resolve();
+		assert.equal(await injecting, true);
+		await flush();
+		assert.equal(steers.length, 1);
+		assert.equal(sends, 2);
+	} finally { release.resolve(); openRelease.resolve(); service.stop(); }
+});
+
 test("concurrent follow-ups on ONE worker session serialize instead of hitting the kernel's already-processing refusal", async () => {
 	// Field 2026-11-07 (box): the user typed while the worker was still running;
 	// pi-agent-core refuses a concurrent prompt ("Agent is already processing.
@@ -430,7 +562,7 @@ test("a DETERMINISTIC Chinese failure reply is delivered VERBATIM (field 2026-11
 	// treated any error as more urgent than the reply. The deterministic reply IS
 	// the finished failure message; appending the raw error after it would be
 	// noise on noise.
-	const { h, service } = harness({ reply: (h) => ({
+	const { h, service } = harness({ reply: () => ({
 		reply: "⚠️ 这次执行被系统中止了。常见原因：① 长时间无进展…可以回复「继续」接着做。",
 		error: "This operation was aborted",
 		deterministic: true,
@@ -448,7 +580,7 @@ test("a NON-deterministic reply with an error keeps the failure signal (appended
 	// means the model answered something but the run still recorded a failure.
 	// Replacing (or dropping) the error hides that the task is unfinished — the
 	// failure line must be APPENDED after the reply, not swallow it.
-	const { h, service } = harness({ reply: (h) => ({
+	const { h, service } = harness({ reply: () => ({
 		reply: "已完成第一步的核对，明细如下：…",
 		error: "tool channel died mid-run",
 		deterministic: false,
@@ -462,7 +594,7 @@ test("a NON-deterministic reply with an error keeps the failure signal (appended
 });
 
 test("an error with NO reply still falls back to 执行未完成", async () => {
-	const { h, service } = harness({ reply: (h) => ({ reply: "", error: "something broke" }) });
+	const { h, service } = harness({ reply: () => ({ reply: "", error: "something broke" }) });
 	service.spawn({ instruction: "统计", sourceConversation: "dt:group:g1", createdBy: "ma1" });
 	service.start(); await flush();
 	assert.match(h.pushes[0]?.text ?? "", /执行未完成：something broke/);
@@ -541,6 +673,7 @@ test("keep-alive window slides with the dialogue, and 0 disables it", async () =
 	assert.equal(await service.inject("dt:slide", "786199", "u1"), true, "hot: bare code injects");
 	nowMs += 100 * 60_000; // 100min after the injection → anchor slid, still inside
 	assert.equal(await service.inject("dt:slide", "786200", "u1"), true, "the window slides: a dialogue that keeps touching the worker keeps it hot");
+	await flush(); // finish the follow-up before simulating hours of silence
 	nowMs += 130 * 60_000; // 130min since the LAST activity → expired
 	assert.equal(await service.inject("dt:slide", "786201", "u1"), false, "cold: 130min of silence closes the window");
 
@@ -583,6 +716,7 @@ test("stickiness survives age: a worker settled hours ago still owns the dialogu
 		VALUES ('wold', '每日对账异常巡检', 'dt:old', 'ma1', 'done', 'worker:wold', ?, ?, ?)`).run(old, old, old);
 	assert.equal(await service.inject("dt:old", "结果呢", "ma1"), true, "「结果呢」 hours later still reaches the worker that did the work");
 	assert.equal(await service.inject("dt:old", "继续", "ma1"), true, "「继续」 keeps the dialogue sticky");
+	await flush(); // a settled worker, not an actively running follow-up
 	// A NEW task must not land in the accumulated transcript (field 2026-11-08 23:44
 	// + 2026-11-10 21:24): triage routes it fresh instead.
 	assert.equal(await service.inject("dt:old", "帮我查一下 0422026111000000654 的下单日志", "ma1"), false, "a fresh task never lands in the stale worker");

@@ -62,6 +62,10 @@ export interface WorkerEngineDeps<Session> {
 	/** One durable round: returns when the turn settles. reply = the final
 	 * assistant text (code-extracted result — no marker parsing anywhere). */
 	send(session: Session, message: string, senderId: string, sourceConversation: string): Promise<{ reply?: string; error?: string; deterministic?: boolean; narrationSuppressed?: boolean; narrationNoted?: boolean }>;
+	/** Add input to a live turn at its next step boundary. The engine checks
+	 * current permissions and turn ownership; idle means use a normal turn. */
+	steer?(conversationId: string, message: string, senderId: string, sourceConversation: string):
+		{ status: "accepted" | "idle" } | { status: "rejected"; reason: string };
 	/** Deliver to the source conversation (idempotent upstream). */
 	push(conversationId: string, text: string): Promise<unknown> | unknown;
 	/** Cancel a live durable round (foreground-escape). Injected because the
@@ -229,12 +233,14 @@ export class WorkerService<Session> {
 	 * The kernel's Agent REFUSES a second prompt while one is in flight
 	 * ("Agent is already processing. Specify streamingBehavior…" — field
 	 * 2026-11-07 on the box, surfaced to the user as 执行未完成). Worker is
-	 * dialogue infrastructure: a follow-up typed while the worker is still
-	 * working must QUEUE behind the running turn and run after it settles —
-	 * not fail, not be dropped, and not be delivered as an error notice.
+	 * dialogue infrastructure: input to a live turn uses steer. Idle turns
+	 * still serialize so racing follow-ups never issue concurrent prompts.
 	 * Keyed by conversation id (one chain per worker session).
 	 */
 	private readonly turnChains = new Map<string, Promise<void>>();
+	/** Follow-up turns do not reopen a done row, so row status alone cannot
+	 * tell whether the worker currently owns a live dialogue. */
+	private readonly runningTurns = new Set<string>();
 	/** conversationId → last hot-window injection (ms). Sliding anchor for the
 	 * keep-alive window: a dialogue that keeps touching the worker keeps it hot
 	 * even as the row's finished_at recedes. Pruned on write to stay bounded. */
@@ -443,7 +449,7 @@ export class WorkerService<Session> {
 		// polling script: the whole flow died on a promise nothing could keep.
 		// The transcript itself is bounded by the engine's pre-turn budget gate +
 		// compaction, NOT by refusing the dialogue.
-		const isLive = LIVE_WORKER_STATUSES.has(recent.status);
+		const isLive = LIVE_WORKER_STATUSES.has(recent.status) || this.runningTurns.has(recent.conversation_id);
 		// Keep-alive is a DONE worker's aftermath-ownership (review P2-3): error
 		// (interrupted; empty session; contract = 「重新执行」) and cancelled
 		// (user pulled the work back) stay cold-gated even when fresh.
@@ -516,9 +522,25 @@ export class WorkerService<Session> {
 			}
 		}
 		const session = await this.opts.open(recent.conversation_id);
-		// Serialize on the session's turn chain: the kernel refuses concurrent
-		// prompts, and a user typing during a running turn expects their message
-		// to be ANSWERED NEXT, not rejected.
+		// Row status is insufficient: a done worker can be running a follow-up.
+		// Ask the engine synchronously after open(), with no await between its
+		// liveness check and queue admission. Accepted input belongs to THIS turn
+		// and must never also become a second send after it settles.
+		const steered = this.opts.steer?.(recent.conversation_id, payload, senderId, sourceConversation);
+		if (steered?.status === "accepted") {
+			console.log(`[worker] follow-up steered: task=${recent.id} conversation=${recent.conversation_id}`);
+			return true;
+		}
+		if (steered?.status === "rejected") {
+			console.warn(`[worker] follow-up steer rejected: task=${recent.id}`);
+			try {
+				await this.opts.push(sourceConversation, `追加指令未投递：${steered.reason}`);
+			} catch (err) { this.opts.onError?.(err); }
+			return true;
+		}
+		// Idle (including a turn that settled while open() awaited) or a host
+		// without steering support: preserve the serial follow-up contract.
+		console.log(`[worker] follow-up queued: task=${recent.id} conversation=${recent.conversation_id}`);
 		this.enqueueTurn(recent.conversation_id, () => this.runTurn(recent, session, payload, senderId, { record: false }));
 		return true;
 	}
@@ -621,6 +643,7 @@ export class WorkerService<Session> {
 	 * linear state machine tracks); follow-up turns are conversation, not
 	 * state — they deliver their reply and leave the row settled. */
 	private async runTurn(task: WorkerTaskRow, session: Session, message: string, senderId: string, opts: { record: boolean }): Promise<void> {
+		this.runningTurns.add(task.conversation_id!);
 		try {
 			const r = await this.opts.send(session, message, senderId, task.source_conversation);
 			// Narration contracts (review adaf0751 P1-A): the kernel flags zero-
@@ -666,6 +689,8 @@ export class WorkerService<Session> {
 			try {
 				await this.deliver(task, `⚠️ 执行未完成：${err instanceof Error ? err.message : String(err)}`, opts);
 			} catch { /* delivery of the failure notice is best-effort */ }
+		} finally {
+			this.runningTurns.delete(task.conversation_id!);
 		}
 	}
 
