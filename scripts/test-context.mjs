@@ -935,3 +935,11 @@ test("strip stops escalating as soon as the budget is met (P1-1)", () => {
 	assert.equal(stripped, 2);
 	assert.equal(agent.state.messages.reduce((a, m) => a + countImageParts(m), 0), 1, "the fitting tail keeps its screenshot");
 });
+
+test("projection system messages carry the prompt in sections — CJK sections count at the CJK rate, not chars÷4 (review e7db0afd P2-A)", () => {
+	const long = "预算门必须看见的真实员工提示，逐字计入计量。".repeat(400);
+	const sys = { role: "system", content: [], sections: { preamble: long }, timestamp: Date.now() };
+	const est = estimateMessageTokens(sys);
+	assert.ok(est >= long.length * 0.9, `CJK sections must count at ~1 token/char (got ${est} for ${long.length} chars)`);
+	assert.ok(est > (long.length / 4) * 2, "strictly above pi's chars÷4 under-count (the old blind spot)");
+});

@@ -131,3 +131,34 @@ test("session.abort + dispose are safe on an idle host", async () => {
 	await host.session.abort();
 	await host.session.dispose();
 });
+
+test("the PROVIDER-visible system prompt is the agent's real prompt, never the loader stub (field 2026-11-10)", async () => {
+	await initPiRuntime();
+	const seen = [];
+	const streamFn = async (model, context) => {
+		seen.push(JSON.stringify(context));
+		return {
+			async *[Symbol.asyncIterator]() {},
+			result: async () => ({ role: "assistant", provider: "spike", model: "m", content: [{ type: "text", text: "好的" }], stopReason: "stop", usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 } }),
+		};
+	};
+	const agent = new Agent({
+		streamFn,
+		initialState: {
+			systemPrompt: "EMPLOYEE-REAL-PROMPT-MARKER 你是数字员工，必须调用工具执行任务，禁止把命令当聊天文本输出。",
+			model: fakeModel,
+			tools: [makeTool("spike_tool", [])],
+		},
+	});
+	const host = await createSessionHost(agent, { conversationId: "conv-real-prompt", tools: agent.state.tools, cwd: dir });
+	await host.session.prompt("帮我查个日志", { expandPromptTemplates: false });
+	const wire = seen.join("\n");
+	assert.ok(wire.includes("EMPLOYEE-REAL-PROMPT-MARKER"), "the provider must see the agent's REAL system prompt");
+	assert.ok(!wire.includes("VE session host"), "the loader stub must never reach the provider (field: worker printed shell fences as chat)");
+	// P2-B (review e7db0afd): a second turn must not re-send or duplicate the
+	// prompt patch — the marker stays exactly once in the per-request wire.
+	await host.session.prompt("第二轮", { expandPromptTemplates: false });
+	const last = seen[seen.length - 1];
+	const count = (last.match(/EMPLOYEE-REAL-PROMPT-MARKER/g) || []).length;
+	assert.equal(count, 1, `prompt must appear exactly once per request (got ${count} on turn 2)`);
+});

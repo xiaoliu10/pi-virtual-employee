@@ -17,6 +17,16 @@
  * promptWithRetry ladder and maybeCompact gates are the field-hardened
  * versions (CJK token math, cut points, honest empty-stall chains) and must
  * stay the only decision makers (0.2.67/0.2.69/0.2.80/0.2.85/0.2.93/0.2.95).
+ *
+ * FIELD 2026-11-10 (worker replying with shell-code blocks as chat text):
+ * the loader's systemPrompt is NOT inert scaffolding — pi's
+ * _rebuildSystemPrompt feeds it to the provider as `customPrompt` (the
+ * "session.systemPrompt stays in step with what the provider sees" contract),
+ * so a stub here REPLACES VE's real employee prompt on the wire. A model that
+ * only sees the stub loses every piece of VE discipline (tool usage, 中文,
+ * 真实取数红线) and role-plays a CLI assistant from its priors + memory
+ * recall (printing bash/cmd fences instead of calling tools). The loader now
+ * carries the agent's REAL system prompt.
  */
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -64,9 +74,13 @@ export async function createSessionHost(agent: Agent, opts: CreateSessionHostOpt
 		noPromptTemplates: true,
 		noThemes: true,
 		noContextFiles: true,
-		// The Agent carries VE's system prompt in its state — the loader's own
-		// prompt machinery is scaffolding we never read.
-		systemPrompt: "VE session host (system prompt lives on the agent).",
+		// The provider-visible system prompt on this path IS the loader's
+		// systemPrompt (pi feeds it to the request builder as customPrompt —
+		// field-proven 2026-11-10, see the header note) — so it must carry the
+		// agent's REAL system prompt, not a stub. Agents are rebuilt on
+		// skills/memory/model revisions and hosts are per-agent, so this never
+		// goes stale within a host's lifetime.
+		systemPrompt: agent.state.systemPrompt || "VE session host (system prompt lives on the agent).",
 		extensionFactories: [
 			// VE settle-gate: evidence-round self-verification on agent_before_settle.
 			// Re-delivered in plugin form after the kernel migration (closed #84).
