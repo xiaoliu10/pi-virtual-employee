@@ -22,6 +22,7 @@
  */
 import { app, type BrowserWindow } from "electron";
 import { DownloadRetryController } from "./update-download-retry.js";
+import { applyUpdaterCacheIsolation } from "./updater-cache-isolation.js";
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { basename, join, sep } from "node:path";
@@ -1632,14 +1633,18 @@ export function stopUpdater(): void {
  * electron-updater names the cache dir from `updaterCacheDirName` in
  * app-update.yml — a STATIC build-time value, identical for every profile on
  * the machine. Two profiles downloading the same version therefore write to
- * the SAME `<localAppData>/pi-virtual-employee-updater/pending/temp-*.exe`;
- * the first one to finish renames it away and the other fails
- * `ENOENT: rename temp-… -> …exe` (field 2026-10-28, exactly this message).
- * electron-updater only retries EBUSY there, so the loser just errors out.
+ * the SAME `<localAppData>/pi-virtual-employee-updater/pending/temp-*.exe` and
+ * each instance's `emptyDir(pending)` wipes the others' finished downloads —
+ * the exact ENOENT family on the 2026-11-12 box (rename temp ENOENT / watchdog
+ * copyfile ENOENT / installer spawn ENOENT) that tripped the machine breaker.
  *
- * Namespacing the cache by profile name removes the collision at the source;
- * the default profile keeps the original path so an existing download is not
- * orphaned by the upgrade.
+ * The 2026-10-28 fix guarded on `setUpdaterCacheDir` — an API electron-updater
+ * 6.8.9 does NOT have — so it silently returned for every profile and the
+ * shared dir stayed (the box logs never showed a single `updater cache
+ * isolated` line). The rebuilt isolation either HAPPENS (an INFO line names
+ * the dir) or SAYS SO (a WARN) — never a silent return. Mechanism and
+ * fail-soft policy live in updater-cache-isolation.ts (tested); this wrapper
+ * only supplies the real electron-updater objects.
  */
 /** Active profile name, derived from the userData path main.ts redirects. */
 function currentProfileName(): string {
@@ -1650,18 +1655,21 @@ function currentProfileName(): string {
 }
 
 function isolateUpdaterCache(profileName: string): void {
-	if (!profileName || profileName === "default") return;
+	const base = join(process.env.LOCALAPPDATA ?? app.getPath("appData"), "pi-virtual-employee-updater");
+	let Helper: (new (cacheDir: string) => { cacheDir: string }) | null = null;
 	try {
-		const base = join(process.env.LOCALAPPDATA ?? app.getPath("appData"), "pi-virtual-employee-updater");
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const target = autoUpdater as any;
-		if (typeof target.setUpdaterCacheDir !== "function") return;
-		target.setUpdaterCacheDir(`${base}-${profileName}`);
-		log("INFO", `updater cache isolated for profile "${profileName}"`);
+		// electron-updater ships no exports map, so the deep path resolves against
+		// the on-disk package in asar (same file layout as the 6.8.9 stack traces).
+		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		Helper = (require("electron-updater/out/DownloadedUpdateHelper") as { DownloadedUpdateHelper: new (cacheDir: string) => { cacheDir: string } }).DownloadedUpdateHelper;
 	} catch (err) {
-		// A cache-dir override must never prevent the updater from working.
-		log("WARN", `could not isolate updater cache: ${err instanceof Error ? err.message : String(err)}`);
+		// applyUpdaterCacheIsolation will report this as a non-isolated outcome;
+		// the WARN below is the only trace — do not let helper loading break the updater.
+		log("WARN", `could not load DownloadedUpdateHelper: ${err instanceof Error ? err.message : String(err)}`);
 	}
+	const outcome = applyUpdaterCacheIsolation(profileName, autoUpdater as never, Helper, base);
+	if (outcome.isolated) log("INFO", `updater cache isolated for profile "${profileName}" -> ${outcome.cacheDir} (${outcome.detail})`);
+	else if (profileName && profileName !== "default") log("WARN", `updater cache NOT isolated for profile "${profileName}": ${outcome.detail}`);
 }
 
 export function setupAutoUpdater(win: BrowserWindow): void {
