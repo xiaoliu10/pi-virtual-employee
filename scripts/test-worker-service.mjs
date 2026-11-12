@@ -46,7 +46,7 @@ function harness(overrides = {}) {
 	const store = new WorkerTaskStore(db);
 	const h = {
 		db, store,
-		sessions: [], sends: [], pushes: [], errors: [], settled: [],
+		sessions: [], sends: [], pushes: [], errors: [], settled: [], steered: [],
 		open: async (cid) => { h.sessions.push(cid); return { cid }; },
 		send: async (session, message) => {
 			h.sends.push({ session, message });
@@ -1125,4 +1125,44 @@ test("an ask settled into the ERROR column (narration-noted zero-action turn) al
 	const injected = await service.inject("dt:group:g1", "0002026110800003400", "ma1");
 	assert.equal(injected, true, "the answer reaches the asking session even from the error column");
 	assert.deepEqual(h.sessions, ["worker:werr"]);
+});
+
+// ---------- steer refreshes the run's progress-push budget (user ruling 2026-11-12) ----------
+
+test("a steered follow-up resets the run's progress budget (capped run revives)", async () => {
+	const entered = deferred(), release = deferred();
+	const resets = [], steered = [];
+	let sends = 0;
+	const { service } = harness({ service: {
+		send: async () => { sends += 1; if (sends === 1) { entered.resolve(); await release.promise; } return { reply: "ok" }; },
+		steer: (cid, text) => { steered.push({ cid, text }); return { status: "accepted" }; },
+		progress: (task) => {
+			const n = { started: 0, stopped: 0, resetBudget: () => resets.push(task.conversationId) };
+			return { start: () => { n.started += 1; }, stop: () => { n.stopped += 1; }, drain: async () => {}, resetBudget: n.resetBudget };
+		},
+	} });
+	service.spawn({ instruction: "长任务", sourceConversation: "dt:single:u9", createdBy: "u9" });
+	service.start(); await entered.promise;
+	try {
+		const before = resets.length;
+		assert.equal(await service.inject("dt:single:u9", "结果呢", "u9"), true, "follow-up steers into the live worker");
+		assert.equal(resets.length, before + 1, "an accepted follow-up refreshes the push budget");
+		assert.match(resets[0], /worker:/, "keyed by the run's conversation");
+	} finally { release.resolve(); await flush(); service.stop(); }
+});
+
+test("a message that never steers (cold bare token) does not touch any budget", async () => {
+	// The refresh is bound to an ACCEPTED steer on a LIVE run. A finished run
+	// whose keep-alive has expired bounces a bare token to the foreground
+	// (return false) — no notifier is alive, so nothing may reset.
+	const resets = [];
+	const { h, service } = harness({ service: {
+		progress: (task) => ({ start() {}, stop() {}, drain: async () => {}, resetBudget: () => resets.push(task.conversationId) }),
+	} });
+	const past = Date.now() - 12 * 60 * 60_000; // way past the 120min keep-alive
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, max_minutes, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wdone', '长任务', 'dt:single:u7', 'u7', 'done', '查询完成：共 37 笔。', 30, 'worker:wdone', ?, ?, ?)`).run(past, past, past);
+	const injected = await service.inject("dt:single:u7", "875055", "u7");
+	assert.equal(injected, false, "cold bare token bounces to the foreground");
+	assert.equal(resets.length, 0, "no live run — no budget refresh");
 });

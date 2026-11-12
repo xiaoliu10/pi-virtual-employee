@@ -38,7 +38,11 @@ export interface ProgressNotifierOptions {
 	/** Final-say gate for whether this note may be pushed at all
 	 *  (silent tasks stay silent; reuse shouldPushScheduledResult). */
 	mayPush?: (note: string) => boolean;
-	/** Hard ceiling on pushes per run — a runaway interval must not spam. */
+	/** Hard ceiling on pushes per run — a runaway interval must not spam.
+ *  The count RESETS when the user sends a follow-up to the run's worker
+ *  (user ruling 2026-11-12): an active dialogue proves someone is watching,
+ *  which is exactly the audience the anti-spam cap exists to protect. See
+ *  resetBudget(). */
 	maxPushes?: number;
 	/** Zero-cost gate checked BEFORE the side LLM call: a run whose notes can
 	 *  never be pushed (silent task) must not burn a summarize per interval
@@ -65,6 +69,16 @@ export interface ProgressNotifier {
 	drain: (timeoutMs?: number) => Promise<void>;
 	/** Test/observability hook: pushes actually performed. */
 	pushedCount: () => number;
+	/**
+	 * Refresh the push budget in place (user ruling 2026-11-12: 「追加消息应该
+	 * 要刷新这个计数」). Called by the router when the user sends a follow-up
+	 * to this run's worker: the cap exists to protect an absent audience from
+	 * spam, and a user who is actively steering the run is by definition
+	 * present — hand them a fresh allowance without ending the run.
+	 * Only the CAP counter resets; the degraded-LLM backoff is an unrelated
+	 * relay-health mechanism and keeps its own state.
+	 */
+	resetBudget: () => void;
 }
 
 /** Clamp the configured interval: ≤0 disables, 1..4 is noise (LLM round-trip
@@ -175,6 +189,14 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 			log("INFO", "progress tick skipped: degraded backoff window");
 			return;
 		}
+		// Cap check BEFORE the side LLM pass (field 2026-11-12, box Nova): the old
+		// position — after summarize — burned one bounded side call every tick
+		// just to log the cap and drop the note. A suppressed budget must be
+		// zero-cost, same rule as the preflight gate above.
+		if (pushes >= maxPushes) {
+			log("WARN", `progress push cap (${maxPushes}) reached — further notes suppressed until the run settles`);
+			return;
+		}
 
 		inFlight = true;
 		try {
@@ -223,10 +245,8 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 				log("INFO", "progress note dropped: mayPush gate rejected it (silent task or missing target)");
 				return;
 			}
-			if (pushes >= maxPushes) {
-				log("WARN", `progress push cap (${maxPushes}) reached — further notes suppressed until the run settles`);
-				return;
-			}
+			// (cap is enforced BEFORE the side pass — see the early check above —
+			// so a suppressed budget never burns a summarize.)
 			pushes += 1;
 			pushInFlight = true;
 			pushSettled = new Promise<void>((resolve) => {
@@ -269,5 +289,11 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 			return Promise.race([pushSettled, timeout]);
 		},
 		pushedCount: () => pushes,
+			resetBudget: () => {
+				// MUST log: a counter that silently resets is indistinguishable from
+				// a cap that never fired, and the next "为什么又开始了" needs this line.
+				if (pushes > 0) log("INFO", `progress budget reset by user follow-up (was ${pushes}/${maxPushes})`);
+				pushes = 0;
+			},
 	};
 }
