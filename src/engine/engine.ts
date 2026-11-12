@@ -19,7 +19,7 @@ import { sidePassMaxTokens } from "./side-pass-budget.js";
 import { runningBackgroundProcesses, stopBackgroundProcesses } from "./tools/shell.js";
 import type { Skill } from "./skills/types.js";
 import { convertToLlm, DEFAULT_COMPACTION_SETTINGS, estimateContextTokens, generateSummary } from "./pi-compaction.js";
-import { formatPlanForTurn, formatPlanMessage, isDanglingNarration, isProcessNarration, looksLikeTask, NARRATION_GUARD_NOTICE, parsePlan, PLAN_PROMPT_HEADER, shouldPushPlanToChat } from "./task-planner.js";
+import { FOLLOWUP_CLASSIFY_PROMPT, formatPlanForTurn, formatPlanMessage, isDanglingNarration, isProcessNarration, looksLikeTask, NARRATION_GUARD_NOTICE, parsePlan, PLAN_PROMPT_HEADER, shouldPushPlanToChat } from "./task-planner.js";
 import { createModels, normalizeContext, ModelsError } from "@earendil-works/pi-ai";
 import { SIDE_PASS_DEFAULT_LEVEL, applyThinkingDeclaration } from "../shared/thinking.js";
 
@@ -3948,6 +3948,62 @@ export class EmployeeEngine implements EmployeeRuntime {
 		} catch (err) {
 			console.warn("[engine] task planning failed:", err instanceof Error ? err.message : err);
 			return null;
+		}
+	}
+
+	/**
+	 * Is this message a CONTINUATION of the running task, or a NEW independent
+	 * request? (user ruling 2026-11-12: single-chat experience — 「上一次对话任务
+	 * 非常大，下一次聊天几乎要等几个小时」.)
+	 *
+	 * While a worker is live, inject() used to own the dialogue UNCONDITIONALLY,
+	 * so an unrelated new ask was absorbed by the running task: no parallel
+	 * worker, and no reply until the huge turn settled (probe 2026-11-12:
+	 * absorbed=true, parallel spawned=false, replies while running=0).
+	 *
+	 * Only task-shaped, non-bare-token messages reach this pass — codes,
+	 * 「继续」/「结果呢」 and other non-task shapes are steered by code without
+	 * spending a call. Bounded like every other side pass (counted as watchdog
+	 * life, sidePassMaxTokens budget).
+	 *
+	 * FAIL-SAFE = "continuation": a failed/ambiguous classification keeps today's
+	 * behaviour (steer into the running task). Defaulting to "new-task" instead
+	 * would spawn a SECOND worker onto the same target — two logins racing for
+	 * one bastion account is the flood-loop/rate-limit incident class, which is
+	 * strictly worse than a delayed answer.
+	 */
+	async classifyWorkerFollowUp(agent: Agent, runningInstruction: string, message: string, conversationId?: string): Promise<"continuation" | "new-task"> {
+		try {
+			const model = agent.state.model;
+			if (!model) return "continuation";
+			const signal = conversationId ? this.beginSideLlmCall(conversationId, 60_000) : undefined;
+			let raw: string | undefined;
+			try {
+				raw = await generateSummary(
+					[{ role: "user", content: `【正在执行的任务】\n${runningInstruction.replace(/\s+/g, " ").slice(0, 600)}\n\n【刚收到的新消息】\n${message.replace(/\s+/g, " ").slice(0, 1000)}`, timestamp: Date.now() }],
+					model,
+					sidePassMaxTokens(model),
+					undefined,
+					signal,
+					FOLLOWUP_CLASSIFY_PROMPT,
+					undefined,
+					undefined,
+					this.rawStreamFn,
+					undefined,
+					SUMMARIZER_RETRY,
+				);
+			} catch (err) {
+				console.warn(`[engine] follow-up classification failed (keeping continuation): ${err instanceof Error ? err.message : String(err)}`.slice(0, 200));
+				return "continuation";
+			} finally {
+				if (conversationId) this.endSideLlmCall(conversationId);
+			}
+			const verdict = /\bNEW\b/i.test(raw ?? "") && !/\bCONT\b/i.test(raw ?? "") ? "new-task" : "continuation";
+			console.log(`[engine] follow-up classified: ${verdict}`);
+			return verdict;
+		} catch (err) {
+			console.warn("[engine] follow-up classification error (keeping continuation):", err instanceof Error ? err.message : err);
+			return "continuation";
 		}
 	}
 

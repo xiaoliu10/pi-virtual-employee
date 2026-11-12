@@ -1748,6 +1748,10 @@ ${tailForProgress(decision.text)}`;
 		steer: (cid, message, senderId, sourceConversation) => engine.steerConversation(cid, message, {
 			senderId, channel: "scheduler", chatType: "single", memoryConversationId: sourceConversation,
 		}),
+		// Bounded side pass on the WORKER session (same model/thinking discipline
+		// as the progress brief); fails safe to "continuation".
+		classifyFollowUp: (session, runningInstruction, message, cid) =>
+			engine.classifyWorkerFollowUp(session, runningInstruction, message, cid),
 		push: (cid, text) => im.pushToConversation(cid, text),
 		// Agent.abort() takes no options (preserveBackground is engine.abortSession
 		// territory). A worker's background scripts belong to the turn being
