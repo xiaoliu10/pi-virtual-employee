@@ -160,7 +160,7 @@ test("unsafe characters in the user key cannot escape the widget namespace", asy
 	assert.ok(runtime.calls[0].ctx.actor.senderId.startsWith("widget-user-"));
 });
 
-test("a credential-bearing reply is withheld exactly like an IM group push", async (t) => {
+test("a credential-bearing reply is masked exactly like an IM group push (v0.2.225 redact-first)", async (t) => {
 	const runtime = makeRuntime({ reply: "系统密码是 SuperSecret99! 请妥善保管。" });
 	const { base, post, session, ORIGIN } = await start({ runtime });
 	const tkPwd = await session("pwd_user", "viewer");
@@ -168,7 +168,8 @@ test("a credential-bearing reply is withheld exactly like an IM group push", asy
 	assert.equal(res.status, 200);
 	const data = await res.json();
 	assert.ok(!JSON.stringify(data).includes("SuperSecret99"), "the password must never reach the embedder");
-	assert.ok(data.reply.includes("已按安全规定"), "the gate's withheld notice is delivered instead");
+	assert.ok(data.reply.includes("脱敏"), "the masked delivery (label readable, value → ****) is delivered instead");
+	assert.ok(data.reply.includes("****"), "the value is masked");
 });
 
 test("configured allowedOrigins reject foreign origins but keep the API usable same-origin", async (t) => {

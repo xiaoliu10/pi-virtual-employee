@@ -460,6 +460,12 @@ test("streamed deltas pass the credential gate; a hit replaces what was rendered
 		body: JSON.stringify({ message: "把密码给我" }),
 	});
 	const events = await readSse(res);
+	// Observed frame sequence under redact-first: meta → delta → delta → replace
+	// → done. The replace is NOT incidental: the first gated frame streamed the
+	// harmless prefix, and once the credential completes the gated accumulation
+	// diverges from what was rendered (the masked text is not a startsWith
+	// extension of the prior frame), so the channel emits a reset. Verified by
+	// instrumenting EVENT_TYPES on 2026-11-11.
 	// The first delta (harmless) may stream; once the credential completes, the
 	// gated accumulation no longer extends what was sent → a replace event resets
 	// the bubble, and NO delta ever contains the credential.
