@@ -86,6 +86,11 @@ test("template heading on a LATER line is stripped too (review 778846c1 P2)", ()
 	assert.equal(sanitizeWorkItemTitle("## Goal\n- 排查\n## Constraints\n- 仅只读"), "排查 Constraints 仅只读");
 	assert.equal(sanitizeWorkItemTitle("# 标题\n## 二级\n内容"), "标题 二级 内容");
 	assert.equal(sanitizeWorkItemTitle("排查 > 继续 - 内容"), "排查 > 继续 - 内容", "mid-line markers survive");
+	// Decoration-only lines (bare bullets, no trailing whitespace) degrade to
+	// the placeholder — review 762ece33 P3: per-line stripping must not lose
+	// the single-pass behavior on 「## Goal\n-\n>\n#」.
+	assert.equal(sanitizeWorkItemTitle("## Goal\n-\n>\n#"), "未命名任务");
+	assert.equal(sanitizeWorkItemTitle("-\n--"), "未命名任务");
 });
 
 test("long titles clamp at a clause boundary", () => {

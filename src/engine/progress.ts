@@ -136,14 +136,16 @@ export function containsTemplateHeadingLine(text: string): boolean {
  * the lines are flattened; empty lines contribute nothing. Each iteration
  * consumes ≥1 char, so the loop terminates; mid-string decoration is left
  * alone (a title may legitimately contain 「>」 or a number after the first
- * clause).
+ * clause). A line that is ONLY bullet chars (「-」「--」) is pure decoration —
+ * review 762ece33 P3: without this branch it survives as a bare「-」title,
+ * a behavioral regression vs the single-pass version.
  */
 export function sanitizeWorkItemTitle(raw: string, max = 40): string {
 	// Inline emphasis first (was last): it can WRAP a heading (「**## Goal**」)
 	// and would otherwise shield the heading strips below.
 	const deEmphasized = (raw ?? "").replace(/[*`_]/g, "");
 	const lineStartDecoration =
-		/^\s*(?:#{1,6}\s*Goal\b[:：]?\s*|#{1,6}\s*|[-*+]\s+|>+\s*)/i;
+		/^\s*(?:#{1,6}\s*Goal\b[:：]?\s*|#{1,6}\s*|[-*+]\s+|>+\s*|[-*+]+\s*$)/i;
 	const text = deEmphasized
 		.split("\n")
 		.map((line) => {
