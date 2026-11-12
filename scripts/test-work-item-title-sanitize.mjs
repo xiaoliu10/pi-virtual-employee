@@ -59,6 +59,26 @@ test("all whitespace collapses to single spaces (single-line display label)", ()
 	assert.equal(sanitizeWorkItemTitle("排查  流水\n下单日志\t异常"), "排查 流水 下单日志 异常");
 });
 
+test("wrapped heading shapes are stripped to fixpoint (review f8f4b4e4: 4 confirmed leaks)", () => {
+	// Bold-wrapped heading: emphasis strip must run FIRST, or「**## Goal**」shields
+	// the heading strip and「##」ships.
+	const bold = sanitizeWorkItemTitle("**## Goal** 排查");
+	assert.ok(!bold.includes("#") && bold === "排查", bold);
+	// Blockquoted heading: quote and heading strip must BOTH apply.
+	const quoted = sanitizeWorkItemTitle("> ## Goal\n> 排查");
+	assert.ok(!quoted.includes("#") && !quoted.includes(">"), quoted);
+	// Bullet-then-heading: bullet strip must re-run after the heading strip.
+	assert.equal(sanitizeWorkItemTitle("- ## Goal\n- 排查"), "排查");
+	// Markers-only input must degrade to the placeholder, not leave「>」behind.
+	assert.equal(sanitizeWorkItemTitle("- ## > `  "), "未命名任务");
+	// Field sample regression: heading strip eats the newline; the line-2 bullet
+	// is then stripped by the NEXT fixpoint iteration.
+	assert.equal(
+		sanitizeWorkItemTitle("## Goal\n- 继续排查流水"),
+		"继续排查流水",
+	);
+});
+
 test("long titles clamp at a clause boundary", () => {
 	const out = sanitizeWorkItemTitle("继续排查流水支付渠道下单日志，定位下单环节是否存在异常并输出结论报告");
 	assert.ok(out.length <= 40, `too long: ${out.length}`);
