@@ -10,7 +10,6 @@
  */
 import type { ConfigStore, ImChannelConfig } from "../db/config-store.js";
 import { decidePump, isUsableBrief, prunePumpState, type PumpState } from "../scheduler/progress-pump.js";
-import { resolveOrigin, type WorkOrigin } from "../scheduler/work-origin.js";
 import type { EmployeeEngine, ModelOption } from "../engine/engine.js";
 import type { ReportService } from "../reports/report-service.js";
 import { EchoAdapter } from "./adapters/echo.js";
@@ -18,7 +17,7 @@ import { DingtalkAdapter } from "./adapters/dingtalk.js";
 import type { IMAdapter, IMIO, InboundActor } from "./types.js";
 import { isCancelPhrase, looksLikeCommandAttempt, parseCommand, type ParsedCommand } from "./commands.js";
 import { diag } from "./diag.js";
-import { CAPABILITY_LABEL, checkPermission, describeAccess, isAdmin, isDeclaredAdmin } from "../security/permissions.js";
+import { CAPABILITY_LABEL, checkPermission, describeAccess, isAdmin } from "../security/permissions.js";
 import { maskId } from "../engine/tools/admin.js";
 import { isAuthorizationPhrase } from "../engine/authorization.js";
 import { startStallWatchdog } from "./watchdog.js";
@@ -612,7 +611,7 @@ export class IMAdapterManager {
 	/** Build the inbound-message IO shared by every adapter. */
 	private makeIO(): IMIO {
 		return {
-			handle: (msg, ctx) => {
+			handle: async (msg, ctx) => {
 				// /stop aborts the in-flight turn WITHOUT wiping context — also
 				// outside the queue, same reason as /new (a wedged turn must not
 				// block its own escape hatch).
@@ -682,60 +681,133 @@ export class IMAdapterManager {
 							: "🆕 新会话已开启（上下文清空，模型设置保留）。";
 					});
 				}
+				if (this.draining) {
+					return "⏳ 系统正在安装应用更新，当前消息不会被执行；请稍后重新发送。";
+				}
+				// Record the sender in this conversation's roster BEFORE any gate:
+				// the roster is how an admin later says "给这个群的人设权限" without
+				// knowing staffIds, so it must include senders we refuse to serve
+				// (a viewer's refusal must not hide them from the roster). Rows are
+				// keyed on the platform-verified id, never on message text.
+				this.engine.recordConversationMember(msg.conversationId, msg.actor);
+				// IM slash commands (OpenClaw-style): /help /new /stop /restart /version /models /model <n|id>
+				if (inbound) {
+					// /new and /stop were already handled above (they must not queue).
+					return this.serialize(msg.conversationId, async () => this.runCommand(msg.conversationId, inbound, msg.actor, msg.text));
+				}
+				// A slash word we do not recognise: log the raw text once. The point
+				// is that the NEXT "命令不生效" report can be answered from the log
+				// instead of guessed at — the client's exact serialization of a
+				// mention is not something we control.
+				if (looksLikeCommandAttempt(msg.text)) {
+					void diag("commands", `unrecognised command attempt conv=${msg.conversationId} raw=${JSON.stringify(msg.text.slice(0, 120))}`, "warn");
+				}
+
+				// Conversation admission floor (RBAC): a conversation may RAISE the
+				// minimum role needed to be served at all (security.conversations
+				// floors.chat). Checked server-side on the platform-verified actor —
+				// message text can never influence it.
+				const admission = checkPermission(this.config, msg.actor, msg.conversationId, "chat");
+				if (!admission.ok) return admission.reason;
+
+				// Admin one-shot authorization — deterministic, no model turn:
+				// exactly 「确认授权」 answers a pending role-refusal request.
+				// Only a platform-verified admin counts; the engine checks.
+				if (isAuthorizationPhrase(msg.text)) {
+					return this.serialize(msg.conversationId, async () => this.engine.confirmAuthorization(msg.conversationId, msg.actor, msg.conversationName));
+				}
+
+				// 「前台执行」escape hatch — deterministic, no model turn: cancel the
+				// convertible chat-dispatched item and re-run its ORIGINAL
+				// instruction inline. The re-run must skip plan-ahead AND triage:
+				// a foreground escape that re-dispatches to background would be
+				// absurd (field 2026-11-05: the dispatch label itself was the
+				// complaint — the escape is the cheap way out).
+				let turnText = msg.text;
+				const escaped = isForegroundEscape(turnText);
+				if (escaped) {
+					const esc = this.takeForegroundEscape(msg);
+					if (esc) {
+						if (!esc.original) return esc.notice!;
+						turnText = esc.original;
+					}
+				}
+
+				const agent = this.engine.getOrCreateSession(msg.conversationId);
+				// ROUTING runs OUTSIDE the per-conversation queue (user ruling
+				// 2026-11-12: 「一起修」). The queue exists because the Agent refuses a
+				// second prompt() on the SAME conversation — it never was a reason to
+				// delay a ROUTING decision. While an inline turn occupied this chat,
+				// the next message could not even be triaged, so a new task waited
+				// hours instead of dispatching to a parallel worker. Only the inline
+				// execution below stays serialized.
+				let planText: string | undefined;
+				try {
+					// Plan-ahead (user ruling 2026-11-03): for task-shaped messages,
+					// push a short numbered plan to the chat BEFORE execution starts,
+					// then hand the same plan to the turn as context so the agent
+					// honors what was promised. Planning is a bounded side pass (60s);
+					// any failure or NO_PLAN verdict simply skips it — execution is
+					// never blocked by planning, and simple questions never see a plan.
+					if (!escaped && this.config.all().general.taskPlanning?.enabled !== false) {
+						try {
+							const plan = await this.engine.planTaskBrief(agent, msg.text, msg.conversationId);
+								if (plan) {
+									// The turn gets the FULL plan; the chat gets `chatText`,
+									// which the planner leaves undefined for short tasks (user
+									// ruling 2026-11-04: no plan for work that finishes fast).
+									planText = plan.turnContext;
+									const occurrenceId = msg.messageId
+										? chatHeartbeatOccurrenceId(msg.channel ?? "im", msg.messageId, Date.now(), 60_000)
+										: undefined;
+									// Push it. A failed push must NOT block execution: the plan
+									// still goes to the turn — the chat just didn't see it.
+									if (plan.chatText && ctx?.onProgress) {
+										await ctx.onProgress(plan.chatText, { occurrenceId: occurrenceId || undefined, kind: "task-plan" })
+											.catch((err) => console.warn("[im] task plan push failed:", err instanceof Error ? err.message : err));
+									}
+									// Router/Worker dispatch (docs/design/router-worker.md P1). Conservative
+									// and ON by default: when it fires, the message does NOT run in this chat
+									// turn — it becomes a work item and this turn returns the ACK instead.
+									// Every failure path falls through to inline execution (no black holes).
+									const dispatched = await this.tryDispatchToWorker(msg, plan.turnContext);
+									// `undefined` = inline; ANY string (including "" = dispatched,
+									// stay silent) means the Router handed the task off.
+									if (dispatched !== undefined) {
+										// The early return skips engine.send's onActivity — fire it
+										// so the renderer task list shows the new item immediately
+										// (review P2-3).
+										this.onActivity?.(msg.conversationId);
+										return dispatched;
+									}
+								}
+						} catch (err) {
+							console.warn("[im] task planning skipped:", err instanceof Error ? err.message : err);
+						}
+					}
+					// Plan-less dispatch attempt (field 2026-11-06): deep tasks (SLS log
+					// queries, 堡垒机 investigations) dispatch WITHOUT a plan. Before this,
+					// a failed plan side pass silently serialized two unrelated jobs into
+					// one chat's queue — the user saw "SLS finished, THEN the batch query
+					// started" and reasonably concluded VE runs globally serial. triage
+					// rejects everything that is not clearly a deep task, so simple
+					// questions still run inline exactly as before.
+					if (!escaped && !planText) {
+						const planlessDispatch = await this.tryDispatchToWorker(msg);
+						if (planlessDispatch !== undefined) {
+							this.onActivity?.(msg.conversationId);
+							return planlessDispatch;
+						}
+					}
+				} catch (err) {
+					console.warn("[im] routing skipped, running inline:", err instanceof Error ? err.message : err);
+				}
+				// INLINE execution — the ONLY part that must serialize: the kernel
+				// refuses concurrent prompts on this conversation's Agent.
 				return this.serialize(msg.conversationId, async () => {
 					if (this.draining) {
 						return "⏳ 系统正在安装应用更新，当前消息不会被执行；请稍后重新发送。";
 					}
-					// Record the sender in this conversation's roster BEFORE any gate:
-					// the roster is how an admin later says "给这个群的人设权限" without
-					// knowing staffIds, so it must include senders we refuse to serve
-					// (a viewer's refusal must not hide them from the roster). Rows are
-					// keyed on the platform-verified id, never on message text.
-					this.engine.recordConversationMember(msg.conversationId, msg.actor);
-					// IM slash commands (OpenClaw-style): /help /new /stop /restart /version /models /model <n|id>
-					if (inbound) {
-						// /new and /stop were already handled above (they must not queue).
-						return this.runCommand(msg.conversationId, inbound, msg.actor, msg.text);
-					}
-					// A slash word we do not recognise: log the raw text once. The point
-					// is that the NEXT "命令不生效" report can be answered from the log
-					// instead of guessed at — the client's exact serialization of a
-					// mention is not something we control.
-					if (looksLikeCommandAttempt(msg.text)) {
-						void diag("commands", `unrecognised command attempt conv=${msg.conversationId} raw=${JSON.stringify(msg.text.slice(0, 120))}`, "warn");
-					}
-
-					// Conversation admission floor (RBAC): a conversation may RAISE the
-					// minimum role needed to be served at all (security.conversations
-					// floors.chat). Checked server-side on the platform-verified actor —
-					// message text can never influence it.
-					const admission = checkPermission(this.config, msg.actor, msg.conversationId, "chat");
-					if (!admission.ok) return admission.reason;
-
-					// Admin one-shot authorization — deterministic, no model turn:
-					// exactly 「确认授权」 answers a pending role-refusal request.
-					// Only a platform-verified admin counts; the engine checks.
-					if (isAuthorizationPhrase(msg.text)) {
-						return await this.engine.confirmAuthorization(msg.conversationId, msg.actor, msg.conversationName);
-					}
-
-					// 「前台执行」escape hatch — deterministic, no model turn: cancel the
-					// convertible chat-dispatched item and re-run its ORIGINAL
-					// instruction inline. The re-run must skip plan-ahead AND triage:
-					// a foreground escape that re-dispatches to background would be
-					// absurd (field 2026-11-05: the dispatch label itself was the
-					// complaint — the escape is the cheap way out).
-					let turnText = msg.text;
-					const escaped = isForegroundEscape(turnText);
-					if (escaped) {
-						const esc = this.takeForegroundEscape(msg);
-						if (esc) {
-							if (!esc.original) return esc.notice!;
-							turnText = esc.original;
-						}
-					}
-
-					const agent = this.engine.getOrCreateSession(msg.conversationId);
 
 					// Long-task progress heartbeat: every `longTaskProgressMin` while a
 					// turn is still running, push a brief progress note to the channel.
@@ -795,63 +867,6 @@ export class IMAdapterManager {
 						: undefined;
 
 					try {
-						// Plan-ahead (user ruling 2026-11-03): for task-shaped messages,
-						// push a short numbered plan to the chat BEFORE execution starts,
-						// then hand the same plan to the turn as context so the agent
-						// honors what was promised. Planning is a bounded side pass (60s);
-						// any failure or NO_PLAN verdict simply skips it — execution is
-						// never blocked by planning, and simple questions never see a plan.
-						let planText: string | undefined;
-						if (!escaped && this.config.all().general.taskPlanning?.enabled !== false) {
-							try {
-								const plan = await this.engine.planTaskBrief(agent, msg.text, msg.conversationId);
-									if (plan) {
-										// The turn gets the FULL plan; the chat gets `chatText`,
-										// which the planner leaves undefined for short tasks (user
-										// ruling 2026-11-04: no plan for work that finishes fast).
-										planText = plan.turnContext;
-										const occurrenceId = msg.messageId
-											? chatHeartbeatOccurrenceId(msg.channel ?? "im", msg.messageId, Date.now(), 60_000)
-											: undefined;
-										// Push it. A failed push must NOT block execution: the plan
-										// still goes to the turn — the chat just didn't see it.
-										if (plan.chatText && ctx?.onProgress) {
-											await ctx.onProgress(plan.chatText, { occurrenceId: occurrenceId || undefined, kind: "task-plan" })
-												.catch((err) => console.warn("[im] task plan push failed:", err instanceof Error ? err.message : err));
-										}
-										// Router/Worker dispatch (docs/design/router-worker.md P1). Conservative
-										// and ON by default: when it fires, the message does NOT run in this chat
-										// turn — it becomes a work item and this turn returns the ACK instead.
-										// Every failure path falls through to inline execution (no black holes).
-										const dispatched = await this.tryDispatchToWorker(msg, plan.turnContext);
-										// `undefined` = inline; ANY string (including "" = dispatched,
-										// stay silent) means the Router handed the task off.
-										if (dispatched !== undefined) {
-											// The early return skips engine.send's onActivity — fire it
-											// so the renderer task list shows the new item immediately
-											// (review P2-3).
-											this.onActivity?.(msg.conversationId);
-											return dispatched;
-										}
-									}
-							} catch (err) {
-								console.warn("[im] task planning skipped:", err instanceof Error ? err.message : err);
-							}
-						}
-						// Plan-less dispatch attempt (field 2026-11-06): deep tasks (SLS log
-						// queries, 堡垒机 investigations) dispatch WITHOUT a plan. Before this,
-						// a failed plan side pass silently serialized two unrelated jobs into
-						// one chat's queue — the user saw "SLS finished, THEN the batch query
-						// started" and reasonably concluded VE runs globally serial. triage
-						// rejects everything that is not clearly a deep task, so simple
-						// questions still run inline exactly as before.
-						if (!escaped && !planText) {
-							const planlessDispatch = await this.tryDispatchToWorker(msg);
-							if (planlessDispatch !== undefined) {
-								this.onActivity?.(msg.conversationId);
-								return planlessDispatch;
-							}
-						}
 						const result = await this.engine.send(
 							agent,
 							planText
