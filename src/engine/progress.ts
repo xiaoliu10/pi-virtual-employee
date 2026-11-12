@@ -126,25 +126,35 @@ export function containsTemplateHeadingLine(text: string): boolean {
  * result degrades to a neutral placeholder rather than an empty `**  **`.
  * Mirrors the field-level contamination rule above (模板标题不是标题，是污染).
  *
- * Decoration stripping runs as a FIXPOINT (review f8f4b4e4: a single pass
- * misses WRAPPED shapes — 「**## Goal** x」「> ## Goal」「- ## Goal\n- …」 keep
- * their `#` because the wrapper is still at the string head when the heading
- * strip runs; and the naive reorder「bullet/quote first」then breaks the field
- * sample, whose bullet is on line TWO). Each iteration consumes ≥1 char, so
- * the loop terminates; mid-string decoration is left alone (a title may
- * legitimately contain 「>」 or a number after the first clause).
+ * Decoration stripping runs as a PER-LINE FIXPOINT (review f8f4b4e4: a single
+ * string-anchored pass misses WRAPPED shapes — 「**## Goal** x」「> ## Goal」
+ * 「- ## Goal\n- …」 keep their `#` because the wrapper is still at the string
+ * head when the heading strip runs; review 778846c1 P2: a string-anchored
+ * LOOP stops at the first ordinary line, so a template heading on a LATER
+ * line — 「排查日志\n## Goal\n- 继续排查」 — survived flattening into the displayed
+ * title). Each line's own leading decorations are stripped to fixpoint, THEN
+ * the lines are flattened; empty lines contribute nothing. Each iteration
+ * consumes ≥1 char, so the loop terminates; mid-string decoration is left
+ * alone (a title may legitimately contain 「>」 or a number after the first
+ * clause).
  */
 export function sanitizeWorkItemTitle(raw: string, max = 40): string {
 	// Inline emphasis first (was last): it can WRAP a heading (「**## Goal**」)
 	// and would otherwise shield the heading strips below.
-	let text = (raw ?? "").replace(/[*`_]/g, "");
+	const deEmphasized = (raw ?? "").replace(/[*`_]/g, "");
 	const lineStartDecoration =
 		/^\s*(?:#{1,6}\s*Goal\b[:：]?\s*|#{1,6}\s*|[-*+]\s+|>+\s*)/i;
-	let prev = "";
-	while (text !== prev) {
-		prev = text;
-		text = text.replace(lineStartDecoration, "");
-	}
+	const text = deEmphasized
+		.split("\n")
+		.map((line) => {
+			let prev = "";
+			while (line !== prev) {
+				prev = line;
+				line = line.replace(lineStartDecoration, "");
+			}
+			return line;
+		})
+		.join(" ");
 	const flat = text.replace(/\s+/g, " ").trim();
 	if (!flat) return "未命名任务";
 	if (flat.length <= max) return flat;

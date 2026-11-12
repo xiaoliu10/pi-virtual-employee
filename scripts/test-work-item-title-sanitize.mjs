@@ -79,6 +79,15 @@ test("wrapped heading shapes are stripped to fixpoint (review f8f4b4e4: 4 confir
 	);
 });
 
+test("template heading on a LATER line is stripped too (review 778846c1 P2)", () => {
+	// String-anchored stripping stops at the first ordinary line; per-line
+	// stripping must reach template headings on later lines before flattening.
+	assert.equal(sanitizeWorkItemTitle("排查日志\n## Goal\n- 继续排查"), "排查日志 继续排查");
+	assert.equal(sanitizeWorkItemTitle("## Goal\n- 排查\n## Constraints\n- 仅只读"), "排查 Constraints 仅只读");
+	assert.equal(sanitizeWorkItemTitle("# 标题\n## 二级\n内容"), "标题 二级 内容");
+	assert.equal(sanitizeWorkItemTitle("排查 > 继续 - 内容"), "排查 > 继续 - 内容", "mid-line markers survive");
+});
+
 test("long titles clamp at a clause boundary", () => {
 	const out = sanitizeWorkItemTitle("继续排查流水支付渠道下单日志，定位下单环节是否存在异常并输出结论报告");
 	assert.ok(out.length <= 40, `too long: ${out.length}`);
