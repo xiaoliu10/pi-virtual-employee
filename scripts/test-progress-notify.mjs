@@ -498,3 +498,94 @@ test("degraded backoff window logs its skip (no silent beats)", async (t) => {
 		mock.timers.reset();
 	}
 });
+
+// ---------- push-cap budget + user follow-up reset (user ruling 2026-11-12) ----------
+
+test("cap reached: ticks are zero-cost (no summarize burned) until resetBudget", async (t) => {
+	// Field 2026-11-12 (box Nova): a 5-hour run burned all 20 pushes, and every
+	// later tick STILL called the side LLM just to log the cap and drop the
+	// note — a suppressed budget must be zero-cost, same rule as preflight.
+	mock.timers.reset();
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	try {
+		const logs = [];
+		const h = make({ maxPushes: 2, log: (level, msg) => logs.push(`${level} ${msg}`) });
+		h.notifier.start();
+		await advance(INTERVAL * 1.2);
+		await advance(INTERVAL * 1.2);
+		assert.equal(h.calls.push, 2, "two pushes fill the budget");
+		const before = h.calls.summarize;
+		await advance(INTERVAL * 1.2);
+		assert.equal(h.calls.push, 2, "cap holds");
+		assert.equal(h.calls.summarize, before, "a capped tick must NOT burn a summarize");
+		assert.ok(logs.some((l) => l.includes("progress push cap (2) reached")), "cap must leave a trace line");
+		h.notifier.stop();
+	} finally {
+		mock.timers.reset();
+	}
+});
+
+test("resetBudget revives a capped budget and logs the refresh", async (t) => {
+	mock.timers.reset();
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	try {
+		const logs = [];
+		const h = make({ maxPushes: 2, log: (level, msg) => logs.push(`${level} ${msg}`) });
+		h.notifier.start();
+		await advance(INTERVAL * 1.2);
+		await advance(INTERVAL * 1.2);
+		assert.equal(h.calls.push, 2);
+		await advance(INTERVAL * 1.2); // capped
+		h.notifier.resetBudget();
+		assert.ok(logs.some((l) => l.includes("progress budget reset by user follow-up (was 2/2)")),
+			"the refresh must be attributed (was N/M)");
+		await advance(INTERVAL * 1.2);
+		assert.equal(h.calls.push, 3, "the next beat pushes again after the refresh");
+		h.notifier.stop();
+	} finally {
+		mock.timers.reset();
+	}
+});
+
+test("resetBudget with a full budget stays silent; a fresh budget does not log", async (t) => {
+	mock.timers.reset();
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	try {
+		const logs = [];
+		const h = make({ log: (level, msg) => logs.push(`${level} ${msg}`) });
+		h.notifier.resetBudget(); // nothing spent yet — nothing to attribute
+		assert.ok(!logs.some((l) => l.includes("budget reset")), "a zero-state reset must not log");
+		h.notifier.start();
+		await advance(INTERVAL * 1.2);
+		assert.equal(h.calls.push, 1);
+		h.notifier.stop();
+	} finally {
+		mock.timers.reset();
+	}
+});
+
+test("resetBudget does not clear the degraded-LLM backoff (unrelated mechanism)", async (t) => {
+	mock.timers.reset();
+	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	try {
+		const logs = [];
+		const h = make({
+			log: (level, msg) => logs.push(`${level} ${msg}`),
+			summarize: async () => ({ text: "⏳ 任务仍在进行中。已完成：登录。剩余：导出。正在：查询。卡点：无", degraded: true }),
+		});
+		h.notifier.start();
+		await advance(INTERVAL * 1.2); // degraded push #1 (streak=1)
+		await advance(INTERVAL * 2);   // degraded #2 (streak=2 → 2-interval backoff) + in-window skip
+		await advance(INTERVAL * 1.2); // degraded #3 pushes (streak=3 → 4-interval backoff)
+		assert.equal(h.calls.push, 3);
+		const skipsBefore = logs.filter((l) => l.includes("progress tick skipped: degraded backoff window")).length;
+		h.notifier.resetBudget();
+		await advance(INTERVAL * 1.2); // still inside the 4-interval window
+		const skipsAfter = logs.filter((l) => l.includes("progress tick skipped: degraded backoff window")).length;
+		assert.ok(skipsAfter > skipsBefore, "backoff must still skip after a budget reset (relay health ≠ user attention)");
+		assert.equal(h.calls.push, 3);
+		h.notifier.stop();
+	} finally {
+		mock.timers.reset();
+	}
+});

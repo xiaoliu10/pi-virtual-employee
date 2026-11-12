@@ -111,6 +111,8 @@ export interface WorkerEngineDeps<Session> {
 	 * history), so main.ts always wires it. */
 	progress?(task: { title: string; target: string; conversationId: string }, session: Session): {
 		start(): void; stop(): void; drain(timeoutMs?: number): Promise<void>;
+		/** User follow-ups reset the push cap (user ruling 2026-11-12). */
+		resetBudget(): void;
 	};
 	maxConcurrent?: number;
 	clock?: { now(): number; setTimeout(fn: () => void, ms: number): unknown };
@@ -227,6 +229,11 @@ export class WorkerService<Session> {
 	/** taskId → live durable session, so the foreground escape can abort the
 	 * round the way WorkService aborts a window. */
 	private readonly sessions = new Map<string, Session>();
+	/** conversationId → live run's progress notifier. A user follow-up steered
+	 *  into the run refreshes its push budget (user ruling 2026-11-12); entries
+	 *  are removed when the run settles, so a refresh can never reach a dead
+	 *  counter. */
+	private readonly activeNotifiers = new Map<string, { resetBudget(): void }>();
 	/**
 	 * sessionKey → tail of that session's turn chain.
 	 *
@@ -529,6 +536,11 @@ export class WorkerService<Session> {
 		const steered = this.opts.steer?.(recent.conversation_id, payload, senderId, sourceConversation);
 		if (steered?.status === "accepted") {
 			console.log(`[worker] follow-up steered: task=${recent.id} conversation=${recent.conversation_id}`);
+			// User ruling 2026-11-12 (「追加消息应该要刷新这个计数」): an accepted
+			// follow-up proves the user is actively watching this run, so its
+			// progress-push allowance resets. A capped 5-hour run recovers on the
+			// very message instead of staying silent until it ends.
+			this.activeNotifiers.get(recent.conversation_id)?.resetBudget();
 			return true;
 		}
 		if (steered?.status === "rejected") {
@@ -616,6 +628,12 @@ export class WorkerService<Session> {
 			session,
 		);
 		notifier?.start();
+		// Live registry for budget refreshes: a user follow-up steered into THIS
+		// run resets its push cap (user ruling 2026-11-12 — 追加消息刷新计数).
+		// Keyed by conversation (inject() knows only the conversation); the entry
+		// dies with the run in the finally below, so a refresh can never reach a
+		// dead counter.
+		if (notifier) this.activeNotifiers.set(task.conversation_id!, notifier);
 		try {
 			// Enqueued like a follow-up: one serial chain per session, so the
 			// dispatch turn and any follow-ups never overlap on the Agent.
@@ -634,6 +652,7 @@ export class WorkerService<Session> {
 		} finally {
 			notifier?.stop();
 			await notifier?.drain(5_000).catch(() => {});
+			this.activeNotifiers.delete(task.conversation_id!);
 			this.sessions.delete(task.id);
 			this.active.delete(task.id);
 		}
