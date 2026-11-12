@@ -15,6 +15,8 @@
  * at most two generic lines, not one every interval (v0.2.145 field lesson).
  */
 
+import { sanitizeWorkItemTitle } from "../engine/progress.js";
+
 /** Behavior knobs collected from the caller's context; re-read live each tick. */
 export interface ProgressNotifierOptions {
 	/** Task title, used in the `⏳ **title**` prefix. */
@@ -210,7 +212,13 @@ export function createProgressNotifier(opts: ProgressNotifierOptions): ProgressN
 			// other, and an untitled 「⏳ 任务仍在进行中」 cannot be attributed
 			// (review P3-2). The engine's own prefix is stripped and rebuilt.
 			const body = text.replace(/^⏳\s*/, "");
-			const note = opts.title ? `⏳ **${opts.title}** ${body}` : `⏳ ${body}`;
+			// Defense in depth (field 2026-11-11: a work item whose STORED title
+			// was the compaction template's Goal section pushed verbatim as
+			// 「⏳ **## Goal\n- …**」). Create-time sanitization fixes new rows;
+			// this cleans EXISTING contaminated titles at the last hop before
+			// the user sees them.
+			const safeTitle = opts.title ? sanitizeWorkItemTitle(opts.title) : "";
+			const note = safeTitle && safeTitle !== "未命名任务" ? `⏳ **${safeTitle}** ${body}` : `⏳ ${body}`;
 			if (opts.mayPush && !opts.mayPush(note)) {
 				log("INFO", "progress note dropped: mayPush gate rejected it (silent task or missing target)");
 				return;
