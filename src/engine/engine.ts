@@ -1786,10 +1786,14 @@ export class EmployeeEngine implements EmployeeRuntime {
 		if (!admission.ok) return { status: "rejected", reason: admission.reason };
 		// Do not run a different group member's instructions under the current
 		// requester's tool permissions. Steering never changes turnActor.
-		if (!isLocalConversation(conversationId)) {
+		// worker: sessions are internal execution contexts, even where legacy
+		// origin inference calls them console. A follow-up must never inherit
+		// a different sender's running turn or cross its source-chat boundary.
+		if (!isLocalConversation(conversationId) || conversationId.startsWith("worker:")) {
 			const owner = this.turnActor.get(conversationId);
 			if (!actor?.senderId || !owner || actor.senderId !== owner.senderId ||
-				actor.channel !== owner.channel || actor.chatType !== owner.chatType) {
+				actor.channel !== owner.channel || actor.chatType !== owner.chatType ||
+				(conversationId.startsWith("worker:") && actor.memoryConversationId !== owner.memoryConversationId)) {
 				return { status: "rejected", reason: "中途指令只能由当前任务的发起人在同一会话发送，不能借用其他人的任务权限。如需立即中断，请发 /stop。" };
 			}
 		}

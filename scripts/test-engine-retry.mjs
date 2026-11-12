@@ -607,6 +607,26 @@ test("steerConversation accepts the TASK OWNER mid-turn and persists senderName 
 	}
 });
 
+test("worker steer checks current owner and source conversation and persists accepted input", async (t) => {
+	const gate = enteredGate();
+	const { engine, history } = makeEngine(t, { streamFn: async () => {
+		gate.enter(); await gate.blocked;
+		return { async *[Symbol.asyncIterator]() {}, result: async () => ({ role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }) };
+	} });
+	const actor = { senderId: "owner", channel: "scheduler", chatType: "single", memoryConversationId: "dt:source" };
+	const agent = engine.getOrCreateSession("worker:steer-test");
+	const running = engine.send(agent, "查日志", { actor });
+	try {
+		await gate.entered;
+		assert.equal(engine.steerConversation("worker:steer-test", "改时间", { ...actor, senderId: "foreign" }).status, "rejected");
+		assert.equal(engine.steerConversation("worker:steer-test", "改时间", { ...actor, memoryConversationId: "dt:other" }).status, "rejected");
+		assert.equal(agent.steered.length, 0);
+		assert.equal(engine.steerConversation("worker:steer-test", "按订单日期前后各一天查", actor).status, "accepted");
+		assert.equal(agent.steered.length, 1);
+		assert.ok(history.listMessages("worker:steer-test").some((m) => m.content.startsWith("按订单日期前后各一天查\n")));
+	} finally { gate.release(); await running; }
+});
+
 for (const mode of ["provider failure", "empty output"]) {
 	test(`undelivered steer preserves deterministic failure for persistent ${mode}, and never leaks into the next send`, async (t) => {
 		const gate = enteredGate();

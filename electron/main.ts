@@ -1743,6 +1743,11 @@ ${tailForProgress(decision.text)}`;
 				if (wc && !wc.isDestroyed()) wc.send("im:activity", cid);
 			},
 		}),
+		// Same actor shape as send(): steer must pass the engine's live owner
+		// and RBAC checks rather than mutating the Agent queue directly.
+		steer: (cid, message, senderId, sourceConversation) => engine.steerConversation(cid, message, {
+			senderId, channel: "scheduler", chatType: "single", memoryConversationId: sourceConversation,
+		}),
 		push: (cid, text) => im.pushToConversation(cid, text),
 		// Agent.abort() takes no options (preserveBackground is engine.abortSession
 		// territory). A worker's background scripts belong to the turn being
