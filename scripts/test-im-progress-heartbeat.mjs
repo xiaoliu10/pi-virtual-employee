@@ -55,18 +55,8 @@ test("the pump gates on the kernel-aware query, not agent.state.isStreaming", ()
 	);
 });
 
-test("the pump still requires a positive interval before firing", () => {
-	// A 0 interval must not burn side LLM calls. The interval guard now lives in
-	// two places: startProgressPump (no timer at all) and decidePump (pure rule).
-	assert.ok(
-		source.includes("const intervalMs = (this.config.all().general.longTaskProgressMin ?? 0) * 60_000;"),
-		"startProgressPump must read the configured cadence",
-	);
-	assert.ok(
-		source.includes("if (intervalMs <= 0) return;"),
-		"a zero/negative interval must disable the pump instead of firing forever",
-	);
-});
+// Cadence selection and disabled intervals are exercised against the actual
+// manager in test-progress-pump-observability.mjs, including task-only mode.
 
 // ---- Behavioral probe: kernel-busy, no isStreaming flag, push still happens ----
 // No bundle import of the manager: it drags the whole engine graph (pi-ai,

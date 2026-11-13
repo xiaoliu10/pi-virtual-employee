@@ -346,14 +346,12 @@ export class IMAdapterManager {
 	private readonly pumpState = new Map<string, PumpState>();
 	private pumpTimer?: ReturnType<typeof setInterval>;
 
-	/** Start the pump. Idempotent; interval comes from longTaskProgressMin. */
+	/** Start once; each tick reads both live cadence settings independently. */
 	startProgressPump(): void {
 		if (this.pumpTimer) return;
-		const intervalMs = (this.config.all().general.longTaskProgressMin ?? 0) * 60_000;
-		if (intervalMs <= 0) return; // explicitly disabled
-		// Tick often relative to the cadence so a conversation that just became due
-		// is noticed promptly; decidePump() enforces the real interval per chat.
-		const tickMs = Math.max(30_000, Math.min(intervalMs, 5 * 60_000));
+		// Keep the lightweight poll alive even when both cadences are disabled:
+		// enabling either setting later must work without restarting the app.
+		const tickMs = 5 * 60_000;
 		this.pumpTimer = setInterval(() => this.pumpTick(), tickMs);
 		// Never hold the process open for a heartbeat.
 		this.pumpTimer.unref?.();
@@ -367,17 +365,29 @@ export class IMAdapterManager {
 
 	private pumpTick(): void {
 		try {
-			const intervalMs = (this.config.all().general.longTaskProgressMin ?? 0) * 60_000;
+			const general = this.config.all().general;
 			const busy = this.engine.busyConversations?.() ?? [];
-			prunePumpState(this.pumpState, busy);
-			const actions = decidePump({ busy, state: this.pumpState, now: Date.now(), intervalMs });
+			// Legacy busy state includes task sessions too. Match their own notifier
+			// cadence; otherwise the global pump bypasses taskProgressMin entirely.
+			const intervals = new Map(busy.map(({ conversationId }) => [
+				conversationId,
+				(/^(?:sched|work|worker):/.test(conversationId)
+					? general.taskProgressMin ?? 0
+					: general.longTaskProgressMin ?? 0) * 60_000,
+			]));
+			const enabled = busy.filter(({ conversationId }) => intervals.get(conversationId)! > 0);
+			prunePumpState(this.pumpState, enabled);
+			const actions = enabled.flatMap((entry) => decidePump({
+				busy: [entry], state: this.pumpState, now: Date.now(), intervalMs: intervals.get(entry.conversationId)!,
+			}));
 			// Observability (field 2026-11-06: the chat pump has NEVER fired since
 			// v0.2.192, with zero log lines anywhere in the chain). A quiet tick
-			// every 5min is fine; state transitions always log.
+			// proves the timer is alive; state transitions always log.
 			console.log(`[im] progress pump tick: busy=${busy.length}${busy.length ? ` [${busy.map((b) => b.conversationId).join(",")}]` : ""} actions=${actions.map((a) => `${a.conversationId}:${a.kind}${a.kind === "skip" ? `/${a.reason}` : ""}`).join(",") || "none"}`);
 			for (const action of actions) {
 				if (action.kind === "fire") {
-					console.log(`[im] progress pump FIRE: ${action.conversationId}`);
+					const intervalMs = intervals.get(action.conversationId)!;
+					console.log(`[im] progress pump FIRE: ${action.conversationId} interval=${intervalMs / 60_000}min`);
 					void this.pumpOne(action.conversationId, intervalMs);
 				} else if (!this.pumpState.has(action.conversationId)) {
 					console.log(`[im] progress pump armed (first sighting): ${action.conversationId}`);
