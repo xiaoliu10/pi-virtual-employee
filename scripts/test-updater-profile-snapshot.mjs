@@ -92,6 +92,28 @@ test("REAL field table: [Nova,,Synapse] becomes [Nova,Orion,Synapse]", () => {
 	assert.equal(profiles.length, 3, `expected exactly 3 instances: ${JSON.stringify(profiles)}`);
 });
 
+test("WMIC redirected CRCRLF output preserves every running profile", () => {
+	// WMIC writes CRCRLF when captured through Node spawnSync on Windows.
+	// Splitting only /\r?\n/ leaves a trailing CR in every field: the anchored
+	// field regex then matches nothing and the installer restores only itself.
+	const table = mainWithProfile("Nova", 1100)
+		+ mainWithProfile("Orion", 1200)
+		+ mainWithProfile("Synapse", 1300)
+		+ child(1101, 1100, "Nova")
+		+ child(1201, 1200, "Orion")
+		+ child(1301, 1300, "Synapse");
+	for (const ending of ["\r\r\n", "\r\n", "\n", "\r"]) {
+		const captured = table.replace(/\r\n/g, ending);
+		assert.deepEqual(parseRunningProfilesFromWmic(captured).sort(), ["Nova", "Orion", "Synapse"], `line ending ${JSON.stringify(ending)}`);
+	}
+});
+
+test("WMIC CRCRLF preserves child evidence for a main with stripped profile args", () => {
+	const table = mainWithProfile("Nova", 1400) + mainBare(1500)
+		+ child(1501, 1500, "Orion") + child(1502, 1500, "Orion");
+	assert.deepEqual(parseRunningProfilesFromWmic(table.replace(/\r\n/g, "\r\r\n")).sort(), ["Nova", "Orion"]);
+});
+
 test("a REAL default-profile instance still yields the empty entry", () => {
 	// Distinguishing "real default" from "named profile with stripped args" is
 	// the whole point: a real default's children point at the app root, not at
