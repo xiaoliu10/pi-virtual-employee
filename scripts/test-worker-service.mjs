@@ -1166,3 +1166,78 @@ test("a message that never steers (cold bare token) does not touch any budget", 
 	assert.equal(injected, false, "cold bare token bounces to the foreground");
 	assert.equal(resets.length, 0, "no live run — no budget refresh");
 });
+
+// ---------- cold finished worker must not absorb ordinary dialogue (field 2026-11-13) ----------
+
+test("a COLD done worker releases an UNRELATED note to triage (classifier new-task)", async () => {
+	// Field 2026-11-13 (box Nova, group): 「早上对账时间是 10 点到 11 点半左右」
+	// was queued into the group's only worker row — a FOUR-DAY-OLD done
+	// 「重新弄一下登录」 run — and the model answered from that stale login
+	// context: 「你想登录哪个系统？」. The cold stickiness is now TOPICAL: the
+	// classifier's new-task verdict hands the note to triage, whose paths carry
+	// the full chat history (foreground rehydrate / sourceContext excerpt).
+	const { h, service } = harness({ service: {
+		classifyFollowUp: async () => "new-task",
+	} });
+	const past = Date.now() - 4 * 24 * 60 * 60_000; // four days old — way cold
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, max_minutes, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wlogin', '重新弄一下登录', 'dt:group:g1', 'ma1', 'done', '登录已完成。', 30, 'worker:wlogin', ?, ?, ?)`).run(past, past, past);
+	const injected = await service.inject("dt:group:g1", "早上对账时间是 10 点到 11 点半左右", "ma1");
+	assert.equal(injected, false, "an unrelated cold note must fall to triage");
+	assert.equal(h.sends.length, 0, "no model turn on the stale session");
+	const rows = h.db.prepare("SELECT * FROM worker_tasks").all();
+	assert.equal(rows.length, 1, "no spawn from the inject path itself");
+});
+
+test("a COLD done worker KEEPS a topical follow-up (classifier continuation)", async () => {
+	// The 2026-11-10 stickiness ruling survives the topical gate: 「结果呢」
+	// hours later still reaches the session that did the work.
+	const { h, service } = harness({ service: {
+		classifyFollowUp: async () => "continuation",
+	} });
+	const past = Date.now() - 4 * 24 * 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, max_minutes, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wscan', '查一下对账异常', 'dt:group:g1', 'ma1', 'done', '扫描完成：44 条异常。', 30, 'worker:wscan', ?, ?, ?)`).run(past, past, past);
+	const injected = await service.inject("dt:group:g1", "结果呢", "ma1");
+	assert.equal(injected, true, "topical stickiness is kept even cold");
+	await flush();
+	assert.equal(h.sends.length, 1, "the follow-up runs on the worker session");
+});
+
+test("a COLD done worker without a classifier keeps legacy stickiness (no stub → no gate)", async () => {
+	// Deployments without the classifier wired (or a fail-safe throw) keep the
+	// 2026-11-10 behaviour: stickiness, never a silent drop.
+	const { h, service } = harness();
+	const past = Date.now() - 4 * 24 * 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, max_minutes, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wlogin2', '重新弄一下登录', 'dt:group:g1', 'ma1', 'done', '登录已完成。', 30, 'worker:wlogin2', ?, ?, ?)`).run(past, past, past);
+	const injected = await service.inject("dt:group:g1", "早上对账时间是 10 点到 11 点半左右", "ma1");
+	assert.equal(injected, true, "no classifier → legacy stickiness (fail-open, never dropped)");
+	await flush();
+	assert.equal(h.sends.length, 1);
+});
+
+test("a HOT done worker still absorbs ordinary dialogue within the keep-alive window", async () => {
+	// The 2026-11-10 dialogue-stickness ruling stays intact inside the window.
+	const { h, service } = harness({ service: { keepAliveMinutes: 120 } });
+	const recent = Date.now() - 30 * 60_000; // 30 minutes ago — hot
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, max_minutes, conversation_id, created_at, started_at, finished_at)
+		VALUES ('whot', '查一下对账异常', 'dt:group:g1', 'ma1', 'done', '扫描完成：44 条异常。', 30, 'worker:whot', ?, ?, ?)`).run(recent, recent, recent);
+	const injected = await service.inject("dt:group:g1", "早上对账时间是 10 点到 11 点半左右", "ma1");
+	assert.equal(injected, true, "the hot worker keeps the conversation");
+	await flush();
+	assert.equal(h.sends.length, 1, "the queued follow-up turn runs on the worker session");
+});
+
+test("an input-request handoff still captures its answer even when stone cold", async () => {
+	// PR #198 value must survive the new cold gate: a finished worker whose
+	// settled output ASKS for input owns the bare-token answer at any age.
+	const { h, service } = harness();
+	const past = Date.now() - 4 * 24 * 60 * 60_000;
+	h.db.prepare(`INSERT INTO worker_tasks (id, instruction, source_conversation, created_by, status, result, max_minutes, conversation_id, created_at, started_at, finished_at)
+		VALUES ('wask', '登录并抓数据', 'dt:group:g1', 'ma1', 'done', '请把验证码发给我。', 30, 'worker:wask', ?, ?, ?)`).run(past, past, past);
+	const injected = await service.inject("dt:group:g1", "875055", "ma1");
+	assert.equal(injected, true, "the asking worker captures its answer at any age");
+	await flush();
+	assert.equal(h.sends.length, 1, "the answer reaches the asking session");
+});

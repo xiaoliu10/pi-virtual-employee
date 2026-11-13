@@ -508,8 +508,9 @@ export class WorkerService<Session> {
 		// back via 「前台执行」 — the foreground rerun owns the payloads, review
 		// P2-3) and errored runs whose columns hold terminal notices keep the
 		// foreground path.
-		if (!hot && isBareContextToken(message)
-			&& !(recent.status === "done" && looksLikeInputRequest(recent.result ?? recent.error ?? ""))) {
+		const inputRequestHandoff = recent.status === "done"
+			&& looksLikeInputRequest(recent.result ?? recent.error ?? "");
+		if (!hot && isBareContextToken(message) && !inputRequestHandoff) {
 			return false;
 		}
 		let payload = message;
@@ -534,18 +535,42 @@ export class WorkerService<Session> {
 			}
 		}
 		const session = await this.opts.open(recent.conversation_id);
-		// An independent NEW request must not be absorbed by the running task
-		// (user ruling 2026-11-12: 「不连贯的那体验是不是太差了」). Codes and
-		// non-task shapes are steered by code above/below without a model call;
-		// only genuinely task-shaped text pays for the classification. Returning
-		// false hands the message back to triage, which spawns a PARALLEL worker
-		// (maxConcurrent) and leaves the running one untouched.
+		// Row status is insufficient: a done worker can be running a follow-up.
+		// Ask the engine synchronously after open(), with no await between its
+		// liveness check and queue admission. Accepted input belongs to THIS turn
+		// and must never also become a second send after it settles.
+		// An independent NEW request must not be absorbed by a running task, and a
+		// COLD finished worker must not absorb an UNRELATED one (user ruling
+		// 2026-11-12 + field 2026-11-13). Codes and non-task shapes are steered by
+		// code above/below without a model call; only genuinely ambiguous text
+		// pays for the classification.
 		// NOT gated on looksLikeTask: the real detector under-detects task-shaped
 		// text (the dispatch path hardcodes true for exactly this reason — 7457cdd),
 		// so gating here would silently miss most new requests. Codes and cancel
 		// phrases skip the call: a code is an answer, and 「取消」 must never wait
 		// on a classification round-trip.
-		if (isLive && !isBareContextToken(message) && !isCancelPhrase(message) && this.opts.classifyFollowUp) {
+		//
+		// Two gates, one classifier:
+		//  - isLive: a NEW request must not be absorbed by the running task
+		//    (ruling 2026-11-12: 「不连贯的那体验是不是太差了」) — NEW hands the
+		//    message back to triage, which spawns a PARALLEL worker (maxConcurrent)
+		//    and leaves the running one untouched.
+		//  - COLD done (window expired): the stickiness ruling (2026-11-10) keeps
+		//    「结果呢」 hours-later attached to the worker that did the work — but
+		//    attachment must be TOPICAL, not unconditional. Field 2026-11-13 (box
+		//    Nova group): 「早上对账时间是 10 点到 11 点半左右」 queued into the
+		//    group's ONLY worker row — a FOUR-DAY-OLD done 「重新弄一下登录」 run —
+		//    and the model answered from that stale login context: 「你想登录哪个
+		//    系统？」. A cold NEW verdict falls to triage, whose paths carry what
+		//    the corpse session cannot: the foreground rehydrates the FULL chat
+		//    history, and a planner spawn carries the source-context excerpt —
+		//    exactly the recycle design (worker recycled, chat context travels).
+		//    Hot rows stay classification-free: a message minutes after the work
+		//    is overwhelmingly for that worker. Classifier failure fails safe to
+		//    continuation on BOTH gates (dropping the message or spawning a
+		//    duplicate onto the same target are both worse than stickiness).
+		if (!isBareContextToken(message) && !isCancelPhrase(message) && this.opts.classifyFollowUp
+			&& (isLive || (recent.status === "done" && !hot))) {
 			let verdict: "continuation" | "new-task" = "continuation";
 			try {
 				verdict = await this.opts.classifyFollowUp(session, recent.instruction, message, recent.conversation_id);
@@ -555,14 +580,14 @@ export class WorkerService<Session> {
 				console.warn("[worker] follow-up classification threw (keeping continuation):", err instanceof Error ? err.message : err);
 			}
 			if (verdict === "new-task") {
-				console.log(`[worker] follow-up is a NEW task — leaving ${recent.id} running, routing to triage`);
+				if (isLive) {
+					console.log(`[worker] follow-up is a NEW task — leaving ${recent.id} running, routing to triage`);
+				} else {
+					console.log(`[worker] cold follow-up is not about ${recent.id} — routing to triage with chat context`);
+				}
 				return false;
 			}
 		}
-		// Row status is insufficient: a done worker can be running a follow-up.
-		// Ask the engine synchronously after open(), with no await between its
-		// liveness check and queue admission. Accepted input belongs to THIS turn
-		// and must never also become a second send after it settles.
 		const steered = this.opts.steer?.(recent.conversation_id, payload, senderId, sourceConversation);
 		if (steered?.status === "accepted") {
 			console.log(`[worker] follow-up steered: task=${recent.id} conversation=${recent.conversation_id}`);
