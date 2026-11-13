@@ -27,31 +27,46 @@ function fakeManager(busyIds, general = { longTaskProgressMin: 10, taskProgressM
 	};
 	manager.pumpState = new Map();
 	manager.pumpOneCalls = [];
-	manager.pumpOne = async (conversationId) => { manager.pumpOneCalls.push(conversationId); };
+	// Mirror the real pumpOne's bookkeeping: a successful push refreshes the
+	// conversation's clock, otherwise due-again math below loses meaning.
+	manager.pumpOne = async (conversationId) => {
+		manager.pumpOneCalls.push(conversationId);
+		const st = manager.pumpState.get(conversationId);
+		if (st) st.lastSentAt = Date.now();
+	};
 	return manager;
 }
 
 test("mixed live conversations keep chat=10min and task=30min cadence", () => {
 	mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
 	try {
+		// worker:request is a CHAT-dispatchED worker (all worker tasks are), so it
+		// follows the CHAT cadence alongside the inline chat — field 2026-11-13.
 		const ids = ["dt:single:viewer", "worker:request", "sched:job:run", "work:item"];
 		const manager = fakeManager(ids);
 		captureLogs(() => manager.pumpTick());
 		mock.timers.tick(10 * 60_000);
 		captureLogs(() => manager.pumpTick());
-		assert.deepEqual(manager.pumpOneCalls, ["dt:single:viewer"], "only inline chat is due at 10min");
+		assert.deepEqual(manager.pumpOneCalls, ["dt:single:viewer", "worker:request"],
+			"inline chat AND chat-dispatched worker are due at the chat cadence");
+		// Now fast-forward ONLY the task-cadence conversations past 30min: the
+		// chat pair stays on its t=10min clock (fires again only at t>=20min),
+		// proving the two cadences are judged independently.
 		manager.pumpOneCalls.length = 0;
-		mock.timers.tick(20 * 60_000);
+		mock.timers.tick(1 * 60_000);
+		for (const id of ["sched:job:run", "work:item"]) {
+			manager.pumpState.get(id).lastSentAt = Date.now() - 31 * 60_000;
+		}
 		const logs = captureLogs(() => manager.pumpTick());
-		assert.deepEqual(manager.pumpOneCalls, ids, "all task namespaces become due at 30min");
+		assert.deepEqual(manager.pumpOneCalls, ["sched:job:run", "work:item"], "only the task cadence is due now");
 		assert.ok(logs.some((line) => line.includes("work:item") && line.includes("interval=30min")), "FIRE must expose the selected cadence");
 	} finally { mock.timers.reset(); }
 });
 
 test("disabling one cadence never disables the other", () => {
 	for (const [general, due] of [
-		[{ longTaskProgressMin: 0, taskProgressMin: 30 }, ["work:item", "sched:job:run", "worker:request"]],
-		[{ longTaskProgressMin: 10, taskProgressMin: 0 }, ["dt:single:viewer"]],
+		[{ longTaskProgressMin: 0, taskProgressMin: 30 }, ["work:item", "sched:job:run"]],
+		[{ longTaskProgressMin: 10, taskProgressMin: 0 }, ["dt:single:viewer", "worker:request"]],
 	]) {
 		const manager = fakeManager(["dt:single:viewer", "work:item", "sched:job:run", "worker:request"], general);
 		captureLogs(() => manager.pumpTick());

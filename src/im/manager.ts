@@ -367,11 +367,18 @@ export class IMAdapterManager {
 		try {
 			const general = this.config.all().general;
 			const busy = this.engine.busyConversations?.() ?? [];
-			// Legacy busy state includes task sessions too. Match their own notifier
-			// cadence; otherwise the global pump bypasses taskProgressMin entirely.
+			// Autonomous/scheduled/window sessions (sched:/work:) follow the TASK
+			// cadence; everything else — inline chats AND chat-dispatched workers —
+			// follows the CHAT cadence. Worker tasks are ALWAYS born from a chat
+			// dispatch (triage), so the user is present: v0.2.171's own semantics
+			// (「用户在场看着，进度提醒是价值」) put them on the chat knob. Field
+			// 2026-11-13: raising taskProgressMin to 30 also stretched chat-dispatched
+			// worker reporting to 30 — the knob split exists precisely so that does
+			// not happen. Without this split the global pump bypasses taskProgressMin
+			// entirely for sched:/work:.
 			const intervals = new Map(busy.map(({ conversationId }) => [
 				conversationId,
-				(/^(?:sched|work|worker):/.test(conversationId)
+				(/^(?:sched|work):/.test(conversationId)
 					? general.taskProgressMin ?? 0
 					: general.longTaskProgressMin ?? 0) * 60_000,
 			]));

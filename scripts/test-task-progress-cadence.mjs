@@ -72,10 +72,13 @@ test("the scheduled-task heartbeat uses the TASK cadence, not the chat cadence",
 	// Field 2026-11-07 (the box): an autonomous/scheduled task reported every
 	// 10 minutes while taskProgressMin was 30 — the runner's in-turn heartbeat
 	// read longTaskProgressMin (the CHAT knob). The two mean different things:
-	//   longTaskProgressMin → an inline chat turn the user is watching
+	//   longTaskProgressMin → what the USER watches: inline chat turns AND
+		//                         chat-dispatched worker tasks (all worker rows are
+	//                         born from a chat dispatch — field 2026-11-13: raising
+	//                         taskProgressMin to 30 stretched their reporting too)
 	//   taskProgressMin     → a scheduled/autonomous window that runs on its own
 	// Wiring lives inline in main.ts's runner, so this pins the SOURCE: every
-	// progress-interval site in the scheduled-task runner must read taskProgressMin,
+	// progress-interval site in the scheduled-task runner must read taskProgressMin.
 	// and longTaskProgressMin may appear only in the IM manager (chat path).
 	const mainSrc = await readFile(join(root, "electron/main.ts"), "utf8");
 	const mgrSrc = await readFile(join(root, "src/im/manager.ts"), "utf8");
@@ -90,12 +93,19 @@ test("the scheduled-task heartbeat uses the TASK cadence, not the chat cadence",
 		"scheduled heartbeat must NOT read longTaskProgressMin (chat cadence) — that is the 10-vs-30 confusion",
 	);
 
-	// The chat path keeps the chat knob (it is the only legitimate consumer).
+	// The chat path keeps the chat knob, and main.ts's ONE legitimate consumer is
+	// the chat-dispatched worker notifier (field 2026-11-13) — everything else in
+	// main.ts (scheduled runner, work windows) stays on the task knob.
 	assert.match(mgrSrc, /general\.longTaskProgressMin/, "the IM manager's chat heartbeat keeps longTaskProgressMin");
 
-	// No OTHER site in main.ts may use the chat knob for progress intervals.
+	// Exactly ONE chat-knob site in main.ts: the chat-dispatched worker notifier.
 	const mainChatKnob = (mainSrc.match(/general\.longTaskProgressMin/g) ?? []).length;
-	assert.equal(mainChatKnob, 0, `main.ts must never read the chat cadence for task progress (found ${mainChatKnob})`);
+	assert.equal(mainChatKnob, 1,
+		`main.ts reads the chat cadence ONLY for the chat-dispatched worker notifier (found ${mainChatKnob})`);
+	const workerNotifierAt = mainSrc.indexOf("ALWAYS born from a");
+	assert.ok(workerNotifierAt > 0, "the chat-dispatched worker notifier comment must exist");
+	const workerBlock = mainSrc.slice(workerNotifierAt - 200, workerNotifierAt + 700);
+	assert.match(workerBlock, /general\.longTaskProgressMin/, "the worker notifier must be the site reading the chat cadence");
 });
 
 test("a work window stops and drains its progress notifier before the completion push", async (t) => {
