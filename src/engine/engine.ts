@@ -4389,7 +4389,7 @@ export class EmployeeEngine implements EmployeeRuntime {
 					: { enabled: cfg.capabilities.mcp?.enabled ?? false, tools: this.mcpManager.tools() },
 					workerTaskDetail: this.workerTaskDetail,
 					sessionDetail: this.sessionDetailDeps(conversationId),
-			work: this.workItems ? { items: this.workItems, fireItem: (id) => this.workBridge?.fireItem(id) ?? false, mine: (opts) => this.mineRecentWork({ ...opts, sinceTs: Date.now() - 24 * 60 * 60_000, sourceConversationId: inferConversationOrigin(conversationId) === "im" ? conversationId : undefined }) } : undefined });
+			work: this.workItems ? { items: this.workItems, fireItem: (id) => this.workBridge?.fireItem(id) ?? false, mine: (opts) => this.mineRecentWork({ ...opts, sinceTs: Date.now() - 24 * 60 * 60_000, sourceConversationId: inferConversationOrigin(conversationId) === "im" ? conversationId : undefined }), pushToOrigin: (cid, text) => this.workBridge?.push(cid, text) ?? Promise.resolve({ ok: false, error: "推送通道未连接" }) } : undefined });
 
 	}
 
