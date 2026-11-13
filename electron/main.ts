@@ -1835,6 +1835,7 @@ ${tailForProgress(decision.text)}`;
 		inject: (cid, message, senderId) => workerService.inject(cid, message, senderId),
 		cancelForEscape: (cid, senderId, note) => workerService.cancelForEscape(cid, senderId, note),
 		keepAliveRemainingMs: (cid) => workerService.keepAliveRemainingMs(cid),
+		sourceForConversation: (cid) => workerTaskStore.sourceForConversation(cid),
 	};
 	// Recovery + dispatch only after IM initialization and bridge installation.
 	workService.start();

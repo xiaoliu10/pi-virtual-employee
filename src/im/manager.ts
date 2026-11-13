@@ -424,8 +424,11 @@ export class IMAdapterManager {
 			// working" note).
 			if (!this.engine.isConversationStreaming(conversationId)) return;
 			const occurrenceId = chatHeartbeatOccurrenceId("pump", conversationId, Date.now(), intervalMs);
-			await this.onProgressPush?.(conversationId, note, occurrenceId);
+			if (!this.onProgressPush) throw new Error("进度推送通道未接通");
+			const result = await this.onProgressPush(conversationId, note, occurrenceId);
+			if (result?.ok !== true) throw new Error(result?.error || "进度推送未确认送达");
 			st.lastSentAt = Date.now();
+			console.log(`[im] progress pump delivered: ${conversationId}${result.skipped ? " (already delivered)" : ""}`);
 		} catch (err) {
 			console.warn(`[im] progress pump push failed for ${conversationId}: ${(err as Error).message}`);
 		} finally {
@@ -434,9 +437,9 @@ export class IMAdapterManager {
 	}
 
 	/** Injected by main.ts: how the pump reaches the IM channel of a conversation. */
-	private onProgressPush?: (conversationId: string, text: string, occurrenceId: string) => Promise<unknown>;
+	private onProgressPush?: (conversationId: string, text: string, occurrenceId: string) => Promise<PushResult>;
 
-	setProgressPusher(fn: (conversationId: string, text: string, occurrenceId: string) => Promise<unknown>): void {
+	setProgressPusher(fn: (conversationId: string, text: string, occurrenceId: string) => Promise<PushResult>): void {
 		this.onProgressPush = fn;
 	}
 
@@ -497,7 +500,11 @@ export class IMAdapterManager {
 		// strip the namespace before handing the id over, or EVERY work: push
 		// would fail as "找不到对应任务" (found by test-resolve-push-target with a
 		// production-faithful injection; the reviewer probe used a bare-id fake).
-		const resolved = resolvePushTarget(conversationId, (id) => this.engine.workItems?.get(id.startsWith("work:") ? id.slice(5) : id));
+		const resolved = resolvePushTarget(
+			conversationId,
+			(id) => this.engine.workItems?.get(id.startsWith("work:") ? id.slice(5) : id),
+			(id) => this.engine.workerBridge?.sourceForConversation?.(id),
+		);
 		if ("error" in resolved) {
 			console.warn(`[im] push target unresolvable: ${resolved.error}`);
 			return { ok: false, error: resolved.error };
@@ -1072,18 +1079,25 @@ function credChanged(prev: ImChannelConfig | undefined, next: ImChannelConfig): 
  * adapters, so "@机器人/new", "／new" and multi-line mentions all work. */
 
 /** Walk a derivation chain to a routable push target. Pure; injectable lookup.
- * `work:<id>` → item.origin_conversation → … until a non-work: id, max 10 hops,
+ * `work:<id>` → item.origin_conversation, `worker:<id>` → source chat, max 10 hops,
  * cycle-safe. Returns an honest error instead of a silent drop. */
 export function resolvePushTarget(
 	start: string,
 	getItem: (id: string) => { origin_conversation: string | null } | undefined,
+	getWorkerSource?: (id: string) => string | undefined,
 ): { target: string } | { error: string } {
 	let current = start;
 	const visited = new Set<string>();
-	for (let hops = 0; current.startsWith("work:"); hops++) {
+	for (let hops = 0; /^(?:work|worker):/.test(current); hops++) {
 		if (hops >= 10) return { error: `派生链过深（>10 层），无法解析推送目标：${start}` };
 		if (visited.has(current)) return { error: `派生链成环，无法解析推送目标：${start}` };
 		visited.add(current);
+		if (current.startsWith("worker:")) {
+			const source = getWorkerSource?.(current);
+			if (!source) return { error: `推送目标 ${current} 找不到来源会话，无法投递` };
+			current = source;
+			continue;
+		}
 		const item = getItem(current);
 		if (!item) return { error: `推送目标 ${current} 不是可投递会话，且找不到对应任务（可能已被删除）` };
 		const parent = item.origin_conversation ?? "";

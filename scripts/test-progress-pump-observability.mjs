@@ -170,7 +170,7 @@ test("pumpOne logs brief start/done around the REAL generation path (review P3)"
 		isConversationStreaming: () => true,
 	};
 	const pushed = [];
-	manager.onProgressPush = async (conversationId, text) => { pushed.push({ conversationId, text }); };
+	manager.onProgressPush = async (conversationId, text) => { pushed.push({ conversationId, text }); return { ok: true }; };
 	const lines = [];
 	const orig = console.log;
 	console.log = (...args) => { lines.push(args.join(" ")); };
@@ -185,4 +185,56 @@ test("pumpOne logs brief start/done around the REAL generation path (review P3)"
 	assert.ok(done > start, "brief done log must come after the generation");
 	assert.equal(pushed.length, 1, "a usable brief is pushed");
 	assert.equal(manager.pumpState.get("dt:a").inFlight, false, "inFlight released after the push");
+});
+
+
+function deliveryManager(conversationId, result = { ok: true }) {
+	const manager = Object.create(IMAdapterManager.prototype);
+	const sent = [];
+	manager.engine = {
+		getOrCreateSession: () => ({}),
+		progressBrief: async () => "已完成登录，正在查询日志。",
+		isConversationStreaming: () => true,
+		workerBridge: { sourceForConversation: id => id === "worker:job" ? "dt:single:source" : undefined },
+	};
+	manager.pumpState = new Map([[conversationId, { lastSentAt: 123, inFlight: false }]]);
+	manager.active = new Map([["dingtalk", {
+		channel: "dingtalk",
+		metadata: { displayName: "fake", capabilities: { proactive: true } },
+		push: async (cid, text) => { sent.push({ cid, text }); return result; },
+	}]]);
+	manager.setProgressPusher((cid, text, occurrenceId) => manager.pushToConversation(cid, text, { occurrenceId, kind: "chat-progress" }));
+	return { manager, sent };
+}
+
+test("worker pump delivers through the actual adapter to its source chat", async () => {
+	const { manager, sent } = deliveryManager("worker:job");
+	await manager.pumpOne("worker:job", 10 * 60_000);
+	assert.equal(sent.length, 1, "the note must reach a real adapter push, not just a pump stub");
+	assert.equal(sent[0].cid, "dt:single:source");
+	assert.ok(manager.pumpState.get("worker:job").lastSentAt > 123);
+});
+
+test("failed or unacknowledged pump delivery never advances the last-success clock", async () => {
+	for (const result of [{ ok: false, error: "platform unavailable" }, undefined]) {
+		const { manager } = deliveryManager("dt:single:source");
+		manager.setProgressPusher(async () => result);
+		await manager.pumpOne("dt:single:source", 10 * 60_000);
+		assert.equal(manager.pumpState.get("dt:single:source").lastSentAt, 123);
+		assert.equal(manager.pumpState.get("dt:single:source").inFlight, false);
+	}
+});
+
+test("an unmapped worker fails visibly and never pushes to an unrelated chat", async () => {
+	const { manager, sent } = deliveryManager("worker:missing");
+	await manager.pumpOne("worker:missing", 10 * 60_000);
+	assert.equal(sent.length, 0);
+	assert.equal(manager.pumpState.get("worker:missing").lastSentAt, 123);
+});
+
+test("a missing progress pusher never consumes the reporting interval", async () => {
+	const { manager } = deliveryManager("dt:single:source");
+	manager.onProgressPush = undefined;
+	await manager.pumpOne("dt:single:source", 10 * 60_000);
+	assert.equal(manager.pumpState.get("dt:single:source").lastSentAt, 123);
 });

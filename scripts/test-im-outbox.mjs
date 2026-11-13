@@ -290,3 +290,18 @@ test("a row left MID-SEND is never re-sent (outcome unknown, not 'delivered')", 
 	db2.close();
 	rmSync(dir, { recursive: true, force: true });
 });
+
+
+test("worker progress ledger records the resolved chat and retries a rejected push", async t => {
+	const file = await dbFile(t);
+	const { manager, sent } = fakeManager({ fail: n => n === 1 });
+	manager.engine = { workerBridge: { sourceForConversation: id => id === "worker:job" ? "dt:source" : undefined } };
+	const { ledger } = useLedger(t, manager, file);
+	const occurrenceId = "chat:pump:worker:job#hb-1";
+	assert.equal((await manager.pushToConversation("worker:job", "进度", { occurrenceId, kind: "chat-progress" })).ok, false);
+	assert.equal(ledger.get(occurrenceId).conversation_id, "dt:source");
+	assert.equal(ledger.get(occurrenceId).status, "failed");
+	assert.equal((await manager.pushToConversation("worker:job", "进度", { occurrenceId, kind: "chat-progress" })).ok, true);
+	assert.equal(sent[0].conversationId, "dt:source");
+	assert.equal(ledger.get(occurrenceId).status, "delivered");
+});

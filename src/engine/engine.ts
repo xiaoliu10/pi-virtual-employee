@@ -751,6 +751,8 @@ export class EmployeeEngine implements EmployeeRuntime {
 		/** Remaining keep-alive window in ms (0 = cold/disabled) — the IM settle
 		 * sweep defers background-process cleanup while this is positive. */
 		keepAliveRemainingMs?(conversationId: string): number;
+		/** Resolve a scratch worker session to the chat that requested it. */
+		sourceForConversation?(conversationId: string): string | undefined;
 	};
 
 	/** Shared by automatic + manual mining; cursors live durably in HistoryStore. */
