@@ -11,14 +11,14 @@ const workDir = await mkdtemp(join(root, "node_modules/.work-tools-test-"));
 after(() => rm(workDir, { recursive: true, force: true }));
 const bundle = join(workDir, "work-tools.mjs");
 await build({
-	stdin: { contents: 'export { createWorkTools } from "./src/engine/tools/work.ts";', resolveDir: root, loader: "ts" },
+	stdin: { contents: 'export { createWorkTools, resetHumanRequestThrottleForTest } from "./src/engine/tools/work.ts";', resolveDir: root, loader: "ts" },
 	outfile: bundle,
 	bundle: true,
 	platform: "node",
 	format: "esm",
 	packages: "external",
 });
-const { createWorkTools } = await import(pathToFileURL(bundle).href);
+const { createWorkTools, resetHumanRequestThrottleForTest } = await import(pathToFileURL(bundle).href);
 
 const GROUP = "dt:group:source";
 const SINGLE = "dt:admin";
@@ -769,4 +769,94 @@ test("create resident:true persists the flag and says so", async () => {
 	const row = [...f.rows.values()].find(r => r.title === "每日对账巡检");
 	assert.equal(row.resident, 1);
 	assert.match(result.content[0].text, /常驻巡检/);
+});
+
+// ---------- request_human: the real channel to ask for codes/credentials (field 2026-11-13) ----------
+
+test("request_human pushes to the origin chat and is throttled per item (30min)", async () => {
+	resetHumanRequestThrottleForTest();
+	const working = row({ id: ID, status: "working", created_by: "admin", origin_conversation: GROUP });
+	const f = fixture({ conversationId: `work:${ID}`, actor: actor({ channel: "scheduler", chatType: "single" }), rows: [working] });
+	const pushed = [];
+	const tools = createWorkTools({
+		workItems: f.rows,
+		config: { all: () => ({ security: f.security }) },
+		conversationId: `work:${ID}`,
+		resolveActor: () => actor({ channel: "scheduler", chatType: "single" }),
+		fireItem: () => true,
+		mine: async () => ({ scanned: 0, proposals: [] }),
+		pushToOrigin: async (cid, text) => { pushed.push({ cid, text }); },
+	});
+	f.tools = tools;
+	const notebook = (params) => tools.find((tool) => tool.name === "manage_work").execute("call", params);
+	const ok = await notebook({ action: "request_human", content: "spay 登录需要最新一条短信验证码，请直接回复数字" });
+	if (!ok.details.ok) console.log("DEBUG-FAIL:", JSON.stringify(ok.details));
+	assert.equal(ok.details.ok, true, "first request delivers");
+	assert.equal(ok.details.pushed, true);
+	assert.deepEqual(pushed, [{ cid: GROUP, text: "⏸ 自主任务「来源任务」需要人工介入：\nspay 登录需要最新一条短信验证码，请直接回复数字" }]);
+	const again = await notebook({ action: "request_human", content: "再问一次" });
+	assert.equal(again.details.ok, false, "second request within 30min is throttled");
+	assert.match(again.details.reason ?? "", /节流/);
+	assert.equal(pushed.length, 1, "throttled request must not push");
+	resetHumanRequestThrottleForTest();
+});
+
+test("request_human walks a derived chain to the root IM conversation", async () => {
+	resetHumanRequestThrottleForTest();
+	const parent = row({ id: "parent-1", status: "working", created_by: "admin", origin_conversation: SINGLE });
+	const child = row({ id: ID, status: "working", created_by: "admin", origin_conversation: "work:parent-1" });
+	const f = fixture({ conversationId: `work:${ID}`, actor: actor({ channel: "scheduler", chatType: "single" }), rows: [parent, child] });
+	const pushed = [];
+	const tools = createWorkTools({
+		workItems: f.rows,
+		config: { all: () => ({ security: f.security }) },
+		conversationId: `work:${ID}`,
+		resolveActor: () => actor({ channel: "scheduler", chatType: "single" }),
+		fireItem: () => true,
+		mine: async () => ({ scanned: 0, proposals: [] }),
+		pushToOrigin: async (cid, text) => { pushed.push({ cid, text }); },
+	});
+	const result = await tools.find((tool) => tool.name === "manage_work").execute("call", { action: "request_human", content: "需要授权" });
+	assert.equal(result.details.ok, true);
+	assert.deepEqual(pushed.map((p) => p.cid), [SINGLE], "chain walks work:<parent> to the IM root");
+	resetHumanRequestThrottleForTest();
+});
+
+test("request_human without a wired channel reports failure instead of pretending", async () => {
+	resetHumanRequestThrottleForTest();
+	const working = row({ id: ID, status: "working", created_by: "admin", origin_conversation: GROUP });
+	const f = fixture({ conversationId: `work:${ID}`, actor: actor({ channel: "scheduler", chatType: "single" }), rows: [working] });
+	const tools = createWorkTools({
+		workItems: f.rows,
+		config: { all: () => ({ security: f.security }) },
+		conversationId: `work:${ID}`,
+		resolveActor: () => actor({ channel: "scheduler", chatType: "single" }),
+		fireItem: () => true,
+		mine: async () => ({ scanned: 0, proposals: [] }),
+		// NO pushToOrigin — the exact box-0.2.228 shape that produced the
+		// 「已推群要求验证码」 self-narration with zero delivered lines.
+	});
+	const result = await tools.find((tool) => tool.name === "manage_work").execute("call", { action: "request_human", content: "需要验证码" });
+	assert.equal(result.details.ok, false);
+	assert.match(result.details.reason ?? "", /未接通/);
+	resetHumanRequestThrottleForTest();
+});
+
+test("manage_work description states that notes never push and request_human is the channel", async () => {
+	resetHumanRequestThrottleForTest();
+	const f = fixture({ conversationId: GROUP, actor: actor(), rows: [row({ id: ID, status: "working", created_by: "admin", origin_conversation: GROUP })] });
+	const tools = createWorkTools({
+		workItems: f.rows,
+		config: { all: () => ({ security: f.security }) },
+		conversationId: GROUP,
+		resolveActor: () => actor(),
+		fireItem: () => true,
+		mine: async () => ({ scanned: 0, proposals: [] }),
+		pushToOrigin: async () => {},
+	});
+	const desc = tools.find((tool) => tool.name === "manage_work").description;
+	assert.match(desc, /不会推送给任何人/, "note actions must be labeled non-delivering");
+	assert.match(desc, /request_human/, "the human channel must be discoverable");
+	assert.match(desc, /30 分钟节流/, "the throttle must be documented");
+	resetHumanRequestThrottleForTest();
 });

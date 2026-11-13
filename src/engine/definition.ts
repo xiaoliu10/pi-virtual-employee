@@ -195,6 +195,9 @@ export interface ToolSetOptions {
 		items: WorkItemStore;
 		/** Fire a work window now (confirm kickoff / resume). Provided by main. */
 		fireItem: (id: string) => boolean;
+		/** Human-request channel (manage_work request_human): deliver to an IM
+		 * conversation. Absent → request_human reports the channel as unwired. */
+		pushToOrigin?: (conversationId: string, text: string) => Promise<unknown>;
 		/** On-demand mining over recent conversation deltas (admin-triggered). */
 		mine: (opts: { maxProposals?: number }) => Promise<{
 			proposals: { title: string; goal: string; evidence: string; conditions: string; originConversation: string | null; id: string }[];
@@ -350,6 +353,7 @@ export function buildTools(input: ToolSetOptions): AgentTool<any>[] {
 			workItems: options.work.items,
 			fireItem: options.work.fireItem,
 			mine: options.work.mine,
+			pushToOrigin: options.work.pushToOrigin,
 			config: options.config,
 			resolveActor: options.resolveActor,
 			conversationId: options.conversationId,

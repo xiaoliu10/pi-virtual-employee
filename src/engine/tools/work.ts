@@ -98,6 +98,31 @@ function chainIncludes(
 	return false;
 }
 
+/** Resolve an item's root IM conversation by walking the origin chain
+ * (work:<parent> -> parent.origin_conversation -> ...). Returns null when the
+ * chain ends without an IM conversation or exceeds 10 hops (cycle guard). */
+function walkOrigin(
+	item: { origin_conversation: string | null },
+	getItem: (id: string) => { origin_conversation: string | null } | undefined,
+): string | null {
+	let cursor = item.origin_conversation;
+	for (let hop = 0; cursor && hop < 10; hop++) {
+		if (!cursor.startsWith("work:")) return cursor;
+		cursor = getItem(cursor.slice(5))?.origin_conversation ?? null;
+	}
+	return null;
+}
+
+/** request_human throttle (field 2026-11-13): one outstanding ask per item per
+ * 30min — an unattended window retrying a login must not spam the admin chat. */
+const HUMAN_REQUEST_THROTTLE_MS = 30 * 60_000;
+const lastHumanRequestAt = new Map<string, number>();
+/** Test seam: the throttle map is module-level by design (one budget per item
+ * across windows), so tests need an explicit reset between cases. */
+export function resetHumanRequestThrottleForTest(): void {
+	lastHumanRequestAt.clear();
+}
+
 function lessonsOf(raw: string | null): string[] {
 	try {
 		const parsed: unknown = raw ? JSON.parse(raw) : [];
@@ -109,6 +134,9 @@ function lessonsOf(raw: string | null): string[] {
 
 export function createWorkTools(deps: {
 	workItems: WorkItemStore;
+	/** Deliver a message to an IM conversation (the human-request channel of
+	 * request_human). Resolution of the origin chain stays inside this module. */
+	pushToOrigin?: (conversationId: string, text: string) => Promise<unknown>;
 	/** False means the persisted queued item will be picked up by the runner later. */
 	fireItem: (id: string) => boolean;
 	/** Optional immediate executor abort. The runner must also honor persisted cancellation. */
@@ -142,15 +170,17 @@ export function createWorkTools(deps: {
 		name: "manage_work",
 		label: "自主任务笔记",
 		description:
-			"仅在当前自主任务的 work:<id> 工作窗口内记录信息；需要该任务创建管理员的有效调度身份且任务正在执行。" +
+			"仅在当前自主任务的 work:<id> 工作窗口内使用；需要该任务创建管理员的有效调度身份且任务正在执行。" +
 			"action=set_conditions：记录执行条件/时间窗/依赖；action=add_lesson：记录踩坑；action=set_progress：更新进展。" +
-			"这些信息会跨窗口保留。资源或人工阻塞应等待来源会话的管理员恢复，不要通过笔记自行恢复。",
+			"这三个动作只是任务笔记，跨窗口保留但【不会推送给任何人】。" +
+			"需要人工介入（验证码、授权、凭据、资源）时用 action=request_human：向任务来源会话的管理员推送一条请求，30 分钟节流防刷屏。" +
+			"发出 request_human 后继续可执行的部分或等待回复；不要通过笔记自行恢复，也不要用 set_progress 冒充已请求人工。",
 		parameters: obj({
-			action: union([lit("set_conditions"), lit("add_lesson"), lit("set_progress")]),
-			content: str({ description: "要记录的内容，简明具体" }),
+			action: union([lit("set_conditions"), lit("add_lesson"), lit("set_progress"), lit("request_human")]),
+			content: str({ description: "要记录的内容，简明具体；request_human 时为给管理员的请求说明（需要什么、为什么、怎么给）" }),
 		}, { open: true }),
 		async execute(_toolCallId, params) {
-			const p = params as { action: "set_conditions" | "add_lesson" | "set_progress"; content: string };
+			const p = params as { action: "set_conditions" | "add_lesson" | "set_progress" | "request_human"; content: string };
 			const itemId = conversationId.startsWith("work:") ? conversationId.slice(5) : "";
 			if (!itemId) return failure("manage_work 只能在对应自主任务的工作会话（work:<id>）中使用。");
 			const actor = resolveActor(conversationId);
@@ -163,9 +193,40 @@ export function createWorkTools(deps: {
 				!isDeclaredAdmin(config, item.created_by)) {
 				return failure("只能记录当前正在执行的自主任务，且调度身份必须匹配仍有管理员权限的创建人。");
 			}
-			if (!["set_conditions", "add_lesson", "set_progress"].includes(p.action)) return failure("未知的笔记操作。");
-			const content = typeof p.content === "string" ? p.content.trim() : "";
-			if (!content) return failure("内容不能为空。");
+		if (!["set_conditions", "add_lesson", "set_progress", "request_human"].includes(p.action)) return failure("未知的笔记操作。");
+		const content = typeof p.content === "string" ? p.content.trim() : "";
+		if (!content) return failure("内容不能为空。");
+		if (p.action === "request_human") {
+			// Field 2026-11-13 (box Nova, 09:35 window): spay login died, 3 SMS codes
+			// all rejected, and the model wrote 「已推群要求提供最新短信验证码」 into
+			// set_progress — but manage_work had NO push capability, so nothing was
+			// ever delivered (zero delivered(group) lines; the user confirmed nothing
+			// arrived). Writing a note is not requesting a human. This action is the
+			// real channel: origin-chain resolved, throttled, logged on both paths.
+			const now = Date.now();
+			const last = lastHumanRequestAt.get(itemId) ?? 0;
+			if (now - last < HUMAN_REQUEST_THROTTLE_MS) {
+				const waitMin = Math.ceil((last + HUMAN_REQUEST_THROTTLE_MS - now) / 60_000);
+				return failure(`人工请求已发出（节流中，约 ${waitMin} 分钟后可再次请求）。请继续可执行的部分，不要重复请求。`);
+			}
+			const origin = walkOrigin(item, (id) => workItems.get(id));
+			if (!origin) return failure("无法解析任务来源会话（origin 链为空、过深或成环），人工请求无法投递；请继续其他可执行部分。");
+			if (!deps.pushToOrigin) return failure("当前部署未接通来源会话推送通道，人工请求无法投递；请继续其他可执行部分。");
+			try {
+				await deps.pushToOrigin(origin, `⏸ 自主任务「${item.title}」需要人工介入：\n${content}`);
+			} catch (err) {
+				console.warn(`[work] human request push FAILED: item=${itemId} origin=${origin}: ${err instanceof Error ? err.message : String(err)}`);
+				return failure(`人工请求推送失败（已留日志），稍后可重试：${err instanceof Error ? err.message : String(err)}`);
+			}
+			lastHumanRequestAt.set(itemId, now);
+			// Gate leaves a trace on BOTH paths (v0.2.173 rule): the delivered line is
+			// what lets an incident review tell 「pushed」 from 「claimed pushed」.
+			console.log(`[work] human request pushed: item=${itemId} origin=${origin}`);
+			return {
+				content: [{ type: "text", text: `已向来源会话推送人工介入请求（30 分钟内不会重复推送）。继续可执行的部分或等待回复；不要用 set_progress 记录「已推群」。` }],
+				details: { ok: true, pushed: true, origin },
+			};
+		}
 			const updated = p.action === "add_lesson"
 				? workItems.addLesson(itemId, content)
 				: workItems.setField(itemId, p.action, content);
