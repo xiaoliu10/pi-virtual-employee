@@ -346,14 +346,12 @@ export class IMAdapterManager {
 	private readonly pumpState = new Map<string, PumpState>();
 	private pumpTimer?: ReturnType<typeof setInterval>;
 
-	/** Start the pump. Idempotent; interval comes from longTaskProgressMin. */
+	/** Start once; each tick reads both live cadence settings independently. */
 	startProgressPump(): void {
 		if (this.pumpTimer) return;
-		const intervalMs = (this.config.all().general.longTaskProgressMin ?? 0) * 60_000;
-		if (intervalMs <= 0) return; // explicitly disabled
-		// Tick often relative to the cadence so a conversation that just became due
-		// is noticed promptly; decidePump() enforces the real interval per chat.
-		const tickMs = Math.max(30_000, Math.min(intervalMs, 5 * 60_000));
+		// Keep the lightweight poll alive even when both cadences are disabled:
+		// enabling either setting later must work without restarting the app.
+		const tickMs = 5 * 60_000;
 		this.pumpTimer = setInterval(() => this.pumpTick(), tickMs);
 		// Never hold the process open for a heartbeat.
 		this.pumpTimer.unref?.();
@@ -367,17 +365,36 @@ export class IMAdapterManager {
 
 	private pumpTick(): void {
 		try {
-			const intervalMs = (this.config.all().general.longTaskProgressMin ?? 0) * 60_000;
+			const general = this.config.all().general;
 			const busy = this.engine.busyConversations?.() ?? [];
-			prunePumpState(this.pumpState, busy);
-			const actions = decidePump({ busy, state: this.pumpState, now: Date.now(), intervalMs });
+			// Autonomous/scheduled/window sessions (sched:/work:) follow the TASK
+			// cadence; everything else — inline chats AND chat-dispatched workers —
+			// follows the CHAT cadence. Worker tasks are ALWAYS born from a chat
+			// dispatch (triage), so the user is present: v0.2.171's own semantics
+			// (「用户在场看着，进度提醒是价值」) put them on the chat knob. Field
+			// 2026-11-13: raising taskProgressMin to 30 also stretched chat-dispatched
+			// worker reporting to 30 — the knob split exists precisely so that does
+			// not happen. Without this split the global pump bypasses taskProgressMin
+			// entirely for sched:/work:.
+			const intervals = new Map(busy.map(({ conversationId }) => [
+				conversationId,
+				(/^(?:sched|work):/.test(conversationId)
+					? general.taskProgressMin ?? 0
+					: general.longTaskProgressMin ?? 0) * 60_000,
+			]));
+			const enabled = busy.filter(({ conversationId }) => intervals.get(conversationId)! > 0);
+			prunePumpState(this.pumpState, enabled);
+			const actions = enabled.flatMap((entry) => decidePump({
+				busy: [entry], state: this.pumpState, now: Date.now(), intervalMs: intervals.get(entry.conversationId)!,
+			}));
 			// Observability (field 2026-11-06: the chat pump has NEVER fired since
 			// v0.2.192, with zero log lines anywhere in the chain). A quiet tick
-			// every 5min is fine; state transitions always log.
+			// proves the timer is alive; state transitions always log.
 			console.log(`[im] progress pump tick: busy=${busy.length}${busy.length ? ` [${busy.map((b) => b.conversationId).join(",")}]` : ""} actions=${actions.map((a) => `${a.conversationId}:${a.kind}${a.kind === "skip" ? `/${a.reason}` : ""}`).join(",") || "none"}`);
 			for (const action of actions) {
 				if (action.kind === "fire") {
-					console.log(`[im] progress pump FIRE: ${action.conversationId}`);
+					const intervalMs = intervals.get(action.conversationId)!;
+					console.log(`[im] progress pump FIRE: ${action.conversationId} interval=${intervalMs / 60_000}min`);
 					void this.pumpOne(action.conversationId, intervalMs);
 				} else if (!this.pumpState.has(action.conversationId)) {
 					console.log(`[im] progress pump armed (first sighting): ${action.conversationId}`);
@@ -407,8 +424,11 @@ export class IMAdapterManager {
 			// working" note).
 			if (!this.engine.isConversationStreaming(conversationId)) return;
 			const occurrenceId = chatHeartbeatOccurrenceId("pump", conversationId, Date.now(), intervalMs);
-			await this.onProgressPush?.(conversationId, note, occurrenceId);
+			if (!this.onProgressPush) throw new Error("进度推送通道未接通");
+			const result = await this.onProgressPush(conversationId, note, occurrenceId);
+			if (result?.ok !== true) throw new Error(result?.error || "进度推送未确认送达");
 			st.lastSentAt = Date.now();
+			console.log(`[im] progress pump delivered: ${conversationId}${result.skipped ? " (already delivered)" : ""}`);
 		} catch (err) {
 			console.warn(`[im] progress pump push failed for ${conversationId}: ${(err as Error).message}`);
 		} finally {
@@ -417,9 +437,9 @@ export class IMAdapterManager {
 	}
 
 	/** Injected by main.ts: how the pump reaches the IM channel of a conversation. */
-	private onProgressPush?: (conversationId: string, text: string, occurrenceId: string) => Promise<unknown>;
+	private onProgressPush?: (conversationId: string, text: string, occurrenceId: string) => Promise<PushResult>;
 
-	setProgressPusher(fn: (conversationId: string, text: string, occurrenceId: string) => Promise<unknown>): void {
+	setProgressPusher(fn: (conversationId: string, text: string, occurrenceId: string) => Promise<PushResult>): void {
 		this.onProgressPush = fn;
 	}
 
@@ -480,7 +500,11 @@ export class IMAdapterManager {
 		// strip the namespace before handing the id over, or EVERY work: push
 		// would fail as "找不到对应任务" (found by test-resolve-push-target with a
 		// production-faithful injection; the reviewer probe used a bare-id fake).
-		const resolved = resolvePushTarget(conversationId, (id) => this.engine.workItems?.get(id.startsWith("work:") ? id.slice(5) : id));
+		const resolved = resolvePushTarget(
+			conversationId,
+			(id) => this.engine.workItems?.get(id.startsWith("work:") ? id.slice(5) : id),
+			(id) => this.engine.workerBridge?.sourceForConversation?.(id),
+		);
 		if ("error" in resolved) {
 			console.warn(`[im] push target unresolvable: ${resolved.error}`);
 			return { ok: false, error: resolved.error };
@@ -1055,18 +1079,25 @@ function credChanged(prev: ImChannelConfig | undefined, next: ImChannelConfig): 
  * adapters, so "@机器人/new", "／new" and multi-line mentions all work. */
 
 /** Walk a derivation chain to a routable push target. Pure; injectable lookup.
- * `work:<id>` → item.origin_conversation → … until a non-work: id, max 10 hops,
+ * `work:<id>` → item.origin_conversation, `worker:<id>` → source chat, max 10 hops,
  * cycle-safe. Returns an honest error instead of a silent drop. */
 export function resolvePushTarget(
 	start: string,
 	getItem: (id: string) => { origin_conversation: string | null } | undefined,
+	getWorkerSource?: (id: string) => string | undefined,
 ): { target: string } | { error: string } {
 	let current = start;
 	const visited = new Set<string>();
-	for (let hops = 0; current.startsWith("work:"); hops++) {
+	for (let hops = 0; /^(?:work|worker):/.test(current); hops++) {
 		if (hops >= 10) return { error: `派生链过深（>10 层），无法解析推送目标：${start}` };
 		if (visited.has(current)) return { error: `派生链成环，无法解析推送目标：${start}` };
 		visited.add(current);
+		if (current.startsWith("worker:")) {
+			const source = getWorkerSource?.(current);
+			if (!source) return { error: `推送目标 ${current} 找不到来源会话，无法投递` };
+			current = source;
+			continue;
+		}
 		const item = getItem(current);
 		if (!item) return { error: `推送目标 ${current} 不是可投递会话，且找不到对应任务（可能已被删除）` };
 		const parent = item.origin_conversation ?? "";

@@ -1760,7 +1760,13 @@ ${tailForProgress(decision.text)}`;
 		progress: (task, session) => createProgressNotifier({
 			title: task.title,
 			target: task.target,
-			intervalMin: config.all().general.taskProgressMin,
+			// CHAT cadence, not taskProgressMin: a worker task is ALWAYS born from a
+			// chat dispatch (triage / follow-up), so the user is present and watching
+			// (v0.2.171's own semantics). Field 2026-11-13: raising taskProgressMin to
+			// 30 stretched chat-dispatched worker reporting to 30 too — exactly the
+			// confusion the knob split exists to prevent. taskProgressMin stays for
+			// the truly unattended runners: scheduled runs and work windows.
+			intervalMin: config.all().general.longTaskProgressMin,
 			// The side pass must be tracked against the WORKER conversation (task
 			// is executed in its own conversation) — field 2026-11-10: passing the
 			// TARGET (source chat) here attributed watchdog side-call liveness to
@@ -1829,6 +1835,7 @@ ${tailForProgress(decision.text)}`;
 		inject: (cid, message, senderId) => workerService.inject(cid, message, senderId),
 		cancelForEscape: (cid, senderId, note) => workerService.cancelForEscape(cid, senderId, note),
 		keepAliveRemainingMs: (cid) => workerService.keepAliveRemainingMs(cid),
+		sourceForConversation: (cid) => workerTaskStore.sourceForConversation(cid),
 	};
 	// Recovery + dispatch only after IM initialization and bridge installation.
 	workService.start();

@@ -89,3 +89,12 @@ test("empty/null origin errors honestly", () => {
 	assert.match(resolvePushTarget("work:empty", get).error ?? "", /来源会话为空/);
 	assert.match(resolvePushTarget("work:nullorigin", get).error ?? "", /来源会话为空/);
 });
+
+
+test("worker sessions resolve through their stored source, including work/worker mixed chains", () => {
+	const source = id => ({ "worker:job": "dt:source", "worker:nested": "work:a2", "worker:cycle": "worker:cycle" })[id];
+	assert.deepEqual(resolvePushTarget("worker:job", get, source), { target: "dt:source" });
+	assert.deepEqual(resolvePushTarget("worker:nested", get, source), { target: "dt:root" });
+	assert.match(resolvePushTarget("worker:missing", get, source).error, /找不到来源/);
+	assert.match(resolvePushTarget("worker:cycle", get, source).error, /成环/);
+});
