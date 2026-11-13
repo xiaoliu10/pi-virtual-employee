@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { nextStallStep, STALL_QUIET_RETRIES } from "./autonomous.js";
 import { allowsSelfScheduling, originLabel, resolveOrigin, type WorkOrigin } from "./work-origin.js";
 /**
@@ -60,7 +61,7 @@ export interface WorkServiceOptions<Session extends WorkSession> {
 	open(item: WorkItemRow, conversationId: string): Session;
 	send(session: Session, message: string, senderId: string, memoryConversationId?: string, memoryChannel?: string): Promise<{ reply?: string; error?: string; deterministic?: boolean; narrationSuppressed?: boolean; narrationNoted?: boolean }>;
 	release(conversationId: string): Promise<void>;
-	push(conversationId: string, text: string): Promise<unknown>;
+	push(conversationId: string, text: string, delivery?: { occurrenceId: string; kind: string }): Promise<{ ok: boolean; error?: string }>; 
 	/** Live kb.enabled AND kb.learn.enabled, checked at completion. */
 	canLearn?(): boolean;
 	/** Live KB tool availability, forwarded to the window protocol so it never
@@ -216,7 +217,7 @@ export class WorkService<Session extends WorkSession> {
 			for (const v of victims) {
 				if (!v.origin_conversation) continue;
 				const text = `⚠️ **任务被中断：${v.title}**\n\n应用在执行中退出，本轮进度已保留，任务处于「需要人工」状态。请核查已发生的操作后，回复明确指示以恢复（或直接取消）。`;
-				void Promise.resolve(this.opts.push(v.origin_conversation, text)).catch(() => {});
+				void this.pushAcknowledged(v.origin_conversation, text).catch((err) => this.opts.onError?.(err));
 			}
 		}
 		this.running = true;
@@ -293,6 +294,12 @@ export class WorkService<Session extends WorkSession> {
 	 * (EMA of its declared NEXT_CHECK gaps), clamped. A 2h-rhythm task that
 	 * stalls must not go quieter than its normal cadence — that is exactly
 	 * the "high-frequency task loses a whole day" failure mode. */
+	private async pushAcknowledged(conversationId: string, text: string, delivery?: { occurrenceId: string; kind: string }): Promise<void> {
+		const result = await this.opts.push(conversationId, text, delivery);
+		if (result?.ok !== true) throw new Error(`[work] delivery not acknowledged: ${delivery?.occurrenceId ?? "notice"} → ${conversationId}: ${result?.error || "missing acknowledgement"}`);
+		console.log(`[work] delivery acknowledged: ${delivery?.occurrenceId ?? "notice"} → ${conversationId}`);
+	}
+
 	private remindInterval(row: WorkItemRow): number {
 		const raw = row.cadence_ms ?? REMIND_DEFAULT_MS;
 		return Math.min(REMIND_MAX_MS, Math.max(REMIND_MIN_MS, raw));
@@ -352,7 +359,7 @@ export class WorkService<Session extends WorkSession> {
 				? `\n\n这已经是第 ${n} 次提醒：如果这件工作已经不需要了，请回复取消它；仍需要则直接回复答复内容让它继续。`
 				: "\n\n直接回复答复内容（如验证码、预计解决时间）即可继续；如果已经不需要了，可以取消这个任务。";
 			const text = `⏸️ 自主任务仍在等待人工：${row.title.slice(0, 200)}\n\n已等待约 ${waitedText}${rhythm}${question ? `。上次的问题：${question}` : ""}${tail}`;
-			try { void Promise.resolve(this.opts.push(cid, text)).catch((err) => this.opts.onError?.(err)); } catch (err) { this.opts.onError?.(err); }
+			void this.pushAcknowledged(cid, text).catch((err) => this.opts.onError?.(err));
 		}
 	}
 
@@ -416,6 +423,11 @@ export class WorkService<Session extends WorkSession> {
 		const convId = `work:${active.id}`;
 		let item: WorkItemRow | undefined;
 		let lastText = "";
+		// Intermediate assistant replies stay inside work:<id>; none are sent by
+		// engine.send. Preserve every accepted turn for the window delivery. The
+		// IM manager splits long messages; clipping here permanently loses reports.
+		const windowTexts: string[] = [];
+		const deliveryId = `work:${active.id}:window:${randomUUID()}`;
 		let question = "";
 		let nextCheckAt: number | undefined;
 		let nextReason: string | undefined;
@@ -580,6 +592,7 @@ export class WorkService<Session extends WorkSession> {
 				}
 				const decision = parseWindowReply(result.reply ?? "", new Date(this.clock.now()));
 				lastText = decision.text;
+				if (lastText.trim()) windowTexts.push(lastText);
 				console.log(`[work] ${item.id.slice(0, 8)} turn ${turn + 1} → ${decision.kind}${decision.kind === "next_check" ? ` raw="${(decision.nextCheckRaw ?? "").slice(0, 120)}" at=${decision.nextCheckAt ?? "invalid"}` : ""}`);
 				if (decision.kind === "human") { question = decision.question || lastText || "需要管理员协助并明确恢复。"; break; }
 				if (decision.kind === "done") {
@@ -778,12 +791,15 @@ export class WorkService<Session extends WorkSession> {
 			const scheduledReason = nowRow.next_check_reason ?? nextReason;
 			const streak = nowRow.fixed_streak ?? 0;
 			const label = pushHeaderLabel(nowRow.origin_note, nowRow.origin);
+			const windowText = windowTexts.join("\n\n") || lastText;
 			const text = nowRow.status === "done"
-				? `✅ **${label}完成：${nowRow.title}**\n\n${lastText}\n\n---\n\n💤 该任务已收尾，不再自动跟进。需要重开请在来源会话说明。`
+				? `✅ **${label}完成：${nowRow.title}**\n\n${windowText}\n\n---\n\n💤 该任务已收尾，不再自动跟进。需要重开请在来源会话说明。`
 				: nowRow.status === "scheduled"
-					? `🔁 **${label}阶段进展：${nowRow.title}**\n\n${tailExcerpt(lastText, 500)}\n\n---\n\n⏭️ **下次跟进**：${new Date(scheduledAt).toLocaleString("zh-CN", { hour12: false })}${scheduledReason ? `\n📋 **跟进原因**：${scheduledReason}` : ""}${streak >= 3 ? `\n\n⚠️ **循环提醒**：已连续 ${streak} 次只在相近的固定时间跟进这一个点。如果这是因为它有新信息可查（如某个批次在该时刻生成），写明依据可继续；但记得覆盖今天其他观察点。若这件工作每天只在这一处查、且查了也不需要判断动作，可建议管理员转成定时任务，自主任务留给需要判断力的跟进。` : ""}`
+					? `🔁 **${label}阶段进展：${nowRow.title}**\n\n${windowText}\n\n---\n\n⏭️ **下次跟进**：${new Date(scheduledAt).toLocaleString("zh-CN", { hour12: false })}${scheduledReason ? `\n📋 **跟进原因**：${scheduledReason}` : ""}${streak >= 3 ? `\n\n⚠️ **循环提醒**：已连续 ${streak} 次只在相近的固定时间跟进这一个点。如果这是因为它有新信息可查（如某个批次在该时刻生成），写明依据可继续；但记得覆盖今天其他观察点。若这件工作每天只在这一处查、且查了也不需要判断动作，可建议管理员转成定时任务，自主任务留给需要判断力的跟进。` : ""}`
 					: `⏸️ **${label}需要人工：${nowRow.title}**\n\n${nowRow.question}\n\n---\n\n💡 **恢复方式**：管理员在来源会话直接回复答复内容（如验证码、预计解决时间）即可继续；恢复前不会自动执行。`;
-			try { await this.opts.push(fresh.origin_conversation, text); } catch (err) { this.opts.onError?.(err); }
+			try {
+				await this.pushAcknowledged(fresh.origin_conversation, text, { occurrenceId: deliveryId, kind: "work-result" });
+			} catch (err) { this.opts.onError?.(err); }
 		}
 	}
 }

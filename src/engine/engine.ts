@@ -326,6 +326,19 @@ function loginGuidanceOf(err: unknown): string | undefined {
 	return `${provider ? `${provider} ` : ""}账号尚未登录，请到 设置 → 账号登录 完成登录`;
 }
 
+/**
+ * Bookkeeping tools whose results are engine-internal notes, never delivery to
+ * the user (work windows: 进展/踩坑/条件/人工请求 + knowledge/skill/memory
+ * capture). A step whose ONLY tool calls are these can never justify
+ * superseding a substantial text emitted just before it — see the
+ * trailing-draft rescue in send(). Deliberately excludes save_report /
+ * save_document: those publish artifacts and can carry a real push, so a
+ * draft emitted BEFORE them must stay resettable.
+ */
+const BOOKKEEPING_NOTE_TOOLS = new Set(["manage_work", "manage_work_items", "save_to_knowledge", "save_to_skill", "remember"]);
+/** A draft shorter than this is step narration, not a lost deliverable. */
+const SUBSTANTIAL_DRAFT_MIN = 200;
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 function deriveTitle(message: string): string {
@@ -3050,6 +3063,9 @@ export class EmployeeEngine implements EmployeeRuntime {
 		const turnCorrection = looksLikeCorrection(message);
 		if (turnId) this.turnIds.set(conversationId, turnId);
 
+		// Every assistant message_end of this turn, in order — the
+		// trailing-draft rescue below reads it once the loop settles.
+		const assistantDrafts: { text: string; toolNames: string[] }[] = [];
 		let reply = "";
 		const unsubscribe = agent.subscribe((event: AgentEvent) => {
 			// Any SDK event (stream deltas, message ends, tool calls) is life.
@@ -3058,14 +3074,15 @@ export class EmployeeEngine implements EmployeeRuntime {
 				const msg = event.message as { content?: unknown; stopReason?: string };
 				const parts = Array.isArray(msg.content) ? (msg.content as { type?: string }[]) : [];
 				const types = parts.map((p) => p.type).join(",") || "(empty)";
-				const textLen = extractText(event.message).length;
-				const toolCalls = parts.filter((p) => p.type === "toolCall").length;
-				console.log(`[engine] assistant msg: stopReason=${msg.stopReason ?? "∅"} parts=[${types}] textLen=${textLen} toolCalls=${toolCalls}`);
+				const text = extractText(event.message);
+				const toolNames = parts.filter((p) => p.type === "toolCall").map((p) => (p as { name?: string }).name ?? "");
+				console.log(`[engine] assistant msg: stopReason=${msg.stopReason ?? "∅"} parts=[${types}] textLen=${text.length} toolCalls=${toolNames.length}`);
 				// Only the FINAL assistant message of the turn is the reply sent to the
 				// channel — intermediate step narrations ("我现在去查…", "让我想想…") are
 				// progress, not the answer. Accumulating them produced a wall of text and
 				// leaked English reasoning into a Chinese reply, so keep just the latest.
-				reply = extractText(event.message);
+				reply = text;
+				assistantDrafts.push({ text, toolNames });
 			}
 		});
 
@@ -3110,6 +3127,38 @@ export class EmployeeEngine implements EmployeeRuntime {
 			// and stops a later turn from inheriting a stale window.
 			this.progress.endTurn(conversationId);
 			await this.computer?.release(conversationId);
+		}
+
+		// TRAILING-DRAFT RESCUE (field 2026-11-13, box work window): the model
+		// regularly emits its full deliverable (巡检报告正文) alongside a
+		// bookkeeping call — manage_work set_progress / add_lesson or
+		// save_to_knowledge — and then closes the turn with a short sign-off
+		// ("…报告已推群…[[NEXT_CHECK]]: …"). Only the LAST assistant text is
+		// the reply, so the report was silently discarded while the sign-off's
+		// unconfirmed "已推群" claim went out instead. A step whose only tool
+		// calls are bookkeeping can never justify superseding a substantial
+		// text, so when the last such step still has a substantial draft
+		// pending and the final text is shorter, prepend the draft — closing
+		// markers ([[NEXT_CHECK]] etc.) stay at the tail where the window
+		// parser expects them. Any non-bookkeeping tool call resets the pending
+		// draft (narration ahead of run_command/browser calls stays
+		// suppressed), and a substantial FINAL text already is the deliverable
+		// (nothing merged — normal chat behavior unchanged).
+		{
+			let pendingDraft = "";
+			for (const step of assistantDrafts) {
+				// A text-only step (the closing sign-off itself, or an empty
+				// thinking tail) never resets the pending draft — the final
+				// message HAS no tool calls, and it must not un-rescue itself.
+				if (step.toolNames.length === 0) continue;
+				if (!step.toolNames.every((name) => BOOKKEEPING_NOTE_TOOLS.has(name))) pendingDraft = "";
+				else if (step.text.trim().length >= SUBSTANTIAL_DRAFT_MIN) pendingDraft = step.text.trim();
+			}
+			const finalTrim = reply.trim();
+			if (pendingDraft && finalTrim.length < pendingDraft.length && !finalTrim.includes(pendingDraft)) {
+				console.log(`[engine] trailing draft rescue: prepending ${pendingDraft.length}-char deliverable ahead of the ${finalTrim.length}-char closing text`);
+				reply = finalTrim ? `${pendingDraft}\n\n${finalTrim}` : pendingDraft;
+			}
 		}
 
 		const errorMessage = agent.state.errorMessage;

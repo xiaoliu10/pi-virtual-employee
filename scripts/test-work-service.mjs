@@ -49,7 +49,7 @@ function fixture(t, overrides = {}) {
 		open: (item, cid) => ({ id: item.id, cid, abort: (opts) => { h.aborted.push(item.id); h.abortOpts.push({ id: item.id, opts }); } }),
 		send: async (session, message, actor) => { h.sends.push({ session, message, actor }); return overrides.send ? overrides.send(h, session, message) : { reply: "成果\n[[TASK_DONE]]" }; },
 		release: async cid => { h.released.push(cid); if (overrides.release) await overrides.release(h); },
-		push: async (cid, text) => { h.pushes.push({ cid, text }); if (overrides.push) await overrides.push(h); },
+		push: async (cid, text, delivery) => { h.pushes.push({ cid, text, delivery }); return overrides.push ? await overrides.push(h) : { ok: true }; },
 		learn: (item, result) => { h.learned.push({ item, result }); },
 		reclaimBackground: (itemId) => { h.reclaimed.push(itemId); },
 		onError: err => h.errors.push(err),
@@ -107,6 +107,26 @@ test("done persists, each turn and KB see fresh conditions/progress/lessons; onl
 	assert.doesNotMatch(h.pushes[0].text, /TASK_DONE/);
 	assert.deepEqual(h.released, [`work:${item.id}`]);
 	assert.equal(h.clock.timers.size, 0);
+});
+
+test("scheduled window delivers its complete report, including earlier turns", async t => {
+	const report = "扫描明细开始\n\n" + Array.from({ length: 90 }, (_, i) => "行 " + i + ": 已核对，金额与流水一致。").join("\n") + "\n\n扫描明细结束";
+	const h = fixture(t, { send: h => h.sends.length === 1
+		? { reply: report }
+		: { reply: "本轮结束，明天再查。\n[[NEXT_CHECK]]: 24h | 新批次生成后" } });
+	const item = h.create(); h.service.start(); await flush();
+	assert.equal(h.store.get(item.id).status, "scheduled");
+	assert.equal(h.pushes.length, 1);
+	assert.ok(h.pushes[0].text.includes(report), "earlier report turns must reach the source in full");
+	assert.ok(h.pushes[0].text.includes("本轮结束，明天再查。"));
+	assert.doesNotMatch(h.pushes[0].text, /NEXT_CHECK|以下为上次进展的节选/);
+});
+
+test("scheduled closing report is not clipped to its last 500 characters", async t => {
+	const report = "报告首部\n\n" + "完整异常明细\n".repeat(180) + "\n\n报告末尾";
+	const h = fixture(t, { send: () => ({ reply: report + "\n[[NEXT_CHECK]]: 24h | 新数据生成后" }) });
+	h.create(); h.service.start(); await flush();
+	assert.ok(h.pushes[0].text.includes(report), "IM delivery splits long text; the service must not drop it first");
 });
 
 test("human always wins, never wakes without explicit resume, answer appears once then clears", async t => {
@@ -374,6 +394,18 @@ test("shutdown clears due timers and aborts without dispatching queued work", as
 	assert.equal(h.store.get(item.id).status, "waiting_human");
 	assert.equal(h.store.get(queued.id).status, "queued");
 	assert.equal(h.clock.timers.size, 0);
+});
+
+test("failed and missing closing delivery acknowledgements surface without undoing work", async t => {
+	for (const result of [{ ok: false, error: "offline" }, undefined]) {
+		const h = fixture(t, { push: () => result });
+		const item = h.create(); h.service.start(); await flush();
+		assert.equal(h.store.get(item.id).status, "done");
+		assert.equal(h.errors.length, 1);
+		assert.match(String(h.errors[0]), /delivery not acknowledged/);
+		assert.equal(h.pushes[0].delivery.kind, "work-result");
+		assert.ok(h.pushes[0].delivery.occurrenceId.startsWith("work:" + item.id + ":window:"));
+	}
 });
 
 test("push/cleanup errors cannot undo a persisted terminal outcome", async t => {

@@ -170,7 +170,7 @@ export function createWorkTools(deps: {
 		description:
 			"仅在当前自主任务的 work:<id> 工作窗口内使用；需要该任务创建管理员的有效调度身份且任务正在执行。" +
 			"action=set_conditions：记录执行条件/时间窗/依赖；action=add_lesson：记录踩坑；action=set_progress：更新进展。" +
-			"这三个动作只是任务笔记，跨窗口保留但【不会推送给任何人】。" +
+			"这三个动作只是任务笔记，跨窗口保留但【不会推送给任何人】；要交付给来源会话的报告或结论，写在窗口收尾正文（最后一条不调用工具的文本）里。" +
 			"需要人工介入（验证码、授权、凭据、资源）时用 action=request_human：向任务来源会话的管理员推送一条请求，30 分钟节流防刷屏。" +
 			"收到投递成功回执后停止依赖该人工输入的重试，不要重复发送短信使验证码失效；等待人工用 [[NEED_HUMAN]] 收尾，管理员在来源会话答复后恢复任务。不得用 set_progress 冒充已请求人工。",
 		parameters: obj({
@@ -237,7 +237,7 @@ export function createWorkTools(deps: {
 			if (!updated) return failure("记录失败，自主任务可能已停止。");
 			const label = p.action === "set_conditions" ? "执行条件" : p.action === "add_lesson" ? "踩坑记录" : "进展";
 			return {
-				content: [{ type: "text", text: `已记录到自主任务「${item.title}」的${label}（共 ${lessonsOf(updated.lessons).length} 条踩坑）。` }],
+				content: [{ type: "text", text: `已记录到自主任务「${item.title}」的${label}（共 ${lessonsOf(updated.lessons).length} 条踩坑）。这是内部笔记，不会推送给来源会话；要交付的报告或结论写在窗口收尾正文（最后一条不调用工具的文本）里。` }],
 				details: { ok: true },
 			};
 		},

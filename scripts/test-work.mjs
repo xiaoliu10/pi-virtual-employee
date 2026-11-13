@@ -317,6 +317,16 @@ test("window prompt teaches segmentation and the honest budget stop (design §8.
 	assert.doesNotMatch(prefix, /超时会自动顺延/, "no stale auto-defer promise may survive in the prompt");
 });
 
+test("window prompt: only the final no-tool text is the delivered window result", () => {
+	const prefix = buildWorkWindowPrefix({ title: "对账巡检", goal: "巡检", turn: 0, budget: { maxTurns: 0, maxMinutes: 90 } });
+	assert.match(prefix, /只有最后一条不调用工具的文本会作为窗口结果推送到来源会话/, "the delivery channel is stated explicitly");
+	assert.match(prefix, /中间的文本块.*只是你自己的过程记录/, "intermediate blocks are named as private notes");
+	assert.match(prefix, /报告、明细、结论都必须完整写在最后这条收尾正文里/, "the deliverable must ride the closing text");
+	// The resident rule keeps its own channel clause (PR #215) — the two must not conflict.
+	const resident = buildWorkWindowPrefix({ title: "t", goal: "g", turn: 0, budget: { maxTurns: 0, maxMinutes: 30 }, resident: true });
+	assert.match(resident, /绝不要在正文里写「报告已推群」/);
+});
+
 test("recovery brief block: rendered verbatim in the prefix memory section; absent → byte-identical prefix", () => {
 	const base = { title: "中断的巡检", goal: "巡检", turn: 0, budget: { maxTurns: 0, maxMinutes: 30 } };
 	const without = buildWorkWindowPrefix(base);
@@ -370,6 +380,7 @@ test("window prefix: resident tasks forbid DONE and require NEXT_CHECK", () => {
 	const plain = buildWorkWindowPrefix(base);
 	assert.match(resident, /常驻巡检/);
 	assert.match(resident, /禁止输出/);
+	assert.match(resident, /绝不要在正文里写「报告已推群」/);
 	assert.doesNotMatch(plain, /禁止输出/);
 	assert.match(plain, /目标全部完成/);
 });

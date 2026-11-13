@@ -123,7 +123,7 @@ test("a work window stops and drains its progress notifier before the completion
 		open: () => { session = { state: { isStreaming: true } }; return session; },
 		send: async () => { session.state.isStreaming = false; return { reply: "窗口完成\n[[TASK_DONE]]" }; },
 		release: async () => {},
-		push: async (_cid, text) => { pushed.push(text); },
+		push: async (_cid, text) => { pushed.push(text); return { ok: true }; },
 		budget: { maxTurns: 1, maxMinutes: 120 },
 		progress: () => ({
 			start() { notifier.starts += 1; },
@@ -156,7 +156,7 @@ test("a window whose send throws still stops and drains the notifier", async (t)
 		open: () => ({ state: { isStreaming: true } }),
 		send: async () => { throw new Error("boom"); },
 		release: async () => {},
-		push: async () => {},
+		push: async () => ({ ok: true }),
 		budget: { maxTurns: 1, maxMinutes: 120 },
 		progress: () => ({
 			start() { notifier.starts += 1; },
