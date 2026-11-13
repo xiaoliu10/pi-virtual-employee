@@ -753,7 +753,11 @@ export function parseRunningProfilesFromWmic(text: string): string[] {
 	interface ProcRow { pid: number; ppid: number; cmd: string }
 	const rows: ProcRow[] = [];
 	let current: Partial<ProcRow> = {};
-	for (const line of text.split(/\r?\n/)) {
+	// Redirected WMIC output uses CRCRLF on Windows. Splitting only CRLF
+	// leaves a trailing CR in each field, so the anchored regex below drops
+	// every row and the watchdog restores only its own profile. Accept all
+	// CR/LF runs before parsing the fields (including LF-only fixtures).
+	for (const line of text.split(/[\r\n]+/)) {
 		const m = /^(CommandLine|ParentProcessId|ProcessId)=(.*)$/.exec(line);
 		if (!m) continue;
 		if (m[1] === "CommandLine") current.cmd = m[2].trim();
