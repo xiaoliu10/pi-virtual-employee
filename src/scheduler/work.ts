@@ -343,8 +343,8 @@ export function buildWorkWindowPrefix(ctx: WorkItemWindowContext): string {
 		? `- 需要人参与 / 需其他单位配合资源 / 权限不足 → 先用 search_knowledge_base 查一遍（账号密码、地址入口、操作流程、规则这类问题知识库大概率已有沉淀，直接问人等于把知识库当摆设；明显只有人能当场提供的信息——验证码、口头确认、对方答复——可免查，问题里写明为什么没查），确认查不到再最后一行单独写 ${AUTONOMOUS_HUMAN_MARK}: 具体需要谁做什么。问题里必须写明「已查知识库（关键词 X），未找到」，以及已尝试的办法——让管理员一次就能给准信。任务会暂停等人，不要空转。`
 		: `- 需要人参与 / 需其他单位配合资源 / 权限不足 → 最后一行单独写 ${AUTONOMOUS_HUMAN_MARK}: 具体需要谁做什么，并写明已尝试的办法。任务会暂停等人，不要空转。`;
 	const unattendedBullet = kbSearch
-		? `- 无人值守：先检测登录状态再操作。登录过期/账号异常 → 先 search_knowledge_base 搜「系统名 + 登录/账号」找最新的账号密码或登录指引，找得到就自己重新登录继续干；知识库确实没有才 ${AUTONOMOUS_HUMAN_MARK}（注明已查知识库无果）。不要索要验证码。`
-		: `- 无人值守：先检测登录状态再操作，登录过期 ${AUTONOMOUS_HUMAN_MARK} 说明，不要索要验证码。`;
+		? `- 无人值守：先检测登录状态再操作。登录过期/账号异常 → 先 search_knowledge_base 搜「系统名 + 登录/账号」找最新的账号密码或登录指引，找得到就自己重新登录继续干；若登录需要发到用户手机的短信验证码等实时人工输入，立即用 manage_work 的 request_human 请求来源会话协助，并以 ${AUTONOMOUS_HUMAN_MARK} 暂停等答复；不要从历史记录猜码、不要反复发送短信使旧码失效。其他登录资源确实查不到时也用 ${AUTONOMOUS_HUMAN_MARK} 说明。`
+		: `- 无人值守：先检测登录状态再操作，登录过期或需要短信验证码等实时人工输入时，用 manage_work 的 request_human 请求来源会话协助，并以 ${AUTONOMOUS_HUMAN_MARK} 暂停等答复；不要猜码或反复发送短信。`;
 	const lessonBullet = `- 踩过的坑（登录态、页面路径、接口 quirks）→ 用 manage_work 记录，别指望下次还记得。${kbLearn ? "卡点解决后若沉淀出了可复用的信息（正确账号、新流程、报错根因），用 save_to_knowledge 存进知识库——下次同类卡点直接查库解决，不再问人。" : ""}`;
 	// Unlimited-turn window (user ruling 2026-10-13): the model must not stop
 	// early out of an imagined turn limit — only the closing markers or the time

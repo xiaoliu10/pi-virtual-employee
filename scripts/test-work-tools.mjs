@@ -1,7 +1,7 @@
 /** Work tool security/queue contract tests; no native DB, IM, or executor. */
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
-import { after, test } from "node:test";
+import { after, test, mock } from "node:test";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { build } from "esbuild";
@@ -11,14 +11,14 @@ const workDir = await mkdtemp(join(root, "node_modules/.work-tools-test-"));
 after(() => rm(workDir, { recursive: true, force: true }));
 const bundle = join(workDir, "work-tools.mjs");
 await build({
-	stdin: { contents: 'export { createWorkTools, resetHumanRequestThrottleForTest } from "./src/engine/tools/work.ts";', resolveDir: root, loader: "ts" },
+	stdin: { contents: 'export { createWorkTools } from "./src/engine/tools/work.ts";', resolveDir: root, loader: "ts" },
 	outfile: bundle,
 	bundle: true,
 	platform: "node",
 	format: "esm",
 	packages: "external",
 });
-const { createWorkTools, resetHumanRequestThrottleForTest } = await import(pathToFileURL(bundle).href);
+const { createWorkTools } = await import(pathToFileURL(bundle).href);
 
 const GROUP = "dt:group:source";
 const SINGLE = "dt:admin";
@@ -771,92 +771,110 @@ test("create resident:true persists the flag and says so", async () => {
 	assert.match(result.content[0].text, /常驻巡检/);
 });
 
-// ---------- request_human: the real channel to ask for codes/credentials (field 2026-11-13) ----------
-
-test("request_human pushes to the origin chat and is throttled per item (30min)", async () => {
-	resetHumanRequestThrottleForTest();
-	const working = row({ id: ID, status: "working", created_by: "admin", origin_conversation: GROUP });
-	const f = fixture({ conversationId: `work:${ID}`, actor: actor({ channel: "scheduler", chatType: "single" }), rows: [working] });
-	const pushed = [];
-	const tools = createWorkTools({
-		workItems: f.rows,
-		config: { all: () => ({ security: f.security }) },
-		conversationId: `work:${ID}`,
-		resolveActor: () => actor({ channel: "scheduler", chatType: "single" }),
-		fireItem: () => true,
-		mine: async () => ({ scanned: 0, proposals: [] }),
-		pushToOrigin: async (cid, text) => { pushed.push({ cid, text }); },
+// ---------- request_human: delivery must be acknowledged before reporting success ----------
+function humanFixture(push, overrides = {}) {
+	const f = fixture({
+		conversationId: "work:" + ID,
+		rows: [row({ status: "working", created_by: "admin", origin_conversation: GROUP }), ...(overrides.parents ?? [])],
 	});
-	f.tools = tools;
-	const notebook = (params) => tools.find((tool) => tool.name === "manage_work").execute("call", params);
-	const ok = await notebook({ action: "request_human", content: "spay 登录需要最新一条短信验证码，请直接回复数字" });
-	if (!ok.details.ok) console.log("DEBUG-FAIL:", JSON.stringify(ok.details));
-	assert.equal(ok.details.ok, true, "first request delivers");
-	assert.equal(ok.details.pushed, true);
-	assert.deepEqual(pushed, [{ cid: GROUP, text: "⏸ 自主任务「来源任务」需要人工介入：\nspay 登录需要最新一条短信验证码，请直接回复数字" }]);
-	const again = await notebook({ action: "request_human", content: "再问一次" });
-	assert.equal(again.details.ok, false, "second request within 30min is throttled");
-	assert.match(again.details.reason ?? "", /节流/);
-	assert.equal(pushed.length, 1, "throttled request must not push");
-	resetHumanRequestThrottleForTest();
+	if (overrides.origin !== undefined) f.rows.get(ID).origin_conversation = overrides.origin;
+	const deps = {
+		workItems: f.rows, config: { all: () => ({ security: f.security }) },
+		conversationId: "work:" + ID,
+		resolveActor: () => actor({ channel: "scheduler", chatType: "single", ...overrides.actor }),
+		fireItem: () => true, mine: async () => ({ scanned: 0, proposals: [] }),
+		...(push ? { pushToOrigin: push } : {}),
+	};
+	const tool = createWorkTools(deps).find(t => t.name === "manage_work");
+	return { ...f, deps, tool, ask: () => tool.execute("call", { action: "request_human", content: "请在来源会话回复手机收到的短信验证码" }) };
+}
+
+test("request_human delivers to its source and consumes the budget only after acknowledgement", async () => {
+	const pushes = [];
+	const h = humanFixture(async (cid, text) => { pushes.push({ cid, text }); return { ok: true }; });
+	const result = await h.ask();
+	assert.equal(result.details.pushed, true);
+	assert.equal(pushes[0].cid, GROUP);
+	assert.match(pushes[0].text, /来源任务/);
+	assert.match(result.content[0].text, /NEED_HUMAN/);
+	const second = await h.ask();
+	assert.equal(second.details.ok, false);
+	assert.match(second.details.reason, /节流/);
+	assert.equal(pushes.length, 1);
+	assert.equal(h.rows.get(ID).status, "working", "notification alone does not pretend the executor has stopped");
 });
 
-test("request_human walks a derived chain to the root IM conversation", async () => {
-	resetHumanRequestThrottleForTest();
-	const parent = row({ id: "parent-1", status: "working", created_by: "admin", origin_conversation: SINGLE });
-	const child = row({ id: ID, status: "working", created_by: "admin", origin_conversation: "work:parent-1" });
-	const f = fixture({ conversationId: `work:${ID}`, actor: actor({ channel: "scheduler", chatType: "single" }), rows: [parent, child] });
-	const pushed = [];
-	const tools = createWorkTools({
-		workItems: f.rows,
-		config: { all: () => ({ security: f.security }) },
-		conversationId: `work:${ID}`,
-		resolveActor: () => actor({ channel: "scheduler", chatType: "single" }),
-		fireItem: () => true,
-		mine: async () => ({ scanned: 0, proposals: [] }),
-		pushToOrigin: async (cid, text) => { pushed.push({ cid, text }); },
-	});
-	const result = await tools.find((tool) => tool.name === "manage_work").execute("call", { action: "request_human", content: "需要授权" });
-	assert.equal(result.details.ok, true);
-	assert.deepEqual(pushed.map((p) => p.cid), [SINGLE], "chain walks work:<parent> to the IM root");
-	resetHumanRequestThrottleForTest();
+test("request_human handles ok:false, thrown sends and missing acknowledgement without burning budget", async () => {
+	for (const failure of [async () => ({ ok: false, error: "offline" }), async () => { throw Error("offline"); }, async () => undefined]) {
+		let calls = 0;
+		const h = humanFixture(async () => { calls++; return calls === 1 ? failure() : { ok: true }; });
+		const failed = await h.ask();
+		assert.equal(failed.details.ok, false);
+		assert.match(failed.details.reason, /尚未确认送达/);
+		assert.equal((await h.ask()).details.pushed, true, "a failed delivery permits an immediate retry");
+		assert.equal(calls, 2);
+	}
 });
 
-test("request_human without a wired channel reports failure instead of pretending", async () => {
-	resetHumanRequestThrottleForTest();
-	const working = row({ id: ID, status: "working", created_by: "admin", origin_conversation: GROUP });
-	const f = fixture({ conversationId: `work:${ID}`, actor: actor({ channel: "scheduler", chatType: "single" }), rows: [working] });
-	const tools = createWorkTools({
-		workItems: f.rows,
-		config: { all: () => ({ security: f.security }) },
-		conversationId: `work:${ID}`,
-		resolveActor: () => actor({ channel: "scheduler", chatType: "single" }),
-		fireItem: () => true,
-		mine: async () => ({ scanned: 0, proposals: [] }),
-		// NO pushToOrigin — the exact box-0.2.228 shape that produced the
-		// 「已推群要求验证码」 self-narration with zero delivered lines.
-	});
-	const result = await tools.find((tool) => tool.name === "manage_work").execute("call", { action: "request_human", content: "需要验证码" });
-	assert.equal(result.details.ok, false);
-	assert.match(result.details.reason ?? "", /未接通/);
-	resetHumanRequestThrottleForTest();
+test("request_human rejects an unwired channel and invalid or cyclic origins", async () => {
+	assert.match((await humanFixture().ask()).details.reason, /未接通/);
+	for (const origin of ["", "console:local", "sched:job", "work:" + ID]) {
+		let calls = 0;
+		const h = humanFixture(async () => { calls++; return { ok: true }; }, { origin });
+		assert.equal((await h.ask()).details.ok, false);
+		assert.equal(calls, 0);
+	}
 });
 
-test("manage_work description states that notes never push and request_human is the channel", async () => {
-	resetHumanRequestThrottleForTest();
-	const f = fixture({ conversationId: GROUP, actor: actor(), rows: [row({ id: ID, status: "working", created_by: "admin", origin_conversation: GROUP })] });
-	const tools = createWorkTools({
-		workItems: f.rows,
-		config: { all: () => ({ security: f.security }) },
-		conversationId: GROUP,
-		resolveActor: () => actor(),
-		fireItem: () => true,
-		mine: async () => ({ scanned: 0, proposals: [] }),
-		pushToOrigin: async () => {},
+test("request_human resolves derived tasks to their root IM conversation", async () => {
+	const pushes = [];
+	const h = humanFixture(async (cid) => { pushes.push(cid); return { ok: true }; }, {
+		origin: "work:parent", parents: [row({ id: "parent", origin_conversation: SINGLE })],
 	});
-	const desc = tools.find((tool) => tool.name === "manage_work").description;
-	assert.match(desc, /不会推送给任何人/, "note actions must be labeled non-delivering");
-	assert.match(desc, /request_human/, "the human channel must be discoverable");
-	assert.match(desc, /30 分钟节流/, "the throttle must be documented");
-	resetHumanRequestThrottleForTest();
+	assert.equal((await h.ask()).details.pushed, true);
+	assert.deepEqual(pushes, [SINGLE]);
+});
+
+test("concurrent request_human calls share an in-flight guard across rebuilt tool sets", async () => {
+	let release;
+	let calls = 0;
+	const h = humanFixture(() => { calls++; return new Promise(resolve => { release = resolve; }); });
+	const first = h.ask();
+	const rebuilt = createWorkTools(h.deps).find(t => t.name === "manage_work");
+	const second = await rebuilt.execute("call", { action: "request_human", content: "重复请求" });
+	assert.equal(second.details.ok, false);
+	assert.match(second.details.reason, /正在发送/);
+	release({ ok: true });
+	assert.equal((await first).details.pushed, true);
+	assert.equal(calls, 1);
+});
+
+test("request_human allows another reminder after 30 minutes", async () => {
+	mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
+	try {
+		const h = humanFixture(async () => ({ ok: true }));
+		assert.equal((await h.ask()).details.pushed, true);
+		mock.timers.tick(30 * 60_000);
+		assert.equal((await h.ask()).details.pushed, true);
+	} finally { mock.timers.reset(); }
+});
+
+test("request_human enforces the work creator's live admin identity", async () => {
+	for (const actor of [{ senderId: "other" }, { channel: "dingtalk" }]) {
+		let calls = 0;
+		const h = humanFixture(async () => { calls++; return { ok: true }; }, { actor });
+		assert.equal((await h.ask()).details.ok, false);
+		assert.equal(calls, 0);
+	}
+	const h = humanFixture(async () => ({ ok: true }));
+	h.security.adminStaffIds = [];
+	assert.equal((await h.ask()).details.ok, false);
+});
+
+test("manage_work distinguishes notes from delivery and explains waiting for a human", () => {
+	const { tool } = humanFixture();
+	assert.match(tool.description, /不会推送给任何人/);
+	assert.match(tool.description, /request_human/);
+	assert.match(tool.description, /NEED_HUMAN/);
+	assert.match(tool.description, /不要重复发送短信/);
 });

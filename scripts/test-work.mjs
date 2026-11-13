@@ -353,10 +353,15 @@ test("window protocol: KB-first before escalation; login expiry searches KB; res
 	assert.match(first, /这类卡点先查知识库搜什么关键词/);
 	// Human-only blockers (verification codes) are exempt from the KB check.
 	assert.match(prefix, /验证码、口头确认、对方答复——可免查/);
+	assert.match(prefix, /request_human/);
+	assert.doesNotMatch(prefix, /不要索要验证码/);
+	assert.match(prefix, /不要从历史记录猜码/);
 	// KB gated off → protocol must not reference unregistered tools.
 	const noKb = buildWorkWindowPrefix({ title: "巡检", goal: "对账", turn: 0, budget: { maxTurns: 15, maxMinutes: 30 }, kbSearchEnabled: false, kbLearnEnabled: false });
 	assert.doesNotMatch(noKb, /search_knowledge_base|save_to_knowledge/);
 	assert.match(noKb, /登录过期/);
+	assert.match(noKb, /request_human/);
+	assert.doesNotMatch(noKb, /不要索要验证码/);
 });
 
 test("window prefix: resident tasks forbid DONE and require NEXT_CHECK", () => {

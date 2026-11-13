@@ -197,7 +197,7 @@ export interface ToolSetOptions {
 		fireItem: (id: string) => boolean;
 		/** Human-request channel (manage_work request_human): deliver to an IM
 		 * conversation. Absent → request_human reports the channel as unwired. */
-		pushToOrigin?: (conversationId: string, text: string) => Promise<unknown>;
+		pushToOrigin?: (conversationId: string, text: string) => Promise<{ ok: boolean; error?: string }>;
 		/** On-demand mining over recent conversation deltas (admin-triggered). */
 		mine: (opts: { maxProposals?: number }) => Promise<{
 			proposals: { title: string; goal: string; evidence: string; conditions: string; originConversation: string | null; id: string }[];
