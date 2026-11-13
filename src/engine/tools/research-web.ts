@@ -13,7 +13,7 @@ export function createResearchWebTool(knowledge: KnowledgeService): AgentTool {
 		name: "research_web",
 		label: "联网研究",
 		description:
-			"知识库未命中时，用搜索引擎查询资料以补充回答。返回若干结果的标题、摘要与来源链接。对其中可复用、可信的结论，应随后调用 save_to_knowledge（source=\"research\"，并带上 sourceUrl）沉淀为知识条目（标记为待核实）。不要把未经验证的网络信息当作官方规则直接断言。",
+			"知识库未命中时，用搜索引擎查询资料以补充回答。返回若干结果的标题、摘要与来源链接。适合事实/文档/指南类静态信息；拿不到实时数据（天气、汇率、股价、赛事比分等）——这类需求直接用 browser_navigate + browser_read 打开权威数据源读取页面，不要用本工具。对其中可复用、可信的结论，应随后调用 save_to_knowledge（source=\"research\"，并带上 sourceUrl）沉淀为知识条目（标记为待核实）。不要把未经验证的网络信息当作官方规则直接断言。",
 		parameters: obj({
 			query: str({ description: "搜索查询词，尽量具体（如「产品X 保修期 多久」）" }),
 		}, { open: true }),
@@ -22,7 +22,7 @@ export function createResearchWebTool(knowledge: KnowledgeService): AgentTool {
 			const hits = await knowledge.researchWeb(query);
 			if (hits.length === 0) {
 				return {
-					content: [{ type: "text", text: `联网研究「${query}」未取得可用结果。请据实说明不确定，需要人工跟进时如实上报，不要虚构已转人工。` }],
+					content: [{ type: "text", text: `联网研究「${query}」未取得可用结果。请据实说明不确定，需要人工跟进时如实上报，不要虚构已转人工。若查询的是实时数据（天气/汇率/股价等），改用 browser_navigate + browser_read 打开权威数据源页面直接读取。` }],
 					details: { query, matched: false },
 				};
 			}
