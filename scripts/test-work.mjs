@@ -370,6 +370,7 @@ test("window prefix: resident tasks forbid DONE and require NEXT_CHECK", () => {
 	const plain = buildWorkWindowPrefix(base);
 	assert.match(resident, /常驻巡检/);
 	assert.match(resident, /禁止输出/);
+	assert.match(resident, /绝不要在正文里写「报告已推群」/);
 	assert.doesNotMatch(plain, /禁止输出/);
 	assert.match(plain, /目标全部完成/);
 });

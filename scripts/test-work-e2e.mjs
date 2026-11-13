@@ -196,7 +196,7 @@ function harness(t) {
 		open: (item, cid) => { history.ensureConversation(cid, `🧭 ${item.title}`); return { abort: () => aborted.push(item.id) }; },
 		send,
 		release: async () => {},
-		push: async (cid, text) => { servicePushes.push({ cid, text }); },
+		push: async (cid, text) => { servicePushes.push({ cid, text }); return { ok: true }; },
 		canLearn: () => true,
 		learn: (item, result) => { learned.push({ item, result }); },
 		budget: { maxTurns: 3, maxMinutes: 30 },
@@ -389,7 +389,7 @@ test("admin pause mid-window: aborts the in-flight send and the final push carri
 		// Window 1 hangs until we resolve the gate — so the pause lands mid-send.
 		send: async (_s, message) => { sends.push({ message }); return gate.promise; },
 		release: async () => {},
-		push: async (cid, text) => { pushes.push({ cid, text }); },
+		push: async (cid, text) => { pushes.push({ cid, text }); return { ok: true }; },
 		canLearn: () => true,
 		learn: () => {},
 		budget: { maxTurns: 3, maxMinutes: 30 },

@@ -1199,12 +1199,9 @@ ${tailForProgress(decision.text)}`;
 			push: (cid, text) => im.pushToConversation(cid, text),
 			log: (level, msg) => console.log(`[work:progress] ${level} ${msg}`),
 		}),
-		// Work-window pushes stay UN-ledgered on purpose: the WorkService push hook
-		// carries no occurrence identity (neither the window start nor the reminder
-		// attempt), and an id minted here (Date.now()) would be a fresh occurrence on
-		// every call — noise in the ledger that dedupes nothing. Giving work windows a
-		// real occurrence is a follow-up that must extend the service's push signature.
-		push: (cid, text) => im.pushToConversation(cid, text),
+		// WorkService owns a distinct window delivery identity; the ledger records
+		// the resolved target and actual result, independently of model narration.
+		push: (cid, text, delivery) => im.pushToConversation(cid, text, delivery),
 		lastInboundAt: (cid, sinceTs) => history.lastInboundAt(cid, sinceTs),
 		canLearn: () => {
 			const kb = config.all().kb;
