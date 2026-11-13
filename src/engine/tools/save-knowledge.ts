@@ -96,7 +96,7 @@ export function createSaveToKnowledgeTool(knowledge: KnowledgeService): AgentToo
 				content: [
 					{
 						type: "text",
-						text: result.merged ? `已合并到已有条目「${title}」。` : `已沉淀新知识条目「${title}」。`,
+						text: (result.merged ? `已合并到已有条目「${title}」。` : `已沉淀新知识条目「${title}」。`) + "这是内部沉淀，不会推送给来源会话；要交付的报告或结论写在窗口收尾正文（最后一条不调用工具的文本）里。",
 					},
 				],
 				details: { saved: true, title, merged: result.merged, id: result.id },
