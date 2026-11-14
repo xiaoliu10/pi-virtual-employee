@@ -473,3 +473,97 @@ test("both channels ship the grip style and a resize cursor", () => {
 	// 独立页的 .wrap 必须能定位抓手
 	assert.ok(/\.wrap\s*\{[^}]*position:relative/.test(page), "独立页 .wrap 必须 position:relative");
 });
+
+/** WCAG 2.1 contrast ratio against #ffffff (handles 3/6-digit hex and opacity). */
+function contrastAgainstWhite(hex, opacity = 1) {
+	const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(hex.trim());
+	assert.ok(m, `unexpected hex color: ${hex}`);
+	const h = m[1].length === 3 ? m[1].split("").map((c) => c + c).join("") : m[1];
+	const ch = [0, 2, 4].map((i) => Number.parseInt(h.slice(i, i + 2), 16));
+	// Alpha-composite over #ffffff before computing relative luminance.
+	const lum = ch
+		.map((v) => (v * opacity + 255 * (1 - opacity)) / 255)
+		.map((s) => (s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4));
+	const L = 0.2126 * lum[0] + 0.7152 * lum[1] + 0.0722 * lum[2];
+	return 1.05 / (L + 0.05);
+}
+
+test("keyboard accessibility (P2): both channels make grip focusable with ARIA and visible focus ring", () => {
+	for (const [label, boot] of [["page", bootPage], ["loader", bootLoader]]) {
+		const env = makeEnv({ width: 1280, height: 900 });
+		const res = boot(env);
+		const panel = res.wrap ?? res.hook.grip.parentNode;
+		const grip = res.hook.grip;
+
+		assert.equal(grip.getAttribute("tabindex"), "0", `${label}: grip must have tabindex="0" so Tab reaches it`);
+		assert.equal(grip.getAttribute("role"), "separator", `${label}: grip must expose separator role`);
+		assert.equal(grip.getAttribute("aria-orientation"), "both", `${label}: grip must declare 2D resize orientation`);
+		assert.ok(grip.getAttribute("aria-label"), `${label}: grip must keep aria-label`);
+
+		// Keyboard arrow resizing changes panel size and persists to localStorage.
+		if (res.hook.setPageSize) res.hook.setPageSize(600, 700);
+		else res.hook.setPanelSize(460, 680);
+		const before = panel.getBoundingClientRect();
+		// Floating panel grows on ArrowLeft/ArrowUp; standalone page grows on ArrowRight/ArrowDown.
+		const keys = label === "loader" ? ["ArrowLeft", "ArrowUp"] : ["ArrowRight", "ArrowDown"];
+		for (const key of keys) {
+			let prevented = false;
+			grip.fire("keydown", { key, preventDefault() { prevented = true; } });
+			assert.equal(prevented, true, `${label}: ${key} should prevent page scroll`);
+		}
+		const after = panel.getBoundingClientRect();
+		assert.ok(after.width > before.width, `${label}: arrow key must widen panel (${before.width} -> ${after.width})`);
+		assert.ok(after.height > before.height, `${label}: arrow key must heighten panel (${before.height} -> ${after.height})`);
+	}
+
+	const page = renderWidgetPage({ title: "t", suggestions: [], disclaimer: "" });
+	const loader = renderWidgetLoader({ icon: "text", iconUrl: "", size: 52 });
+	for (const [label, html] of [["page", page], ["loader", loader]]) {
+		assert.match(html, /\.rzer:focus-visible\s*\{[^}]*outline:/, `${label}: focus-visible outline must be styled`);
+	}
+});
+
+test("affordance & contrast (P1): grip hit target >= 28x28, visual mark >= 12x12, resting contrast >= 3:1", async () => {
+	const postcss = (await import("postcss")).default;
+	const page = renderWidgetPage({ title: "t", suggestions: [], disclaimer: "" });
+	const loader = renderWidgetLoader({ icon: "text", iconUrl: "", size: 52 });
+
+	for (const [label, html] of [["page", page], ["loader", loader]]) {
+		let cssText;
+		if (label === "page") {
+			cssText = html.match(/<style>([\s\S]*?)<\/style>/)?.[1] ?? "";
+		} else {
+			// var css = "<JSON-encoded SHARED_CSS>" + `\n ... \n`;
+			const start = html.indexOf("var css = ") + "var css = ".length;
+			const plusIdx = html.indexOf(" + `", start);
+			const endIdx = html.indexOf("`;\n  var style", plusIdx);
+			assert.ok(plusIdx > start && endIdx > plusIdx, "loader css parts found");
+			try {
+				cssText = JSON.parse(html.slice(start, plusIdx)) + html.slice(plusIdx + 4, endIdx);
+			} catch (err) {
+				assert.fail(`loader css JSON parse failed: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		}
+		assert.ok(cssText, `${label}: extracted CSS`);
+		const rootCss = postcss.parse(cssText);
+
+		let rzerW = 0, rzerH = 0, markW = 0, markH = 0, color = "", opacity = 1;
+		rootCss.walkRules((rule) => {
+			const sel = rule.selector.trim();
+			if (sel === ".rzer") {
+				rule.walkDecls("width", (d) => { rzerW = Number.parseFloat(d.value); });
+				rule.walkDecls("height", (d) => { rzerH = Number.parseFloat(d.value); });
+			}
+			if (sel === ".rzer::after") {
+				rule.walkDecls("width", (d) => { markW = Number.parseFloat(d.value); });
+				rule.walkDecls("height", (d) => { markH = Number.parseFloat(d.value); });
+				rule.walkDecls("border-right", (d) => { color = d.value.split(/\s+/).pop() ?? ""; });
+				rule.walkDecls("opacity", (d) => { opacity = Number.parseFloat(d.value); });
+			}
+		});
+		assert.ok(rzerW >= 28 && rzerH >= 28, `${label}: hit area must be >= 28x28, got ${rzerW}x${rzerH}`);
+		assert.ok(markW >= 12 && markH >= 12, `${label}: visual mark must be >= 12x12, got ${markW}x${markH}`);
+		const ratio = contrastAgainstWhite(color, opacity);
+		assert.ok(ratio >= 3.0, `${label}: resting grip contrast against #fff must be >= 3:1 (got ${ratio.toFixed(2)}:1 for ${color} @ opacity=${opacity})`);
+	}
+});
