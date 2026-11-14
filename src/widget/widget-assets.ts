@@ -78,13 +78,19 @@ input, textarea { font-family: inherit; }
 .step[open] > summary .t-chev, .think[open] > summary .t-chev { opacity:1; }
 .think[open] > summary .t-chev, .step[open] > summary .t-chev { transform:rotate(90deg); }
 /* 思考正文：浅灰虚化（用户要求）——浅灰 + 极轻 blur，读感是「背景过程」而非结论 */
-/* 拖拽调整大小（v0.2.193）：右下角抓手，浮窗与独立页共用 */
-.rzer { position:absolute; right:0; bottom:0; width:22px; height:22px; z-index:3;
+/* 拖拽调整大小（v0.2.193）：右下角抓手，浮窗与独立页共用。
+   P1/P2（2026-11-14 ETC 报障）：28×28 热区 + 双层 ≥12px 角标、常态对比 ≥3:1、焦点环不被 overflow 裁切 */
+.rzer { position:absolute; right:0; bottom:0; width:28px; height:28px; z-index:3;
   cursor:nwse-resize; touch-action:none; user-select:none; -webkit-user-select:none; }
-.rzer::after { content:""; position:absolute; right:5px; bottom:5px; width:9px; height:9px;
-  border-right:2px solid #c9c9cf; border-bottom:2px solid #c9c9cf; border-radius:0 0 3px 0;
-  opacity:.75; transition:opacity .15s ease; }
-.rzer:hover::after { opacity:1; border-color:#8e8e93; }
+.rzer::before { content:""; position:absolute; right:10px; bottom:10px; width:7px; height:7px;
+  border-right:2px solid #76767a; border-bottom:2px solid #76767a; border-radius:0 0 2px 0;
+  opacity:.8; transition:border-color .15s ease, opacity .15s ease; }
+.rzer::after { content:""; position:absolute; right:5px; bottom:5px; width:13px; height:13px;
+  border-right:2px solid #76767a; border-bottom:2px solid #76767a; border-radius:0 0 4px 0;
+  opacity:1; transition:border-color .15s ease, opacity .15s ease; }
+.rzer:hover::before, .rzer:hover::after { opacity:1; border-color:#1f2329; }
+.rzer:focus-visible { outline:2px solid #4c6ef5; outline-offset:-3px; border-radius:4px; }
+.rzer:focus-visible::before, .rzer:focus-visible::after { opacity:1; border-color:#4c6ef5; }
 /* 拖动期间：禁掉选中/文本光标，避免拖出蓝色选区 */
 .ve-resizing, .ve-resizing * { user-select:none !important; -webkit-user-select:none !important;
   cursor:nwse-resize !important; }
@@ -271,8 +277,11 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
     if (saved) setPanelSize(saved.w, saved.h);
     var grip = document.createElement("div");
     grip.className = "rzer";
-    grip.setAttribute("title", "拖动调整大小");
-    grip.setAttribute("aria-label", "拖动调整大小");
+    grip.setAttribute("tabindex", "0");
+    grip.setAttribute("role", "separator");
+    grip.setAttribute("aria-orientation", "both");
+    grip.setAttribute("title", "拖动或聚焦后用方向键调整大小");
+    grip.setAttribute("aria-label", "拖动或聚焦后用方向键调整大小");
     panel.appendChild(grip);
     var start = null;
     function onDown(e) {
@@ -788,8 +797,11 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     if (saved) setPageSize(saved.w, saved.h);
     var grip = document.createElement("div");
     grip.className = "rzer";
-    grip.setAttribute("title", "拖动调整大小");
-    grip.setAttribute("aria-label", "拖动调整大小");
+    grip.setAttribute("tabindex", "0");
+    grip.setAttribute("role", "separator");
+    grip.setAttribute("aria-orientation", "both");
+    grip.setAttribute("title", "拖动或聚焦后用方向键调整大小");
+    grip.setAttribute("aria-label", "拖动或聚焦后用方向键调整大小");
     wrapEl.appendChild(grip);
     var start = null;
     grip.addEventListener("pointerdown", function (e) {
