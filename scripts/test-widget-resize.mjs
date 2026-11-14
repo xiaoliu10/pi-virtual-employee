@@ -197,7 +197,9 @@ class El {
 	getBoundingClientRect() {
 		const w = Number.parseFloat(this.style.width) || 380;
 		const h = Number.parseFloat(this.style.height) || 560;
-		return { width: w, height: h, top: 0, left: 0, right: w, bottom: h };
+		const left = Number.parseFloat(this.style.left) || 0;
+		const top = Number.parseFloat(this.style.top) || 0;
+		return { width: w, height: h, left, top, right: left + w, bottom: top + h };
 	}
 	setPointerCapture() {}
 	releasePointerCapture() {}
@@ -261,6 +263,9 @@ function bootPage(env) {
 	env.body.children = [];
 	const wrap = new El("div");
 	wrap.className = "wrap";
+	const headEl = new El("div");
+	headEl.className = "head";
+	wrap.appendChild(headEl);
 	env.body.appendChild(wrap);
 	env.byId.set("msgs", msgs);
 	env.byId.set("body", bodyEl);
@@ -357,7 +362,7 @@ test("standalone page: a grip exists inside .wrap and dragging grows the panel",
 	assert.equal(grip.parentNode, wrap, "抓手必须在 .wrap 内部才能定位到角上");
 
 	// 初始宽度未知（页面没设内联宽度时会回落到 stub 的 380）
-	hook.setPageSize(600, 700);
+	hook.setPanelSize(600, 700);
 	const before = wrap.getBoundingClientRect();
 	assert.equal(Math.round(before.width), 600);
 	assert.equal(Math.round(before.height), 700);
@@ -374,7 +379,7 @@ test("standalone page: a grip exists inside .wrap and dragging grows the panel",
 test("standalone page: min size is clamped (a panel dragged to nothing is a bug)", () => {
 	const env = makeEnv();
 	const { wrap, hook } = bootPage(env);
-	hook.setPageSize(600, 700);
+	hook.setPanelSize(600, 700);
 	const grip = hook.grip;
 	grip.fire("pointerdown", { clientX: 600, clientY: 700, pointerId: 1, preventDefault() {} });
 	grip.fire("pointermove", { clientX: -5000, clientY: -5000 });
@@ -387,16 +392,16 @@ test("standalone page: min size is clamped (a panel dragged to nothing is a bug)
 test("standalone page: size respects the viewport (never grows off-screen)", () => {
 	const env = makeEnv({ width: 900, height: 700 });
 	const { wrap, hook } = bootPage(env);
-	hook.setPageSize(100000, 100000);
+	hook.setPanelSize(100000, 100000);
 	const r = wrap.getBoundingClientRect();
 	assert.ok(r.width <= 900 - 32 + 1, `宽度必须夹在视口内，实际 ${r.width}`);
-	assert.ok(r.height <= 700 - 24 + 1, `高度必须夹在视口内，实际 ${r.height}`);
+	assert.ok(r.height <= 700 + 1, `高度必须夹在视口内，实际 ${r.height}`);
 });
 
 test("standalone page: the chosen size persists and is re-applied on the next boot", () => {
 	const env = makeEnv();
 	const first = bootPage(env);
-	first.hook.setPageSize(640, 780);
+	first.hook.setPanelSize(640, 780);
 	first.hook.grip.fire("pointerdown", { clientX: 640, clientY: 780, pointerId: 1, preventDefault() {} });
 	first.hook.grip.fire("pointerup", { pointerId: 1 });
 
@@ -421,9 +426,9 @@ test("standalone page: a corrupt stored size never breaks the panel", () => {
 	}
 });
 
-test("floating panel: dragging LEFT/UP grows it (anchored to the bottom-right corner)", () => {
+test("floating panel: the se handle follows the pointer (right/down grows, top-left pinned)", () => {
 	const env = makeEnv();
-	const { host, hook } = bootLoader(env);
+	const { hook } = bootLoader(env);
 	assert.ok(hook, "浮窗通道也必须暴露 resize 钩子");
 	const grip = hook.grip;
 	const panel = grip.parentNode;
@@ -431,13 +436,18 @@ test("floating panel: dragging LEFT/UP grows it (anchored to the bottom-right co
 	hook.setPanelSize(420, 600);
 	const before = panel.getBoundingClientRect();
 	assert.equal(Math.round(before.width), 420);
+	assert.ok(panel.style.left && panel.style.top, "面板必须 left/top 自由定位，不再锚死");
+	assert.equal(panel.style.right, "auto", "锚定 right 必须解除");
+	assert.equal(panel.style.bottom, "auto", "锚定 bottom 必须解除");
 
-	// 锚在右下角：向左上拖 = 变大
+	// 抓 se 角往右下拖 = 变大，且左上边不动（抓手跟鼠标）
 	grip.fire("pointerdown", { clientX: 100, clientY: 100, pointerId: 2, preventDefault() {} });
-	grip.fire("pointermove", { clientX: 40, clientY: 20 });
+	grip.fire("pointermove", { clientX: 160, clientY: 180 });
 	const after = panel.getBoundingClientRect();
-	assert.equal(Math.round(after.width), 480, "向左拖必须变宽");
-	assert.equal(Math.round(after.height), 680, "向上拖必须变高");
+	assert.equal(Math.round(after.width), 480, "向右拖必须变宽");
+	assert.equal(Math.round(after.height), 680, "向下拖必须变高");
+	assert.equal(Math.round(after.left), Math.round(before.left), "se 拖拽左上边必须钉住");
+	assert.equal(Math.round(after.top), Math.round(before.top), "se 拖拽左上边必须钉住");
 	grip.fire("pointerup", { pointerId: 2 });
 });
 
@@ -470,8 +480,16 @@ test("both channels ship the grip style and a resize cursor", () => {
 		assert.ok(/\.rzer\s*\{[^}]*cursor:nwse-resize/.test(html), `${label}: 抓手必须有 nwse-resize 光标`);
 		assert.ok(/\.rzer::after\s*\{[^}]*border-right/.test(html), `${label}: 抓手必须有可见的角标`);
 	}
-	// 独立页的 .wrap 必须能定位抓手
-	assert.ok(/\.wrap\s*\{[^}]*position:relative/.test(page), "独立页 .wrap 必须 position:relative");
+	// 独立页的 .wrap 必须自由定位（absolute），抓手/手柄才能跟鼠标
+	assert.ok(/\.wrap\s*\{[^}]*position:absolute/.test(page), "独立页 .wrap 必须 position:absolute");
+	// 八向手柄的热区与诚实光标必须随包下发
+	for (const [label, rawHtml] of [["page", page], ["loader", loader]]) {
+		// The loader embeds SHARED_CSS JSON-encoded (\" escapes); normalize first.
+		const html = rawHtml.split('\\"').join('"');
+		for (const dir of ["n", "s", "e", "w", "ne", "nw", "sw"]) {
+			assert.ok(new RegExp('\\.rzh\\[data-dir="' + dir + '"\\][^}]*cursor:').test(html), label + ": 手柄 " + dir + " 必须有光标");
+		}
+	}
 });
 
 /** WCAG 2.1 contrast ratio against #ffffff (handles 3/6-digit hex and opacity). */
@@ -501,11 +519,11 @@ test("keyboard accessibility (P2): both channels make grip focusable with ARIA a
 		assert.ok(grip.getAttribute("aria-label"), `${label}: grip must keep aria-label`);
 
 		// Keyboard arrow resizing changes panel size and persists to localStorage.
-		if (res.hook.setPageSize) res.hook.setPageSize(600, 700);
+		if (res.hook.setPanelSize) res.hook.setPanelSize(600, 700);
 		else res.hook.setPanelSize(460, 680);
 		const before = panel.getBoundingClientRect();
-		// Floating panel grows on ArrowLeft/ArrowUp; standalone page grows on ArrowRight/ArrowDown.
-		const keys = label === "loader" ? ["ArrowLeft", "ArrowUp"] : ["ArrowRight", "ArrowDown"];
+		// Unified (2026-11-14 free windowing): right/down grows on BOTH channels.
+		const keys = ["ArrowRight", "ArrowDown"];
 		for (const key of keys) {
 			let prevented = false;
 			grip.fire("keydown", { key, preventDefault() { prevented = true; } });
@@ -565,5 +583,86 @@ test("affordance & contrast (P1): grip hit target >= 28x28, visual mark >= 12x12
 		assert.ok(markW >= 12 && markH >= 12, `${label}: visual mark must be >= 12x12, got ${markW}x${markH}`);
 		const ratio = contrastAgainstWhite(color, opacity);
 		assert.ok(ratio >= 3.0, `${label}: resting grip contrast against #fff must be >= 3:1 (got ${ratio.toFixed(2)}:1 for ${color} @ opacity=${opacity})`);
+	}
+});
+
+test("floating panel: title-bar drag moves the whole window and persists position", () => {
+	const env = makeEnv();
+	const { hook } = bootLoader(env);
+	const panel = hook.grip.parentNode;
+	const head = panel.querySelector(".head");
+	assert.ok(head, "panel must have a title bar");
+	assert.equal(head.getAttribute("tabindex"), "0", "head must be keyboard-reachable");
+	hook.setPos(300, 300); // 先放到视口中间，避免夹取干扰位移断言
+	const before = panel.getBoundingClientRect();
+	head.fire("pointerdown", { target: head, clientX: 500, clientY: 500, pointerId: 7, preventDefault() {} });
+	head.fire("pointermove", { clientX: 560, clientY: 540 });
+	const after = panel.getBoundingClientRect();
+	assert.equal(Math.round(after.left), Math.round(before.left) + 60, "整窗必须横向跟鼠标");
+	assert.equal(Math.round(after.top), Math.round(before.top) + 40, "整窗必须纵向跟鼠标");
+	head.fire("pointerup", { pointerId: 7 });
+	const saved = JSON.parse(env.store.get("ve-widget-pos"));
+	assert.equal(saved.x, Math.round(after.left), "位置必须落盘");
+	assert.equal(saved.y, Math.round(after.top));
+	const second = bootLoader(env);
+	const r2 = second.hook.grip.parentNode.getBoundingClientRect();
+	assert.equal(Math.round(r2.left), saved.x, "重开必须恢复位置");
+	assert.equal(Math.round(r2.top), saved.y);
+});
+
+test("floating panel: pressing the close button never starts a move drag", () => {
+	const env = makeEnv();
+	const { hook } = bootLoader(env);
+	const panel = hook.grip.parentNode;
+	const head = panel.querySelector(".head");
+	const btn = head.querySelector("button");
+	assert.ok(btn, "stub head must carry the close button");
+	const before = panel.getBoundingClientRect();
+	head.fire("pointerdown", { target: btn, clientX: 500, clientY: 500, pointerId: 8, preventDefault() {} });
+	head.fire("pointermove", { clientX: 560, clientY: 540 });
+	const after = panel.getBoundingClientRect();
+	assert.equal(Math.round(after.left), Math.round(before.left), "按关闭按钮不得拖动窗口");
+	head.fire("pointerup", { pointerId: 8 });
+});
+
+test("both channels: eight resize handles; the nw handle tracks the pointer", () => {
+	for (const [label, boot] of [["page", bootPage], ["loader", bootLoader]]) {
+		const env = makeEnv();
+		const res = boot(env);
+		const hook = res.hook;
+		const target = label === "page" ? res.wrap : hook.grip.parentNode;
+		for (const dir of ["n", "s", "e", "w", "ne", "nw", "se", "sw"]) {
+			assert.ok(hook.handles && hook.handles[dir], label + ": 手柄 " + dir + " 必须存在");
+		}
+		hook.setPanelSize(600, 700);
+		const before = target.getBoundingClientRect();
+		const nw = hook.handles.nw;
+		nw.fire("pointerdown", { clientX: 300, clientY: 300, pointerId: 9, preventDefault() {} });
+		nw.fire("pointermove", { clientX: 340, clientY: 330 });
+		const after = target.getBoundingClientRect();
+		assert.equal(Math.round(after.left), Math.round(before.left) + 40, label + ": nw 拖拽左边必须跟鼠标");
+		assert.equal(Math.round(after.top), Math.round(before.top) + 30, label + ": nw 拖拽顶边必须跟鼠标");
+		assert.equal(Math.round(after.width), Math.round(before.width) - 40, label + ": nw 拖拽必须变窄");
+		assert.equal(Math.round(after.height), Math.round(before.height) - 30, label + ": nw 拖拽必须变矮");
+		nw.fire("pointerup", { pointerId: 9 });
+	}
+});
+
+test("both channels: head arrow keys move the window; corrupt stored position never breaks boot", () => {
+	for (const [label, boot] of [["page", bootPage], ["loader", bootLoader]]) {
+		const env = makeEnv();
+		const res = boot(env);
+		const target = label === "page" ? res.wrap : res.hook.grip.parentNode;
+		const head = target.querySelector(".head");
+		assert.ok(head, label + ": head must exist");
+		const before = target.getBoundingClientRect();
+		head.fire("keydown", { key: "ArrowRight", preventDefault() {} });
+		const after = target.getBoundingClientRect();
+		assert.equal(Math.round(after.left), Math.round(before.left) + 24, label + ": ArrowRight 必须移动窗口");
+	}
+	for (const bad of ["not-json", "{}", '{"x":"a"}', "[]"]) {
+		const env = makeEnv();
+		env.store.set("ve-widget-pos", bad);
+		assert.doesNotThrow(() => bootLoader(env), "损坏位置 " + bad + " 不得抛错");
 	}
 });

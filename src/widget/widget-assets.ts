@@ -94,12 +94,213 @@ input, textarea { font-family: inherit; }
 /* 拖动期间：禁掉选中/文本光标，避免拖出蓝色选区 */
 .ve-resizing, .ve-resizing * { user-select:none !important; -webkit-user-select:none !important;
   cursor:nwse-resize !important; }
+.ve-moving, .ve-moving * { user-select:none !important; -webkit-user-select:none !important;
+  cursor:grabbing !important; }
+/* 八向缩放手柄（2026-11-14）：抓哪条边/哪个角，哪条边就跟鼠标走；只有 se 角
+   保留可见折角（视觉语言裁定），其余七向是无命中区但光标诚实的热区。 */
+.rzh { position:absolute; z-index:3; }
+.rzh[data-dir="n"] { left:10px; right:10px; top:0; height:8px; cursor:ns-resize; }
+.rzh[data-dir="s"] { left:10px; right:10px; bottom:0; height:8px; cursor:ns-resize; }
+.rzh[data-dir="e"] { top:10px; bottom:10px; right:0; width:8px; cursor:ew-resize; }
+.rzh[data-dir="w"] { top:10px; bottom:10px; left:0; width:8px; cursor:ew-resize; }
+.rzh[data-dir="ne"] { top:0; right:0; width:16px; height:16px; cursor:nesw-resize; }
+.rzh[data-dir="nw"] { top:0; left:0; width:16px; height:16px; cursor:nwse-resize; }
+.rzh[data-dir="sw"] { bottom:0; left:0; width:16px; height:16px; cursor:nesw-resize; }
+/* 标题栏 = 移动把手（按住整窗跟鼠标） */
+.head { cursor:grab; user-select:none; -webkit-user-select:none; touch-action:none; }
+.head:active { cursor:grabbing; }
+.head:focus-visible { outline:2px solid #4c6ef5; outline-offset:-2px; }
 .think-b { margin:0 0 10px; padding:2px 2px 2px 14px; border-left:1px solid #f0f0f2;
   font-size:13px; line-height:1.65; color:#a9a9ae; filter:blur(.3px); white-space:pre-wrap; word-break:break-word;
   max-height:240px; overflow-y:auto; }
 .msg.streaming::after { content:"▍"; color:#4f6ef7; animation:ve-blink 1s step-start infinite; }
 @keyframes ve-blink { 50% { opacity:0; } }
 `;
+
+/**
+ * Free windowing for both widget channels (2026-11-14 user ruling: "the panel
+ * is anchored dead at the bottom-right and the grip does not follow the
+ * mouse"). Replaces the v0.2.193 bottom-right-anchored resize:
+ *   - the panel/wrap is positioned by left/top (right/bottom:auto) — NOTHING
+ *     stays pinned to the viewport;
+ *   - holding the TITLE BAR moves the whole window with the pointer;
+ *   - EIGHT resize handles (4 edges + 4 corners); the grabbed edge/corner
+ *     tracks the pointer (the opposite edge stays put while clamped);
+ *   - only the se corner keeps the visible chevron (visual language ruling);
+ *     the other seven are invisible hit zones with honest cursors;
+ *   - size AND position persist in localStorage and are re-applied (clamped)
+ *     on boot and on viewport resize.
+ * Embedded into both channel scripts; plain ES5-ish, no backticks/${} inside.
+ */
+const WINDOWING_JS = [
+"function initWindowing(target, opts) {",
+"  if (!target) return;",
+"  var MIN_W = opts.minW || 380, MIN_H = opts.minH || 420;",
+"  var maxHGap = opts.maxHGap == null ? 130 : opts.maxHGap;",
+"  function clampNum(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }",
+"  function vw() { return window.innerWidth || 1280; }",
+"  function vh() { return window.innerHeight || 800; }",
+"  function limits() { return { maxW: Math.max(MIN_W, vw() - 32), maxH: Math.max(MIN_H, vh() - maxHGap) }; }",
+"  function readJSON(key) {",
+"    try {",
+"      if (!window.localStorage) return null;",
+"      var raw = window.localStorage.getItem(key);",
+"      if (!raw) return null;",
+"      var o = JSON.parse(raw);",
+"      return o && typeof o === \"object\" ? o : null;",
+"    } catch (e) { return null; }",
+"  }",
+"  function writeJSON(key, o) {",
+"    try { if (window.localStorage) window.localStorage.setItem(key, JSON.stringify(o)); } catch (e) {}",
+"  }",
+"  function rect() { return target.getBoundingClientRect(); }",
+"  function setSize(w, h) {",
+"    var lim = limits();",
+"    target.style.width = clampNum(w, MIN_W, lim.maxW) + \"px\";",
+"    target.style.height = clampNum(h, MIN_H, lim.maxH) + \"px\";",
+"  }",
+"  function setPos(x, y) {",
+"    var r = rect();",
+"    target.style.right = \"auto\";",
+"    target.style.bottom = \"auto\";",
+"    target.style.left = Math.round(clampNum(x, 0, Math.max(0, vw() - r.width))) + \"px\";",
+"    target.style.top = Math.round(clampNum(y, 0, Math.max(0, vh() - r.height))) + \"px\";",
+"  }",
+"  function save() {",
+"    var r = rect();",
+"    writeJSON(opts.sizeKey, { w: Math.round(r.width), h: Math.round(r.height) });",
+"    writeJSON(opts.posKey, { x: Math.round(r.left), y: Math.round(r.top) });",
+"  }",
+"  var ss = readJSON(opts.sizeKey);",
+"  if (ss && isFinite(ss.w) && isFinite(ss.h)) setSize(ss.w, ss.h);",
+"  var sp = readJSON(opts.posKey);",
+"  if (sp && isFinite(sp.x) && isFinite(sp.y)) setPos(sp.x, sp.y);",
+"  else if (opts.anchored) setPos(vw() - (opts.gapRight || 24) - rect().width, vh() - (opts.gapBottom || 92) - rect().height);",
+"  else setPos(Math.max(0, (vw() - rect().width) / 2), 0);",
+"  var head = target.querySelector(\".head\");",
+"  if (head) {",
+"    head.setAttribute(\"tabindex\", \"0\");",
+"    head.setAttribute(\"title\", \"拖动或用方向键移动面板\");",
+"    head.setAttribute(\"aria-label\", \"拖动或用方向键移动面板\");",
+"    var mst = null;",
+"    head.addEventListener(\"pointerdown\", function (e) {",
+"      var t = e.target;",
+"      if (t && (t.tagName === \"BUTTON\" || (t.closest && t.closest(\"button\")))) return;",
+"      var r = rect();",
+"      mst = { x: e.clientX, y: e.clientY, left: r.left, top: r.top };",
+"      if (document.documentElement && document.documentElement.classList) document.documentElement.classList.add(\"ve-moving\");",
+"      if (head.setPointerCapture && e.pointerId != null) { try { head.setPointerCapture(e.pointerId); } catch (err) {} }",
+"      if (e.preventDefault) e.preventDefault();",
+"    });",
+"    head.addEventListener(\"pointermove\", function (e) {",
+"      if (!mst) return;",
+"      setPos(mst.left + (e.clientX - mst.x), mst.top + (e.clientY - mst.y));",
+"    });",
+"    function moveEnd(e) {",
+"      if (!mst) return;",
+"      mst = null;",
+"      save();",
+"      if (document.documentElement && document.documentElement.classList) document.documentElement.classList.remove(\"ve-moving\");",
+"      if (head.releasePointerCapture && e && e.pointerId != null) { try { head.releasePointerCapture(e.pointerId); } catch (err) {} }",
+"    }",
+"    head.addEventListener(\"pointerup\", moveEnd);",
+"    head.addEventListener(\"pointercancel\", moveEnd);",
+"    head.addEventListener(\"keydown\", function (e) {",
+"      var dx = e.key === \"ArrowRight\" ? 24 : e.key === \"ArrowLeft\" ? -24 : 0;",
+"      var dy = e.key === \"ArrowDown\" ? 24 : e.key === \"ArrowUp\" ? -24 : 0;",
+"      if (!dx && !dy) return;",
+"      var r = rect();",
+"      setPos(r.left + dx, r.top + dy);",
+"      save();",
+"      if (e.preventDefault) e.preventDefault();",
+"    });",
+"  }",
+"  var DIRS = [\"n\", \"s\", \"e\", \"w\", \"ne\", \"nw\", \"se\", \"sw\"];",
+"  var grip = null;",
+"  var handles = {};",
+"  DIRS.forEach(function (dir) {",
+"    var hEl = document.createElement(\"div\");",
+"    var isSe = dir === \"se\";",
+"    hEl.className = isSe ? \"rzer\" : \"rzh\";",
+"    hEl.setAttribute(\"data-dir\", dir);",
+"    if (isSe) {",
+"      grip = hEl;",
+"      hEl.setAttribute(\"tabindex\", \"0\");",
+"      hEl.setAttribute(\"role\", \"separator\");",
+"      hEl.setAttribute(\"aria-orientation\", \"both\");",
+"      hEl.setAttribute(\"title\", \"拖动或聚焦后用方向键调整大小\");",
+"      hEl.setAttribute(\"aria-label\", \"拖动或聚焦后用方向键调整大小\");",
+"    } else {",
+"      hEl.setAttribute(\"aria-hidden\", \"true\");",
+"    }",
+"    target.appendChild(hEl);",
+"    handles[dir] = hEl;",
+"    var st = null;",
+"    hEl.addEventListener(\"pointerdown\", function (e) {",
+"      var r = rect();",
+"      st = { x: e.clientX, y: e.clientY, left: r.left, top: r.top, w: r.width, h: r.height };",
+"      if (document.documentElement && document.documentElement.classList) document.documentElement.classList.add(\"ve-resizing\");",
+"      if (hEl.setPointerCapture && e.pointerId != null) { try { hEl.setPointerCapture(e.pointerId); } catch (err) {} }",
+"      if (e.preventDefault) e.preventDefault();",
+"    });",
+"    hEl.addEventListener(\"pointermove\", function (e) {",
+"      if (!st) return;",
+"      var dx = e.clientX - st.x, dy = e.clientY - st.y;",
+"      var L = st.left, T = st.top, R = st.left + st.w, B = st.top + st.h;",
+"      if (dir.indexOf(\"e\") >= 0) R = R + dx;",
+"      if (dir.indexOf(\"s\") >= 0) B = B + dy;",
+"      if (dir.indexOf(\"w\") >= 0) L = L + dx;",
+"      if (dir.indexOf(\"n\") >= 0) T = T + dy;",
+"      var lim = limits();",
+"      var w = clampNum(R - L, MIN_W, lim.maxW);",
+"      var h = clampNum(B - T, MIN_H, lim.maxH);",
+"      if (dir.indexOf(\"w\") >= 0) L = st.left + st.w - w; else L = st.left;",
+"      if (dir.indexOf(\"n\") >= 0) T = st.top + st.h - h; else T = st.top;",
+"      target.style.width = w + \"px\";",
+"      target.style.height = h + \"px\";",
+"      target.style.right = \"auto\";",
+"      target.style.bottom = \"auto\";",
+"      target.style.left = Math.round(L) + \"px\";",
+"      target.style.top = Math.round(T) + \"px\";",
+"    });",
+"    function end(e) {",
+"      if (!st) return;",
+"      st = null;",
+"      save();",
+"      if (document.documentElement && document.documentElement.classList) document.documentElement.classList.remove(\"ve-resizing\");",
+"      if (hEl.releasePointerCapture && e && e.pointerId != null) { try { hEl.releasePointerCapture(e.pointerId); } catch (err) {} }",
+"    }",
+"    hEl.addEventListener(\"pointerup\", end);",
+"    hEl.addEventListener(\"pointercancel\", end);",
+"  });",
+"  grip.addEventListener(\"keydown\", function (e) {",
+"    var dw = e.key === \"ArrowRight\" ? 24 : e.key === \"ArrowLeft\" ? -24 : 0;",
+"    var dh = e.key === \"ArrowDown\" ? 24 : e.key === \"ArrowUp\" ? -24 : 0;",
+"    if (!dw && !dh) return;",
+"    var r = rect();",
+"    setSize(r.width + dw, r.height + dh);",
+"    save();",
+"    if (e.preventDefault) e.preventDefault();",
+"  });",
+"  window.addEventListener(\"resize\", function () {",
+"    var r = rect();",
+"    if (!r || !r.width) return;",
+"    setSize(r.width, r.height);",
+"    setPos(r.left, r.top);",
+"  });",
+"  window.__veWidgetResize = {",
+"    grip: grip,",
+"    handles: handles,",
+"    setPanelSize: setSize,",
+"    setSize: setSize,",
+"    setPos: setPos,",
+"    readSize: function () { return readJSON(opts.sizeKey); },",
+"    readPos: function () { return readJSON(opts.posKey); },",
+"  };",
+"}",
+].join("\n");
+
+
 
 /**
  * The embeddable loader. Usage on the business system's page:
@@ -137,7 +338,10 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
   var state = { open: false, busy: false, cfg: null, messages: [] };
 
   var host = document.createElement("div");
-  host.style.cssText = "position:fixed;right:0;bottom:0;z-index:2147483000;width:0;height:0;";
+  // Full-viewport layer (2026-11-14): the panel is positioned by left/top in
+  // VIEWPORT coordinates, so the host can no longer be a zero-size point at
+  // the bottom-right corner. Children re-enable pointer events.
+  host.style.cssText = "position:fixed;left:0;top:0;width:100%;height:100%;z-index:2147483000;pointer-events:none;";
   var root = host.attachShadow ? host.attachShadow({ mode: "open" }) : host;
   document.body.appendChild(host);
 
@@ -149,6 +353,7 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
   .launcher:hover { transform:scale(1.06); box-shadow:0 8px 26px rgba(79,110,247,.5); }
   .launcher img { width:100%; height:100%; object-fit:cover; border-radius:50%; display:block; }
   .launcher svg { display:block; }
+  .panel,.launcher { pointer-events:auto; }
   .panel { position:absolute; right:24px; bottom:92px; width:460px; max-width:calc(100vw - 32px);
     height:680px; max-height:calc(100vh - 130px); background:#fff; border-radius:14px;
     box-shadow:0 12px 48px rgba(0,0,0,.18); display:flex; flex-direction:column; overflow:hidden;
@@ -237,99 +442,10 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
 
   function q(sel) { return panel.querySelector(sel); }
 
-  /* ── 可拖拽调整大小（v0.2.193，用户：对话框太小，要能拖大拖小）─────────
-     面板锚在右下角，所以抓右下角往左上拖 = 变大。尺寸存 localStorage，
-     刷新/重开都保留；视口缩小时按上限夹取，绝不留下够不着的面板。 */
-  var SIZE_KEY = "ve-widget-size";
-  var MIN_W = 380, MIN_H = 420;
-  function clampNum(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
-  function panelLimits() {
-    // 与 CSS 的 max-width/max-height 保持同一口径，避免 CSS 把内联高度截短
-    return {
-      maxW: Math.max(MIN_W, (window.innerWidth || 1280) - 32),
-      maxH: Math.max(MIN_H, (window.innerHeight || 800) - 130)
-    };
-  }
-  function setPanelSize(w, h) {
-    var lim = panelLimits();
-    panel.style.width = clampNum(w, MIN_W, lim.maxW) + "px";
-    panel.style.height = clampNum(h, MIN_H, lim.maxH) + "px";
-  }
-  function readSize() {
-    try {
-      if (!window.localStorage) return null;
-      var raw = window.localStorage.getItem(SIZE_KEY);
-      if (!raw) return null;
-      var o = JSON.parse(raw);
-      if (!o || typeof o.w !== "number" || typeof o.h !== "number") return null;
-      if (!isFinite(o.w) || !isFinite(o.h)) return null;
-      return o;
-    } catch (e) { return null; }
-  }
-  function writeSize(w, h) {
-    try {
-      if (window.localStorage) window.localStorage.setItem(SIZE_KEY, JSON.stringify({ w: Math.round(w), h: Math.round(h) }));
-    } catch (e) { /* 隐私模式/localStorage 关闭：只是不记忆，不影响拖拽 */ }
-  }
-  function initResize() {
-    var saved = readSize();
-    // 打开时先套用记忆尺寸（视口兜底），再做一次窗口适配
-    if (saved) setPanelSize(saved.w, saved.h);
-    var grip = document.createElement("div");
-    grip.className = "rzer";
-    grip.setAttribute("tabindex", "0");
-    grip.setAttribute("role", "separator");
-    grip.setAttribute("aria-orientation", "both");
-    grip.setAttribute("title", "拖动或聚焦后用方向键调整大小");
-    grip.setAttribute("aria-label", "拖动或聚焦后用方向键调整大小");
-    panel.appendChild(grip);
-    var start = null;
-    function onDown(e) {
-      var r = panel.getBoundingClientRect();
-      start = { x: e.clientX, y: e.clientY, w: r.width, h: r.height };
-      document.documentElement.classList.add("ve-resizing") || document.body.classList.add("ve-resizing");
-      if (grip.setPointerCapture && e.pointerId != null) { try { grip.setPointerCapture(e.pointerId); } catch (err) {} }
-      if (e.preventDefault) e.preventDefault();
-    }
-    function onMove(e) {
-      if (!start) return;
-      // 锚在右下角：向左上拖为正增长
-      setPanelSize(start.w + (start.x - e.clientX), start.h + (start.y - e.clientY));
-    }
-    function onUp(e) {
-      if (!start) return;
-      start = null;
-      var r = panel.getBoundingClientRect();
-      writeSize(r.width, r.height);
-      var root2 = document.documentElement;
-      if (root2 && root2.classList) root2.classList.remove("ve-resizing");
-      if (document.body && document.body.classList) document.body.classList.remove("ve-resizing");
-      if (grip.releasePointerCapture && e && e.pointerId != null) { try { grip.releasePointerCapture(e.pointerId); } catch (err) {} }
-    }
-    grip.addEventListener("pointerdown", onDown);
-    grip.addEventListener("pointermove", onMove);
-    grip.addEventListener("pointerup", onUp);
-    grip.addEventListener("pointercancel", onUp);
-    // 键盘可达：方向键微调，给不方便拖鼠标的场景留一条路
-    grip.addEventListener("keydown", function (e) {
-      var r = panel.getBoundingClientRect();
-      var dx = e.key === "ArrowLeft" ? 24 : e.key === "ArrowRight" ? -24 : 0;
-      var dy = e.key === "ArrowUp" ? 24 : e.key === "ArrowDown" ? -24 : 0;
-      if (!dx && !dy) return;
-      setPanelSize(r.width + dx, r.height + dy);
-      var r2 = panel.getBoundingClientRect();
-      writeSize(r2.width, r2.height);
-      if (e.preventDefault) e.preventDefault();
-    });
-    // 视口变化：按新上限夹取，别把记忆尺寸撑出屏幕
-    window.addEventListener("resize", function () {
-      var cur = panel.getBoundingClientRect();
-      if (!cur || !cur.width) return;
-      setPanelSize(cur.width, cur.height);
-    });
-    window.__veWidgetResize = { grip: grip, setPanelSize: setPanelSize, readSize: readSize };
-  }
-  initResize();
+  ${WINDOWING_JS}
+  // Floating channel: remember size+position; first open keeps the classic
+  // bottom-right LOOK (computed, not anchored) so nothing jumps for users.
+  initWindowing(panel, { sizeKey: "ve-widget-size", posKey: "ve-widget-pos", anchored: true, gapRight: 24, gapBottom: 92, maxHGap: 130, minW: 380, minH: 420 });
   function body() { return q(".body"); }
   function msgs() { return q(".msgs"); }
   function scrollEnd() { body().scrollTop = body().scrollHeight; }
@@ -706,8 +822,8 @@ export function renderWidgetPage(): string {
 <style>
 ${SHARED_CSS}
 body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; background:#f7f8fa;
-  display:flex; justify-content:center; }
-.wrap { position:relative; width:100%; max-width:880px; display:flex; flex-direction:column; height:100vh; background:#fff; }
+  display:flex; justify-content:center; position:relative; }
+.wrap { position:absolute; left:0; top:0; width:100%; max-width:880px; display:flex; flex-direction:column; height:100vh; background:#fff; }
 .head { padding:16px 20px; border-bottom:1px solid #eef0f4; font-size:16px; font-weight:600; color:#1f2329; flex-shrink:0; }
 .body { flex:1; overflow-y:auto; padding:20px; }
 .hero { font-size:24px; font-weight:700; color:#1f2329; margin-bottom:16px; }
@@ -762,91 +878,11 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
   function el(id) { return document.getElementById(id); }
   function scrollEnd() { var b = el("body"); b.scrollTop = b.scrollHeight; }
 
-  /* ── 可拖拽调整大小（v0.2.193）：与浮窗同一语义，抓右下角拖宽/拖高 ── */
-  var SIZE_KEY = "ve-widget-page-size";
-  var MIN_W = 420, MIN_H = 480;
   var wrapEl = document.querySelector(".wrap");
-  function clampNum(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
-  function pageLimits() {
-    return {
-      maxW: Math.max(MIN_W, (window.innerWidth || 1280) - 32),
-      maxH: Math.max(MIN_H, (window.innerHeight || 800) - 24)
-    };
-  }
-  function setPageSize(w, h) {
-    if (!wrapEl) return;
-    var lim = pageLimits();
-    wrapEl.style.maxWidth = "none";           // 默认 max-width:720 会让「拖宽」无效
-    wrapEl.style.width = clampNum(w, MIN_W, lim.maxW) + "px";
-    wrapEl.style.height = clampNum(h, MIN_H, lim.maxH) + "px";
-  }
-  function readSize() {
-    try {
-      if (!window.localStorage) return null;
-      var raw = window.localStorage.getItem(SIZE_KEY);
-      if (!raw) return null;
-      var o = JSON.parse(raw);
-      if (!o || typeof o.w !== "number" || typeof o.h !== "number") return null;
-      if (!isFinite(o.w) || !isFinite(o.h)) return null;
-      return o;
-    } catch (e) { return null; }
-  }
-  function writeSize(w, h) {
-    try {
-      if (window.localStorage) window.localStorage.setItem(SIZE_KEY, JSON.stringify({ w: Math.round(w), h: Math.round(h) }));
-    } catch (e) {}
-  }
-  (function initResize() {
-    if (!wrapEl) return;
-    var saved = readSize();
-    if (saved) setPageSize(saved.w, saved.h);
-    var grip = document.createElement("div");
-    grip.className = "rzer";
-    grip.setAttribute("tabindex", "0");
-    grip.setAttribute("role", "separator");
-    grip.setAttribute("aria-orientation", "both");
-    grip.setAttribute("title", "拖动或聚焦后用方向键调整大小");
-    grip.setAttribute("aria-label", "拖动或聚焦后用方向键调整大小");
-    wrapEl.appendChild(grip);
-    var start = null;
-    grip.addEventListener("pointerdown", function (e) {
-      var r = wrapEl.getBoundingClientRect();
-      start = { x: e.clientX, y: e.clientY, w: r.width, h: r.height };
-      if (document.body && document.body.classList) document.body.classList.add("ve-resizing");
-      if (grip.setPointerCapture && e.pointerId != null) { try { grip.setPointerCapture(e.pointerId); } catch (err) {} }
-      if (e.preventDefault) e.preventDefault();
-    });
-    grip.addEventListener("pointermove", function (e) {
-      if (!start) return;
-      setPageSize(start.w + (e.clientX - start.x), start.h + (e.clientY - start.y));
-    });
-    function end(e) {
-      if (!start) return;
-      start = null;
-      var r = wrapEl.getBoundingClientRect();
-      writeSize(r.width, r.height);
-      if (document.body && document.body.classList) document.body.classList.remove("ve-resizing");
-      if (grip.releasePointerCapture && e && e.pointerId != null) { try { grip.releasePointerCapture(e.pointerId); } catch (err) {} }
-    }
-    grip.addEventListener("pointerup", end);
-    grip.addEventListener("pointercancel", end);
-    grip.addEventListener("keydown", function (e) {
-      var r = wrapEl.getBoundingClientRect();
-      var dx = e.key === "ArrowRight" ? 24 : e.key === "ArrowLeft" ? -24 : 0;
-      var dy = e.key === "ArrowDown" ? 24 : e.key === "ArrowUp" ? -24 : 0;
-      if (!dx && !dy) return;
-      setPageSize(r.width + dx, r.height + dy);
-      var r2 = wrapEl.getBoundingClientRect();
-      writeSize(r2.width, r2.height);
-      if (e.preventDefault) e.preventDefault();
-    });
-    window.addEventListener("resize", function () {
-      var cur = wrapEl.getBoundingClientRect();
-      if (!cur || !cur.width) return;
-      setPageSize(cur.width, cur.height);
-    });
-    window.__veWidgetResize = { grip: grip, setPageSize: setPageSize, readSize: readSize };
-  })();
+  ${WINDOWING_JS}
+  // Standalone page: same free windowing; the column starts centered and can
+  // be moved/resized like the floating panel (full viewport height allowed).
+  if (wrapEl) initWindowing(wrapEl, { sizeKey: "ve-widget-page-size", posKey: "ve-widget-page-pos", anchored: false, maxHGap: 0, minW: 420, minH: 480 });
   function add(cls, text) {
     var d = document.createElement("div");
     d.className = "msg " + cls; d.textContent = text;

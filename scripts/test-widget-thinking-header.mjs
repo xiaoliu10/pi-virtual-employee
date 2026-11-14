@@ -55,14 +55,14 @@ test("the standalone page opens wider than the old 720px cap", () => {
 });
 
 test("drag floors were raised so the header always fits", () => {
-	// Two separate constants: popup (SIZE_KEY) and standalone page.
-	const popup = /var MIN_W = (\d+), MIN_H = (\d+);\n  var wrapEl = document.querySelector\("\.page/.test(src)
-		? null : /var MIN_W = (\d+), MIN_H = (\d+);/.exec(src);
+	// Free windowing (2026-11-14): the per-channel floors ride in the
+	// initWindowing options instead of module-level constants.
+	const popup = /initWindowing\(panel, \{[^}]*minW: (\d+), minH: (\d+)/.exec(src);
 	assert.ok(popup, "popup minimums must exist");
 	assert.ok(Number(popup[1]) >= 380, `popup min width ${popup[1]} must fit the header`);
 	assert.ok(Number(popup[2]) >= 420, `popup min height ${popup[2]}`);
 
-	const pageMin = /var MIN_W = (\d+), MIN_H = (\d+);\n  var wrapEl/.exec(src);
+	const pageMin = /initWindowing\(wrapEl, \{[^}]*minW: (\d+), minH: (\d+)/.exec(src);
 	assert.ok(pageMin, "page minimums must exist");
 	assert.ok(Number(pageMin[1]) >= 420, `page min width ${pageMin[1]}`);
 	assert.ok(Number(pageMin[2]) >= 480, `page min height ${pageMin[2]}`);
