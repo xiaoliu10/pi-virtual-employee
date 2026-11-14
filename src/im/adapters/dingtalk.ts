@@ -311,11 +311,20 @@ export class DingtalkAdapter implements IMAdapter {
 			// while the (slow) model call runs.
 			client.socketCallBackResponse(res.headers.messageId, {});
 			this.lastInboundAt = Date.now();
+			// Field 2026-11-14 (a group message vanished with ZERO log lines): the
+			// two silent returns below made ingress losses unattributable — no way
+			// to tell "DingTalk never pushed it" from "we dropped it here". Log
+			// arrival once per callback so the next loss is decidable: arrival line
+			// + drop warn = dropped in this process; no arrival line = the callback
+			// never reached us (stream gap).
+			const cbId = res.headers.messageId ?? "?";
+			console.log(`[im:dingtalk] inbound callback messageId=${cbId}`);
 
 			let msg: AnyRobotMsg;
 			try {
 				msg = JSON.parse(res.data) as AnyRobotMsg;
 			} catch {
+				console.warn(`[im:dingtalk] inbound DROPPED: payload unparsable messageId=${cbId}`);
 				return;
 			}
 
@@ -359,7 +368,12 @@ export class DingtalkAdapter implements IMAdapter {
 				}
 			}
 			const hasImage = !!images?.length;
-			if (!text && !hasImage && !fileNote) return;
+			if (!text && !hasImage && !fileNote) {
+				console.warn(
+					`[im:dingtalk] inbound DROPPED: empty text/image/file messageId=${cbId} msgtype=${msg.msgtype ?? "?"} rawLen=${rawContent.length}`,
+				);
+				return;
+			}
 			const promptText = [text || (hasImage ? "（用户发来一张图片，请查看图片内容并按需要回应）" : ""), fileNote]
 				.filter(Boolean)
 				.join("\n\n");
