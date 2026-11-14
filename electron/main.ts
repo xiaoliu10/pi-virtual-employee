@@ -1646,10 +1646,48 @@ ${tailForProgress(decision.text)}`;
 		}
 	};
 	void startWidget();
+
+	// ACP transport (2026-11): external ACP clients (Synapse) drive this
+	// employee over a fixed loopback port + Bearer token. Separate listener
+	// from the console's random-port transport; config-gated, restart to apply.
+	let acpServer: Server | undefined;
+	const startAcp = async (): Promise<void> => {
+		const a = config.all().acp;
+		if (!a.enabled) return;
+		if (!a.token.trim()) {
+			console.warn("[acp] enabled but token is empty — NOT starting (open relay guard)");
+			return;
+		}
+		try {
+			const { startAcpTransport } = await import("../src/acp/server.js");
+			const started = await startAcpTransport(engine, {
+				port: a.port,
+				token: a.token,
+				actorStaffId: a.actorStaffId,
+				actorName: a.actorName,
+				profileId: activeProfile,
+				appVersion: app.getVersion(),
+			});
+			acpServer = started.server;
+			if (started.port !== a.port) {
+				config.update({ acp: { port: started.port } });
+				console.warn(`[acp] port ${a.port} busy → bound ${started.port} and persisted it`);
+			}
+			console.log(`[acp] transport on 127.0.0.1:${started.port} (actor=${a.actorStaffId})`);
+		} catch (err) {
+			console.warn("[acp] failed to start:", err instanceof Error ? err.message : String(err));
+		}
+	};
+	void startAcp();
+
 	app.on("will-quit", () => {
 		try {
 			widgetServer?.closeAllConnections?.();
 			widgetServer?.close();
+		} catch { /* best effort */ }
+		try {
+			acpServer?.closeAllConnections?.();
+			acpServer?.close();
 		} catch { /* best effort */ }
 	});
 

@@ -200,6 +200,14 @@ export interface AppConfig {
 		/** Peers allowed to assert X-Forwarded-For (reverse-proxy deployments). */
 		trustedProxies: string[];
 	};
+	/** ACP (Agent Client Protocol) Streamable-HTTP transport for external clients (Synapse). */
+	acp: {
+		enabled: boolean;
+		port: number;
+		token: string;
+		actorStaffId: string;
+		actorName: string;
+	};
 	reports: {
 		enabled: boolean;
 		target: "gitee" | "oss";

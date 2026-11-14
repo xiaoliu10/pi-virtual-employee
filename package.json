@@ -56,6 +56,7 @@
     "verify:asar:linux": "node scripts/verify-asar.mjs release/linux-unpacked/resources/app.asar"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^2.6.0",
     "@earendil-works/chord": "1.5.2",
     "@earendil-works/pi-agent-core": "^1.5.2",
     "@earendil-works/pi-ai": "^1.5.2",

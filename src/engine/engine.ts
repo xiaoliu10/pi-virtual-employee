@@ -4503,4 +4503,13 @@ export class EmployeeEngine implements EmployeeRuntime {
 	isReadOnlyConversation(conversationId: string): boolean {
 		return this.history.isReadOnly(conversationId);
 	}
+
+	/**
+	 * Persist an ACP-origin conversation before its first turn. The `acp:`
+	 * origin marks it REMOTE (see inferConversationOrigin) so it can never fall
+	 * back to the console origin whose no-actor path grants implicit admin.
+	 */
+	ensureAcpConversation(conversationId: string): void {
+		this.history.ensureConversation(conversationId, "ACP 会话", "acp");
+	}
 }

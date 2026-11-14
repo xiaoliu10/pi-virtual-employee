@@ -521,6 +521,26 @@ export interface AppConfig {
 		trustedProxies: string[];
 	};
 	/**
+	 * ACP (Agent Client Protocol) transport (2026-11): lets an external ACP
+	 * client (Synapse) drive this employee over Streamable HTTP. The token is
+	 * mandatory while enabled — loopback still requires it, so a stray browser
+	 * page cannot POST prompts. ACP conversations run as ONE fixed service
+	 * account (acp.actorStaffId) whose role comes from security.people; the
+	 * external client owns interactive approval before sending each prompt.
+	 */
+	acp: {
+		/** Master switch. The ACP listener starts only when true (restart to apply). */
+		enabled: boolean;
+		/** Fixed loopback port; the client needs a stable address. */
+		port: number;
+		/** Bearer token, required while enabled. Empty = service refuses to start. */
+		token: string;
+		/** Fixed service-account staff id used for every ACP turn's verified actor. */
+		actorStaffId: string;
+		/** Display name recorded in audit/history alongside the actor. */
+		actorName: string;
+	};
+	/**
 	 * Report / artifact center. Generated reports (scheduled-task outputs, etc.)
 	 * are persisted locally (with run history) and pushed to a configurable Gitee
 	 * repo; the IM push carries a shareable link. EVERY field is instance-specific
@@ -680,6 +700,13 @@ export const DEFAULTS: AppConfig = {
 		launcherIconUrl: "",
 		launcherSize: 52,
 		trustedProxies: [],
+	},
+	acp: {
+		enabled: false,
+		port: 17890,
+		token: "",
+		actorStaffId: "acp-synapse",
+		actorName: "Synapse ACP",
 	},
 	reports: {
 		enabled: false,
