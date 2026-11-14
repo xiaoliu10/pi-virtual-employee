@@ -546,3 +546,58 @@ test("MID-TURN: a model with thinking keeps its note visible-above until done (p
 	assert.ok(midTurn.idx < midTurn.answerIdx, "仍在答文上方");
 	assert.match(midTurn.title, /思考 · 用时 \d+ 秒/, "完成态标题");
 });
+
+test("TOOL CALLS: steps render ABOVE the answer bubble, and empty cursor bubble is hidden until text arrives", async () => {
+	// Field 2026-11-14 (user screenshot): addStep appended AFTER box, leaving an
+	// empty bordered white bubble with only a blinking blue cursor sitting
+	// between the thinking text and the 7 tool rows — and even the final answer
+	// landed above the tool list instead of at the bottom.
+	const events = [
+		{ type: "thinking_delta", text: "先查批号和规则" },
+		{ type: "tool_start", toolName: "search_knowledge_base", toolCallId: "t1" },
+		{ type: "tool_end", toolCallId: "t1", isError: false, durationMs: 40 },
+		{ type: "tool_start", toolName: "browser_navigate", toolCallId: "t2" },
+		{ type: "tool_end", toolCallId: "t2", isError: false, durationMs: 120 },
+		{ type: "delta", text: "最终结论：已核验完成。" },
+		{ type: "done" },
+	];
+	const html = renderWidgetPage({ title: "t", suggestions: [], disclaimer: "" });
+	let midTools = null;
+	const { transcript, send } = bootPage(html, events, [
+		{
+			afterCount: 3, // thinking_delta + tool_start + tool_end — no answer delta yet
+			fn: () => {
+				const kinds = transcript.children.map((c) => String(c.className));
+				const thinkIdx = kinds.findIndex((c) => c.includes("think"));
+				const stepIdx = kinds.findIndex((c) => c.includes("step"));
+				const answerIdx = kinds.findIndex((c) => c.includes("ai"));
+				const box = transcript.children[answerIdx];
+				midTools = {
+					thinkIdx,
+					stepIdx,
+					answerIdx,
+					boxHidden: box ? box.classList.contains("hidden") : false,
+				};
+			},
+		},
+	]);
+	await send("查一下");
+	for (let i = 0; i < 100 && midTools === null; i++) await new Promise((r) => setTimeout(r, 20));
+
+	assert.ok(midTools, "mid-turn observation must fire");
+	assert.ok(midTools.thinkIdx < midTools.stepIdx, "thinking sits above tool steps");
+	assert.ok(midTools.stepIdx < midTools.answerIdx, `tool step must sit ABOVE answer bubble (step=${midTools.stepIdx}, answer=${midTools.answerIdx})`);
+	assert.equal(midTools.boxHidden, true, "empty cursor-only answer bubble must be hidden while tools run");
+
+	await new Promise((r) => setTimeout(r, 50));
+	const finalKinds = transcript.children.map((c) => String(c.className));
+	const thinkIdx = finalKinds.findIndex((c) => c.includes("think"));
+	const stepIdxs = finalKinds.map((c, i) => (c.includes("step") ? i : -1)).filter((i) => i >= 0);
+	const answerIdx = finalKinds.findIndex((c) => c.includes("ai"));
+	const finalBox = transcript.children[answerIdx];
+	assert.equal(stepIdxs.length, 2, "both tool steps rendered");
+	assert.ok(thinkIdx < stepIdxs[0], "thinking above first tool");
+	assert.ok(stepIdxs[1] < answerIdx, `final answer must sit BELOW all tool steps (lastStep=${stepIdxs[1]}, answer=${answerIdx})`);
+	assert.equal(finalBox.classList.contains("hidden"), false, "final answer is visible");
+	assert.equal(finalBox.textContent, "最终结论：已核验完成。");
+});
