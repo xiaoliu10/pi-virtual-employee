@@ -148,7 +148,7 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
     box-shadow:0 12px 48px rgba(0,0,0,.18); display:flex; flex-direction:column; overflow:hidden;
     font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; }
   .head { padding:14px 16px; display:flex; align-items:center; justify-content:space-between;
-    border-bottom:1px solid #eef0f4; }
+    border-bottom:1px solid #eef0f4; flex-shrink:0; }
   .head .t { font-size:15px; font-weight:600; color:#1f2329; }
   .head button { background:none; border:none; font-size:16px; color:#86909c; padding:4px; }
   .body { flex:1; overflow-y:auto; padding:16px; background:#f7f8fa; }
@@ -163,7 +163,7 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
   .msg.ai { background:#fff; border:1px solid #e5e6eb; border-top-left-radius:4px; }
   .msg.me { background:#4f6ef7; color:#fff; margin-left:auto; border-top-right-radius:4px; }
   .msg.err { background:#fff7e8; border:1px solid #ffd591; color:#ad6800; }
-  .foot { border-top:1px solid #eef0f4; padding:10px 12px 6px; background:#fff; }
+  .foot { border-top:1px solid #eef0f4; padding:10px 12px 6px; background:#fff; flex-shrink:0; }
   .box { width:100%; height:64px; resize:none; border:1px solid #e5e6eb; border-radius:10px;
     padding:8px 10px; font-size:14px; color:#1f2329; outline:none; }
   .box:focus { border-color:#4f6ef7; }
@@ -420,8 +420,9 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
     }).catch(function (e) { handlers.onerror("网络错误：" + e); });
   }
 
-  /** 工具行 — Desktop pi-tool 摘要：工具族 SVG 图标 + 粗体「正在执行」+ 状态章。 */
-  function addStep(msgs, toolName) {
+  /** 工具行 — Desktop pi-tool 摘要：工具族 SVG 图标 + 粗体「正在执行」+ 状态章。
+   *  插在回答气泡之前（thinking → tools → answer，field 2026-11-14）。 */
+  function addStep(msgs, toolName, anchor) {
     var step = document.createElement("details");
     step.className = "step";
     var head = document.createElement("summary");
@@ -439,7 +440,8 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
     chev.innerHTML = ICONS.chev;
     head.appendChild(run); head.appendChild(name); head.appendChild(chip); head.appendChild(chev);
     step.appendChild(head);
-    msgs.appendChild(step);
+    if (anchor && anchor.parentNode === msgs) msgs.insertBefore(step, anchor);
+    else msgs.appendChild(step);
     scrollEnd();
     return step;
   }
@@ -593,6 +595,7 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
         else { thinkEl.remove(); thinkEl = null; } // 从不思考的模型：不留空面板
       }
       box.classList.remove("streaming");
+      box.classList.remove("hidden");
       if (!box.textContent || box.textContent === "正在思考…") box.textContent = aiText || "（空回复）";
       state.busy = false;
       q(".send").disabled = false;
@@ -608,6 +611,7 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
           case "delta":
             aiText += ev.text;
             box.textContent = aiText;
+            box.classList.remove("hidden");
             // 回答文本开始 → 思考阶段结束，按用户要求收起面板（思考恢复会重开）
             if (thinkEl) paintThinking(thinkEl, thinkText, false);
             scrollEnd();
@@ -615,13 +619,14 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
           case "replace":
             aiText = ev.text;
             box.textContent = aiText || "（内容已按安全策略隐藏）";
+            box.classList.remove("hidden");
             if (thinkEl) paintThinking(thinkEl, thinkText, false);
             scrollEnd();
             break;
           case "tool_start":
-            if (!aiText) box.textContent = "";
+            if (!aiText) { box.textContent = ""; box.classList.add("hidden"); }
             if (thinkEl) paintThinking(thinkEl, thinkText, false);
-            lastTool = addStep(m, ev.toolName);
+            lastTool = addStep(m, ev.toolName, box);
             if (ev.toolCallId) tools[ev.toolCallId] = lastTool;
             scrollEnd();
             break;
@@ -631,14 +636,14 @@ export function renderWidgetLoader(look: LauncherLook = { icon: "text", iconUrl:
             break;
           }
           case "thinking_delta":
-            if (!aiText) box.textContent = "";
+            if (!aiText) { box.textContent = ""; box.classList.add("hidden"); }
             if (!thinkEl) thinkEl = addThinking(m, box);
             thinkText += ev.text;
             paintThinking(thinkEl, thinkText, true);
             scrollEnd();
             break;
           case "thinking_replace":
-            if (!aiText) box.textContent = "";
+            if (!aiText) { box.textContent = ""; box.classList.add("hidden"); }
             if (!thinkEl) thinkEl = addThinking(m, box);
             thinkText = ev.text;
             paintThinking(thinkEl, thinkText, true);
@@ -694,7 +699,7 @@ ${SHARED_CSS}
 body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; background:#f7f8fa;
   display:flex; justify-content:center; }
 .wrap { position:relative; width:100%; max-width:880px; display:flex; flex-direction:column; height:100vh; background:#fff; }
-.head { padding:16px 20px; border-bottom:1px solid #eef0f4; font-size:16px; font-weight:600; color:#1f2329; }
+.head { padding:16px 20px; border-bottom:1px solid #eef0f4; font-size:16px; font-weight:600; color:#1f2329; flex-shrink:0; }
 .body { flex:1; overflow-y:auto; padding:20px; }
 .hero { font-size:24px; font-weight:700; color:#1f2329; margin-bottom:16px; }
 .hero em { font-style:normal; color:#4f6ef7; }
@@ -707,7 +712,7 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
 .msg.ai { background:#f7f8fa; border:1px solid #e5e6eb; }
 .msg.me { background:#4f6ef7; color:#fff; margin-left:auto; }
 .msg.err { background:#fff7e8; border:1px solid #ffd591; color:#ad6800; }
-.foot { border-top:1px solid #eef0f4; padding:14px 20px 8px; }
+.foot { border-top:1px solid #eef0f4; padding:14px 20px 8px; flex-shrink:0; }
 .box { width:100%; height:72px; resize:none; border:1px solid #e5e6eb; border-radius:10px;
   padding:10px 12px; font-size:14px; outline:none; }
 .box:focus { border-color:#4f6ef7; }
@@ -715,7 +720,7 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
 .send { background:#4f6ef7; border:none; color:#fff; border-radius:8px; padding:8px 20px; font-size:14px; }
 .send:disabled { background:#c9cdd4; }
 .dis { text-align:center; font-size:12px; color:#c9cdd4; padding:6px 0; }
-.hidden { display:none; }
+.hidden { display:none !important; }
 </style>
 </head>
 <body>
@@ -906,8 +911,9 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
       return pump();
     }).catch(function (e) { handlers.onerror("网络错误：" + e); });
   }
-  /** 工具行 — Desktop pi-tool 摘要：工具族 SVG 图标 + 粗体「正在执行」+ 状态章。 */
-  function addStep(list, toolName) {
+  /** 工具行 — Desktop pi-tool 摘要：工具族 SVG 图标 + 粗体「正在执行」+ 状态章。
+   *  插在回答气泡之前（thinking → tools → answer，field 2026-11-14）。 */
+  function addStep(list, toolName, anchor) {
     var step = document.createElement("details");
     step.className = "step";
     var head = document.createElement("summary");
@@ -925,7 +931,8 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
     chev.innerHTML = ICONS.chev;
     head.appendChild(run); head.appendChild(name); head.appendChild(chip); head.appendChild(chev);
     step.appendChild(head);
-    list.appendChild(step);
+    if (anchor && anchor.parentNode === list) list.insertBefore(step, anchor);
+    else list.appendChild(step);
     scrollEnd();
     return step;
   }
@@ -1061,6 +1068,7 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
         else { thinkEl.remove(); thinkEl = null; } // 从不思考的模型：不留空面板
       }
       box.classList.remove("streaming");
+      box.classList.remove("hidden");
       if (!box.textContent || box.textContent === "正在思考…") box.textContent = aiText || "（空回复）";
       busy = false; el("send").disabled = false; el("box").focus();
       scrollEnd();
@@ -1073,6 +1081,7 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
           case "delta":
             aiText += ev.text;
             box.textContent = aiText;
+            box.classList.remove("hidden");
             // 回答文本开始 → 思考阶段结束，按用户要求收起面板（思考恢复会重开）
             if (thinkEl) paintThinking(thinkEl, thinkText, false);
             scrollEnd();
@@ -1080,13 +1089,14 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
           case "replace":
             aiText = ev.text;
             box.textContent = aiText || "（内容已按安全策略隐藏）";
+            box.classList.remove("hidden");
             if (thinkEl) paintThinking(thinkEl, thinkText, false);
             scrollEnd();
             break;
           case "tool_start":
-            if (!aiText) box.textContent = "";
+            if (!aiText) { box.textContent = ""; box.classList.add("hidden"); }
             if (thinkEl) paintThinking(thinkEl, thinkText, false);
-            lastTool = addStep(list, ev.toolName);
+            lastTool = addStep(list, ev.toolName, box);
             if (ev.toolCallId) tools[ev.toolCallId] = lastTool;
             scrollEnd();
             break;
@@ -1096,14 +1106,14 @@ body { font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif; bac
             break;
           }
           case "thinking_delta":
-            if (!aiText) box.textContent = "";
+            if (!aiText) { box.textContent = ""; box.classList.add("hidden"); }
             if (!thinkEl) thinkEl = addThinking(list, box);
             thinkText += ev.text;
             paintThinking(thinkEl, thinkText, true);
             scrollEnd();
             break;
           case "thinking_replace":
-            if (!aiText) box.textContent = "";
+            if (!aiText) { box.textContent = ""; box.classList.add("hidden"); }
             if (!thinkEl) thinkEl = addThinking(list, box);
             thinkText = ev.text;
             paintThinking(thinkEl, thinkText, true);

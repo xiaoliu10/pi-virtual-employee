@@ -414,3 +414,46 @@ test("loader: a never-thinking model leaves no empty note (mid-turn and final)",
 	for (let i = 0; i < 100 && midTurn === null; i++) await new Promise((r) => setTimeout(r, 20));
 	assert.equal(midTurn, 0, "浮窗通道：答文开始时不得留下空思考面板");
 });
+
+test("loader: tool steps render ABOVE answer bubble and empty cursor bubble is hidden mid-process", async () => {
+	let midTools = null;
+	const { panel, send } = bootLoader(
+		[
+			{ type: "thinking_delta", text: "先查一下" },
+			{ type: "tool_start", toolName: "search_knowledge_base", toolCallId: "t1" },
+			{ type: "tool_end", toolCallId: "t1", isError: false, durationMs: 30 },
+			{ type: "delta", text: "核验完成。" },
+			{ type: "done" },
+		],
+		[
+			{
+				afterCount: 2, // thinking_delta + tool_start
+				fn: () => {
+					const msgs = panel.querySelector(".msgs");
+					const kinds = msgs.children.map((c) => String(c.className));
+					const thinkIdx = kinds.findIndex((c) => c.includes("think"));
+					const stepIdx = kinds.findIndex((c) => c.includes("step"));
+					const answerIdx = kinds.findIndex((c) => c.includes("ai"));
+					const box = msgs.children[answerIdx];
+					midTools = { thinkIdx, stepIdx, answerIdx, boxHidden: box ? box.classList.contains("hidden") : false };
+				},
+			},
+		],
+	);
+	await send("查一下");
+	for (let i = 0; i < 100 && midTools === null; i++) await new Promise((r) => setTimeout(r, 20));
+	assert.ok(midTools, "观察点必须触发");
+	assert.ok(midTools.thinkIdx < midTools.stepIdx, "浮窗：思考在工具上方");
+	assert.ok(midTools.stepIdx < midTools.answerIdx, `浮窗：工具必须在答文上方 (step=${midTools.stepIdx}, answer=${midTools.answerIdx})`);
+	assert.equal(midTools.boxHidden, true, "浮窗：过程运行且无正文时隐藏空气泡光标");
+
+	await new Promise((r) => setTimeout(r, 50));
+	const msgs = panel.querySelector(".msgs");
+	const finalKinds = msgs.children.map((c) => String(c.className));
+	const stepIdx = finalKinds.findIndex((c) => c.includes("step"));
+	const answerIdx = finalKinds.findIndex((c) => c.includes("ai"));
+	const finalBox = msgs.children[answerIdx];
+	assert.ok(stepIdx < answerIdx, "浮窗：最终答文在所有工具步骤最下方");
+	assert.equal(finalBox.classList.contains("hidden"), false, "浮窗：最终答文可见");
+	assert.equal(finalBox.textContent, "核验完成。");
+});
