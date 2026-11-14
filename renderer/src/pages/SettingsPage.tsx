@@ -714,6 +714,9 @@ export function SettingsPage({ config, onChange, updater, onClose }: SettingsPag
 	const setWidget = (patch: Partial<AppConfig["widget"]>) =>
 		setDraft((value) => value ? { ...value, widget: { ...value.widget, ...patch } } : value);
 
+	const setAcp = (patch: Partial<AppConfig["acp"]>) =>
+		setDraft((value) => value ? { ...value, acp: { ...value.acp, ...patch } } : value);
+
 	const cancel = () => {
 		setDraft(config);
 		setError(null);
@@ -1677,6 +1680,48 @@ X-VE-Secret: <接入密钥>
 													)}
 												</div>
 											</div>
+
+
+										<div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
+											<div className="text-sm font-medium text-slate-800">ACP 接入（Agent Client Protocol）</div>
+											<div className="mt-1 text-xs leading-relaxed text-slate-400">
+												供 Synapse 等 ACP 客户端通过标准协议（Streamable HTTP）驱动本员工执行任务。仅监听 127.0.0.1，必须携带 Bearer 令牌；每个 ACP 会话以固定服务账号身份运行，其角色在「人员管理」中配置（要执行 shell 需授 admin/operator）。启用/停用或改端口后需重启应用生效。
+											</div>
+											<div className="mt-3 space-y-3">
+												<label className="flex cursor-pointer items-center justify-between rounded-xl border border-indigo-200 bg-indigo-50/50 px-4 py-3">
+													<div><div className="text-sm font-medium text-slate-800">启用 ACP 服务</div><div className="mt-0.5 text-xs text-indigo-700/70">开启后按下方端口在 /acp 路径提供 ACP 协议服务（重启生效）。</div></div>
+													<input type="checkbox" checked={draft.acp.enabled} onChange={(e) => setAcp({ enabled: e.target.checked })} className="h-5 w-5 accent-indigo-500" />
+												</label>
+												<div className="grid grid-cols-2 gap-3">
+													<Field label="ACP 端口" hint="固定本机端口，默认 17890。客户端填写 http://127.0.0.1:端口/acp。">
+														<input type="number" min={1} max={65535} value={draft.acp.port}
+															onChange={(e) => setAcp({ port: Math.min(65535, Math.max(1, Math.floor(Number(e.target.valueAsNumber) || 17890))) })}
+															className={inputCls} />
+													</Field>
+													<Field label="服务账号标识" hint="每个 ACP 任务以此身份（channel=acp）执行；需在人员管理登记同标识并授角色。">
+														<input value={draft.acp.actorStaffId} onChange={(e) => setAcp({ actorStaffId: e.target.value })} className={inputCls + " font-mono"} />
+													</Field>
+												</div>
+												<Field label="访问令牌（必填）" hint="ACP 客户端携带的 Bearer 令牌；启用后为空则服务拒绝启动。泄露时点「重新生成」轮换。">
+													<div className="flex gap-2">
+														<input value={draft.acp.token} onChange={(e) => setAcp({ token: e.target.value })} placeholder="启用前请生成或填写令牌" className={inputCls + " font-mono"} />
+														<button type="button"
+															onClick={() => { const b = new Uint8Array(24); crypto.getRandomValues(b); setAcp({ token: Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("") }); }}
+															className="shrink-0 rounded-lg border border-slate-300 px-3 text-xs text-slate-600 hover:bg-slate-50">重新生成</button>
+													</div>
+												</Field>
+												<Field label="服务账号显示名" hint="审计与历史记录中展示的名称。">
+													<input value={draft.acp.actorName} onChange={(e) => setAcp({ actorName: e.target.value })} className={inputCls} />
+												</Field>
+												{draft.acp.enabled && (
+													<div className="rounded-xl bg-slate-50 px-4 py-3 text-xs leading-relaxed text-slate-500">
+														<div className="font-medium text-slate-700">客户端接入地址（重启后生效）</div>
+														<code className="mt-1 block font-mono text-[11px]">http://127.0.0.1:{draft.acp.port}/acp</code>
+														<div className="mt-1 text-amber-700/80">ACP 会话使用 acp: 前缀的独立 origin，不继承本机控制台的隐式管理权限；未携带令牌的请求一律 401。</div>
+													</div>
+												)}
+											</div>
+										</div>
 
 											{(() => {
 												const u = updater.state;

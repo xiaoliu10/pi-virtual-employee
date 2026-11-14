@@ -417,5 +417,9 @@ export function inferConversationOrigin(id: string): string {
 	// untrusted — never treat them as the local console (RBAC trust boundary),
 	// and never let them write profile-scope memory.
 	if (id.startsWith("widget:")) return "widget";
+	// ACP transport (2026-11): remote machine clients (Synapse). Like widget,
+	// REMOTE and untrusted — never inherits the console's implicit admin; the
+	// turn's verified actor carries the role instead.
+	if (id.startsWith("acp:")) return "acp";
 	return "console";
 }
